@@ -2122,17 +2122,19 @@ class CollectionsResponse(BaseModel):
 
 class CollectionAccessRequest(BaseModel):
     """PUT /collections/{name}/access (#606): the whole state at once. Open
-    takes no names; restricted grants exactly the people and service
-    principals named (none: Engineers only)."""
+    takes no names; restricted grants exactly the people, service principals
+    and groups (#784) named (none: Engineers only). A body without `groups`
+    grants no group."""
     model_config = ConfigDict(extra="forbid")
     restricted: bool
     users: list[Annotated[str, Field(max_length=64)]] = Field(default_factory=list, max_length=1000)
     service_principals: list[Annotated[str, Field(max_length=64)]] = Field(default_factory=list, max_length=1000)
+    groups: list[Annotated[str, Field(max_length=64)]] = Field(default_factory=list, max_length=1000)
 
     @model_validator(mode="after")
     def _names_only_when_restricted(self):
-        if not self.restricted and (self.users or self.service_principals):
-            raise ValueError("an open collection takes no users or service principals")
+        if not self.restricted and (self.users or self.service_principals or self.groups):
+            raise ValueError("an open collection takes no users, service principals or groups")
         return self
 
 
@@ -2140,6 +2142,7 @@ class CollectionAccessResponse(BaseModel):
     restricted: bool
     users: list[str]
     service_principals: list[str]
+    groups: list[str]
 
 
 # ── Ingest ────────────────────────────────────────────────────────────────────
@@ -2773,6 +2776,43 @@ class PrincipalCreateRequest(BaseModel):
 class KeyIssueRequest(BaseModel):
     label: str = Field(default="", max_length=64)
     days: StrictInt = Field(default=90, ge=1, le=365)
+
+
+# Groups for collection access (#784).
+
+class Group(BaseModel):
+    name: str
+    created_at: str
+    users: list[str]
+    service_principals: list[str]
+
+
+class GroupList(BaseModel):
+    groups: list[Group]
+
+
+class GroupResult(BaseModel):
+    group: Group
+
+
+class GroupCreateRequest(BaseModel):
+    name: str   # no length cap: the route refuses any name breaking the rule as INVALID_GROUP_NAME
+
+
+class GroupRenameRequest(BaseModel):
+    name: str   # the new name; refused as INVALID_GROUP_NAME when it breaks the rule
+
+
+class GroupMembersRequest(BaseModel):
+    """PUT /auth/groups/{name}/members: the whole member list at once."""
+    model_config = ConfigDict(extra="forbid")
+    users: list[Annotated[str, Field(max_length=64)]] = Field(default_factory=list, max_length=1000)
+    service_principals: list[Annotated[str, Field(max_length=64)]] = Field(default_factory=list, max_length=1000)
+
+
+class GroupDeleteResult(BaseModel):
+    name: str
+    collections: list[str]
 
 
 # ── Error ─────────────────────────────────────────────────────────────────────
@@ -16286,7 +16326,7 @@ async def delete_collection(name: CollectionName, confirm: str | None = None):
 
 def _access_body(state: store.CollectionAccess) -> CollectionAccessResponse:
     return CollectionAccessResponse(restricted=state.restricted, users=list(state.users),
-                                    service_principals=list(state.service_principals))
+                                    service_principals=list(state.service_principals), groups=list(state.groups))
 
 
 async def _missing(name: str, outcome: str):
@@ -16316,25 +16356,26 @@ def _names(before: tuple, after: tuple) -> tuple[list, list]:
 
 @router.put("/{name}/access", response_model=CollectionAccessResponse)
 async def set_collection_access(name: CollectionName, body: CollectionAccessRequest, request: Request = None):
-    """Set who may use the collection, the whole state at once (#606)."""
+    """Set who may use the collection, the whole state at once (#606), groups included (#784)."""
     audit.note(collection=name)
     missing = await _missing(name, "Nothing was changed")
     if missing is not None:
         return missing
     try:
         before, after = await asyncio.to_thread(store.set_collection_access, name, body.restricted,
-                                                body.users, body.service_principals)
+                                                body.users, body.service_principals, body.groups)
     except store.Refused as exc:
         return api_error(422, "INVALID_PARAMETER", str(exc))
     added_users, removed_users = _names(before.users, after.users)
     added_svc, removed_svc = _names(before.service_principals, after.service_principals)
+    added_groups, removed_groups = _names(before.groups, after.groups)
     audit.note(restricted_before=before.restricted, restricted_after=after.restricted,
-               added={"users": added_users, "service_principals": added_svc},
-               removed={"users": removed_users, "service_principals": removed_svc})
+               added={"users": added_users, "service_principals": added_svc, "groups": added_groups},
+               removed={"users": removed_users, "service_principals": removed_svc, "groups": removed_groups})
     actor = getattr(access.principal_of(request), "username", "?")
-    _log.warning("Admin %r set the access of collection %r: %s, %d people and %d service principals granted",
-                 actor, name, "restricted" if after.restricted else "open", len(after.users),
-                 len(after.service_principals))
+    _log.warning("Admin %r set the access of collection %r: %s, %d people, %d service principals and %d groups "
+                 "granted", actor, name, "restricted" if after.restricted else "open", len(after.users),
+                 len(after.service_principals), len(after.groups))
     return _access_body(after)
 ```
 
@@ -19063,6 +19104,13 @@ ACCESS: dict[tuple[str, str], str] = {
     ("POST", "/auth/service-principals/{name}/enable"): ENGINEER,
     ("POST", "/auth/service-principals/{name}/keys"): ENGINEER,
     ("POST", "/auth/service-principals/{name}/keys/{key_id}/revoke"): ENGINEER,
+    # Groups for collection access (#784): Engineers, in a browser session only.
+    # Nothing under /auth uses DELETE, so a group is deleted with a POST.
+    ("GET", "/auth/groups"): ENGINEER,
+    ("POST", "/auth/groups"): ENGINEER,
+    ("POST", "/auth/groups/{name}/rename"): ENGINEER,
+    ("PUT", "/auth/groups/{name}/members"): ENGINEER,
+    ("POST", "/auth/groups/{name}/delete"): ENGINEER,
     # The audit log (#29): Engineers, in a browser session only (HUMAN_ONLY).
     ("GET", "/audit"): ENGINEER,
     ("GET", "/audit.csv"): ENGINEER,
@@ -19080,10 +19128,11 @@ ACCESS: dict[tuple[str, str], str] = {
 # GET /auth/me answers for a key. The audit log too (#29): a leaked key can't
 # read who did what, or question text when that is recorded. And two-step
 # verification (#607): service keys are unchanged and have no second factor.
-# And per-collection access (#606), so a leaked key can't open a collection to
-# another principal.
+# And per-collection access (#606), and groups (#784), so a leaked key can't
+# open a collection to another principal.
 HUMAN_ONLY = frozenset(path for _, path in ACCESS
-                       if path.startswith(("/auth/users", "/auth/service-principals", "/auth/mfa"))) | {
+                       if path.startswith(("/auth/users", "/auth/service-principals", "/auth/mfa",
+                                           "/auth/groups"))) | {
     "/auth/logout", "/auth/password", "/audit", "/audit.csv", "/collections/{name}/access"}
 
 
@@ -19190,6 +19239,13 @@ Per-collection access (#606, schema 4): a collection named in
 `collection_grants` (people or service principals) and Engineers may use it;
 any other collection is open to every account its role allows. Names are the
 canonical (stored) collection names. The rule itself is in access.py.
+
+Groups for collection access (#784, schema 5): Engineers make groups
+(`groups`) of people and service principals (`group_members`), and a
+restricted collection can be granted to a group (`collection_group_grants`) as
+well as to accounts. A member may use it while both the grant and their
+membership hold. Members and grants name the group's id, so a rename keeps
+them; deleting a group removes both, and never opens a collection.
 """
 from __future__ import annotations
 
@@ -19220,7 +19276,7 @@ KEY_DAYS_DEFAULT = 90            # a key's lifetime when none is given (Q23) ...
 KEY_DAYS_MAX = 365               # ... and the longest allowed
 _DAY_S = 86400
 NO_PASSWORD = "!"                # a principal's password hash: never verifies
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 MFA_PENDING_S = 10 * 60          # a started set-up must be confirmed within 10 minutes
 MFA_CHALLENGE_S = 5 * 60         # the code must follow the password within 5 minutes ...
 MFA_CHALLENGE_TRIES = 5          # ... with at most 5 codes per challenge
@@ -19306,6 +19362,25 @@ CREATE TABLE IF NOT EXISTS collection_grants (
     granted_at REAL NOT NULL,
     PRIMARY KEY (collection, user_id)
 );
+CREATE TABLE IF NOT EXISTS groups (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS group_members (
+    group_id INTEGER NOT NULL REFERENCES groups(id),
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    added_at REAL NOT NULL,
+    PRIMARY KEY (group_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS group_members_user ON group_members(user_id);
+CREATE TABLE IF NOT EXISTS collection_group_grants (
+    collection TEXT NOT NULL,
+    group_id INTEGER NOT NULL REFERENCES groups(id),
+    granted_at REAL NOT NULL,
+    PRIMARY KEY (collection, group_id)
+);
+CREATE INDEX IF NOT EXISTS collection_group_grants_group ON collection_group_grants(group_id);
 """
 
 _ready: set[str] = set()
@@ -19319,7 +19394,9 @@ class Refused(Exception):
     NOT_A_USER, REFUSED for the bootstrap rules, or one of the MFA codes
     (MFA_ALREADY_ENROLLED, MFA_ENROLLMENT_NOT_STARTED, MFA_CODE_INCORRECT,
     MFA_NOT_ENROLLED, MFA_REQUIRED, MFA_ENROLL_FIRST), or UNKNOWN_ACCOUNT for a
-    collection grant naming no such account (#606)."""
+    collection grant naming no such account (#606), or for groups (#784)
+    GROUP_EXISTS, GROUP_NOT_FOUND, and UNKNOWN_GROUP for a collection grant
+    naming no such group."""
 
     def __init__(self, message: str, code: str = "REFUSED"):
         super().__init__(message)
@@ -19420,9 +19497,10 @@ def _connect(write: bool = False):
 
 
 def _migrate(conn) -> None:
-    """Version 2 (PR 3): users.kind. Versions 3 (#607) and 4 (#606) only add
-    tables, which _SCHEMA creates; version 4 leaves every existing collection
-    open, since none is named in restricted_collections. In a write transaction, so the API and the operator
+    """Version 2 (PR 3): users.kind. Versions 3 (#607), 4 (#606) and 5 (#784)
+    only add tables, which _SCHEMA creates; version 4 leaves every existing collection
+    open, since none is named in restricted_collections, and version 5 adds no
+    group, so no state changes. In a write transaction, so the API and the operator
     command can't both add the column."""
     conn.execute("BEGIN IMMEDIATE")
     columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
@@ -20005,6 +20083,7 @@ class CollectionAccess:
     restricted: bool
     users: tuple[str, ...] = ()
     service_principals: tuple[str, ...] = ()
+    groups: tuple[str, ...] = ()                 # #784
 
 
 def _access(conn, collection: str) -> CollectionAccess:
@@ -20012,8 +20091,11 @@ def _access(conn, collection: str) -> CollectionAccess:
         return CollectionAccess(False)
     rows = conn.execute("SELECT u.username, u.kind FROM collection_grants g JOIN users u ON u.id = g.user_id "
                         "WHERE g.collection = ? ORDER BY u.username", (collection,)).fetchall()
+    groups = conn.execute("SELECT gr.name FROM collection_group_grants gg JOIN groups gr ON gr.id = gg.group_id "
+                          "WHERE gg.collection = ? ORDER BY gr.name", (collection,)).fetchall()
     return CollectionAccess(True, tuple(r["username"] for r in rows if r["kind"] == "user"),
-                            tuple(r["username"] for r in rows if r["kind"] == "service"))
+                            tuple(r["username"] for r in rows if r["kind"] == "service"),
+                            tuple(r["name"] for r in groups))
 
 
 def collection_access(collection: str) -> CollectionAccess:
@@ -20023,10 +20105,15 @@ def collection_access(collection: str) -> CollectionAccess:
 
 
 def restricted_collections() -> dict[str, frozenset[int]]:
-    """Every restricted collection and the ids of the accounts granted it."""
+    """Every restricted collection and the ids of the accounts that may use
+    it: granted directly, or a member of a group granted it (#784)."""
     with _connect() as conn:
         found = {row["collection"]: set() for row in conn.execute("SELECT collection FROM restricted_collections")}
         for row in conn.execute("SELECT collection, user_id FROM collection_grants"):
+            if row["collection"] in found:
+                found[row["collection"]].add(row["user_id"])
+        for row in conn.execute("SELECT gg.collection, m.user_id FROM collection_group_grants gg "
+                                "JOIN group_members m ON m.group_id = gg.group_id"):
             if row["collection"] in found:
                 found[row["collection"]].add(row["user_id"])
     return {name: frozenset(ids) for name, ids in found.items()}
@@ -20034,15 +20121,19 @@ def restricted_collections() -> dict[str, frozenset[int]]:
 
 def has_access(user_id: int, role: str, collection: str) -> bool:
     """An Engineer reaches every collection; anyone else an open one, or a
-    restricted one they are granted. Read on every call, so a change applies to
-    the next request."""
+    restricted one they are granted, directly or through a group (#784). Read
+    on every call, so a change applies to the next request."""
     if role == "engineer":
         return True
     collection = _canonical(collection)
     with _connect() as conn:
         if conn.execute("SELECT 1 FROM restricted_collections WHERE collection = ?", (collection,)).fetchone() is None:
             return True
-        return conn.execute("SELECT 1 FROM collection_grants WHERE collection = ? AND user_id = ?",
+        if conn.execute("SELECT 1 FROM collection_grants WHERE collection = ? AND user_id = ?",
+                        (collection, user_id)).fetchone() is not None:
+            return True
+        return conn.execute("SELECT 1 FROM collection_group_grants gg JOIN group_members m "
+                            "ON m.group_id = gg.group_id WHERE gg.collection = ? AND m.user_id = ? LIMIT 1",
                             (collection, user_id)).fetchone() is not None
 
 
@@ -20084,30 +20175,45 @@ def _grant_ids(conn, names, kind: str) -> list[int]:
     return ids
 
 
-def _restrict(conn, collection: str, user_ids) -> None:
+def _group_ids(conn, names) -> list[int]:
+    ids = []
+    for name in names:
+        row = conn.execute("SELECT id FROM groups WHERE name = ?", (str(name).strip().lower(),)).fetchone()
+        if row is None:
+            raise Refused(f"no group is named {name!r}", "UNKNOWN_GROUP")
+        ids.append(row["id"])
+    return ids
+
+
+def _restrict(conn, collection: str, user_ids, group_ids=()) -> None:
     now = _now()
     conn.execute("INSERT OR IGNORE INTO restricted_collections (collection, restricted_at) VALUES (?, ?)",
                  (collection, now))
     conn.execute("DELETE FROM collection_grants WHERE collection = ?", (collection,))
     conn.executemany("INSERT INTO collection_grants (collection, user_id, granted_at) VALUES (?, ?, ?)",
                      [(collection, user_id, now) for user_id in dict.fromkeys(user_ids)])
+    conn.execute("DELETE FROM collection_group_grants WHERE collection = ?", (collection,))
+    conn.executemany("INSERT INTO collection_group_grants (collection, group_id, granted_at) VALUES (?, ?, ?)",
+                     [(collection, group_id, now) for group_id in dict.fromkeys(group_ids)])
 
 
 def _open(conn, collection: str) -> None:
     conn.execute("DELETE FROM collection_grants WHERE collection = ?", (collection,))
+    conn.execute("DELETE FROM collection_group_grants WHERE collection = ?", (collection,))
     conn.execute("DELETE FROM restricted_collections WHERE collection = ?", (collection,))
 
 
-def set_collection_access(collection: str, restricted: bool, users=(), service_principals=()):
+def set_collection_access(collection: str, restricted: bool, users=(), service_principals=(), groups=()):
     """An Engineer's change (PUT /collections/{name}/access): the whole state
     at once. Returns (before, after). An unknown name refuses the whole change
-    (UNKNOWN_ACCOUNT); disabled accounts may be granted."""
+    (UNKNOWN_ACCOUNT, or UNKNOWN_GROUP for a group, #784); disabled accounts may
+    be granted."""
     collection = _canonical(collection)
     with _connect(write=True) as conn:
         before = _access(conn, collection)
         if restricted:
             ids = _grant_ids(conn, users, "user") + _grant_ids(conn, service_principals, "service")
-            _restrict(conn, collection, ids)
+            _restrict(conn, collection, ids, _group_ids(conn, groups))
         else:
             _open(conn, collection)
         return before, _access(conn, collection)
@@ -20115,7 +20221,8 @@ def set_collection_access(collection: str, restricted: bool, users=(), service_p
 
 def restrict_to(collection: str, user_id: int | None) -> tuple[CollectionAccess, CollectionAccess]:
     """A new collection: restricted, granted only to its creator (none when
-    None). Returns (the state it replaced, the state written), for put_back."""
+    None), with no group. Returns (the state it replaced, the state written),
+    for put_back."""
     collection = _canonical(collection)
     with _connect(write=True) as conn:
         before = _access(conn, collection)
@@ -20132,32 +20239,41 @@ def _no_store() -> bool:
 
 
 def _grant_set(conn, collection: str):
-    """None for an open collection; otherwise the ids of the accounts granted it."""
+    """None for an open collection; otherwise the ids of the accounts granted
+    it and the ids of the groups granted it (#784)."""
     if conn.execute("SELECT 1 FROM restricted_collections WHERE collection = ?", (collection,)).fetchone() is None:
         return None
-    return [row["user_id"] for row in
-            conn.execute("SELECT user_id FROM collection_grants WHERE collection = ?", (collection,))]
+    users = [row["user_id"] for row in
+             conn.execute("SELECT user_id FROM collection_grants WHERE collection = ?", (collection,))]
+    groups = [row["group_id"] for row in
+              conn.execute("SELECT group_id FROM collection_group_grants WHERE collection = ?", (collection,))]
+    return users, groups
 
 
 def copy_collection_access(source: str, target: str,
                            narrowed_by: Iterable[str] = ()) -> tuple[CollectionAccess, CollectionAccess]:
     """The target takes the source's state: open stays open, restricted copies
-    its grants. With `narrowed_by` (the collections a staging or recovery copy
-    was made from, its chain after itself, #788, #792), it takes the narrowest
-    of them all: restricted when any is, to the accounts granted every
-    restricted one. Returns (the target's state it replaced, the state
-    written)."""
+    its grants, to accounts and to groups (#784). With `narrowed_by` (the
+    collections a staging or recovery copy was made from, its chain after
+    itself, #788, #792), it takes the narrowest of them all: restricted when
+    any is, to the accounts granted directly every restricted one and the
+    groups granted every one, each intersected on its own, so it is never
+    wider than any of them and a group grant stays one. Returns (the target's
+    state it replaced, the state written)."""
     source, target = _canonical(source), _canonical(target)
     if _no_store():
         return CollectionAccess(False), CollectionAccess(False)
     with _connect(write=True) as conn:
         before = _access(conn, target)
         sets = [_grant_set(conn, source)] + [_grant_set(conn, _canonical(n)) for n in narrowed_by]
-        restricted = [ids for ids in sets if ids is not None]
+        restricted = [grants for grants in sets if grants is not None]
         if not restricted:
             _open(conn, target)
         else:
-            _restrict(conn, target, [i for i in restricted[0] if all(i in ids for ids in restricted[1:])])
+            first_users, first_groups = restricted[0]
+            _restrict(conn, target,
+                      [i for i in first_users if all(i in users for users, _ in restricted[1:])],
+                      [g for g in first_groups if all(g in groups for _, groups in restricted[1:])])
         return before, _access(conn, target)
 
 
@@ -20166,7 +20282,8 @@ def put_back(collection: str, expected: CollectionAccess, previous: CollectionAc
     `previous`, but only while it is still `expected`, the state the failed
     create wrote. A concurrent create or import that wrote its own state since
     keeps it, so a failure never takes another's grants nor opens a collection.
-    One transaction. True when it put the state back."""
+    An account or group in `previous` that no longer exists is left out
+    (narrower, never wider). One transaction. True when it put the state back."""
     collection = _canonical(collection)
     with _connect(write=True) as conn:
         if _access(conn, collection) != expected:
@@ -20180,7 +20297,12 @@ def put_back(collection: str, expected: CollectionAccess, previous: CollectionAc
                 row = conn.execute("SELECT id FROM users WHERE username = ? AND kind = ?", (name, kind)).fetchone()
                 if row is not None:
                     ids.append(row["id"])
-        _restrict(conn, collection, ids)
+        group_ids = []
+        for name in previous.groups:
+            row = conn.execute("SELECT id FROM groups WHERE name = ?", (name,)).fetchone()
+            if row is not None:
+                group_ids.append(row["id"])
+        _restrict(conn, collection, ids, group_ids)
         return True
 
 
@@ -20190,6 +20312,94 @@ def drop_collection_access(collection: str) -> None:
         return
     with _connect(write=True) as conn:
         _open(conn, _canonical(collection))
+
+
+# ── groups for collection access (#784) ──────────────────────────────────────
+
+@dataclass(frozen=True)
+class Group:
+    id: int
+    name: str
+    created_at: float
+    users: tuple[str, ...] = ()
+    service_principals: tuple[str, ...] = ()
+
+
+def _group(conn, row) -> Group:
+    members = conn.execute("SELECT u.username, u.kind FROM group_members m JOIN users u ON u.id = m.user_id "
+                           "WHERE m.group_id = ? ORDER BY u.username", (row["id"],)).fetchall()
+    return Group(row["id"], row["name"], row["created_at"],
+                 tuple(m["username"] for m in members if m["kind"] == "user"),
+                 tuple(m["username"] for m in members if m["kind"] == "service"))
+
+
+def _existing_group(conn, name: str):
+    row = conn.execute("SELECT * FROM groups WHERE name = ?", (name,)).fetchone()
+    if row is None:
+        raise Refused(f"there is no group {name!r}", "GROUP_NOT_FOUND")
+    return row
+
+
+def list_groups() -> list[Group]:
+    with _connect() as conn:
+        return [_group(conn, row) for row in conn.execute("SELECT * FROM groups ORDER BY name")]
+
+
+def get_group(name: str) -> Group:
+    """The group (GROUP_NOT_FOUND when there is none). `name` is the stored form."""
+    with _connect() as conn:
+        return _group(conn, _existing_group(conn, name))
+
+
+def create_group(name: str) -> Group:
+    """A new group with no members. `name` is the stored form (the router
+    checks the rule)."""
+    with _connect(write=True) as conn:
+        if conn.execute("SELECT 1 FROM groups WHERE name = ?", (name,)).fetchone() is not None:
+            raise Refused(f"a group named {name!r} already exists", "GROUP_EXISTS")
+        conn.execute("INSERT INTO groups (name, created_at) VALUES (?, ?)", (name, _now()))
+        return _group(conn, _existing_group(conn, name))
+
+
+def rename_group(name: str, new: str) -> Group:
+    """Members and grants name the group's id, so they stay. Renaming to its
+    own name changes nothing."""
+    with _connect(write=True) as conn:
+        row = _existing_group(conn, name)
+        if new != name:
+            if conn.execute("SELECT 1 FROM groups WHERE name = ?", (new,)).fetchone() is not None:
+                raise Refused(f"a group named {new!r} already exists", "GROUP_EXISTS")
+            conn.execute("UPDATE groups SET name = ? WHERE id = ?", (new, row["id"]))
+        return _group(conn, _existing_group(conn, new))
+
+
+def set_group_members(name: str, users=(), service_principals=()) -> tuple[Group, Group]:
+    """The whole member list at once. An unknown name refuses the whole change
+    (UNKNOWN_ACCOUNT); disabled accounts may be members. Returns (before, after)."""
+    with _connect(write=True) as conn:
+        row = _existing_group(conn, name)
+        before = _group(conn, row)
+        ids = _grant_ids(conn, users, "user") + _grant_ids(conn, service_principals, "service")
+        now = _now()
+        conn.execute("DELETE FROM group_members WHERE group_id = ?", (row["id"],))
+        conn.executemany("INSERT INTO group_members (group_id, user_id, added_at) VALUES (?, ?, ?)",
+                         [(row["id"], user_id, now) for user_id in dict.fromkeys(ids)])
+        return before, _group(conn, row)
+
+
+def delete_group(name: str) -> list[str]:
+    """The group, its members and every collection grant to it, in one
+    transaction. A collection restricted only through it stays restricted.
+    Returns the collections whose grant was removed, sorted."""
+    with _connect(write=True) as conn:
+        row = _existing_group(conn, name)
+        collections = sorted(r["collection"] for r in
+                             conn.execute("SELECT collection FROM collection_group_grants WHERE group_id = ?",
+                                          (row["id"],)))
+        conn.execute("DELETE FROM collection_group_grants WHERE group_id = ?", (row["id"],))
+        conn.execute("DELETE FROM group_members WHERE group_id = ?", (row["id"],))
+        conn.execute("DELETE FROM groups WHERE id = ?", (row["id"],))
+        return collections
 ```
 
 ### api/auth/middleware.py
@@ -20630,8 +20840,9 @@ def headers(role: str = "engineer", base_url: str = "http://testserver") -> dict
 """Per-collection access (#606): who may use which collection.
 
 A collection is open, or restricted to the accounts granted it (people or
-service principals; a key acts as its principal). Engineers reach every
-collection. The state is in the store (store.py, schema 4); this module holds
+service principals; a key acts as its principal), directly or through a group
+granted it (#784: store.has_access and store.restricted_collections answer for
+both). Engineers reach every collection. The state is in the store (store.py, schema 4); this module holds
 the rule and the check the routes call.
 
 A refused caller gets the answer the route gives a collection, session, job or
@@ -20770,6 +20981,11 @@ challenge (the `rag_mfa` cookie) instead of a session, and POST
 own set-up, recovery codes and turn-off are under /auth/mfa; engineers reset a
 user's enrollment and switch "required for everyone". Codes and secrets are in
 their one answer only (no-store) and never logged or audited.
+
+Groups for collection access (#784): Engineers create, rename and delete groups
+of people and service principals under /auth/groups (browser sessions only, as
+account administration), and grant collections to them with PUT
+/collections/{name}/access. Each change is one WARNING line and one audit record.
 """
 from __future__ import annotations
 
@@ -20783,10 +20999,11 @@ from fastapi.responses import JSONResponse
 from auth import passwords, store
 from config import settings
 from services import audit
-from models.schemas import (AdminUserList, AdminUserResult, AuthStatus, AuthUser, KeyIssueRequest, LoginRequest,
-                            MfaCodeRequest, MfaDisableRequest, MfaPolicyRequest, PasswordChangeRequest,
-                            PrincipalCreateRequest, RoleChangeRequest, ServicePrincipalList, ServicePrincipalResult,
-                            UserCreateRequest)
+from models.schemas import (AdminUserList, AdminUserResult, AuthStatus, AuthUser, GroupCreateRequest,
+                            GroupDeleteResult, GroupList, GroupMembersRequest, GroupRenameRequest, GroupResult,
+                            KeyIssueRequest, LoginRequest, MfaCodeRequest, MfaDisableRequest, MfaPolicyRequest,
+                            PasswordChangeRequest, PrincipalCreateRequest, RoleChangeRequest, ServicePrincipalList,
+                            ServicePrincipalResult, UserCreateRequest)
 from utils import api_error
 
 router = APIRouter(prefix="/auth")
@@ -21448,6 +21665,125 @@ async def revoke_key(name: str, key_id: str, request: Request):
         return _principal_refused(actor, "revoke-key", target, exc)
     _log.warning("Admin %r revoked key %s of service principal %r", actor, key_id, target)
     return JSONResponse({"principal": _principal_body(principal)})
+
+
+# ── groups for collection access (#784; Engineers only, in auth/policy.py) ────
+# Each change and each refusal is one WARNING line naming the Engineer, the
+# action and the group, as account administration's are.
+
+_GROUP_STATUS = {"GROUP_NOT_FOUND": 404, "GROUP_EXISTS": 409}
+
+
+def _group_body(group: store.Group) -> dict:
+    return {"name": group.name, "created_at": _iso(group.created_at), "users": list(group.users),
+            "service_principals": list(group.service_principals)}
+
+
+def _group_refusal(actor: str, action: str, target: str, code: str, message: str, status: int | None = None):
+    _log.warning("Admin %r: %s of group %r refused: %s", actor, action, target, message)
+    return api_error(status or _GROUP_STATUS.get(code, 409), code, message)
+
+
+def _group_refused(actor: str, action: str, target: str, exc: store.Refused):
+    message = str(exc)
+    message = message[:1].upper() + message[1:] + "."
+    if exc.code == "UNKNOWN_ACCOUNT":
+        # As PUT /collections/{name}/access answers an unknown account (#606).
+        return _group_refusal(actor, action, target, "INVALID_PARAMETER", message, 422)
+    return _group_refusal(actor, action, target, exc.code, message)
+
+
+def _group_not_found(actor: str, action: str, typed: str):
+    return _group_refusal(actor, action, typed, "GROUP_NOT_FOUND", f"There is no group {typed!r}.")
+
+
+def _invalid_group_name(actor: str, action: str, typed: str):
+    return _group_refusal(actor, action, typed, "INVALID_GROUP_NAME",
+                          f"The group name must be {passwords.USERNAME_RULE}.", 422)
+
+
+@router.get("/groups", response_model=GroupList)
+async def list_groups():
+    groups = await asyncio.to_thread(store.list_groups)
+    return {"groups": [_group_body(g) for g in groups]}
+
+
+@router.post("/groups", status_code=201, response_model=GroupResult)
+async def create_group(body: GroupCreateRequest, request: Request):
+    actor = request.state.auth.username
+    name = passwords.normalize_username(body.name)
+    audit.note(target=name or _shown(body.name))
+    if name is None:
+        return _invalid_group_name(actor, "create", _shown(body.name))
+    try:
+        group = await asyncio.to_thread(store.create_group, name)
+    except store.Refused as exc:
+        return _group_refused(actor, "create", name, exc)
+    _log.warning("Admin %r created group %r", actor, name)
+    return JSONResponse({"group": _group_body(group)}, status_code=201)
+
+
+@router.post("/groups/{name}/rename", response_model=GroupResult)
+async def rename_group(name: str, body: GroupRenameRequest, request: Request):
+    actor = request.state.auth.username
+    target = _target(name)
+    new = passwords.normalize_username(body.name)
+    audit.note(target=target or _shown(name), name=new or _shown(body.name))
+    if target is None:
+        return _group_not_found(actor, "rename", _shown(name))
+    if new is None:
+        return _invalid_group_name(actor, "rename", target)
+    try:
+        group = await asyncio.to_thread(store.rename_group, target, new)
+    except store.Refused as exc:
+        return _group_refused(actor, "rename", target, exc)
+    _log.warning("Admin %r renamed group %r to %r", actor, target, new)
+    return {"group": _group_body(group)}
+
+
+def _sorted_change(before: tuple, after: tuple) -> tuple[list, list]:
+    return sorted(set(after) - set(before)), sorted(set(before) - set(after))
+
+
+@router.put("/groups/{name}/members", response_model=GroupResult)
+async def set_group_members(name: str, body: GroupMembersRequest, request: Request):
+    """The group's members, the whole list at once."""
+    actor = request.state.auth.username
+    target = _target(name)
+    audit.note(target=target or _shown(name))
+    if target is None:
+        return _group_not_found(actor, "set-members", _shown(name))
+    try:
+        before, after = await asyncio.to_thread(store.set_group_members, target, body.users,
+                                                body.service_principals)
+    except store.Refused as exc:
+        return _group_refused(actor, "set-members", target, exc)
+    added_users, removed_users = _sorted_change(before.users, after.users)
+    added_svc, removed_svc = _sorted_change(before.service_principals, after.service_principals)
+    audit.note(added={"users": added_users, "service_principals": added_svc},
+               removed={"users": removed_users, "service_principals": removed_svc})
+    _log.warning("Admin %r set the members of group %r: %d people and %d service principals", actor, target,
+                 len(after.users), len(after.service_principals))
+    return {"group": _group_body(after)}
+
+
+@router.post("/groups/{name}/delete", response_model=GroupDeleteResult)
+async def delete_group(name: str, request: Request):
+    """The group, its members and its collection grants. A collection granted
+    only to it stays restricted."""
+    actor = request.state.auth.username
+    target = _target(name)
+    audit.note(target=target or _shown(name))
+    if target is None:
+        return _group_not_found(actor, "delete", _shown(name))
+    try:
+        collections = await asyncio.to_thread(store.delete_group, target)
+    except store.Refused as exc:
+        return _group_refused(actor, "delete", target, exc)
+    audit.note(collections=collections)
+    _log.warning("Admin %r deleted group %r; its grants on %d collections were removed", actor, target,
+                 len(collections))
+    return {"name": target, "collections": collections}
 ```
 
 The audit log (#29). `api/services/audit.py` writes, rotates and reads the log and records each audited request in its middleware; `api/routers/audit.py` serves it to AI Engineers. See SPECIFICATIONS.md §3.1.9.
@@ -21572,6 +21908,10 @@ ACTIONS: dict[tuple[str, str], str] = {
     ("POST", "/auth/service-principals/{name}/enable"): "admin.principal.enable",
     ("POST", "/auth/service-principals/{name}/keys"): "admin.key.issue",
     ("POST", "/auth/service-principals/{name}/keys/{key_id}/revoke"): "admin.key.revoke",
+    ("POST", "/auth/groups"): "admin.group.create",                        # #784
+    ("POST", "/auth/groups/{name}/rename"): "admin.group.rename",
+    ("PUT", "/auth/groups/{name}/members"): "admin.group.members",
+    ("POST", "/auth/groups/{name}/delete"): "admin.group.delete",
     ("GET", "/audit"): "audit.view",
     ("GET", "/audit.csv"): "audit.download",
 }
@@ -22682,6 +23022,7 @@ import CollectionsPage from './pages/CollectionsPage'
 import HealthPage from './pages/HealthPage'
 import UsersPage from './pages/UsersPage'
 import ServiceKeysPage from './pages/ServiceKeysPage'
+import GroupsPage from './pages/GroupsPage'
 import AuditPage from './pages/AuditPage'
 import TransferPage from './pages/TransferPage'
 import HelpTransferPage from './pages/HelpTransferPage'
@@ -22761,6 +23102,7 @@ export default function AppRouter() {
               <Route path="/health" element={<HealthPage />} />
               <Route path="/users" element={<UsersPage />} />
               <Route path="/service-keys" element={<ServiceKeysPage />} />
+              <Route path="/groups" element={<GroupsPage />} />
               <Route path="/audit" element={<AuditPage />} />
             </>
           )}
@@ -23198,6 +23540,15 @@ export const api = {
     request<{ principal: ServicePrincipal; key: ServiceKey; secret: string }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/keys`, { label, days }),
   revokeKey: (name: string, keyId: string) =>
     request<{ principal: ServicePrincipal }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/keys/${encodeURIComponent(keyId)}/revoke`),
+  // Groups for collection access (Engineers only, #784).
+  listGroups: () => request<{ groups: Group[] }>('GET', '/auth/groups'),
+  createGroup: (name: string) => request<{ group: Group }>('POST', '/auth/groups', { name }),
+  renameGroup: (name: string, newName: string) =>
+    request<{ group: Group }>('POST', `/auth/groups/${encodeURIComponent(name)}/rename`, { name: newName }),
+  setGroupMembers: (name: string, users: string[], service_principals: string[]) =>
+    request<{ group: Group }>('PUT', `/auth/groups/${encodeURIComponent(name)}/members`, { users, service_principals }),
+  deleteGroup: (name: string) =>
+    request<{ name: string; collections: string[] }>('POST', `/auth/groups/${encodeURIComponent(name)}/delete`),
   // The audit log (#29), for Engineers: a page of records, newest first.
   listAudit: (filters: AuditFilters, before?: string) =>
     request<AuditPage>('GET', `/audit${auditQuery(filters, before ? { before } : {})}`),
@@ -23206,7 +23557,7 @@ export const api = {
   // Answers with the name as stored, first letter capitalised (#372).
   createCollection: (body: CreateCollectionBody) => request<{ name: string; status: string }>('POST', '/collections', body),
   deleteCollection: (name: string) => request('DELETE', `/collections/${name}?confirm=true`),
-  // Who may use a collection (#606), for Engineers: open, or restricted to the named accounts.
+  // Who may use a collection (#606), for Engineers: open, or restricted to the named accounts and groups (#784).
   getCollectionAccess: (name: string) => request<CollectionAccess>('GET', `/collections/${encodeURIComponent(name)}/access`),
   setCollectionAccess: (name: string, body: CollectionAccess) =>
     request<CollectionAccess>('PUT', `/collections/${encodeURIComponent(name)}/access`, body),
@@ -23290,7 +23641,8 @@ export interface CollectionInfo {
   name: string; object_count: number; index_type: string; distance_metric: string; created_at: string | null
   hnsw_config?: { ef: number; efConstruction: number; maxConnections: number } | null
 }
-export interface CollectionAccess { restricted: boolean; users: string[]; service_principals: string[] }
+export interface CollectionAccess { restricted: boolean; users: string[]; service_principals: string[]; groups: string[] }
+export interface Group { name: string; created_at: string; users: string[]; service_principals: string[] }
 export interface CreateCollectionBody {
   name: string; index_type: string; distance_metric: string; hnsw_config: { efConstruction: number; maxConnections: number; ef: number }
 }
@@ -23517,6 +23869,7 @@ const MENUS: MenuDef[] = [
     { label: 'Collections', to: '/collections', roles: ENGINEER },
     { label: 'Users', to: '/users', roles: ENGINEER },
     { label: 'Service keys', to: '/service-keys', roles: ENGINEER },
+    { label: 'Groups', to: '/groups', roles: ENGINEER },
     { label: 'Audit', to: '/audit', roles: ENGINEER },
     { label: 'Health', to: '/health', roles: ENGINEER },
   ] },
@@ -25933,15 +26286,18 @@ export default function GoldStandardPage() {
 
 ```typescript
 import { useState, useEffect, useRef } from 'react'
-import { api, AdminUser, CollectionAccess, CollectionInfo, ServicePrincipal } from '../api/client'
+import { api, AdminUser, CollectionAccess, CollectionInfo, Group, ServicePrincipal } from '../api/client'
 import { useAuth } from '../context/AuthContext'
 
-// Who may use each collection (#606): "Open", "Restricted (n)" with n grants,
-// or a dash when the state couldn't be read.
+// Who may use each collection (#606): "Open", "Restricted (n)" with n grants
+// (people, service principals and groups, #784), or a dash when the state
+// couldn't be read.
 function accessLabel(a: CollectionAccess | null | undefined): string {
   if (!a) return '—'
-  return a.restricted ? `Restricted (${a.users.length + a.service_principals.length})` : 'Open'
+  return a.restricted ? `Restricted (${a.users.length + a.service_principals.length + (a.groups?.length ?? 0)})` : 'Open'
 }
+
+const CLOSED: CollectionAccess = { restricted: false, users: [], service_principals: [], groups: [] }
 
 export default function CollectionsPage() {
   // Query-only mode (#670): no create or delete; the list and access stay.
@@ -25966,9 +26322,10 @@ export default function CollectionsPage() {
   // Per-collection access (#606): each row's state, and the Access dialog.
   const [access, setAccess] = useState<Record<string, CollectionAccess | null>>({})
   const [accessTarget, setAccessTarget] = useState('')
-  const [draft, setDraft] = useState<CollectionAccess>({ restricted: false, users: [], service_principals: [] })
+  const [draft, setDraft] = useState<CollectionAccess>(CLOSED)
   const [people, setPeople] = useState<AdminUser[]>([])
   const [principals, setPrincipals] = useState<ServicePrincipal[]>([])
+  const [groups, setGroups] = useState<Group[]>([])
   const [accessError, setAccessError] = useState('')
   // The dialog's own read of the state: until it succeeds the choice is
   // unknown and Save stays disabled; once the Engineer changes something, a
@@ -25977,7 +26334,7 @@ export default function CollectionsPage() {
   // since) is ignored, so it can't become this dialog's draft (#788). The
   // opening's lists of people and service principals are numbered the same
   // way, so an earlier opening's late answer or error never reaches this one
-  // (#792).
+  // (#792), and so are its groups (#784).
   const [accessLoaded, setAccessLoaded] = useState(false)
   const touched = useRef(false)
   const accessRead = useRef(0)
@@ -26000,10 +26357,10 @@ export default function CollectionsPage() {
     setAccessTarget(name)
     setAccessLoaded(false)
     touched.current = false
-    setDraft({ restricted: false, users: [], service_principals: [] })
+    setDraft(CLOSED)
     api.getCollectionAccess(name).then(a => {
       if (ticket !== accessRead.current) return
-      if (!touched.current) setDraft({ ...a })
+      if (!touched.current) setDraft({ ...a, groups: a.groups ?? [] })
       setAccessLoaded(true)
     }).catch((e: unknown) => {
       if (ticket !== accessRead.current) return
@@ -26023,6 +26380,13 @@ export default function CollectionsPage() {
       if (ticket !== accessRead.current) return
       setAccessError(`Could not load the service principals: ${e instanceof Error ? e.message : String(e)}`)
     })
+    api.listGroups().then(r => {
+      if (ticket !== accessRead.current) return
+      setGroups(r.groups)
+    }).catch((e: unknown) => {
+      if (ticket !== accessRead.current) return
+      setAccessError(`Could not load the groups: ${e instanceof Error ? e.message : String(e)}`)
+    })
   }
 
   function closeAccess() {
@@ -26031,14 +26395,14 @@ export default function CollectionsPage() {
     setAccessError('')
   }
 
-  function toggle(list: 'users' | 'service_principals', name: string) {
+  function toggle(list: 'users' | 'service_principals' | 'groups', name: string) {
     touched.current = true
     setDraft(d => ({ ...d, [list]: d[list].includes(name) ? d[list].filter(n => n !== name) : [...d[list], name] }))
   }
 
   async function saveAccess() {
     if (!accessLoaded) return
-    const body = draft.restricted ? draft : { restricted: false, users: [], service_principals: [] }
+    const body = draft.restricted ? draft : CLOSED
     try {
       const saved = await api.setCollectionAccess(accessTarget, body)
       setAccess(prev => ({ ...prev, [accessTarget]: saved }))
@@ -26189,7 +26553,7 @@ export default function CollectionsPage() {
             </label>
             <label className="flex items-center gap-2 text-sm mb-3">
               <input type="radio" name="access-mode" checked={accessLoaded && draft.restricted} disabled={!accessLoaded} onChange={() => { touched.current = true; setDraft(d => ({ ...d, restricted: true })) }} />
-              Restricted: only the accounts ticked below (and AI Engineers)
+              Restricted: only the accounts and groups ticked below (and AI Engineers)
             </label>
             {accessLoaded && draft.restricted && (
               <div className="space-y-3 mb-4">
@@ -26209,6 +26573,16 @@ export default function CollectionsPage() {
                     <label key={p.name} className="flex items-center gap-2 text-sm">
                       <input type="checkbox" checked={draft.service_principals.includes(p.name)} onChange={() => toggle('service_principals', p.name)} />
                       {p.name}{p.enabled ? '' : ' (disabled)'}
+                    </label>
+                  ))}
+                </fieldset>
+                <fieldset>
+                  <legend className="text-xs text-gray-500 mb-1">Groups</legend>
+                  {groups.length === 0 && <p className="text-xs text-gray-400">None</p>}
+                  {groups.map(g => (
+                    <label key={g.name} className="flex items-center gap-2 text-sm">
+                      <input type="checkbox" checked={draft.groups.includes(g.name)} onChange={() => toggle('groups', g.name)} />
+                      {g.name} ({g.users.length + g.service_principals.length} {g.users.length + g.service_principals.length === 1 ? 'member' : 'members'})
                     </label>
                   ))}
                 </fieldset>
@@ -27640,6 +28014,231 @@ export default function ServiceKeysPage() {
 }
 ```
 
+### ui/src/pages/GroupsPage.tsx
+
+```typescript
+import { FormEvent, useEffect, useRef, useState } from 'react'
+import { api, AdminUser, Group, ServicePrincipal } from '../api/client'
+
+// Groups for collection access, for Engineers (#784). A group holds people and
+// service principals; a restricted collection granted to a group (Access on the
+// Collections page) is usable by its members while both hold. The API decides
+// everything: names follow the username rule, a rename keeps members and
+// grants, and deleting a group removes its grants without opening anything.
+export default function GroupsPage() {
+  const [groups, setGroups] = useState<Group[]>([])
+  const [listError, setListError] = useState('')
+  const [actionError, setActionError] = useState('')
+  const [name, setName] = useState('')
+  const [busy, setBusy] = useState(false)
+  // The Members dialog: the group, its draft, and the lists to tick. Each
+  // opening is numbered, so an earlier opening's late lists never reach it.
+  const [membersOf, setMembersOf] = useState('')
+  const [draft, setDraft] = useState<{ users: string[]; service_principals: string[] }>({ users: [], service_principals: [] })
+  const [people, setPeople] = useState<AdminUser[]>([])
+  const [principals, setPrincipals] = useState<ServicePrincipal[]>([])
+  const [dialogError, setDialogError] = useState('')
+  const opening = useRef(0)
+  const [renaming, setRenaming] = useState('')
+  const [newName, setNewName] = useState('')
+  const [deleting, setDeleting] = useState('')
+
+  async function load() {
+    try {
+      setGroups((await api.listGroups()).groups)
+      setListError('')
+    } catch (e: unknown) {
+      setListError(`Could not load the groups: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+
+  useEffect(() => { load() }, [])
+
+  const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
+
+  async function create(e: FormEvent) {
+    e.preventDefault()
+    setActionError('')
+    setBusy(true)
+    try {
+      await api.createGroup(name)
+      setName('')
+    } catch (err: unknown) {
+      setActionError(message(err))
+    } finally {
+      setBusy(false)
+      await load()
+    }
+  }
+
+  function openMembers(g: Group) {
+    const ticket = ++opening.current
+    setDialogError('')
+    setMembersOf(g.name)
+    setDraft({ users: [...g.users], service_principals: [...g.service_principals] })
+    api.listUsers().then(r => { if (ticket === opening.current) setPeople(r.users) })
+      .catch((e: unknown) => { if (ticket === opening.current) setDialogError(`Could not load the people: ${message(e)}`) })
+    api.listPrincipals().then(r => { if (ticket === opening.current) setPrincipals(r.principals) })
+      .catch((e: unknown) => { if (ticket === opening.current) setDialogError(`Could not load the service principals: ${message(e)}`) })
+  }
+
+  function closeDialogs() {
+    opening.current++
+    setMembersOf('')
+    setRenaming('')
+    setDeleting('')
+    setDialogError('')
+  }
+
+  function toggle(list: 'users' | 'service_principals', member: string) {
+    setDraft(d => ({ ...d, [list]: d[list].includes(member) ? d[list].filter(n => n !== member) : [...d[list], member] }))
+  }
+
+  async function run(action: () => Promise<unknown>) {
+    setDialogError('')
+    setBusy(true)
+    try {
+      await action()
+      closeDialogs()
+    } catch (e: unknown) {
+      setDialogError(message(e))
+    } finally {
+      setBusy(false)
+      await load()
+    }
+  }
+
+  const memberCount = (g: Group) => g.users.length + g.service_principals.length
+
+  return (
+    <div className="max-w-5xl mx-auto">
+      <h1 className="text-2xl font-bold mb-2">Groups</h1>
+      <p className="text-sm text-gray-600 mb-6">
+        A group holds people and service principals. Grant a restricted collection to a group with <strong>Access</strong> on
+        the Collections page, and its members may use it while they are in the group. Changes apply to everyone's next
+        request.
+      </p>
+      {listError && <p role="alert" className="text-red-600 text-sm mb-4">{listError}</p>}
+
+      <form onSubmit={create} className="flex flex-wrap items-end gap-3 mb-6">
+        <label className="text-sm text-gray-700">
+          Name
+          <input id="new-group-name" value={name} onChange={e => setName(e.target.value)} autoComplete="off"
+            className="mt-1 block border border-gray-300 rounded px-3 py-2 text-sm" required />
+        </label>
+        <button type="submit" disabled={busy || !name}
+          className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700 disabled:opacity-50">Create group</button>
+        <p className="text-xs text-gray-500 basis-full">
+          3-32 characters: lowercase letters, digits, '.', '_' or '-'; a name no other group has.
+        </p>
+      </form>
+
+      {actionError && <p role="alert" className="text-red-600 text-sm mb-4">{actionError}</p>}
+
+      {groups.length === 0 && !listError && <p className="text-sm text-gray-500">No groups yet.</p>}
+
+      {groups.length > 0 && (
+        <table className="w-full text-sm border-collapse">
+          <thead>
+            <tr className="border-b border-gray-200 text-left text-gray-600">
+              <th className="py-2 pr-4">Name</th>
+              <th className="py-2 pr-4">People</th>
+              <th className="py-2 pr-4">Service principals</th>
+              <th className="py-2"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {groups.map(g => (
+              <tr key={g.name} data-group={g.name} className="border-b border-gray-100">
+                <td className="py-2 pr-4 font-medium">{g.name}</td>
+                <td className="py-2 pr-4">{g.users.join(', ') || '—'}</td>
+                <td className="py-2 pr-4">{g.service_principals.join(', ') || '—'}</td>
+                <td className="py-2 space-x-3 whitespace-nowrap">
+                  <button disabled={busy} onClick={() => openMembers(g)} className="text-blue-600 hover:underline disabled:opacity-50">Members</button>
+                  <button disabled={busy} onClick={() => { setDialogError(''); setNewName(g.name); setRenaming(g.name) }} className="text-blue-600 hover:underline disabled:opacity-50">Rename</button>
+                  <button disabled={busy} onClick={() => { setDialogError(''); setDeleting(g.name) }} className="text-red-500 hover:underline disabled:opacity-50">Delete</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      {membersOf && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
+          <div role="dialog" aria-label={`Members of ${membersOf}`} className="bg-white rounded-xl p-6 w-96 shadow-xl max-h-[80vh] overflow-y-auto">
+            <h2 className="font-semibold mb-3">Members of {membersOf}</h2>
+            <div className="space-y-3 mb-4">
+              <fieldset>
+                <legend className="text-xs text-gray-500 mb-1">People</legend>
+                {people.map(u => (
+                  <label key={u.username} className="flex items-center gap-2 text-sm">
+                    <input type="checkbox" checked={draft.users.includes(u.username)} onChange={() => toggle('users', u.username)} />
+                    {u.username}{u.enabled ? '' : ' (disabled)'}
+                  </label>
+                ))}
+              </fieldset>
+              <fieldset>
+                <legend className="text-xs text-gray-500 mb-1">Service principals</legend>
+                {principals.length === 0 && <p className="text-xs text-gray-400">None</p>}
+                {principals.map(p => (
+                  <label key={p.name} className="flex items-center gap-2 text-sm">
+                    <input type="checkbox" checked={draft.service_principals.includes(p.name)} onChange={() => toggle('service_principals', p.name)} />
+                    {p.name}{p.enabled ? '' : ' (disabled)'}
+                  </label>
+                ))}
+              </fieldset>
+            </div>
+            {dialogError && <p role="alert" className="text-red-600 text-sm mb-4">{dialogError}</p>}
+            <div className="flex justify-end gap-2">
+              <button onClick={closeDialogs} className="text-sm text-gray-500">Cancel</button>
+              <button disabled={busy} onClick={() => run(() => api.setGroupMembers(membersOf, draft.users, draft.service_principals))}
+                className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700 disabled:opacity-40">Save</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {renaming && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
+          <div role="dialog" aria-label={`Rename ${renaming}`} className="bg-white rounded-xl p-6 w-96 shadow-xl">
+            <h2 className="font-semibold mb-3">Rename {renaming}</h2>
+            <p className="text-sm text-gray-600 mb-3">Its members and the collections granted to it stay.</p>
+            <input aria-label="New name" value={newName} onChange={e => setNewName(e.target.value)} autoComplete="off"
+              className="border rounded px-3 py-2 text-sm w-full mb-4" />
+            {dialogError && <p role="alert" className="text-red-600 text-sm mb-4">{dialogError}</p>}
+            <div className="flex justify-end gap-2">
+              <button onClick={closeDialogs} className="text-sm text-gray-500">Cancel</button>
+              <button disabled={busy || !newName} onClick={() => run(() => api.renameGroup(renaming, newName))}
+                className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700 disabled:opacity-40">Rename</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {deleting && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
+          <div role="dialog" aria-label={`Delete ${deleting}`} className="bg-white rounded-xl p-6 w-96 shadow-xl">
+            <h2 className="font-semibold text-red-600 mb-3">Delete group {deleting}?</h2>
+            <p className="text-sm text-gray-600 mb-4">
+              Its members lose what the group gave them: every collection grant to {deleting} is removed. A collection
+              granted only to this group stays restricted (AI Engineers and any other grants).
+              {(() => { const g = groups.find(x => x.name === deleting); return g ? ` It has ${memberCount(g)} ${memberCount(g) === 1 ? 'member' : 'members'}.` : '' })()}
+            </p>
+            {dialogError && <p role="alert" className="text-red-600 text-sm mb-4">{dialogError}</p>}
+            <div className="flex justify-end gap-2">
+              <button onClick={closeDialogs} className="text-sm text-gray-500">Cancel</button>
+              <button disabled={busy} onClick={() => run(() => api.deleteGroup(deleting))}
+                className="bg-red-600 text-white px-4 py-2 rounded text-sm hover:bg-red-700 disabled:opacity-40">Delete</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+```
+
 ### ui/src/pages/AuditPage.tsx
 
 ```typescript
@@ -27648,6 +28247,7 @@ import { api, AuditFilters, AuditPage as AuditPageData, AuditRecord, auditCsvUrl
 
 // The names the API records (api/services/audit.py ALL_ACTIONS), for the filter.
 const ACTIONS = [
+  'admin.group.create', 'admin.group.delete', 'admin.group.members', 'admin.group.rename',
   'admin.key.issue', 'admin.key.revoke', 'admin.mfa.policy', 'admin.principal.create', 'admin.principal.disable',
   'admin.principal.enable', 'admin.principal.set-role', 'admin.user.create', 'admin.user.disable',
   'admin.user.enable', 'admin.user.reset-mfa', 'admin.user.reset-password', 'admin.user.set-role', 'audit.download',
@@ -31324,10 +31924,19 @@ MATRIX = (
     # Two-step verification (#607): a 404 for no such account, a 422 for no value.
     ("POST", "/auth/users/vfy-no-such-user/reset-mfa", None, "engineer"),
     ("POST", "/auth/mfa/policy", {}, "engineer"),
+    # Groups for collection access (#784): a list, a 422 for no name, or a 404
+    # for a group that doesn't exist; nothing changes.
+    ("GET", "/auth/groups", None, "engineer"),
+    ("POST", "/auth/groups", {}, "engineer"),
+    ("POST", "/auth/groups/vfy-no-such-group/rename", {"name": "vfy-no-such-other"}, "engineer"),
+    ("PUT", "/auth/groups/vfy-no-such-group/members", {}, "engineer"),
+    ("POST", "/auth/groups/vfy-no-such-group/delete", None, "engineer"),
 )
 # Routes an API key can't use whatever its role (S5 of PR 3): every account,
-# principal and key route, logout and the password change; and the audit log (#29).
-KEY_REFUSED = ("/auth/users", "/auth/service-principals", "/auth/logout", "/auth/password", "/audit", "/auth/mfa")
+# principal and key route, logout and the password change; the audit log (#29);
+# and groups (#784).
+KEY_REFUSED = ("/auth/users", "/auth/service-principals", "/auth/logout", "/auth/password", "/audit", "/auth/mfa",
+               "/auth/groups")
 # And per-collection access (#606), by its path's end.
 KEY_REFUSED_SUFFIX = "/access"
 SESSION_ROUTES = (("GET", "/auth/me", None), ("POST", "/auth/logout", None), ("POST", "/auth/password", {}))
@@ -32199,11 +32808,13 @@ def check_collection_access(operator_ok):
     and a Developer key can't see or use it until granted, and the access routes
     refuse a key. Changes and refusals are in the audit log. In the Prepare
     area, a document the granted Developer imports into it is hidden from a
-    Developer without access (#788)."""
+    Developer without access (#788). Granted to a group, the collection
+    reaches a Developer not granted directly while it is a member, and no
+    longer once removed (#784)."""
     expect(operator_ok, "creates accounts, a service principal and a collection, so it runs only on the verify project")
     admin = role_token("engineer")
     name = "VfyAccess" + secrets.token_hex(4)
-    users, principal = [], None
+    users, principal, group = [], None, None
     document, document_owner = None, None
     try:
         status, raw, _ = code("POST", "/collections", {"name": name}, token=admin)
@@ -32240,13 +32851,15 @@ def check_collection_access(operator_ok):
 
         status, raw, _ = code("PUT", "/collections/{}/access".format(name),
                               {"restricted": True, "users": [dev], "service_principals": [principal]}, token=admin)
-        expect(status == 200 and json.loads(raw) == {"restricted": True, "users": [dev], "service_principals": [principal]},
+        expect(status == 200 and json.loads(raw) == {"restricted": True, "users": [dev], "service_principals": [principal],
+                                                     "groups": []},
                "granting answered {} {}".format(status, raw[:200]))
         for who in ("Developer", "key"):
             expect(listed(who), "{} doesn't see the collection once granted".format(who))
             got = answer(who, "GET", "/ingest/config/" + name)
             expect(got[0] == 200, "{}: the granted collection's settings answered {}".format(who, got))
         expect(not listed("End User"), "the End User sees a collection not granted to it")
+
 
         # The Prepare area (#606 Q18, #788): a .csv is labelled from its data,
         # with no LLM call, so preparing it is quick.
@@ -32276,6 +32889,35 @@ def check_collection_access(operator_ok):
         status, raw, _ = code("GET", "/prepare/documents/" + document, token=other_token)
         expect((status, error_code(raw)) == (404, "DOCUMENT_NOT_FOUND"),
                "a Developer without access reading the document answered {} {}".format(status, error_code(raw)))
+        callers["Other"] = {"token": other_token}
+        # Groups (#784): a Developer not granted directly reaches the collection
+        # through a group, and no longer once removed from it.
+        group = "vfy-g-" + secrets.token_hex(4)
+        status, raw, _ = code("POST", "/auth/groups", {"name": group}, token=admin)
+        expect(status == 201, "creating group {} answered {} {}".format(group, status, error_code(raw)))
+        status, raw, _ = code("PUT", "/auth/groups/{}/members".format(group), {"users": [other]}, token=admin)
+        expect(status == 200, "adding the Developer to {} answered {} {}".format(group, status, error_code(raw)))
+        expect(not listed("Other"), "a group not granted the collection gave the Developer access")
+        status, raw, _ = code("PUT", "/collections/{}/access".format(name),
+                              {"restricted": True, "users": [dev], "service_principals": [principal], "groups": [group]},
+                              token=admin)
+        expect(status == 200 and json.loads(raw).get("groups") == [group],
+               "granting the group answered {} {}".format(status, raw[:200]))
+        expect(listed("Other"), "the Developer doesn't see the collection granted to its group")
+        got = answer("Other", "GET", "/ingest/config/" + name)
+        expect(got[0] == 200, "Developer: the collection granted to its group answered {}".format(got))
+        got = answer("key", "GET", "/auth/groups")
+        expect(got == (403, "KEY_NOT_ALLOWED"), "a key listing groups answered {}".format(got))
+        status, raw, _ = code("PUT", "/auth/groups/{}/members".format(group), {}, token=admin)
+        expect(status == 200, "emptying {} answered {} {}".format(group, status, error_code(raw)))
+        expect(not listed("Other"), "the Developer still sees the collection after leaving the group")
+        status, raw, _ = code("POST", "/auth/groups/{}/delete".format(group), token=admin)
+        expect(status == 200 and json.loads(raw).get("collections") == [name],
+               "deleting {} answered {} {}".format(group, status, raw[:200]))
+        group = None
+        status, raw, _ = code("GET", "/collections/{}/access".format(name), token=admin)
+        expect(json.loads(raw) == {"restricted": True, "users": [dev], "service_principals": [principal], "groups": []},
+               "after the group's delete the access is {}".format(raw[:200]))
         got = answer("key", "PUT", "/collections/{}/access".format(name), {"restricted": False})
         expect(got == (403, "KEY_NOT_ALLOWED"), "a key changing access answered {}".format(got))
         got = answer("key", "GET", "/collections/{}/access".format(name))
@@ -32286,16 +32928,20 @@ def check_collection_access(operator_ok):
             status, raw, _ = code("GET", query, token=admin)
             expect(status == 200, "GET /audit answered {}".format(status))
             return [r for r in json.loads(raw)["records"] if all(r.get(k) == v for k, v in match.items())]
-        # The newest record is the key's refused change below; this is the Engineer's grant.
+        # The newest records are the key's refused change below and the group's
+        # grant (#784); the oldest is the Engineer's first grant.
         change = audited("collection.access", result="success")
-        expect(change and change[0]["details"].get("added") == {"users": [dev], "service_principals": [principal]},
-               "the change's audit record is {}".format(change[:1]))
+        expect(change and change[-1]["details"].get("added") == {"users": [dev], "service_principals": [principal],
+                                                                 "groups": []},
+               "the change's audit record is {}".format(change[-1:]))
         refused = audited("query", actor=user)
         expect(refused and refused[0]["result"] == "refused" and refused[0]["details"].get("reason") == "collection_access",
                "the refused query's audit record is {}".format(refused[:1]))
         expect(audited("collection.access.refused", actor=principal),
                "no collection.access.refused record for the key's settings read")
     finally:
+        if group:
+            code("POST", "/auth/groups/{}/delete".format(group), token=admin)
         if document:
             code("DELETE", "/prepare/documents/" + document, token=document_owner)
         code("DELETE", "/collections/{}?confirm=true".format(name), token=admin)
@@ -36082,6 +36728,9 @@ KEPT = {
     ("POST", "/auth/service-principals/{name}/keys/{key_id}/revoke"),
     ("POST", "/query"), ("POST", "/export"), ("GET", "/packages/{filename}"),
     ("PUT", "/collections/{name}/access"),
+    # Groups for collection access (#784): /auth routes, like account administration.
+    ("POST", "/auth/groups"), ("POST", "/auth/groups/{name}/rename"), ("PUT", "/auth/groups/{name}/members"),
+    ("POST", "/auth/groups/{name}/delete"),
 }
 
 
@@ -40898,12 +41547,15 @@ class StoreTests(AccessTestCase):
     def test_a_version_3_store_gains_the_tables_and_every_collection_stays_open(self):
         path = store.db_path()
         conn = sqlite3.connect(path)
-        conn.executescript("DROP TABLE collection_grants; DROP TABLE restricted_collections; PRAGMA user_version = 3;")
+        conn.executescript("DROP TABLE collection_grants; DROP TABLE restricted_collections; "
+                           "DROP TABLE collection_group_grants; DROP TABLE group_members; DROP TABLE groups; "
+                           "PRAGMA user_version = 3;")
         conn.close()
         store._ready.clear()
         self.assertTrue(store.has_access(store.get_user("user").id, "end_user", SECRET))
         version = sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0]
-        self.assertEqual(version, 4)
+        self.assertEqual(version, 5)
+        self.assertEqual(store.list_groups(), [])
         self.assertEqual(store.get_user("dev").role, "developer")       # rows kept
 
     def test_the_rule(self):
@@ -40995,16 +41647,18 @@ class AccessRouteTests(AccessTestCase):
 
     def test_read_and_set(self):
         answer = self.client.get(f"/collections/{SECRET.lower()}/access", headers=self.as_("eng"))
-        self.assertEqual(answer.json(), {"restricted": True, "users": ["dev"], "service_principals": ["svc"]})
+        self.assertEqual(answer.json(), {"restricted": True, "users": ["dev"], "service_principals": ["svc"],
+                                         "groups": []})
         self.assertEqual(self.client.get(f"/collections/{OPEN}/access", headers=self.as_("eng")).json(),
-                         {"restricted": False, "users": [], "service_principals": []})
+                         {"restricted": False, "users": [], "service_principals": [], "groups": []})
         self.refused(self.client.get("/collections/Nowhere/access", headers=self.as_("eng")))
         answer = self.put(SECRET, {"restricted": True, "users": ["DEV2", "user"], "service_principals": []})
-        self.assertEqual(answer.json(), {"restricted": True, "users": ["dev2", "user"], "service_principals": []})
+        self.assertEqual(answer.json(), {"restricted": True, "users": ["dev2", "user"], "service_principals": [],
+                                         "groups": []})
         item = self.records("collection.access")[-1]
         self.assertEqual((item["actor"], item["collection"], item["result"]), ("eng", SECRET, "success"))
-        self.assertEqual(item["details"]["added"], {"users": ["dev2", "user"], "service_principals": []})
-        self.assertEqual(item["details"]["removed"], {"users": ["dev"], "service_principals": ["svc"]})
+        self.assertEqual(item["details"]["added"], {"users": ["dev2", "user"], "service_principals": [], "groups": []})
+        self.assertEqual(item["details"]["removed"], {"users": ["dev"], "service_principals": ["svc"], "groups": []})
         self.assertEqual((item["details"]["restricted_before"], item["details"]["restricted_after"]), (True, True))
 
     def test_refused_changes_change_nothing(self):
@@ -41764,6 +42418,345 @@ class PrepareAreaTests(AccessTestCase):
                 item = [r for r in self.records(action) if r["actor"] == "dev2"][-1]
                 self.assertEqual((item["result"], item["collection"], item["details"].get("reason")),
                                  ("refused", SECRET, "collection_access"), item)
+
+
+class GroupTestCase(AccessTestCase):
+    """Groups for collection access (#784): AccessTestCase, plus a group
+    `team` holding `dev2` and the principal `svc2`, neither granted SECRET
+    directly."""
+
+    def setUp(self):
+        super().setUp()
+        store.create_group("team")
+        store.set_group_members("team", ["dev2"], ["svc2"])
+
+    def group_call(self, method, path, body=None, who="eng"):
+        return self.client.request(method, "/auth/groups" + path, json=body, headers=self.as_(who))
+
+    def error(self, answer):
+        return answer.status_code, answer.json()["error"]["code"]
+
+
+class GroupRuleTests(GroupTestCase):
+    def test_a_version_4_store_gains_the_group_tables_and_keeps_its_grants(self):
+        path = store.db_path()
+        conn = sqlite3.connect(path)
+        conn.executescript("DROP TABLE collection_group_grants; DROP TABLE group_members; DROP TABLE groups; "
+                           "PRAGMA user_version = 4;")
+        conn.close()
+        store._ready.clear()
+        self.assertEqual(store.collection_access(SECRET), store.CollectionAccess(True, ("dev",), ("svc",)))
+        self.assertEqual(sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0], 5)
+        self.assertEqual(store.list_groups(), [])
+        self.assertFalse(store.has_access(store.get_user("dev2").id, "developer", SECRET))
+
+    def test_a_member_reaches_a_collection_granted_to_the_group(self):
+        dev2 = store.get_user("dev2")
+        self.assertFalse(store.has_access(dev2.id, "developer", SECRET))
+        self.put(SECRET, {"restricted": True, "users": ["dev"], "groups": ["TEAM"]})
+        self.assertEqual(store.collection_access(SECRET), store.CollectionAccess(True, ("dev",), (), ("team",)))
+        self.assertTrue(store.has_access(dev2.id, "developer", SECRET))
+        self.assertTrue(store.has_access(store.get_user("dev").id, "developer", SECRET))     # direct grant
+        self.assertFalse(store.has_access(store.get_user("user").id, "end_user", SECRET))     # not a member
+        self.assertIn(SECRET, self.names("dev2"))
+        self.assertIn(SECRET, self.names("svc2"))                                            # a key, as its principal
+        self.assertNotIn(SECRET, self.names("user"))
+        answer = self.client.post("/query", json={"question": "What?", "collection": SECRET},
+                                  headers=self.as_("user"))
+        self.refused(answer)
+
+    def test_the_restricted_listing_counts_members(self):
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        ids = store.restricted_collections()[SECRET]
+        self.assertEqual(ids, frozenset({store.get_user("dev2").id, store.get_principal("svc2").id}))
+
+    def test_a_membership_or_grant_change_applies_to_the_next_request(self):
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        headers = self.as_("dev2")                                   # one session throughout
+        listed = lambda: [c["name"] for c in self.client.get("/collections", headers=headers).json()["collections"]]
+        self.assertIn(SECRET, listed())
+        store.set_group_members("team", [], ["svc2"])
+        self.assertNotIn(SECRET, listed())
+        store.set_group_members("team", ["dev2"], [])
+        self.assertIn(SECRET, listed())
+        self.put(SECRET, {"restricted": True, "users": ["dev"]})        # the group's grant removed
+        self.assertNotIn(SECRET, listed())
+
+    def test_deleting_the_group_keeps_the_collection_restricted(self):
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        self.assertEqual(store.delete_group("team"), [SECRET])
+        self.assertEqual(store.collection_access(SECRET), store.CollectionAccess(True, (), (), ()))
+        self.assertFalse(store.has_access(store.get_user("dev2").id, "developer", SECRET))
+        self.assertEqual(self.names("user"), [OPEN])
+        store.create_group("team")                                   # a new group of the same name gets nothing
+        self.assertEqual(store.collection_access(SECRET).groups, ())
+
+    def test_a_disabled_member_stays_and_a_demoted_engineer_is_bound(self):
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        store.set_enabled("dev2", False)
+        store.set_enabled("dev2", True)
+        self.assertEqual(store.get_group("team").users, ("dev2",))
+        self.assertTrue(store.has_access(store.get_user("dev2").id, "developer", SECRET))
+        store.create_user("boss", "engineer", passwords.generate_password(), must_change_password=False)
+        boss = store.get_user("boss")
+        self.assertTrue(store.has_access(boss.id, "engineer", SECRET))
+        store.set_role("boss", "developer")
+        self.assertFalse(store.has_access(boss.id, "developer", SECRET))
+        store.set_group_members("team", ["boss"], [])
+        self.assertTrue(store.has_access(boss.id, "developer", SECRET))
+
+    def test_a_rename_keeps_members_and_grants(self):
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        group = store.rename_group("team", "crew")
+        self.assertEqual((group.name, group.users, group.service_principals), ("crew", ("dev2",), ("svc2",)))
+        self.assertEqual(store.collection_access(SECRET).groups, ("crew",))
+        self.assertTrue(store.has_access(store.get_user("dev2").id, "developer", SECRET))
+        self.assertEqual(store.rename_group("crew", "crew").name, "crew")       # its own name: no change
+
+    def test_a_collection_delete_drops_its_group_grants(self):
+        async def delete(name):
+            self.collections.discard(name)
+            return 1
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        with patch.object(wc, "delete_collection_when_idle", delete):
+            self.assertEqual(self.client.delete(f"/collections/{SECRET}?confirm=true",
+                                                headers=self.as_("eng")).status_code, 200)
+        conn = sqlite3.connect(store.db_path())
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM collection_group_grants WHERE collection = ?",
+                                      (SECRET,)).fetchone()[0], 0)
+        conn.close()
+        self.assertEqual(store.collection_access(SECRET), store.CollectionAccess(False))
+        self.assertEqual(store.get_group("team").users, ("dev2",))              # the group itself stays
+
+    def test_opening_drops_the_group_grants(self):
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        self.put(SECRET, {"restricted": False})
+        self.put(SECRET, {"restricted": True})
+        self.assertEqual(store.collection_access(SECRET).groups, ())
+
+    def test_a_job_owner_reaches_through_a_group(self):
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        self.assertTrue(store.owner_has_access({"name": "dev2", "kind": "user"}, SECRET))
+        self.assertTrue(store.owner_has_access({"name": "svc2", "kind": "service"}, SECRET))
+        self.assertFalse(store.owner_has_access({"name": "user", "kind": "user"}, SECRET))
+        self.assertFalse(importer._refused({"name": "dev2", "kind": "user"}, SECRET))
+        self.assertTrue(importer._refused({"name": "user", "kind": "user"}, SECRET))
+
+
+class GroupAccessRouteTests(GroupTestCase):
+    def test_read_and_set_with_groups(self):
+        answer = self.put(SECRET, {"restricted": True, "users": ["dev"], "groups": ["team"]})
+        self.assertEqual(answer.json(), {"restricted": True, "users": ["dev"], "service_principals": [],
+                                         "groups": ["team"]})
+        self.assertEqual(self.client.get(f"/collections/{SECRET}/access", headers=self.as_("eng")).json(),
+                         answer.json())
+        item = self.records("collection.access")[-1]
+        self.assertEqual(item["details"]["added"], {"users": [], "service_principals": [], "groups": ["team"]})
+        self.assertEqual(item["details"]["removed"], {"users": [], "service_principals": ["svc"], "groups": []})
+        self.put(SECRET, {"restricted": True, "users": ["dev"]})            # a v1.3.0 body: no group
+        item = self.records("collection.access")[-1]
+        self.assertEqual(item["details"]["removed"], {"users": [], "service_principals": [], "groups": ["team"]})
+        self.assertEqual(store.collection_access(SECRET).groups, ())
+
+    def test_an_unknown_group_or_groups_on_an_open_collection_change_nothing(self):
+        before = store.collection_access(SECRET)
+        for body in ({"restricted": True, "groups": ["nobody"]}, {"restricted": True, "groups": ["dev"]},
+                     {"restricted": False, "groups": ["team"]}, {"restricted": True, "groups": ["x" * 65]}):
+            with self.subTest(body=body):
+                self.assertEqual(self.error(self.put(SECRET, body)), (422, "INVALID_PARAMETER"))
+        self.assertEqual(store.collection_access(SECRET), before)
+
+
+class GroupRouteTests(GroupTestCase):
+    def test_engineers_in_a_session_only(self):
+        store.create_principal("boss", "engineer")
+        key = store.issue_key("boss")[1]
+        for method, path, body in (("GET", "", None), ("POST", "", {"name": "new"}),
+                                   ("POST", "/team/rename", {"name": "crew"}),
+                                   ("PUT", "/team/members", {"users": []}), ("POST", "/team/delete", None)):
+            with self.subTest(route=f"{method} {path}"):
+                self.assertEqual(self.error(self.group_call(method, path, body, who="dev")), (403, "FORBIDDEN"))
+                answer = self.client.request(method, "/auth/groups" + path, json=body,
+                                             headers={"Authorization": "Bearer " + key})
+                self.assertEqual(self.error(answer), (403, "KEY_NOT_ALLOWED"))
+        self.assertEqual(store.get_group("team").users, ("dev2",))
+
+    def test_create_list_rename_members_delete(self):
+        answer = self.group_call("POST", "", {"name": "Legal.Team"})
+        self.assertEqual(answer.status_code, 201, answer.text)
+        self.assertEqual({k: v for k, v in answer.json()["group"].items() if k != "created_at"},
+                         {"name": "legal.team", "users": [], "service_principals": []})
+        self.assertRegex(answer.json()["group"]["created_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        listed = self.group_call("GET", "").json()["groups"]
+        self.assertEqual([g["name"] for g in listed], ["legal.team", "team"])
+        self.assertEqual((listed[1]["users"], listed[1]["service_principals"]), (["dev2"], ["svc2"]))
+        answer = self.group_call("PUT", "/legal.team/members", {"users": ["DEV", "user"], "service_principals": ["svc"]})
+        self.assertEqual((answer.json()["group"]["users"], answer.json()["group"]["service_principals"]),
+                         (["dev", "user"], ["svc"]))
+        answer = self.group_call("PUT", "/legal.team/members", {"users": ["dev"]})
+        self.assertEqual((answer.json()["group"]["users"], answer.json()["group"]["service_principals"]),
+                         (["dev"], []))
+        answer = self.group_call("POST", "/legal.team/rename", {"name": "Legal"})
+        self.assertEqual(answer.json()["group"]["name"], "legal")
+        self.put(SECRET, {"restricted": True, "groups": ["legal", "team"]})
+        self.put(OPEN, {"restricted": True, "groups": ["legal"]})
+        answer = self.group_call("POST", "/legal/delete")
+        self.assertEqual(answer.json(), {"name": "legal", "collections": [OPEN, SECRET]})
+        self.assertEqual(store.collection_access(SECRET).groups, ("team",))
+        self.assertEqual(store.collection_access(OPEN), store.CollectionAccess(True, (), (), ()))
+        self.assertEqual([g["name"] for g in self.group_call("GET", "").json()["groups"]], ["team"])
+
+    def test_refusals(self):
+        cases = [
+            ("POST", "", {"name": "x"}, (422, "INVALID_GROUP_NAME")),
+            ("POST", "", {"name": "a" * 300}, (422, "INVALID_GROUP_NAME")),
+            ("POST", "", {"name": "TEAM"}, (409, "GROUP_EXISTS")),
+            ("POST", "", {}, (422, "INVALID_PARAMETER")),
+            ("POST", "/nobody/rename", {"name": "crew"}, (404, "GROUP_NOT_FOUND")),
+            ("POST", "/no%20such/rename", {"name": "crew"}, (404, "GROUP_NOT_FOUND")),
+            ("POST", "/team/rename", {"name": "!!"}, (422, "INVALID_GROUP_NAME")),
+            ("PUT", "/nobody/members", {"users": []}, (404, "GROUP_NOT_FOUND")),
+            ("PUT", "/team/members", {"users": ["nobody"]}, (422, "INVALID_PARAMETER")),
+            ("PUT", "/team/members", {"users": ["svc"]}, (422, "INVALID_PARAMETER")),
+            ("PUT", "/team/members", {"service_principals": ["dev"]}, (422, "INVALID_PARAMETER")),
+            ("PUT", "/team/members", {"groups": ["team"]}, (422, "INVALID_PARAMETER")),
+            ("POST", "/nobody/delete", None, (404, "GROUP_NOT_FOUND")),
+        ]
+        store.create_group("crew")
+        cases.append(("POST", "/team/rename", {"name": "crew"}, (409, "GROUP_EXISTS")))
+        for method, path, body, expected in cases:
+            with self.subTest(route=f"{method} {path}", body=body):
+                self.assertEqual(self.error(self.group_call(method, path, body)), expected)
+        group = store.get_group("team")
+        self.assertEqual((group.name, group.users, group.service_principals), ("team", ("dev2",), ("svc2",)))
+
+    def test_the_audit_records(self):
+        self.group_call("POST", "", {"name": "crew"})
+        self.group_call("PUT", "/crew/members", {"users": ["dev", "user"], "service_principals": ["svc"]})
+        self.group_call("PUT", "/crew/members", {"users": ["dev2"]})
+        self.group_call("POST", "/crew/rename", {"name": "squad"})
+        self.put(SECRET, {"restricted": True, "groups": ["squad"]})
+        self.group_call("POST", "/squad/delete")
+        self.group_call("POST", "", {"name": "team"})                      # refused: exists
+        records = [r for r in self.records() if r["action"].startswith("admin.group.")]
+        self.assertEqual([(r["action"], r["target"], r["result"]) for r in records], [
+            ("admin.group.create", "crew", "success"), ("admin.group.members", "crew", "success"),
+            ("admin.group.members", "crew", "success"), ("admin.group.rename", "crew", "success"),
+            ("admin.group.delete", "squad", "success"), ("admin.group.create", "team", "refused")])
+        self.assertEqual(records[1]["details"]["added"], {"users": ["dev", "user"], "service_principals": ["svc"]})
+        self.assertEqual(records[2]["details"]["added"], {"users": ["dev2"], "service_principals": []})
+        self.assertEqual(records[2]["details"]["removed"], {"users": ["dev", "user"], "service_principals": ["svc"]})
+        self.assertEqual(records[3]["details"]["name"], "squad")
+        self.assertEqual(records[4]["details"]["collections"], [SECRET])
+        self.assertEqual(records[5]["details"]["code"], "GROUP_EXISTS")
+        self.assertEqual(self.records("admin.group.list"), [])
+        self.assertIn("admin.group.delete", audit.ALL_ACTIONS)
+
+
+class GroupCopyTests(GroupTestCase):
+    """Copies and imports carry group grants under the same rules as account
+    grants (#788, #792)."""
+
+    def test_a_copy_takes_the_group_grants(self):
+        self.put(SECRET, {"restricted": True, "users": ["dev"], "groups": ["team"]})
+        store.copy_collection_access(SECRET, "Secret_ab12cd34")
+        self.assertEqual(store.collection_access("Secret_ab12cd34"),
+                         store.CollectionAccess(True, ("dev",), (), ("team",)))
+        importer._start_access({"name": "dev", "kind": "user"}, SECRET, "Secret_cd34ef56")
+        self.assertEqual(store.collection_access("Secret_cd34ef56").groups, ("team",))
+        store.set_group_members("team", [], [])                    # a membership change reaches the copy
+        self.assertFalse(store.has_access(store.get_user("dev2").id, "developer", "Secret_ab12cd34"))
+
+    def test_narrowing_intersects_accounts_and_groups_on_their_own(self):
+        store.create_group("crew")
+        store.set_group_members("crew", ["dev2"], [])
+        self.put(SECRET, {"restricted": True, "users": ["dev", "dev2"], "groups": ["team", "crew"]})
+        self.put(STAGING, {"restricted": True, "users": ["dev"], "groups": ["team"]})
+        store.copy_collection_access(STAGING, NESTED, access.scope(STAGING)[1:])
+        self.assertEqual(store.collection_access(NESTED), store.CollectionAccess(True, ("dev",), (), ("team",)))
+        # dev2 is granted directly in SECRET but only through a group in STAGING: never wider, so no own grant.
+        self.put(STAGING, {"restricted": True, "groups": ["crew"]})
+        store.copy_collection_access(STAGING, NESTED, access.scope(STAGING)[1:])
+        self.assertEqual(store.collection_access(NESTED), store.CollectionAccess(True, (), (), ("crew",)))
+
+    def test_a_copy_needs_the_group_grant_of_every_collection_in_its_chain(self):
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        self.assertTrue(access.allowed(store.authenticate_key(self.key2), STAGING) is False)   # the copy's own state
+        self.put(STAGING, {"restricted": True, "groups": ["team"]})
+        self.assertTrue(access.allowed(store.authenticate_key(self.key2), STAGING))
+        self.put(SECRET, {"restricted": True})                     # narrowing the target reaches the copy
+        self.assertFalse(access.allowed(store.authenticate_key(self.key2), STAGING))
+        self.assertNotIn(STAGING, self.names("svc2"))
+
+    def test_put_back_restores_group_grants_and_leaves_out_a_deleted_group(self):
+        self.put(SECRET, {"restricted": True, "users": ["dev"], "groups": ["team"]})
+        previous, written = store.restrict_to(SECRET, store.get_user("dev2").id)
+        self.assertEqual(written, store.CollectionAccess(True, ("dev2",), (), ()))
+        self.assertTrue(store.put_back(SECRET, written, previous))
+        self.assertEqual(store.collection_access(SECRET), previous)
+        previous, written = store.restrict_to(SECRET, None)
+        store.delete_group("team")
+        self.assertTrue(store.put_back(SECRET, written, previous))
+        self.assertEqual(store.collection_access(SECRET), store.CollectionAccess(True, ("dev",), (), ()))
+        store.create_group("crew")
+        self.put(SECRET, {"restricted": True, "groups": ["crew"]})
+        self.assertFalse(store.put_back(SECRET, written, previous))          # not the state it wrote: kept
+        self.assertEqual(store.collection_access(SECRET).groups, ("crew",))
+
+    def test_a_new_collection_starts_with_no_group(self):
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        store.restrict_to("Brandnew", store.get_user("dev2").id)
+        self.assertEqual(store.collection_access("Brandnew"), store.CollectionAccess(True, ("dev2",), (), ()))
+
+
+class GroupRecoveryTests(GroupTestCase):
+    """A staging or recovery copy made by collection_recovery carries its
+    target's group grants as its own state, and discarding the copy drops
+    them (#784 with #606, #788, #792)."""
+
+    class Client:
+        class collections:
+            @staticmethod
+            def exists(name):
+                return False
+
+            @staticmethod
+            def delete(name):
+                pass
+
+    def test_begin_copies_group_grants_and_discard_drops_them(self):
+        from services import collection_recovery
+        self.put(SECRET, {"restricted": True, "users": ["dev"], "groups": ["team"]})
+        record = collection_recovery.begin(SECRET, "import", self.Client)
+        copy = record["staging"]
+        self.assertEqual(store.collection_access(copy), store.CollectionAccess(True, ("dev",), (), ("team",)))
+        self.assertTrue(store.has_access(store.get_user("dev2").id, "developer", copy))    # through the group
+        kept = collection_recovery.begin(SECRET, "tune", self.Client)["staging"]
+        collection_recovery.discard(record, self.Client)
+        conn = sqlite3.connect(store.db_path())
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM collection_group_grants WHERE collection = ?",
+                                      (copy,)).fetchone()[0], 0)
+        conn.close()
+        self.assertFalse(store.collection_access(copy).restricted)
+        # Deleting the group removes its grant on the kept copy too, which stays restricted.
+        self.assertEqual(store.delete_group("team"), sorted([SECRET, kept]))
+        self.assertEqual(store.collection_access(kept), store.CollectionAccess(True, ("dev",), (), ()))
+        self.assertFalse(store.has_access(store.get_user("dev2").id, "developer", kept))
+
+    def test_begin_on_a_copy_intersects_the_group_grants_of_its_chain(self):
+        from services import collection_recovery
+        store.create_group("crew")
+        store.set_group_members("crew", ["dev2"], [])
+        self.put(SECRET, {"restricted": True, "groups": ["team", "crew"]})
+        self.put(STAGING, {"restricted": True, "groups": ["team"]})
+        record = collection_recovery.begin(STAGING, "tune", self.Client)
+        self.assertEqual(store.collection_access(record["staging"]), store.CollectionAccess(True, (), (), ("team",)))
+        self.put(STAGING, {"restricted": False})                   # the copy open: the original decides
+        record = collection_recovery.begin(STAGING, "tune", self.Client)
+        self.assertEqual(store.collection_access(record["staging"]).groups, ("crew", "team"))
+        self.assertTrue(access.allowed(store.authenticate_key(self.key2), record["staging"]))
+        store.set_group_members("team", ["dev2"], [])               # svc2 leaves: the chain refuses its key
+        self.assertFalse(access.allowed(store.authenticate_key(self.key2), record["staging"]))
 
 
 if __name__ == "__main__":
@@ -50159,8 +51152,8 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     for (const p of ['/qa', '/collections', '/health', '/qa']) {
       await s.page.goto(BASE + p, { waitUntil: 'networkidle2' }); await sleep(500);
     }
-    const pages = (await readNav(s.page).catch(() => ({ pages: [] }))).pages;  // the Engineer's 12: Q&A and the menus' 11 (#616, Prepare #638)
-    r.check('the session survives navigation and reloads', pages.length === 12, JSON.stringify(pages));
+    const pages = (await readNav(s.page).catch(() => ({ pages: [] }))).pages;  // the Engineer's 13: Q&A and the menus' 12 (#616, Prepare #638, Groups #784)
+    r.check('the session survives navigation and reloads', pages.length === 13, JSON.stringify(pages));
     await chooseFromMenu(s.page, 'account', 'Log out').catch(() => {});
     await s.page.waitForFunction(() => location.pathname === '/login', { timeout: 10000 }).catch(() => {});
     const me = await s.page.evaluate(async () => (await fetch('/api/auth/me')).status);
@@ -50262,7 +51255,7 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     const s = await session(browser, BASE, 'engineer');
     await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' }); await sleep(1500);
     const links = (await readNav(s.page).catch(() => ({ pages: [] }))).pages;  // through the menus (#616)
-    for (const want of ['Q&A', 'Import', 'Prepare', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health', 'Users', 'Service keys', 'Audit']) {
+    for (const want of ['Q&A', 'Import', 'Prepare', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health', 'Users', 'Service keys', 'Groups', 'Audit']) {
       r.check(`Engineer nav includes ${want}`, links.includes(want), JSON.stringify(links));
     }
     await s.ctx.close();
@@ -58713,11 +59706,13 @@ const CITATIONS = [
   { source_file: 'beta.txt', chunk_index: 0, score: null, excerpt: 'Second excerpt.' },
 ];
 // Answers for the pages a case may pass through; a case adds or overrides routes.
-const OPEN = { restricted: false, users: [], service_principals: [] };
+const OPEN = { restricted: false, users: [], service_principals: [], groups: [] };
 const base = (extra = {}) => ({
   'GET /api/collections': json(200, { collections: COLS }),
   // Each collection's access on the Collections page (#606): open unless a case says otherwise.
   'GET /api/collections/*': json(200, OPEN),
+  // The groups the Access dialog offers (#784): none unless a case says otherwise.
+  'GET /api/auth/groups': json(200, { groups: [] }),
   'GET /api/retrieval/config/*': call => json(200, retrievalConfig(call.path.split('/').pop())),
   'GET /api/packages': json(200, { packages: [] }),
   'GET /api/tune/*': call => json(200, { collection: call.path.split('/').pop(), fidelity: 'with-sources', source_document_count: 2, can_rechunk: true, can_reembed: true, can_reindex: true, note: '' }),
@@ -58799,7 +59794,7 @@ function collectionsCases() {
       await waitFor(s.page, () => !document.querySelector('.fixed.inset-0'), 'the dialog to close');
       const puts = callsTo(s, 'PUT', '/api/collections/' + B + '/access');
       assert.equal(puts.length, 2);
-      assert.deepEqual(puts[1].body, { restricted: true, users: ['vfy-developer'], service_principals: ['vfy-svc'] });
+      assert.deepEqual(puts[1].body, { restricted: true, users: ['vfy-developer'], service_principals: ['vfy-svc'], groups: [] });
       await waitText(s.page, 'Restricted (2)');
     } },
     { name: 'Access (#606): when the dialog cannot read the state, the choice stays unknown and Save is disabled', open: open({
@@ -58845,7 +59840,7 @@ function collectionsCases() {
         const puts = s.calls.filter(call => call.method === 'PUT');
         assert.equal(puts.length, 1);
         assert.equal(puts[0].path, '/api/collections/' + B + '/access');
-        assert.deepEqual(puts[0].body, { restricted: true, users: ['vfy-developer'], service_principals: [] });
+        assert.deepEqual(puts[0].body, { restricted: true, users: ['vfy-developer'], service_principals: [], groups: [] });
       } };
     })(),
     (() => {
@@ -58913,6 +59908,40 @@ function collectionsCases() {
         assert.equal(principalsReads, 2);
       } };
     })(),
+    { name: 'Access (#784): groups are offered with their member counts, counted in the column, and a ticked group is sent', open: open({
+      ['GET /api/collections/' + A + '/access']: json(200, { restricted: true, users: ['vfy-developer'], service_principals: [], groups: ['vfy-team'] }),
+      'GET /api/auth/users': json(200, { users: [] }),
+      'GET /api/auth/service-principals': json(200, { principals: [] }),
+      'GET /api/auth/groups': json(200, { groups: [
+        { name: 'vfy-solo', created_at: '2026-01-02T12:00:00Z', users: ['vfy-developer'], service_principals: [] },
+        { name: 'vfy-team', created_at: '2026-01-02T12:00:00Z', users: ['vfy-developer', 'vfy-off'], service_principals: ['vfy-svc'] },
+      ] }),
+      'PUT /api/collections/*': call => json(200, call.body),
+    }), async run(s) {
+      await waitText(s.page, 'Restricted (2)');
+      await (await s.page.$$('tbody button'))[0].click();   // row A: Access
+      await waitText(s.page, 'Access to ' + A);
+      await waitText(s.page, 'vfy-solo (1 member)');
+      await waitText(s.page, 'vfy-team (3 members)');
+      const groups = () => s.page.evaluate(() => [...[...document.querySelectorAll('.fixed fieldset')][2].querySelectorAll('input[type=checkbox]')].map(b => b.checked));
+      assert.deepEqual(await groups(), [false, true]);
+      await (await s.page.$$('.fixed fieldset'))[2].$$('input[type=checkbox]').then(b => b[0].click());
+      assert.deepEqual(await groups(), [true, true]);
+      await press(s.page, 'Save');
+      await waitFor(s.page, () => !document.querySelector('.fixed.inset-0'), 'the dialog to close');
+      const puts = callsTo(s, 'PUT', '/api/collections/' + A + '/access');
+      assert.deepEqual(puts.map(c => c.body), [{ restricted: true, users: ['vfy-developer'], service_principals: [], groups: ['vfy-team', 'vfy-solo'] }]);
+      await waitText(s.page, 'Restricted (3)');
+    } },
+    { name: 'Access (#784): a failed groups read shows its message in the dialog', open: open({
+      'GET /api/auth/users': json(200, { users: [] }),
+      'GET /api/auth/service-principals': json(200, { principals: [] }),
+      'GET /api/auth/groups': apiError(500, 'INTERNAL_ERROR', 'Synthetic groups failure.'),
+    }), async run(s) {
+      await waitText(s.page, A);
+      await (await s.page.$$('tbody button'))[0].click();
+      await waitText(s.page, 'Could not load the groups: Synthetic groups failure.');
+    } },
     { name: 'New Collection modal starts with HNSW, Cosine and the three HNSW sliders at their defaults and bounds', open: open(), async run(s) {
       await waitText(s.page, A);
       await press(s.page, '+ New Collection');
@@ -59108,7 +60137,7 @@ function navigationCases() {
 function navMenuCases() {
   const DATA = { key: 'data', label: 'Data', entries: ['Import', 'Prepare', 'Transfer'] };
   const TUNE = { key: 'tune', label: 'Tune', entries: ['Chunking', 'Retrieval', 'Gold Standard'] };
-  const ADMIN = { key: 'admin', label: 'Admin', entries: ['Collections', 'Users', 'Service keys', 'Audit', 'Health'] };
+  const ADMIN = { key: 'admin', label: 'Admin', entries: ['Collections', 'Users', 'Service keys', 'Groups', 'Audit', 'Health'] };
   const account = (username, badge) => ({ key: 'account', label: `${username} ${badge}`, entries: ['Account', 'Change password', 'Log out'] });
   const want = {
     end_user: [account('vfy-end-user', 'End User')],
@@ -59379,7 +60408,7 @@ function usersCases() {
   return [
     { name: 'Engineer\'s Admin menu has Users, which opens the Users page', open: { role: 'engineer', path: '/qa', routes: usersApi() }, async run(s) {
       await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
-      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Prepare', 'Transfer', 'Chunking', 'Retrieval', 'Gold Standard', 'Collections', 'Users', 'Service keys', 'Audit', 'Health']);
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Prepare', 'Transfer', 'Chunking', 'Retrieval', 'Gold Standard', 'Collections', 'Users', 'Service keys', 'Groups', 'Audit', 'Health']);
       await chooseFromMenu(s.page, 'admin', 'Users');
       await waitPath(s.page, '/users');
       await waitText(s.page, 'vfy-developer');
@@ -60033,10 +61062,10 @@ function auditCases() {
     return routes;
   };
   return [
-    { name: 'Engineer\'s Admin menu has Audit after Service keys, which opens the page', open: { role: 'engineer', path: '/qa', routes: auditApi() }, async run(s) {
+    { name: 'Engineer\'s Admin menu has Audit after Groups, which opens the page', open: { role: 'engineer', path: '/qa', routes: auditApi() }, async run(s) {
       await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
       const admin = (await readNav(s.page)).menus.find(m => m.key === 'admin').entries;
-      assert.equal(admin.indexOf('Audit'), admin.indexOf('Service keys') + 1);
+      assert.equal(admin.indexOf('Audit'), admin.indexOf('Groups') + 1);
       await chooseFromMenu(s.page, 'admin', 'Audit');
       await waitPath(s.page, '/audit');
       await waitText(s.page, 'nightly (key keyid0000001)');
@@ -60277,7 +61306,7 @@ function queryOnlyCases() {
     { name: 'Query-only Engineer: the nav shows the Query-only tag and Q&A, Transfer and the Admin pages, without Import, Prepare, Chunking, Retrieval or Gold Standard', open: qo('engineer', '/qa'), async run(s) {
       await ready(s.page);
       assert.equal(await tag(s.page), 'Query-only');
-      assert.deepEqual(await nav(s.page), ['Q&A', 'Transfer', 'Collections', 'Users', 'Service keys', 'Audit', 'Health']);
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Transfer', 'Collections', 'Users', 'Service keys', 'Groups', 'Audit', 'Health']);
     } },
     { name: 'Query-only Developer: the nav shows the tag, Q&A and Transfer, and no Tune menu', open: qo('developer', '/qa'), async run(s) {
       await ready(s.page);
@@ -60324,8 +61353,108 @@ function queryOnlyCases() {
       await waitText(s.page, A);
       await ready(s.page);
       assert.equal(await tag(s.page), null);
-      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Prepare', 'Transfer', 'Chunking', 'Retrieval', 'Gold Standard', 'Collections', 'Users', 'Service keys', 'Audit', 'Health']);
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Prepare', 'Transfer', 'Chunking', 'Retrieval', 'Gold Standard', 'Collections', 'Users', 'Service keys', 'Groups', 'Audit', 'Health']);
       assert.equal(await s.page.evaluate(() => [...document.querySelectorAll('main button')].some(b => b.textContent.trim() === '+ New Collection')), true);
+    } },
+  ];
+}
+
+// The Groups page (#784): Engineers manage groups for collection access. The
+// API is stubbed with a small in-memory list.
+function groupsCases() {
+  const group = (name, users = [], service_principals = []) => ({ name, created_at: '2026-10-01T12:00:00Z', users, service_principals });
+  const person = name => ({ username: name, role: 'developer', enabled: name !== 'vfy-off', must_change_password: false, created_at: '2026-01-02T12:00:00Z' });
+  const groupsApi = (extra = {}) => {
+    const list = [group('vfy-team', ['vfy-developer'], ['vfy-svc'])];
+    const find = call => list.find(g => g.name === decodeURIComponent(call.path.split('/')[4]));
+    return base({
+      'GET /api/auth/groups': () => json(200, { groups: JSON.parse(JSON.stringify(list)) }),
+      'GET /api/auth/users': json(200, { users: [person('vfy-developer'), person('vfy-off')] }),
+      'GET /api/auth/service-principals': json(200, { principals: [{ name: 'vfy-svc', role: 'end_user', enabled: true, created_at: '2026-01-02T12:00:00Z', keys: [] }] }),
+      'POST /api/auth/groups': call => {
+        if (list.some(g => g.name === call.body.name.toLowerCase())) return apiError(409, 'GROUP_EXISTS', `A group named '${call.body.name.toLowerCase()}' already exists.`);
+        const g = group(call.body.name.toLowerCase());
+        list.push(g);
+        return json(201, { group: g });
+      },
+      'POST /api/auth/groups/*': call => {
+        const g = find(call), action = call.path.split('/')[5];
+        if (!g) return apiError(404, 'GROUP_NOT_FOUND', 'There is no group.');
+        if (action === 'rename') { g.name = call.body.name.toLowerCase(); return json(200, { group: g }); }
+        list.splice(list.indexOf(g), 1);
+        return json(200, { name: g.name, collections: [A] });
+      },
+      'PUT /api/auth/groups/*': call => {
+        const g = find(call);
+        g.users = [...call.body.users].sort(); g.service_principals = [...call.body.service_principals].sort();
+        return json(200, { group: g });
+      },
+      ...extra,
+    });
+  };
+  const open = (extra = {}) => ({ role: 'engineer', path: '/groups', routes: groupsApi(extra) });
+  const rowButton = (page, name, label) => page.evaluate((n, l) => {
+    const b = [...document.querySelectorAll(`tr[data-group="${n}"] button`)].find(x => x.textContent.trim() === l);
+    if (!b) return false; b.click(); return true;
+  }, name, label);
+  return [
+    { name: 'Engineer\'s Admin menu has Groups after Service keys, which opens the page', open: { role: 'engineer', path: '/qa', routes: groupsApi() }, async run(s) {
+      await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
+      const admin = (await readNav(s.page)).menus.find(m => m.key === 'admin').entries;
+      assert.equal(admin.indexOf('Groups'), admin.indexOf('Service keys') + 1);
+      await chooseFromMenu(s.page, 'admin', 'Groups');
+      await waitPath(s.page, '/groups');
+      await waitText(s.page, 'vfy-team');
+    } },
+    ...['developer', 'end_user'].map(role => ({ name: `${role === 'developer' ? 'Developer' : 'End User'} has no Groups link and is sent from /groups to Q&A`, open: { role, path: '/groups', routes: base() }, async run(s) {
+      await waitText(s.page, 'Ask a Question');
+      await waitPath(s.page, '/qa');
+      assert.equal((await nav(s.page)).includes('Groups'), false);
+      assert.equal(callsTo(s, 'GET', '/api/auth/groups').length, 0);
+    } })),
+    { name: 'Groups page: create (a refused name shows the message), members, rename and delete (asks first)', open: open(), async run(s) {
+      await waitText(s.page, 'vfy-team');
+      const row = await s.page.evaluate(() => [...document.querySelector('tr[data-group="vfy-team"]').cells].slice(0, 3).map(c => c.textContent.trim()));
+      assert.deepEqual(row, ['vfy-team', 'vfy-developer', 'vfy-svc']);
+      await fill(s.page, '#new-group-name', 'VFY-Team');
+      await press(s.page, 'Create group');
+      await waitText(s.page, "A group named 'vfy-team' already exists.");
+      await fill(s.page, '#new-group-name', 'vfy-legal');
+      await press(s.page, 'Create group');
+      await waitFor(s.page, () => !!document.querySelector('tr[data-group="vfy-legal"]'), 'the new group');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/groups').map(c => c.body), [{ name: 'VFY-Team' }, { name: 'vfy-legal' }]);
+      assert.equal(await rowButton(s.page, 'vfy-legal', 'Members'), true);
+      await waitText(s.page, 'Members of vfy-legal');
+      await waitText(s.page, 'vfy-off (disabled)');
+      const boxes = await s.page.$$('.fixed input[type=checkbox]');
+      await boxes[1].click();   // vfy-off
+      await boxes[2].click();   // vfy-svc
+      await press(s.page, 'Save');
+      await waitFor(s.page, () => !document.querySelector('.fixed.inset-0'), 'the dialog to close');
+      assert.deepEqual(callsTo(s, 'PUT', '/api/auth/groups/vfy-legal/members').map(c => c.body), [{ users: ['vfy-off'], service_principals: ['vfy-svc'] }]);
+      assert.equal(await rowButton(s.page, 'vfy-legal', 'Rename'), true);
+      await waitText(s.page, 'Rename vfy-legal');
+      await fill(s.page, '.fixed input', 'vfy-counsel');
+      await press(s.page, 'Rename', '.fixed button');
+      await waitFor(s.page, () => !!document.querySelector('tr[data-group="vfy-counsel"]'), 'the renamed group');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/groups/vfy-legal/rename').map(c => c.body), [{ name: 'vfy-counsel' }]);
+      assert.equal(await rowButton(s.page, 'vfy-counsel', 'Delete'), true);
+      await waitText(s.page, 'Delete group vfy-counsel?');
+      await waitText(s.page, 'stays restricted');
+      assert.equal(callsTo(s, 'POST', '/api/auth/groups/vfy-counsel/delete').length, 0);   // asked first
+      await press(s.page, 'Delete', '.fixed button');
+      await waitFor(s.page, () => !document.querySelector('tr[data-group="vfy-counsel"]'), 'the group to go');
+      assert.equal(callsTo(s, 'POST', '/api/auth/groups/vfy-counsel/delete').length, 1);
+    } },
+    { name: 'Groups page: a refused rename keeps the dialog open with the message', open: open({
+      'POST /api/auth/groups/*': apiError(409, 'GROUP_EXISTS', "A group named 'vfy-x' already exists."),
+    }), async run(s) {
+      await waitText(s.page, 'vfy-team');
+      assert.equal(await rowButton(s.page, 'vfy-team', 'Rename'), true);
+      await fill(s.page, '.fixed input', 'vfy-x');
+      await press(s.page, 'Rename', '.fixed button');
+      await waitText(s.page, "A group named 'vfy-x' already exists.");
+      assert.equal(await modalOpen(s.page), true);
     } },
   ];
 }
@@ -60340,6 +61469,7 @@ async function runUiControlTests(browser, baseUrl, reporter) {
   await run('Users page: Engineers manage accounts (#25)', usersCases());
   await run('Two-step verification: account page, login code, forced set-up, Users page (#607)', mfaCases());
   await run('Service keys page: Engineers manage service principals and keys (#25)', serviceKeysCases());
+  await run('Groups page: Engineers manage groups for collection access (#784)', groupsCases());
   await run('Audit page: Engineers read the audit log (#29)', auditCases());
   await run('Prepare page: list, preview, upload, jobs, deletes and import (#638)', prepareCases());
   await run('Q&A input, citations toggle, answer display and End User view (#400)', qaCases());
@@ -61348,7 +62478,7 @@ ENUMS = {
 SPAN_NAMES = frozenset("rag." + v for v in ENUMS["rag.operation"])
 
 # Explicit code-owned vocabulary. Raw URL/path values never enter this schema.
-ROUTES = frozenset(('DELETE /collections/{name}', 'DELETE /prepare/documents/{document_id}', 'DELETE /prepare/documents/{document_id}/prepared', 'GET /audit', 'GET /audit.csv', 'GET /auth/me', 'GET /auth/mfa', 'GET /auth/service-principals', 'GET /auth/status', 'GET /auth/users', 'GET /collections', 'GET /collections/{name}/access', 'GET /export/job/{job_id}', 'GET /export/jobs', 'GET /goldstandard/diagnostics', 'GET /goldstandard/download/{filename}', 'GET /goldstandard/session/{session_id}', 'GET /goldstandard/sessions', 'GET /health', 'GET /health/details', 'GET /help/transfer', 'GET /import/job/{job_id}', 'GET /import/jobs', 'GET /ingest/config/{collection}', 'GET /ingest/job/{job_id}', 'GET /ingest/jobs', 'GET /metrics/latency', 'GET /packages', 'GET /packages/{filename}', 'GET /prepare/documents', 'GET /prepare/documents/{document_id}', 'GET /prepare/documents/{document_id}/prepared', 'GET /prepare/documents/{document_id}/raw', 'GET /prepare/job/{job_id}', 'GET /prepare/jobs', 'GET /retrieval/config/{collection}', 'GET /tune/job/{job_id}', 'GET /tune/{collection}', 'PATCH /goldstandard/session/{session_id}/pair/{pair_id}', 'POST /auth/login', 'POST /auth/login/mfa', 'POST /auth/logout', 'POST /auth/mfa/disable', 'POST /auth/mfa/enroll', 'POST /auth/mfa/enroll/confirm', 'POST /auth/mfa/policy', 'POST /auth/mfa/recovery-codes', 'POST /auth/password', 'POST /auth/service-principals', 'POST /auth/service-principals/{name}/disable', 'POST /auth/service-principals/{name}/enable', 'POST /auth/service-principals/{name}/keys', 'POST /auth/service-principals/{name}/keys/{key_id}/revoke', 'POST /auth/service-principals/{name}/role', 'POST /auth/users', 'POST /auth/users/{username}/disable', 'POST /auth/users/{username}/enable', 'POST /auth/users/{username}/reset-mfa', 'POST /auth/users/{username}/reset-password', 'POST /auth/users/{username}/role', 'POST /collections', 'POST /export', 'POST /goldstandard/generate', 'POST /goldstandard/regenerate', 'POST /goldstandard/save', 'POST /import', 'POST /ingest/config', 'POST /ingest/upload', 'POST /prepare/import', 'POST /prepare/job/{job_id}/cancel', 'POST /prepare/jobs', 'POST /prepare/upload', 'POST /query', 'POST /retrieval/config', 'POST /tune/rechunk', 'POST /tune/reembed', 'POST /tune/reindex', 'PUT /collections/{name}/access'))
+ROUTES = frozenset(('DELETE /collections/{name}', 'DELETE /prepare/documents/{document_id}', 'DELETE /prepare/documents/{document_id}/prepared', 'GET /audit', 'GET /audit.csv', 'GET /auth/groups', 'GET /auth/me', 'GET /auth/mfa', 'GET /auth/service-principals', 'GET /auth/status', 'GET /auth/users', 'GET /collections', 'GET /collections/{name}/access', 'GET /export/job/{job_id}', 'GET /export/jobs', 'GET /goldstandard/diagnostics', 'GET /goldstandard/download/{filename}', 'GET /goldstandard/session/{session_id}', 'GET /goldstandard/sessions', 'GET /health', 'GET /health/details', 'GET /help/transfer', 'GET /import/job/{job_id}', 'GET /import/jobs', 'GET /ingest/config/{collection}', 'GET /ingest/job/{job_id}', 'GET /ingest/jobs', 'GET /metrics/latency', 'GET /packages', 'GET /packages/{filename}', 'GET /prepare/documents', 'GET /prepare/documents/{document_id}', 'GET /prepare/documents/{document_id}/prepared', 'GET /prepare/documents/{document_id}/raw', 'GET /prepare/job/{job_id}', 'GET /prepare/jobs', 'GET /retrieval/config/{collection}', 'GET /tune/job/{job_id}', 'GET /tune/{collection}', 'PATCH /goldstandard/session/{session_id}/pair/{pair_id}', 'POST /auth/groups', 'POST /auth/groups/{name}/delete', 'POST /auth/groups/{name}/rename', 'POST /auth/login', 'POST /auth/login/mfa', 'POST /auth/logout', 'POST /auth/mfa/disable', 'POST /auth/mfa/enroll', 'POST /auth/mfa/enroll/confirm', 'POST /auth/mfa/policy', 'POST /auth/mfa/recovery-codes', 'POST /auth/password', 'POST /auth/service-principals', 'POST /auth/service-principals/{name}/disable', 'POST /auth/service-principals/{name}/enable', 'POST /auth/service-principals/{name}/keys', 'POST /auth/service-principals/{name}/keys/{key_id}/revoke', 'POST /auth/service-principals/{name}/role', 'POST /auth/users', 'POST /auth/users/{username}/disable', 'POST /auth/users/{username}/enable', 'POST /auth/users/{username}/reset-mfa', 'POST /auth/users/{username}/reset-password', 'POST /auth/users/{username}/role', 'POST /collections', 'POST /export', 'POST /goldstandard/generate', 'POST /goldstandard/regenerate', 'POST /goldstandard/save', 'POST /import', 'POST /ingest/config', 'POST /ingest/upload', 'POST /prepare/import', 'POST /prepare/job/{job_id}/cancel', 'POST /prepare/jobs', 'POST /prepare/upload', 'POST /query', 'POST /retrieval/config', 'POST /tune/rechunk', 'POST /tune/reembed', 'POST /tune/reindex', 'PUT /auth/groups/{name}/members', 'PUT /collections/{name}/access'))
 ENUMS.update({"http.route": ROUTES | {"unmatched"},
               "rag.tuning_operation": frozenset(("rechunk", "reembed", "reindex")),
               "http.status_class": frozenset(("1xx", "2xx", "3xx", "4xx", "5xx"))})

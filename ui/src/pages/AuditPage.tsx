@@ -3,6 +3,7 @@ import { api, AuditFilters, AuditPage as AuditPageData, AuditRecord, auditCsvUrl
 
 // The names the API records (api/services/audit.py ALL_ACTIONS), for the filter.
 const ACTIONS = [
+  'admin.group.create', 'admin.group.delete', 'admin.group.members', 'admin.group.rename',
   'admin.key.issue', 'admin.key.revoke', 'admin.mfa.policy', 'admin.principal.create', 'admin.principal.disable',
   'admin.principal.enable', 'admin.principal.set-role', 'admin.user.create', 'admin.user.disable',
   'admin.user.enable', 'admin.user.reset-mfa', 'admin.user.reset-password', 'admin.user.set-role', 'audit.download',

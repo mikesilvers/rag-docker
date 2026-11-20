@@ -130,9 +130,13 @@ low, `403 FORBIDDEN`. Programs use service API keys instead of a session
 user: anyone with the role may poll or open them, if they may use the collection.
 
 **Who may use each collection** (#606). On top of the role, each collection is
-*open* (every account whose role allows it) or *restricted* to the people and
-service principals an AI Engineer grants it; AI Engineers reach every
-collection. A **new collection starts restricted to whoever made it**: one
+*open* (every account whose role allows it) or *restricted* to the people,
+service principals and groups an AI Engineer grants it; AI Engineers reach every
+collection. A **group** (#784, the **Groups** page in the Admin menu) holds
+people and service principals: its members may use the collections granted to
+it while they are members, and a change to a group applies to everyone's next
+request. Deleting a group removes its grants and never opens a collection.
+A **new collection starts restricted to whoever made it**: one
 created on the Collections page or with **+ New** on the Import page, or by an
 import under a new name (an import next to an existing collection copies that
 collection's access). End Users and other Developers don't see it until an AI
@@ -655,7 +659,7 @@ the build model is the answer model (for example `BUILD_LLM_MODEL` equal to
 
 **AI Engineers** can manage collections, including deleting them, from the dedicated **Collections** page. **Developers** can create a collection inline from the Import page using the **+ New** button next to the collection selector.
 
-A new collection is restricted to the account that created it (#606). For End Users or other Developers to see it, an AI Engineer opens it, or grants it to them, with **Access** on the Collections page ([Who may use each collection](#accounts-and-roles)).
+A new collection is restricted to the account that created it (#606). For End Users or other Developers to see it, an AI Engineer opens it, or grants it to them or to a group they belong to, with **Access** on the Collections page ([Who may use each collection](#accounts-and-roles)).
 
 A collection is a named vector index that holds chunks from one or more documents. Choose HNSW (approximate, fast) or Flat (exact, slower at scale).
 
