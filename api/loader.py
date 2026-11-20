@@ -23,10 +23,13 @@ restricted with no grants, so only AI Engineers can use it until one opens it
 or grants it on the Collections page; it never copies another collection's
 access. Only a replace keeps the collection's access.
 
-The passphrase of an encrypted package is asked for without echo when standard
-input is a terminal, and otherwise read as the first line of standard input
-(`docker compose exec -T api python -m loader NAME < file`). It is never an
-argument, never printed and never recorded.
+An encrypted package is opened by its key file (a key export, the default since
+#676) or its passphrase (#27); its age header says which. The key is asked for
+without echo when standard input is a terminal (paste the AGE-SECRET-KEY-1...
+line), and otherwise read as the whole of standard input, the key file itself
+(`docker compose exec -T api python -m loader NAME < NAME.key`). A passphrase is
+asked for the same way, or read as the first line of standard input
+(`... < passphrase-file`). Neither is ever an argument, printed or recorded.
 
 Each step is one line on standard error, prefixed "loader: ". Exit status: 0
 loaded, 1 refused or failed, 2 usage error. Every run past the arguments writes
@@ -83,6 +86,8 @@ def _audit(package: str, on_conflict: str, encrypted: bool, collection: str | No
            result: str = "success", code: str | None = None, chunks: int | None = None) -> None:
     from services import audit
     details: dict = {"on_conflict": on_conflict, "encrypted": encrypted}
+    if _state.get("encryption"):
+        details["encryption"] = _state["encryption"]    # "key" or "passphrase", never the secret (#676)
     if chunks is not None:
         details["chunks"] = chunks
     if code:
@@ -123,6 +128,18 @@ def _passphrase() -> str:
     return sys.stdin.readline().rstrip("\r\n")
 
 
+def _key(limit: int) -> str:
+    """The key file's text (#676): a hidden prompt on a terminal, otherwise the
+    whole of standard input, refused past `limit` characters."""
+    if sys.stdin.isatty():
+        return getpass.getpass("Key (the AGE-SECRET-KEY-1... line): ")
+    text = sys.stdin.read(limit + 1)
+    if len(text) > limit:
+        raise _Refused("KEY_INVALID", f"the key on standard input is longer than {limit} characters; "
+                                      "give the package's key file")
+    return text
+
+
 def _lock(upload_dir: str):
     """The one-load-at-a-time lock, held until the returned file is closed."""
     Path(upload_dir).mkdir(parents=True, exist_ok=True)
@@ -145,7 +162,7 @@ def _progress(job: dict, done: threading.Event) -> None:
             _say(f"chunks written: {count}")
 
 
-def _load(package: str, on_conflict: str, passphrase: str | None) -> dict:
+def _load(package: str, on_conflict: str, passphrase: str | None, identity=None) -> dict:
     """Run the import code on the package and return its finished job record."""
     from services import importer
     job_id = "load-" + uuid.uuid4().hex[:8]
@@ -155,7 +172,8 @@ def _load(package: str, on_conflict: str, passphrase: str | None) -> dict:
         "job_id": job_id, "status": "queued", "filename": package, "on_conflict": on_conflict,
         "collection": None, "original_collection": None, "chunks_written": 0, "fidelity": None,
         "renamed": False, "notes": [], "restored_sessions": [], "error": None, "error_code": None,
-        "error_detail": None, "encrypted": passphrase is not None,
+        "error_detail": None, "encrypted": passphrase is not None or identity is not None,
+        "encryption": "key" if identity is not None else "passphrase" if passphrase is not None else "none",
         "owner": None, "operator": True,        # access: restricted, no grants (#670)
     }
     job = importer._jobs[job_id]
@@ -164,7 +182,10 @@ def _load(package: str, on_conflict: str, passphrase: str | None) -> dict:
     ticker = threading.Thread(target=_progress, args=(job, done), daemon=True)
     ticker.start()
     try:
-        importer._run(job_id, package, on_conflict, passphrase)
+        if identity is not None:
+            importer._run(job_id, package, on_conflict, passphrase, identity=identity)
+        else:
+            importer._run(job_id, package, on_conflict, passphrase)
     finally:
         done.set()
     return job
@@ -207,8 +228,22 @@ def main(argv=None) -> int:
             regular = False
         if not regular:
             raise _Refused("PACKAGE_NOT_FOUND", f"no package named '{package}' in ./exports; copy it there first")
-        passphrase = None
-        if encrypted:
+        passphrase = identity = None
+        if encrypted and importer.package_kind(package) == "key":
+            # A key export (#676): its header says so.
+            _state["encryption"] = "key"
+            text = _key(age_stream.KEY_FILE_MAX)
+            if not text.strip():
+                raise _Refused("KEY_REQUIRED", f"'{package}' is encrypted with a key; give its key file "
+                                               "on standard input")
+            try:
+                identity = age_stream.parse_identity(text)
+            except age_stream.AgeError:
+                raise _Refused("KEY_INVALID", "that isn't the package's key file (one AGE-SECRET-KEY-1... "
+                                              "line)") from None
+            text = None
+        elif encrypted:
+            _state["encryption"] = "passphrase"
             passphrase = _passphrase()
             if not passphrase:
                 raise _Refused("PASSPHRASE_REQUIRED", f"'{package}' is encrypted; give its passphrase")
@@ -216,7 +251,7 @@ def main(argv=None) -> int:
         # API runs at its start. Under the lock, and nothing else imports here.
         for removed in importer.sweep_interrupted_imports():
             _say(f"removed a collection an interrupted load left half-built: {removed}")
-        job = _load(package, on_conflict, passphrase)
+        job = _load(package, on_conflict, passphrase, identity)
     except _Refused as refused:
         _state["done"] = True
         _say(f"load refused: {refused.code}: {refused}")

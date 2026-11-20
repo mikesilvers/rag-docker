@@ -63,7 +63,7 @@ def active_job_for(collection: str) -> str | None:
 
 @telemetry.traced("rag.export")
 def _run(job_id: str, collection: str, include_models: bool,
-         passphrase: str | None = None) -> None:
+         passphrase: str | None = None, encryption: str | None = None) -> None:
     job = _jobs[job_id]
 
     def progress(written: int) -> None:
@@ -84,8 +84,10 @@ def _run(job_id: str, collection: str, include_models: bool,
         # it is released before the terminal status is written.
         with collection_writes.guard(collection):
             job["status"] = "running"
+            # `key` only when it is asked for, so a build without one is called as before.
+            keyed = {"key": True} if encryption == "key" else {}
             result = packager.build(collection, include_models=include_models, progress=progress,
-                                    passphrase=passphrase)
+                                    passphrase=passphrase, **keyed)
     except packager.PackageError as exc:
         telemetry.outcome("error", exc)
         _log.warning("Export of %r refused (%s): %s", collection, exc.code, exc.message)
@@ -109,13 +111,24 @@ def _run(job_id: str, collection: str, include_models: bool,
         # export finish also sees when its package expires (#677). A failure
         # leaves the package unrecorded, never expired: the job says so. The
         # collection is recorded too: an encrypted package follows its access (#794).
+        # A key export's key file is recorded too, with the same finish time:
+        # each is deleted by its own full download, and expiry deletes both (#676).
         warnings = list(result["warnings"])
+        key_filename = result.get("key_filename")
+        finished = datetime.now(timezone.utc)
         try:
-            package_retention.record_export(result["filename"], datetime.now(timezone.utc), collection)
+            package_retention.record_export(result["filename"], finished, collection)
+            if key_filename:
+                package_retention.record_export(key_filename, finished, collection)
         except Exception:                          # noqa: BLE001 - reported in the warnings
             _log.exception("Could not record the expiry of package %s", result["filename"])
-            warnings.append("The package's expiry could not be recorded, so it won't be deleted "
-                            "automatically. Delete it from ./exports by hand once it has been copied.")
+            if key_filename:
+                warnings.append("The expiry of the package and its key file could not be recorded, so "
+                                "they won't be deleted automatically. Delete both from ./exports by hand "
+                                "once they have been copied.")
+            else:
+                warnings.append("The package's expiry could not be recorded, so it won't be deleted "
+                                "automatically. Delete it from ./exports by hand once it has been copied.")
         finish(
             status="completed",
             filename=result["filename"],
@@ -125,6 +138,7 @@ def _run(job_id: str, collection: str, include_models: bool,
             fidelity=result["fidelity"],
             models_bundled=result["models_bundled"],
             retrieve_script=result["retrieve_script"],
+            key_filename=key_filename,
             warnings=warnings,
         )
     finally:
@@ -136,16 +150,24 @@ def _run(job_id: str, collection: str, include_models: bool,
 
 
 async def start_export_job(collection: str, include_models: bool = False,
-                           passphrase: str | None = None, owner: dict | None = None) -> str:
+                           passphrase: str | None = None, owner: dict | None = None,
+                           encryption: str | None = None) -> str:
     """Register the job and run the build off the event loop.
 
-    A passphrase makes the package encrypted (#27). It is handed to the worker
-    as an argument only: the job record says `encrypted`, never the passphrase.
+    `encryption` is `"key"` (a new X25519 key per package, #676), `"passphrase"`
+    (#27) or `"none"`. Left out, it is `"passphrase"` with a passphrase and
+    `"none"` without: the API's own default, a key, is set by POST /export
+    (ExportRequest). The passphrase is handed to the worker as an argument
+    only: the job record says `encryption` and `encrypted`, never a secret.
 
     Raises ExportInProgressError carrying the running job id if one is already in flight
     for this collection; that job's record is always stored by then (#326).
     Raises ExportStartingError if that start hasn't stored it within START_WAIT.
     """
+    if encryption is None:
+        encryption = "passphrase" if passphrase is not None else "none"
+    if (encryption == "passphrase") != (passphrase is not None):
+        raise ValueError("a passphrase goes with encryption 'passphrase' only")
     job_id = str(uuid.uuid4())[:8]
     deadline = None
     while True:
@@ -194,7 +216,9 @@ async def start_export_job(collection: str, include_models: bool = False,
                 "fidelity": None,
                 "models_bundled": None,
                 "retrieve_script": None,
-                "encrypted": passphrase is not None,
+                "encrypted": encryption != "none",
+                "encryption": encryption,
+                "key_filename": None,
                 "warnings": [],
                 "error": None,
                 "error_code": None,
@@ -216,7 +240,7 @@ async def start_export_job(collection: str, include_models: bool = False,
     # export does not stall the API: queries and other collections carry on, and
     # only guarded writes to this collection wait for it (spec §6.1, #509).
     task = asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, collection, include_models,
-                                         passphrase))
+                                         passphrase, encryption))
     # _run ends it first; this also covers a task that never ran its worker.
     task.add_done_callback(lambda _task: collection_writes.end_job("export", job_id))
     return job_id

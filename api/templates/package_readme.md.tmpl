@@ -14,6 +14,8 @@ original documents it was built from.
 
 @@INCLUDE:encryption@@
 
+@@ENCRYPTION_NOTE@@
+
 ## What fidelity means
 
 @@INCLUDE:fidelity_table@@
@@ -32,7 +34,7 @@ This package is **`@@FIDELITY@@`**. @@FIDELITY_NOTE@@
 ```bash
 curl -X POST http://localhost:8080/api/import \
   -H 'Content-Type: application/json' \
-  -d '{"filename": "@@PACKAGE_FILENAME@@", "on_conflict": "abort"@@IMPORT_PASSPHRASE@@}'
+  -d '{"filename": "@@PACKAGE_FILENAME@@", "on_conflict": "abort"@@IMPORT_SECRET@@}'
 ```
 
 3. Poll the returned `job_id` at `GET /api/import/job/{job_id}`.

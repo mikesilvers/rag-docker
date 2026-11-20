@@ -21,10 +21,17 @@ A package copied straight from the host folder is still deleted after the expiry
 a download is refused (409 PACKAGE_BUSY) and the sweep skips it until its next
 run. Claiming a download and the sweep's check-and-delete take the same lock.
 
-**One way to delete.** `delete` removes the package, its companion files (none
-yet; #676's key file will be one) and its record entry, and writes one
-`package.delete` audit record. `may_sweep` alone decides whether the sweep may
-delete a package, so a later "keep" flag changes only that function.
+**One way to delete.** `delete` removes the package, its companion files (none)
+and its record entry, and writes one `package.delete` audit record. `may_sweep`
+alone decides whether the sweep may delete a package, so a later "keep" flag
+changes only that function.
+
+**Key files (#676).** A key export's key file, `<package>.key`, is recorded on
+its own, with the package's finish time and collection. It follows the same
+rules by its own name: a full download of it deletes it and only it, a full
+download of the package leaves it, and expiry deletes whichever of the two is
+still there. So it is not a companion: deleting it with the package would lose
+the key of a package downloaded first.
 
 **The record.** Each entry is `{"finished_at": ..., "collection": ...}`: the
 collection is the one exported, so an encrypted package exported here follows
@@ -65,7 +72,9 @@ RECORD_NAME = "exported_packages.json"
 SWEEP_INTERVAL_S = 15 * 60
 # The names a download serves: what exports write (packager.package_stem). The
 # `ragpkg-` prefix rules out a leading `.` and the class rules out `/`.
-NAME = re.compile(r"ragpkg-[A-Za-z0-9._-]+\.tar\.gz(?:\.age)?")
+NAME = re.compile(r"ragpkg-[A-Za-z0-9._-]+\.tar\.gz(?:\.age(?:\.key)?)?")
+# A key export's key file (#676): `<package>.tar.gz.age.key`.
+KEY_SUFFIX = ".tar.gz.age.key"
 _TIME = "%Y-%m-%dT%H:%M:%SZ"
 
 _lock = threading.RLock()
@@ -86,6 +95,11 @@ def lock():
 
 def valid_name(name) -> bool:
     return isinstance(name, str) and NAME.fullmatch(name) is not None
+
+
+def is_key_name(name) -> bool:
+    """A key file's name (#676), as the download rule admits it."""
+    return valid_name(name) and name.endswith(KEY_SUFFIX)
 
 
 def _exports() -> Path:
@@ -236,7 +250,8 @@ def recorded_collections() -> dict[str, str | None]:
 
 
 def companions(filename: str) -> list[str]:
-    """Files deleted with a package. None yet: #676's key file will be one."""
+    """Files deleted with a package. None: a key file (#676) is recorded and
+    deleted on its own, so downloading the package never deletes its key."""
     return []
 
 

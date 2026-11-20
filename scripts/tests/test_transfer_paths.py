@@ -168,7 +168,8 @@ class ExportOffLoopTests(RouteTestCase):
         async def scenario():
             threads["loop"] = threading.get_ident()
             async with asgi_client() as api:
-                start = await api.post("/export", json={"collection": "Coll"})
+                # Unencrypted, so the stand-in build is called as before (#676).
+                start = await api.post("/export", json={"collection": "Coll", "encryption": "none"})
                 self.assertEqual(start.status_code, 202, start.text)
                 job_id = start.json()["job_id"]
                 await until(started.is_set, "the build to start")
@@ -218,10 +219,11 @@ class PackageListTests(RouteTestCase):
             {"filename": good.name, "size_bytes": good.stat().st_size, "collection": "Corpus",
              "chunk_count": 12, "fidelity": "with-sources",
              "created_at": "2026-10-21T08:00:00Z", "readable": True, "encrypted": False,
+             "encryption": "none", "key_on_server": False,     # #676
              "expires_at": None},           # not exported here (#677)
             {"filename": junk.name, "size_bytes": junk.stat().st_size, "collection": None,
              "chunk_count": None, "fidelity": None, "created_at": None, "readable": False,
-             "encrypted": False, "expires_at": None},
+             "encrypted": False, "encryption": "none", "key_on_server": False, "expires_at": None},
         ])
 
 

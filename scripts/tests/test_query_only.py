@@ -294,6 +294,17 @@ class AppTests(Folders):
             self.assertIs(self.client.get("/auth/me", headers=self.session("user")).json()["query_only"], False)
         self.assertNotIn("query_only", self.client.get("/auth/status").json())
 
+    def test_user_answers_carry_lan_mode(self):
+        """LAN mode (#26) is in every user answer, so the Transfer page can hide
+        the unencrypted export (#676)."""
+        with patch.object(settings, "rag_lan_mode", True):
+            response = self.client.post("/auth/login", json={"username": "user", "password": self.passwords["user"]},
+                                        headers={"Origin": ORIGIN})
+            self.assertIs(response.json()["lan_mode"], True)
+            self.assertIs(self.client.get("/auth/me", headers=self.session("user")).json()["lan_mode"], True)
+        self.assertIs(self.client.get("/auth/me", headers=self.session("user")).json()["lan_mode"], False)
+        self.assertNotIn("lan_mode", self.client.get("/auth/status").json())
+
 
 # ── S4: the loader ───────────────────────────────────────────────────────────
 
@@ -313,10 +324,11 @@ class LoaderTests(Folders):
         return name
 
     def fake_run(self, status="completed", **fields):
-        def run(job_id, filename, on_conflict, passphrase=None):
+        def run(job_id, filename, on_conflict, passphrase=None, identity=None):
             job = importer._jobs[job_id]
             self.calls.append({"job": dict(job), "filename": filename, "on_conflict": on_conflict,
-                               "passphrase": passphrase, "lock_held": self.lock_is_held()})
+                               "passphrase": passphrase, "identity": identity,
+                               "lock_held": self.lock_is_held()})
             job.update({"status": status, **fields})
         return patch.object(importer, "_run", run)
 
@@ -427,6 +439,47 @@ class LoaderTests(Folders):
         self.assertEqual(code, 1)
         self.assertIn("PASSPHRASE_REQUIRED", err)
         self.assertEqual(len(self.calls), 1)
+
+    def key_package(self, name="ragpkg-vfy-3.tar.gz.age"):
+        """A package encrypted to a new key (#676), and the key file's text."""
+        from datetime import datetime, timezone
+        from services import age_stream
+        identity = age_stream.generate_identity()
+        with open(self.root / "exports" / name, "wb") as fh:
+            enc = age_stream.Encryptor(fh, recipient=identity.public_bytes)
+            enc.write(b"not read: the import run is replaced")
+            enc.close()
+        return name, identity, age_stream.identity_file(identity, datetime.now(timezone.utc), name)
+
+    def test_a_key_package_reads_its_key_file_from_stdin(self):
+        name, identity, text = self.key_package()
+        with self.fake_run(collection="K", original_collection="K", chunks_written=1):
+            code, err = self.main([name], stdin=text)
+        self.assertEqual(code, 0, err)
+        call = self.calls[0]
+        self.assertIsNone(call["passphrase"])
+        self.assertEqual(call["identity"].public_bytes, identity.public_bytes)
+        self.assertEqual(call["job"]["encryption"], "key")
+        line = identity.encode()
+        self.assertNotIn(line, err)
+        self.assertNotIn(line, (self.root / "audit" / "audit.jsonl").read_text())
+        details = self.records("operator.load")[-1]["details"]
+        self.assertEqual((details["encrypted"], details["encryption"]), (True, "key"))
+
+    def test_a_key_package_without_a_valid_key_is_refused_before_the_load(self):
+        name, identity, text = self.key_package()
+        for stdin, code_name in (("", "KEY_REQUIRED"), ("\n# just a comment\n", "KEY_INVALID"),
+                                 ("correct horse battery staple\n", "KEY_INVALID"),
+                                 ("x" * 5000, "KEY_INVALID")):
+            with self.subTest(code=code_name, stdin=stdin[:12]), self.fake_run():
+                code, err = self.main([name], stdin=stdin)
+                self.assertEqual(code, 1, err)
+                self.assertIn(code_name, err)
+                record = self.records("operator.load")[-1]
+                self.assertEqual((record["result"], record["details"]["code"],
+                                  record["details"]["encryption"]), ("refused", code_name, "key"))
+        self.assertEqual(self.calls, [])
+        self.assertNotIn(identity.encode(), (self.root / "audit" / "audit.jsonl").read_text())
 
     def test_progress_lines(self):
         name = self.package()
