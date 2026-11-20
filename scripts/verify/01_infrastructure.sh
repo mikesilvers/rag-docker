@@ -44,6 +44,8 @@ python3 "$REPO_ROOT/scripts/tests/test_weaviate_pin.py"
 check "the Weaviate pin is the same everywhere and Dependabot leaves it alone (#530)" $?
 python3 "$REPO_ROOT/scripts/tests/test_upgrade_backup.py"
 check "the README's 1.1.0 backup and rollback commands check before they write, and pin alpine (#679)" $?
+python3 "$REPO_ROOT/scripts/tests/test_backup_scripts.py"
+check "the backup and restore scripts encrypt each volume with its own key and refuse a wrong key before emptying anything (#848)" $?
 python3 "$REPO_ROOT/scripts/tests/test_version_agreement.py"
 check "the first-party version strings name the same release (#605)" $?
 python3 "$REPO_ROOT/scripts/tests/test_ci_workflow.py"
