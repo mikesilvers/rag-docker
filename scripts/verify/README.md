@@ -1008,9 +1008,9 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `ui_ingest_check.py` | the checks of suite 22, one per subcommand, on the host, and its cleanup (#641) |
 | `23_llm_split.sh` | the build and answer models (#671), full runs only: with `BUILD_LLM_MODEL` set to a small model, preparation and gold standard use it and query uses the answer model |
 | `llm_split.py` | helper for suite 23, run in the API container: pulls the small model, runs the three tasks through the services' code and prints the models Ollama reports answering each (#671) |
-| `24_query_only.sh` | §2.6 and §10.11 — query-only mode (#670): the overlay resolved without starting it; registers `../tests/test_query_only.py`; the start-up refusal of a non-boolean `RAG_QUERY_ONLY`; the loader's refusal on a full instance; with `stack.sh run --query-only`, build and export, `stack.sh query-only-mode`, then the load, the refusals, access and Q&A on the query-only instance, and a key package loaded with its key file on standard input and refused `KEY_REQUIRED` without it (#676) |
+| `24_query_only.sh` | §2.6 and §10.11 — query-only mode (#670): the overlay resolved without starting it; registers `../tests/test_query_only.py`; the start-up refusal of a non-boolean `RAG_QUERY_ONLY`; the loader's refusal on a full instance; with `stack.sh run --query-only`, build and export, `stack.sh query-only-mode`, then the load, the refusals, access and Q&A on the query-only instance, and a key package loaded with its key file on standard input and refused `KEY_FILE_REQUIRED` without it (#676) |
 | `query_only_config.py` | host-side, standard library: `docker-compose.yml` with and without `docker-compose.query-only.yml` as `docker compose config` resolves them; only the api's `RAG_QUERY_ONLY` may differ (#670) |
-| `../tests/test_query_only.py` | API image, no network (also on the host): `RAG_QUERY_ONLY` parsing, the refused and kept routes, the refusals through the app and their order, `query_only` in the user answers, `lan_mode` in the user answers (#676), the loader (usage, refusals, lock, passphrase, a key package's key file on standard input with `KEY_REQUIRED` and `KEY_INVALID` (#676), results `success`/`refused`/`failed`/`interrupted`, the Ctrl-C handler) and the access of a collection it creates (#670) |
+| `../tests/test_query_only.py` | API image, no network (also on the host): `RAG_QUERY_ONLY` parsing, the refused and kept routes, the refusals through the app and their order, `query_only` in the user answers, `lan_mode` in the user answers (#676), the loader (usage, refusals, lock, passphrase, a key package's key file on standard input with `KEY_FILE_REQUIRED` and `KEY_FILE_INVALID` (#676), results `success`/`refused`/`failed`/`interrupted`, the Ctrl-C handler) and the access of a collection it creates (#670) |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
 | `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
 | `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530); the nginx tag in SPECIFICATIONS.md's compose copy and 11.3 image list matches docker-compose.yml (#665), registered by infrastructure |
@@ -1226,8 +1226,8 @@ Since #676 the module also writes and reads files for a new X25519 key: `generat
 the key file in age's identity layout (`identity_file`, `parse_identity`), the `X25519` stanza
 on both sides, and `header_kind`, which tells a key package from a passphrase one by its header
 alone. Export encrypts to a new key by default and writes `<package>.key` (0600) beside the
-package; import and the query-only loader choose the secret by the header (`KEY_REQUIRED`,
-`KEY_INVALID`, `KEY_NOT_EXPECTED`). `test_export_encryption.py` runs the 68 testkit vectors that
+package; import and the query-only loader choose the secret by the header (`KEY_FILE_REQUIRED`,
+`KEY_FILE_INVALID`, `KEY_FILE_NOT_EXPECTED`). `test_export_encryption.py` runs the 68 testkit vectors that
 carry an X25519 key and an independent X25519 decryption, and checks the key build, the key
 file, the export choices (LAN mode's `ENCRYPTION_REQUIRED`), the import refusals and that no key
 reaches a job record, log or response.
@@ -1276,7 +1276,7 @@ deleting the key only, a package download leaving the key, expiry deleting both,
 key file and a restricted collection's key answering `404 PACKAGE_NOT_FOUND`. Suite 05's block
 "a key export (#676)" then checks on the verify stack that a default export is a key export with
 `<package>.key` at mode 600 and no plain archive in `./exports` while it runs, that two exports
-have different keys, that import without the key is refused `400 KEY_REQUIRED`, that the key's
+have different keys, that import without the key is refused `400 KEY_FILE_REQUIRED`, that the key's
 full download deletes the key and keeps the package, and that import with the key file's text
 completes.
 

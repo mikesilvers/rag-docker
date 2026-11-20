@@ -1106,14 +1106,14 @@ class KeyApi(Fixture):
         pp = self.sealed(name="ragpkg-pp-20261027T000000Z-0123abcd.tar.gz.age")
         plain = self.exports / (STEM + ".tar.gz")
         packager._write_archive(self.stage(), STEM, plain)
-        cases = ((archive.name, {}, "KEY_REQUIRED"),
-                 (archive.name, {"passphrase": PASSPHRASE}, "KEY_REQUIRED"),
-                 (archive.name, {"key": "not a key"}, "KEY_INVALID"),
+        cases = ((archive.name, {}, "KEY_FILE_REQUIRED"),
+                 (archive.name, {"passphrase": PASSPHRASE}, "KEY_FILE_REQUIRED"),
+                 (archive.name, {"key": "not a key"}, "KEY_FILE_INVALID"),
                  (archive.name, {"key": "AGE-SECRET-KEY-PQ-1HZLGZUPT4ETPKDEV8HSGFDCYZ4E522W0A7PU2LHT8EH9W6YLNC3SW78XKG"},
-                  "KEY_INVALID"),
+                  "KEY_FILE_INVALID"),
                  (pp.name, {"key": line}, "PASSPHRASE_REQUIRED"),
                  (pp.name, {}, "PASSPHRASE_REQUIRED"),
-                 (plain.name, {"key": line}, "KEY_NOT_EXPECTED"),
+                 (plain.name, {"key": line}, "KEY_FILE_NOT_EXPECTED"),
                  ("ragpkg-missing.tar.gz.age", {}, "PASSPHRASE_REQUIRED"))
         for filename, secret, code in cases:
             with self.subTest(code=code, secret=list(secret)), \

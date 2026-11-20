@@ -190,9 +190,9 @@ kkey=$(api_get "/export/job/$ejob" | jfield "['key_filename']")
 check_eq "the default export is encrypted with a new key" "$(api_get "/export/job/$ejob" | jfield "['encryption']")" "key"
 loader -- "$kpkg"
 rc=$?
-[ "$rc" = 1 ] && grep -q "KEY_REQUIRED" "$OUT"
-check "the loader refuses a key package with no key on standard input (exit 1, KEY_REQUIRED)" $? "exit $rc: $(tail -2 "$OUT")"
-check_eq "the refusal is an operator.load audit record" "$(last_load)" "refused KEY_REQUIRED $kpkg"
+[ "$rc" = 1 ] && grep -q "KEY_FILE_REQUIRED" "$OUT"
+check "the loader refuses a key package with no key on standard input (exit 1, KEY_FILE_REQUIRED)" $? "exit $rc: $(tail -2 "$OUT")"
+check_eq "the refusal is an operator.load audit record" "$(last_load)" "refused KEY_FILE_REQUIRED $kpkg"
 check_eq "the key file downloads" "$(curl -s -o /tmp/vfy_qo_key.txt -m 120 -w '%{http_code}' "$API/packages/$kkey")" "200"
 _rag_require_lock_owner
 (cd "$REPO_ROOT" && docker compose exec -T api python -m loader "$kpkg" --on-conflict rename) \

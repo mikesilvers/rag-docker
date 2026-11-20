@@ -471,9 +471,9 @@ class LoaderTests(Folders):
 
     def test_a_key_package_without_a_valid_key_is_refused_before_the_load(self):
         name, identity, text = self.key_package()
-        for stdin, code_name in (("", "KEY_REQUIRED"), ("\n# just a comment\n", "KEY_INVALID"),
-                                 ("correct horse battery staple\n", "KEY_INVALID"),
-                                 ("x" * 5000, "KEY_INVALID")):
+        for stdin, code_name in (("", "KEY_FILE_REQUIRED"), ("\n# just a comment\n", "KEY_FILE_INVALID"),
+                                 ("correct horse battery staple\n", "KEY_FILE_INVALID"),
+                                 ("x" * 5000, "KEY_FILE_INVALID")):
             with self.subTest(code=code_name, stdin=stdin[:12]), self.fake_run():
                 code, err = self.main([name], stdin=stdin)
                 self.assertEqual(code, 1, err)

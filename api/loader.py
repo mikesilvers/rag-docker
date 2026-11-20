@@ -135,7 +135,7 @@ def _key(limit: int) -> str:
         return getpass.getpass("Key (the AGE-SECRET-KEY-1... line): ")
     text = sys.stdin.read(limit + 1)
     if len(text) > limit:
-        raise _Refused("KEY_INVALID", f"the key on standard input is longer than {limit} characters; "
+        raise _Refused("KEY_FILE_INVALID", f"the key on standard input is longer than {limit} characters; "
                                       "give the package's key file")
     return text
 
@@ -234,12 +234,12 @@ def main(argv=None) -> int:
             _state["encryption"] = "key"
             text = _key(age_stream.KEY_FILE_MAX)
             if not text.strip():
-                raise _Refused("KEY_REQUIRED", f"'{package}' is encrypted with a key; give its key file "
+                raise _Refused("KEY_FILE_REQUIRED", f"'{package}' is encrypted with a key; give its key file "
                                                "on standard input")
             try:
                 identity = age_stream.parse_identity(text)
             except age_stream.AgeError:
-                raise _Refused("KEY_INVALID", "that isn't the package's key file (one AGE-SECRET-KEY-1... "
+                raise _Refused("KEY_FILE_INVALID", "that isn't the package's key file (one AGE-SECRET-KEY-1... "
                                               "line)") from None
             text = None
         elif encrypted:

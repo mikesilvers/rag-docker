@@ -545,12 +545,12 @@ completion, the written filename.
 
 A package whose filename ends in `.tar.gz.age` is encrypted, and its age header
 says which secret it needs (#676). A key package needs `"key"`, its key file's
-text: without one the request is refused `400 KEY_REQUIRED`, and a `key` that
-isn't an age key file `400 KEY_INVALID`. A passphrase package needs
+text: without one the request is refused `400 KEY_FILE_REQUIRED`, and a `key` that
+isn't an age key file `400 KEY_FILE_INVALID`. A passphrase package needs
 `"passphrase"`: without one the request is refused `400 PASSPHRASE_REQUIRED`, as
 is an encrypted file whose header can't be read and that comes with no secret. A
 secret sent for any other package is refused `400 PASSPHRASE_NOT_EXPECTED` or
-`400 KEY_NOT_EXPECTED`. All are decided by the filename and the header before any
+`400 KEY_FILE_NOT_EXPECTED`. All are decided by the filename and the header before any
 job is created (#27). The job reports `encrypted` and `encryption` and never holds
 the passphrase or the key.
 
@@ -1062,9 +1062,9 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | `PACKAGE_TOO_LARGE` | the package's members add up to more than `max_package_expanded_bytes` (16 GiB by default); `detail` `{"limit": <cap>, "member": <name>}`; nothing is imported (§6.2 check 1, #317) |
 | `PASSPHRASE_REQUIRED` | HTTP 400 from `POST /import`: a `.tar.gz.age` package without a passphrase; no job (#27) |
 | `PASSPHRASE_NOT_EXPECTED` | HTTP 400 from `POST /import`: a passphrase for a package that is not encrypted; no job (#27) |
-| `KEY_REQUIRED` | HTTP 400 from `POST /import`: a key package without `key`; no job (#676) |
-| `KEY_INVALID` | HTTP 400 from `POST /import`: a `key` that isn't an age X25519 key file; no job (#676) |
-| `KEY_NOT_EXPECTED` | HTTP 400 from `POST /import`: a `key` for a package that is not encrypted; no job (#676) |
+| `KEY_FILE_REQUIRED` | HTTP 400 from `POST /import`: a key package without `key`; no job (#676) |
+| `KEY_FILE_INVALID` | HTTP 400 from `POST /import`: a `key` that isn't an age X25519 key file; no job (#676) |
+| `KEY_FILE_NOT_EXPECTED` | HTTP 400 from `POST /import`: a `key` for a package that is not encrypted; no job (#676) |
 | `ENCRYPTION_REQUIRED` | HTTP 400 from `POST /export`: `encryption: "none"` in LAN mode; no job (#676) |
 | `PACKAGE_FORMAT_UNSUPPORTED` | `package_format` newer than this instance |
 | `PACKAGE_CORRUPT` | digest mismatch, a manifest `files` key outside the package (check 3), invalid retained sources or a chunk naming a source the package lacks (check 3a), or invalid evaluation-session metadata (check 4a); names the file |
@@ -1146,7 +1146,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E41 | A package of more than `max_package_members` entries, directories included, fails `PACKAGE_TOO_MANY_MEMBERS`, folders implied by member paths counting once each (a directory member's own folder as its entry; a name with a `..` component is refused `PACKAGE_UNREADABLE` before its folders are counted), and one whose members add up to more than `max_package_expanded_bytes` fails `PACKAGE_TOO_LARGE`, each with its message and `detail`, for `.tar.gz` and `.tar.gz.age` packages alike; a package exactly at a cap imports; a member with a negative size is refused `PACKAGE_UNREADABLE` before its size is counted, and a sparse file (old GNU type `S`, PAX sparse 0.0, 0.1 or 1.0) is refused `PACKAGE_UNREADABLE`; a `.tar.gz` refusal extracts nothing and reads no header after the refusing member, a `.tar.gz.age` refusal leaves at most the cap's bytes, and the job creates no collection and leaves no work directory (#317), by `test_package_limits.py` with caps of 1 MiB and 20 entries set through the environment |
 | E42 | A package's `manifest.json` records `answer_llm` and `build_llm` as `{"model": <name>}`, with `llm` the same as `answer_llm`, at `package_format` 1; with a build model that differs from the answer model, `include_models: true` bundles the embedding and answer models only (#671), by `test_retrieval_import.py` and `validate_package.py` on a real export |
 | E43 | Import checks and installs only this instance's answer model: a build model that differs, absent or not, is neither checked, installed nor noted (#671), by `test_retrieval_import.py` |
-| E44 | A default export is a key export (#676): `<stem>.tar.gz.age` with one `X25519` stanza and `<stem>.tar.gz.age.key` (0600, age's identity layout) beside it, a new key every time, no plaintext archive and nothing left by a failure; the package opens with the key file through import and an independent decryption, every vendored CCTV vector with an X25519 key behaves as its `expect:` says, `KEY_REQUIRED`, `KEY_INVALID`, `KEY_NOT_EXPECTED` and `ENCRYPTION_REQUIRED` refuse before any job, a wrong key fails `DECRYPT_FAILED` (`reason` `key`) touching nothing, and the key file is downloaded once and expired on its own, by `test_export_encryption.py`, `test_package_download.py`, `test_query_only.py` and suites 05, 18 and 24 |
+| E44 | A default export is a key export (#676): `<stem>.tar.gz.age` with one `X25519` stanza and `<stem>.tar.gz.age.key` (0600, age's identity layout) beside it, a new key every time, no plaintext archive and nothing left by a failure; the package opens with the key file through import and an independent decryption, every vendored CCTV vector with an X25519 key behaves as its `expect:` says, `KEY_FILE_REQUIRED`, `KEY_FILE_INVALID`, `KEY_FILE_NOT_EXPECTED` and `ENCRYPTION_REQUIRED` refuse before any job, a wrong key fails `DECRYPT_FAILED` (`reason` `key`) touching nothing, and the key file is downloaded once and expired on its own, by `test_export_encryption.py`, `test_package_download.py`, `test_query_only.py` and suites 05, 18 and 24 |
 
 ---
 

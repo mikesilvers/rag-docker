@@ -624,7 +624,7 @@ audit log, health, and export with the package list and download.
    (`.tar.gz.age`) its age header says which secret opens it. A key package
    reads its key file on standard input, `docker compose exec -T api python -m
    loader <package> < <package>.key`, or asks for the `AGE-SECRET-KEY-1...` line
-   without echo on a terminal (`KEY_REQUIRED`, `KEY_INVALID` refuse the load). A
+   without echo on a terminal (`KEY_FILE_REQUIRED`, `KEY_FILE_INVALID` refuse the load). A
    passphrase package asks for the passphrase, or reads it as the first line of
    standard input with `... < passphrase-file`. Neither is ever an argument. One load runs at a
    time. Each step is a line starting `loader:`; the exit status is 0 loaded,
@@ -1467,10 +1467,10 @@ job starts:
 
 | Refusal | When |
 |---|---|
-| `400 KEY_REQUIRED` | a key package without `key` (a passphrase alone included) |
-| `400 KEY_INVALID` | `key` isn't the text of an age key file (one `AGE-SECRET-KEY-1...` line) |
+| `400 KEY_FILE_REQUIRED` | a key package without `key` (a passphrase alone included) |
+| `400 KEY_FILE_INVALID` | `key` isn't the text of an age key file (one `AGE-SECRET-KEY-1...` line) |
 | `400 PASSPHRASE_REQUIRED` | a passphrase package without `passphrase` (a key alone included), or an encrypted file whose header can't be read and no secret |
-| `400 KEY_NOT_EXPECTED`, `400 PASSPHRASE_NOT_EXPECTED` | a secret sent for an unencrypted package |
+| `400 KEY_FILE_NOT_EXPECTED`, `400 PASSPHRASE_NOT_EXPECTED` | a secret sent for an unencrypted package |
 | `422` | both `key` and `passphrase` |
 
 A wrong key or passphrase, or a damaged encrypted file, fails the import job with

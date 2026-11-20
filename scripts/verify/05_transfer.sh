@@ -1500,7 +1500,7 @@ check "#676: each export has its own key" $? "$kpub / $kpub2"
 
 code=$(post_code "/import" "{\"filename\":\"$KPKG\",\"on_conflict\":\"rename\"}" /tmp/vfy_key_nokey.json)
 check_eq "#676: import without the key is refused 400" "$code" "400"
-check_eq "#676: ... KEY_REQUIRED" "$(jfield "['error']['code']" < /tmp/vfy_key_nokey.json)" "KEY_REQUIRED"
+check_eq "#676: ... KEY_FILE_REQUIRED" "$(jfield "['error']['code']" < /tmp/vfy_key_nokey.json)" "KEY_FILE_REQUIRED"
 
 kcode=$(curl -s -o /tmp/vfy_key.txt -m 120 -w '%{http_code}' "$API/packages/$KKEY")
 check_eq "#676: GET /packages/<package>.key downloads the key file" "$kcode" "200"

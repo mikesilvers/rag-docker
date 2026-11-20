@@ -1608,7 +1608,7 @@ def _key(limit: int) -> str:
         return getpass.getpass("Key (the AGE-SECRET-KEY-1... line): ")
     text = sys.stdin.read(limit + 1)
     if len(text) > limit:
-        raise _Refused("KEY_INVALID", f"the key on standard input is longer than {limit} characters; "
+        raise _Refused("KEY_FILE_INVALID", f"the key on standard input is longer than {limit} characters; "
                                       "give the package's key file")
     return text
 
@@ -1707,12 +1707,12 @@ def main(argv=None) -> int:
             _state["encryption"] = "key"
             text = _key(age_stream.KEY_FILE_MAX)
             if not text.strip():
-                raise _Refused("KEY_REQUIRED", f"'{package}' is encrypted with a key; give its key file "
+                raise _Refused("KEY_FILE_REQUIRED", f"'{package}' is encrypted with a key; give its key file "
                                                "on standard input")
             try:
                 identity = age_stream.parse_identity(text)
             except age_stream.AgeError:
-                raise _Refused("KEY_INVALID", "that isn't the package's key file (one AGE-SECRET-KEY-1... "
+                raise _Refused("KEY_FILE_INVALID", "that isn't the package's key file (one AGE-SECRET-KEY-1... "
                                               "line)") from None
             text = None
         elif encrypted:
@@ -15301,14 +15301,14 @@ async def start_import_job(filename: str, on_conflict: str, passphrase: str | No
                               f"'{name}' is not encrypted, so it takes no passphrase. "
                               "Anyone with the file can read it.")
     if not encrypted and key is not None:
-        raise PassphraseError("KEY_NOT_EXPECTED",
+        raise PassphraseError("KEY_FILE_NOT_EXPECTED",
                               f"'{name}' is not encrypted, so it takes no key. "
                               "Anyone with the file can read it.")
     identity = None
     if encrypted:
         kind = await asyncio.to_thread(package_kind, name)
         if kind == "key" and key is None:
-            raise PassphraseError("KEY_REQUIRED",
+            raise PassphraseError("KEY_FILE_REQUIRED",
                                   f"'{name}' is encrypted with a key. Send its key file to import it.")
         if kind == "passphrase" and passphrase is None:
             raise PassphraseError("PASSPHRASE_REQUIRED",
@@ -15320,7 +15320,7 @@ async def start_import_job(filename: str, on_conflict: str, passphrase: str | No
             try:
                 identity = age_stream.parse_identity(key)
             except age_stream.AgeError:
-                raise PassphraseError("KEY_INVALID",
+                raise PassphraseError("KEY_FILE_INVALID",
                                       "The key isn't the text of an age key file "
                                       "(one AGE-SECRET-KEY-1... line).") from None
             passphrase = None
@@ -30153,9 +30153,9 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `ui_ingest_check.py` | the checks of suite 22, one per subcommand, on the host, and its cleanup (#641) |
 | `23_llm_split.sh` | the build and answer models (#671), full runs only: with `BUILD_LLM_MODEL` set to a small model, preparation and gold standard use it and query uses the answer model |
 | `llm_split.py` | helper for suite 23, run in the API container: pulls the small model, runs the three tasks through the services' code and prints the models Ollama reports answering each (#671) |
-| `24_query_only.sh` | §2.6 and §10.11 — query-only mode (#670): the overlay resolved without starting it; registers `../tests/test_query_only.py`; the start-up refusal of a non-boolean `RAG_QUERY_ONLY`; the loader's refusal on a full instance; with `stack.sh run --query-only`, build and export, `stack.sh query-only-mode`, then the load, the refusals, access and Q&A on the query-only instance, and a key package loaded with its key file on standard input and refused `KEY_REQUIRED` without it (#676) |
+| `24_query_only.sh` | §2.6 and §10.11 — query-only mode (#670): the overlay resolved without starting it; registers `../tests/test_query_only.py`; the start-up refusal of a non-boolean `RAG_QUERY_ONLY`; the loader's refusal on a full instance; with `stack.sh run --query-only`, build and export, `stack.sh query-only-mode`, then the load, the refusals, access and Q&A on the query-only instance, and a key package loaded with its key file on standard input and refused `KEY_FILE_REQUIRED` without it (#676) |
 | `query_only_config.py` | host-side, standard library: `docker-compose.yml` with and without `docker-compose.query-only.yml` as `docker compose config` resolves them; only the api's `RAG_QUERY_ONLY` may differ (#670) |
-| `../tests/test_query_only.py` | API image, no network (also on the host): `RAG_QUERY_ONLY` parsing, the refused and kept routes, the refusals through the app and their order, `query_only` in the user answers, `lan_mode` in the user answers (#676), the loader (usage, refusals, lock, passphrase, a key package's key file on standard input with `KEY_REQUIRED` and `KEY_INVALID` (#676), results `success`/`refused`/`failed`/`interrupted`, the Ctrl-C handler) and the access of a collection it creates (#670) |
+| `../tests/test_query_only.py` | API image, no network (also on the host): `RAG_QUERY_ONLY` parsing, the refused and kept routes, the refusals through the app and their order, `query_only` in the user answers, `lan_mode` in the user answers (#676), the loader (usage, refusals, lock, passphrase, a key package's key file on standard input with `KEY_FILE_REQUIRED` and `KEY_FILE_INVALID` (#676), results `success`/`refused`/`failed`/`interrupted`, the Ctrl-C handler) and the access of a collection it creates (#670) |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
 | `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
 | `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530); the nginx tag in SPECIFICATIONS.md's compose copy and 11.3 image list matches docker-compose.yml (#665), registered by infrastructure |
@@ -30371,8 +30371,8 @@ Since #676 the module also writes and reads files for a new X25519 key: `generat
 the key file in age's identity layout (`identity_file`, `parse_identity`), the `X25519` stanza
 on both sides, and `header_kind`, which tells a key package from a passphrase one by its header
 alone. Export encrypts to a new key by default and writes `<package>.key` (0600) beside the
-package; import and the query-only loader choose the secret by the header (`KEY_REQUIRED`,
-`KEY_INVALID`, `KEY_NOT_EXPECTED`). `test_export_encryption.py` runs the 68 testkit vectors that
+package; import and the query-only loader choose the secret by the header (`KEY_FILE_REQUIRED`,
+`KEY_FILE_INVALID`, `KEY_FILE_NOT_EXPECTED`). `test_export_encryption.py` runs the 68 testkit vectors that
 carry an X25519 key and an independent X25519 decryption, and checks the key build, the key
 file, the export choices (LAN mode's `ENCRYPTION_REQUIRED`), the import refusals and that no key
 reaches a job record, log or response.
@@ -30421,7 +30421,7 @@ deleting the key only, a package download leaving the key, expiry deleting both,
 key file and a restricted collection's key answering `404 PACKAGE_NOT_FOUND`. Suite 05's block
 "a key export (#676)" then checks on the verify stack that a default export is a key export with
 `<package>.key` at mode 600 and no plain archive in `./exports` while it runs, that two exports
-have different keys, that import without the key is refused `400 KEY_REQUIRED`, that the key's
+have different keys, that import without the key is refused `400 KEY_FILE_REQUIRED`, that the key's
 full download deletes the key and keeps the package, and that import with the key file's text
 completes.
 
@@ -36689,9 +36689,9 @@ kkey=$(api_get "/export/job/$ejob" | jfield "['key_filename']")
 check_eq "the default export is encrypted with a new key" "$(api_get "/export/job/$ejob" | jfield "['encryption']")" "key"
 loader -- "$kpkg"
 rc=$?
-[ "$rc" = 1 ] && grep -q "KEY_REQUIRED" "$OUT"
-check "the loader refuses a key package with no key on standard input (exit 1, KEY_REQUIRED)" $? "exit $rc: $(tail -2 "$OUT")"
-check_eq "the refusal is an operator.load audit record" "$(last_load)" "refused KEY_REQUIRED $kpkg"
+[ "$rc" = 1 ] && grep -q "KEY_FILE_REQUIRED" "$OUT"
+check "the loader refuses a key package with no key on standard input (exit 1, KEY_FILE_REQUIRED)" $? "exit $rc: $(tail -2 "$OUT")"
+check_eq "the refusal is an operator.load audit record" "$(last_load)" "refused KEY_FILE_REQUIRED $kpkg"
 check_eq "the key file downloads" "$(curl -s -o /tmp/vfy_qo_key.txt -m 120 -w '%{http_code}' "$API/packages/$kkey")" "200"
 _rag_require_lock_owner
 (cd "$REPO_ROOT" && docker compose exec -T api python -m loader "$kpkg" --on-conflict rename) \
@@ -37912,9 +37912,9 @@ class LoaderTests(Folders):
 
     def test_a_key_package_without_a_valid_key_is_refused_before_the_load(self):
         name, identity, text = self.key_package()
-        for stdin, code_name in (("", "KEY_REQUIRED"), ("\n# just a comment\n", "KEY_INVALID"),
-                                 ("correct horse battery staple\n", "KEY_INVALID"),
-                                 ("x" * 5000, "KEY_INVALID")):
+        for stdin, code_name in (("", "KEY_FILE_REQUIRED"), ("\n# just a comment\n", "KEY_FILE_INVALID"),
+                                 ("correct horse battery staple\n", "KEY_FILE_INVALID"),
+                                 ("x" * 5000, "KEY_FILE_INVALID")):
             with self.subTest(code=code_name, stdin=stdin[:12]), self.fake_run():
                 code, err = self.main([name], stdin=stdin)
                 self.assertEqual(code, 1, err)
@@ -50407,7 +50407,7 @@ check "#676: each export has its own key" $? "$kpub / $kpub2"
 
 code=$(post_code "/import" "{\"filename\":\"$KPKG\",\"on_conflict\":\"rename\"}" /tmp/vfy_key_nokey.json)
 check_eq "#676: import without the key is refused 400" "$code" "400"
-check_eq "#676: ... KEY_REQUIRED" "$(jfield "['error']['code']" < /tmp/vfy_key_nokey.json)" "KEY_REQUIRED"
+check_eq "#676: ... KEY_FILE_REQUIRED" "$(jfield "['error']['code']" < /tmp/vfy_key_nokey.json)" "KEY_FILE_REQUIRED"
 
 kcode=$(curl -s -o /tmp/vfy_key.txt -m 120 -w '%{http_code}' "$API/packages/$KKEY")
 check_eq "#676: GET /packages/<package>.key downloads the key file" "$kcode" "200"

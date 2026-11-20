@@ -1137,14 +1137,14 @@ async def start_import_job(filename: str, on_conflict: str, passphrase: str | No
                               f"'{name}' is not encrypted, so it takes no passphrase. "
                               "Anyone with the file can read it.")
     if not encrypted and key is not None:
-        raise PassphraseError("KEY_NOT_EXPECTED",
+        raise PassphraseError("KEY_FILE_NOT_EXPECTED",
                               f"'{name}' is not encrypted, so it takes no key. "
                               "Anyone with the file can read it.")
     identity = None
     if encrypted:
         kind = await asyncio.to_thread(package_kind, name)
         if kind == "key" and key is None:
-            raise PassphraseError("KEY_REQUIRED",
+            raise PassphraseError("KEY_FILE_REQUIRED",
                                   f"'{name}' is encrypted with a key. Send its key file to import it.")
         if kind == "passphrase" and passphrase is None:
             raise PassphraseError("PASSPHRASE_REQUIRED",
@@ -1156,7 +1156,7 @@ async def start_import_job(filename: str, on_conflict: str, passphrase: str | No
             try:
                 identity = age_stream.parse_identity(key)
             except age_stream.AgeError:
-                raise PassphraseError("KEY_INVALID",
+                raise PassphraseError("KEY_FILE_INVALID",
                                       "The key isn't the text of an age key file "
                                       "(one AGE-SECRET-KEY-1... line).") from None
             passphrase = None
