@@ -219,6 +219,8 @@ export interface AuthUser {
   mfa_enrolled?: boolean; mfa_required?: boolean; mfa_enrollment_required?: boolean
   // Query-only mode (#670): the pages that change data are hidden.
   query_only?: boolean
+  // LAN mode (#26): the Transfer page offers no unencrypted export (#676).
+  lan_mode?: boolean
 }
 export interface AdminUser {
   username: string; role: Role; enabled: boolean; must_change_password: boolean; created_at: string; mfa_enrolled?: boolean
@@ -305,8 +307,10 @@ export interface MetricsResult {
   total_latency: LatencyStats
   history: LatencyRecord[]
 }
-// passphrase: only for an encrypted export (#27), 12 to 1024 characters.
-export interface ExportBody { collection: string; include_models: boolean; passphrase?: string }
+// encryption (#676): a new key (the API's default), a passphrase (#27, 12 to
+// 1024 characters, sent only with 'passphrase'), or none (refused in LAN mode).
+export type Encryption = 'key' | 'passphrase' | 'none'
+export interface ExportBody { collection: string; include_models: boolean; encryption?: Encryption; passphrase?: string }
 export interface ExportStart { job_id: string; status: string; collection: string }
 export interface ExportJob {
   job_id: string; status: string; collection: string; chunks_written: number
@@ -314,12 +318,18 @@ export interface ExportJob {
   fidelity: string | null; models_bundled: boolean | null; retrieve_script: boolean | null
   warnings: string[]; error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
   encrypted?: boolean
+  encryption?: Encryption
+  // A key export's key file (#676): its name, and whether it is still on the
+  // server (a full download of it deletes it).
+  key_filename?: string | null
+  key_on_server?: boolean
   // When the package is deleted if nobody downloads it (UTC, #677); null once
   // it has been downloaded or swept.
   expires_at?: string | null
 }
-// passphrase: required for a .tar.gz.age package and refused for any other (#27).
-export interface ImportBody { filename: string; on_conflict: string; passphrase?: string }
+// passphrase: required for a passphrase .tar.gz.age package (#27); key: the
+// text of the key file of a key package (#676). Each is refused for any other.
+export interface ImportBody { filename: string; on_conflict: string; passphrase?: string; key?: string }
 export interface ImportStart { job_id: string; status: string; filename: string }
 export interface ImportJob {
   job_id: string; status: string; filename: string; on_conflict: string
@@ -328,6 +338,7 @@ export interface ImportJob {
   restored_sessions?: { source_session_id: string; session_id: string; collection: string }[]
   error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
   encrypted?: boolean
+  encryption?: Encryption
 }
 // Running and recent jobs (#617). owner is null for a job recorded before
 // owners were, which only an Engineer sees ("owner unknown").
@@ -366,6 +377,10 @@ export interface PackageSummary {
   filename: string; size_bytes: number; collection: string | null
   chunk_count: number | null; fidelity: string | null; created_at: string | null; readable: boolean
   encrypted?: boolean
+  // 'none' for a .tar.gz; 'key' or 'passphrase' from a .tar.gz.age header, null
+  // when it can't be read (#676). key_on_server: its key file is still there.
+  encryption?: Encryption | null
+  key_on_server?: boolean
   // When a package this instance exported is deleted if nobody downloads it
   // (UTC, #677); null for one copied in to be imported.
   expires_at?: string | null
