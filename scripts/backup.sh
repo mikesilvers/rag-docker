@@ -60,10 +60,25 @@ fi
 parent=${dir:-$HOME/rag-docker-backups}
 abs=$(rb_abspath "$parent") || rb_die "can't use '$parent' (a '.' or '..' in a folder that doesn't exist yet)"
 case "$abs" in *:*) rb_die "the backup folder's path can't contain ':' (docker's mount separator): $abs" ;; esac
+inside="$abs is inside the git checkout; write backups outside it (the default is ~/rag-docker-backups) or under its ignored backups/ folder"
+allowed=
 case "$abs/" in
-  "$RB_ROOT/backups/"*) ;;
-  "$RB_ROOT/"*) rb_die "$abs is inside the git checkout; write backups outside it (the default is ~/rag-docker-backups) or under its ignored backups/ folder" ;;
+  "$RB_ROOT/backups/"*) allowed=yes ;;
+  "$RB_ROOT/"*) rb_die "$inside" ;;
 esac
+# The same check through the filesystem, so a path that names the checkout in
+# another case (macOS's default filesystem ignores case) is refused too: each
+# existing folder of the path, deepest first, is compared with backups/ and
+# with the checkout as the same file (device and inode).
+p=$abs
+while [ -z "$allowed" ]; do
+  if [ -d "$p" ]; then
+    [ "$p" -ef "$RB_ROOT/backups" ] && break
+    [ "$p" -ef "$RB_ROOT" ] && rb_die "$inside"
+  fi
+  case "$p" in /|'') break ;; esac
+  p=$(dirname "$p")
+done
 [ ! -e "$abs" ] || [ -d "$abs" ] || rb_die "$abs exists and is not a folder"
 ts=$(date -u +%Y%m%dT%H%M%SZ)
 run="$abs/${RB_PREFIX}-$ts"
@@ -87,7 +102,10 @@ for v in $found; do
   tmp="$arc.tmp"
   # A new key pair for this volume only: the secret key goes straight into its
   # file, and only the recipient (the public key) is passed to the next step.
-  if (set -o noclobber; rb_run "$RB_IMAGE" age-keygen 2>/dev/null >"$key") &&
+  # age-keygen's stderr (the public key, or Docker's error) is kept to show it
+  # if the step fails; the later steps' stderr goes straight through.
+  keyerr=
+  if keyerr=$( (set -o noclobber; rb_run "$RB_IMAGE" age-keygen 2>&1 >"$key") ) && keyerr= &&
     recipient=$(rb_run -i "$RB_IMAGE" age-keygen -y <"$key") &&
     case "$recipient" in age1*) true ;; *) false ;; esac &&
     rb_run -v "${RB_PREFIX}_$v:/data:ro" "$RB_IMAGE" \
@@ -98,6 +116,7 @@ for v in $found; do
     echo "$v: $(echo "$n" | tr -d ' ') entries -> $arc, key $key"
   else
     echo "$v: backup FAILED"
+    rb_show_error "$keyerr"
     rm -f "$tmp" "$key"
     failed="$failed $v"
   fi
