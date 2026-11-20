@@ -740,7 +740,9 @@ class ReviewerCoverageTests(AuditTestCase):
             "auth.mfa", "auth.mfa.enroll", "auth.mfa.recovery-codes", "auth.mfa.disable", "admin.user.reset-mfa",
             "admin.mfa.policy",
             # Per-collection access (#606); its refusals elsewhere are written directly.
-            "collection.access"})
+            "collection.access",
+            # Groups for collection access (#784).
+            "admin.group.create", "admin.group.rename", "admin.group.members", "admin.group.delete"})
         # Not recorded (D3): other GETs, job polling, gold-standard generate/edit/regenerate.
         # A preparation job's cancel is an action, not polling (#638).
         for method, path in audit.ACTIONS:

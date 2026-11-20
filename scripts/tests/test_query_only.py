@@ -72,6 +72,9 @@ KEPT = {
     ("POST", "/auth/service-principals/{name}/keys/{key_id}/revoke"),
     ("POST", "/query"), ("POST", "/export"), ("GET", "/packages/{filename}"),
     ("PUT", "/collections/{name}/access"),
+    # Groups for collection access (#784): /auth routes, like account administration.
+    ("POST", "/auth/groups"), ("POST", "/auth/groups/{name}/rename"), ("PUT", "/auth/groups/{name}/members"),
+    ("POST", "/auth/groups/{name}/delete"),
 }
 
 

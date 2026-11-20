@@ -107,6 +107,13 @@ ACCESS: dict[tuple[str, str], str] = {
     ("POST", "/auth/service-principals/{name}/enable"): ENGINEER,
     ("POST", "/auth/service-principals/{name}/keys"): ENGINEER,
     ("POST", "/auth/service-principals/{name}/keys/{key_id}/revoke"): ENGINEER,
+    # Groups for collection access (#784): Engineers, in a browser session only.
+    # Nothing under /auth uses DELETE, so a group is deleted with a POST.
+    ("GET", "/auth/groups"): ENGINEER,
+    ("POST", "/auth/groups"): ENGINEER,
+    ("POST", "/auth/groups/{name}/rename"): ENGINEER,
+    ("PUT", "/auth/groups/{name}/members"): ENGINEER,
+    ("POST", "/auth/groups/{name}/delete"): ENGINEER,
     # The audit log (#29): Engineers, in a browser session only (HUMAN_ONLY).
     ("GET", "/audit"): ENGINEER,
     ("GET", "/audit.csv"): ENGINEER,
@@ -124,10 +131,11 @@ ACCESS: dict[tuple[str, str], str] = {
 # GET /auth/me answers for a key. The audit log too (#29): a leaked key can't
 # read who did what, or question text when that is recorded. And two-step
 # verification (#607): service keys are unchanged and have no second factor.
-# And per-collection access (#606), so a leaked key can't open a collection to
-# another principal.
+# And per-collection access (#606), and groups (#784), so a leaked key can't
+# open a collection to another principal.
 HUMAN_ONLY = frozenset(path for _, path in ACCESS
-                       if path.startswith(("/auth/users", "/auth/service-principals", "/auth/mfa"))) | {
+                       if path.startswith(("/auth/users", "/auth/service-principals", "/auth/mfa",
+                                           "/auth/groups"))) | {
     "/auth/logout", "/auth/password", "/audit", "/audit.csv", "/collections/{name}/access"}
 
 

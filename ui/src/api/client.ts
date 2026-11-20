@@ -141,6 +141,15 @@ export const api = {
     request<{ principal: ServicePrincipal; key: ServiceKey; secret: string }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/keys`, { label, days }),
   revokeKey: (name: string, keyId: string) =>
     request<{ principal: ServicePrincipal }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/keys/${encodeURIComponent(keyId)}/revoke`),
+  // Groups for collection access (Engineers only, #784).
+  listGroups: () => request<{ groups: Group[] }>('GET', '/auth/groups'),
+  createGroup: (name: string) => request<{ group: Group }>('POST', '/auth/groups', { name }),
+  renameGroup: (name: string, newName: string) =>
+    request<{ group: Group }>('POST', `/auth/groups/${encodeURIComponent(name)}/rename`, { name: newName }),
+  setGroupMembers: (name: string, users: string[], service_principals: string[]) =>
+    request<{ group: Group }>('PUT', `/auth/groups/${encodeURIComponent(name)}/members`, { users, service_principals }),
+  deleteGroup: (name: string) =>
+    request<{ name: string; collections: string[] }>('POST', `/auth/groups/${encodeURIComponent(name)}/delete`),
   // The audit log (#29), for Engineers: a page of records, newest first.
   listAudit: (filters: AuditFilters, before?: string) =>
     request<AuditPage>('GET', `/audit${auditQuery(filters, before ? { before } : {})}`),
@@ -149,7 +158,7 @@ export const api = {
   // Answers with the name as stored, first letter capitalised (#372).
   createCollection: (body: CreateCollectionBody) => request<{ name: string; status: string }>('POST', '/collections', body),
   deleteCollection: (name: string) => request('DELETE', `/collections/${name}?confirm=true`),
-  // Who may use a collection (#606), for Engineers: open, or restricted to the named accounts.
+  // Who may use a collection (#606), for Engineers: open, or restricted to the named accounts and groups (#784).
   getCollectionAccess: (name: string) => request<CollectionAccess>('GET', `/collections/${encodeURIComponent(name)}/access`),
   setCollectionAccess: (name: string, body: CollectionAccess) =>
     request<CollectionAccess>('PUT', `/collections/${encodeURIComponent(name)}/access`, body),
@@ -235,7 +244,8 @@ export interface CollectionInfo {
   name: string; object_count: number; index_type: string; distance_metric: string; created_at: string | null
   hnsw_config?: { ef: number; efConstruction: number; maxConnections: number } | null
 }
-export interface CollectionAccess { restricted: boolean; users: string[]; service_principals: string[] }
+export interface CollectionAccess { restricted: boolean; users: string[]; service_principals: string[]; groups: string[] }
+export interface Group { name: string; created_at: string; users: string[]; service_principals: string[] }
 export interface CreateCollectionBody {
   name: string; index_type: string; distance_metric: string; hnsw_config: { efConstruction: number; maxConnections: number; ef: number }
 }

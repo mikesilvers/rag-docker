@@ -15,6 +15,7 @@ import CollectionsPage from './pages/CollectionsPage'
 import HealthPage from './pages/HealthPage'
 import UsersPage from './pages/UsersPage'
 import ServiceKeysPage from './pages/ServiceKeysPage'
+import GroupsPage from './pages/GroupsPage'
 import AuditPage from './pages/AuditPage'
 import TransferPage from './pages/TransferPage'
 import HelpTransferPage from './pages/HelpTransferPage'
@@ -94,6 +95,7 @@ export default function AppRouter() {
               <Route path="/health" element={<HealthPage />} />
               <Route path="/users" element={<UsersPage />} />
               <Route path="/service-keys" element={<ServiceKeysPage />} />
+              <Route path="/groups" element={<GroupsPage />} />
               <Route path="/audit" element={<AuditPage />} />
             </>
           )}

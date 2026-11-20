@@ -1599,7 +1599,7 @@ one may. The role of a request is the one stored for its user at that moment, ne
 | any session, after a due password change (also one with a two-step set-up due) | `GET /auth/mfa`, `POST /auth/mfa/enroll`, `POST /auth/mfa/enroll/confirm`, `POST /auth/mfa/recovery-codes`, `POST /auth/mfa/disable` |
 | `end_user` | `GET /collections`, `POST /query`, `GET /retrieval/config/{collection}` |
 | `developer` | `GET /health/details`; `POST /collections`; `POST /ingest/upload`, `GET /ingest/job/{job_id}`, `GET /ingest/jobs`, `GET /ingest/config/{collection}`, `POST /ingest/config`; `POST /retrieval/config`; `POST /goldstandard/generate`, `GET /goldstandard/session/{session_id}`, `GET /goldstandard/sessions`, `PATCH /goldstandard/session/{session_id}/pair/{pair_id}`, `POST /goldstandard/regenerate`, `POST /goldstandard/save`, `GET /goldstandard/download/{filename}`; `POST /export`, `GET /export/job/{job_id}`, `GET /export/jobs`, `POST /import`, `GET /import/job/{job_id}`, `GET /import/jobs`, `GET /packages`, `GET /packages/{filename}` (#677), `GET /help/transfer`; `GET /tune/{collection}`; document preparation (§3.1.11): `POST /prepare/upload`, `GET /prepare/documents`, `GET /prepare/documents/{document_id}`, `GET /prepare/documents/{document_id}/raw`, `GET /prepare/documents/{document_id}/prepared`, `DELETE /prepare/documents/{document_id}`, `DELETE /prepare/documents/{document_id}/prepared`, `POST /prepare/jobs`, `GET /prepare/jobs`, `GET /prepare/job/{job_id}`, `POST /prepare/job/{job_id}/cancel`, `POST /prepare/import` |
-| `engineer` | `DELETE /collections/{name}`; per-collection access (#606, browser sessions only): `GET /collections/{name}/access`, `PUT /collections/{name}/access`; `POST /tune/rechunk`, `POST /tune/reembed`, `POST /tune/reindex`, `GET /tune/job/{job_id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; FastAPI's `GET /docs`, `GET /docs/oauth2-redirect`, `GET /redoc`, `GET /openapi.json`; account administration: `GET /auth/users`, `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `POST /auth/users/{username}/role`, `POST /auth/users/{username}/disable`, `POST /auth/users/{username}/enable`, `POST /auth/users/{username}/reset-mfa`, `POST /auth/mfa/policy`; service principals and keys: `GET /auth/service-principals`, `POST /auth/service-principals`, `POST /auth/service-principals/{name}/role`, `POST /auth/service-principals/{name}/disable`, `POST /auth/service-principals/{name}/enable`, `POST /auth/service-principals/{name}/keys`, `POST /auth/service-principals/{name}/keys/{key_id}/revoke`; the audit log (§3.1.9): `GET /audit`, `GET /audit.csv` |
+| `engineer` | `DELETE /collections/{name}`; per-collection access (#606, browser sessions only): `GET /collections/{name}/access`, `PUT /collections/{name}/access`; `POST /tune/rechunk`, `POST /tune/reembed`, `POST /tune/reindex`, `GET /tune/job/{job_id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; FastAPI's `GET /docs`, `GET /docs/oauth2-redirect`, `GET /redoc`, `GET /openapi.json`; account administration: `GET /auth/users`, `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `POST /auth/users/{username}/role`, `POST /auth/users/{username}/disable`, `POST /auth/users/{username}/enable`, `POST /auth/users/{username}/reset-mfa`, `POST /auth/mfa/policy`; service principals and keys: `GET /auth/service-principals`, `POST /auth/service-principals`, `POST /auth/service-principals/{name}/role`, `POST /auth/service-principals/{name}/disable`, `POST /auth/service-principals/{name}/enable`, `POST /auth/service-principals/{name}/keys`, `POST /auth/service-principals/{name}/keys/{key_id}/revoke`; groups for collection access (#784, browser sessions only): `GET /auth/groups`, `POST /auth/groups`, `POST /auth/groups/{name}/rename`, `PUT /auth/groups/{name}/members`, `POST /auth/groups/{name}/delete`; the audit log (§3.1.9): `GET /audit`, `GET /audit.csv` |
 
 The matrix is one table in `api/auth/policy.py`. A route without an entry is refused for everyone (`403
 FORBIDDEN`), and a registered check fails when a route lacks an entry or an entry names no route. Jobs and
@@ -1725,8 +1725,9 @@ enabled. The account routes stay for people: `GET /auth/users` lists no principa
 
 **Per-collection access** (#606). A collection is *open* or *restricted*. A restricted collection may be used
 only by Engineers and the accounts granted it: people and service principals (a key acts as its principal, so all
-of a principal's keys share its grants). Grants are per account; there are no groups. A granted account does on the
-collection everything its role allows; an ungranted one can do nothing with it. Engineers reach every collection.
+of a principal's keys share its grants), directly or as a member of a group granted it (**Groups**, below, #784). A
+granted account does on the collection everything its role allows; an ungranted one can do nothing with it. Engineers
+reach every collection.
 The state is in `auth.db` (schema version 4, tables `restricted_collections` and `collection_grants`, keyed by the
 stored collection name): a store from before #606 gains the empty tables on first open, so every existing
 collection stays open. A staging or recovery collection of a rebuild or import (`<target>__tuning_<token>`,
@@ -1798,11 +1799,43 @@ disabled or its role changes; an Engineer demoted to a lower role is then bound 
 
 | Route | Request | Success |
 |---|---|---|
-| `GET /collections/{name}/access` | | `200 {"restricted", "users", "service_principals"}`, names sorted. No such collection: `404 COLLECTION_NOT_FOUND`; Weaviate unavailable: `503 SERVICE_UNAVAILABLE` |
-| `PUT /collections/{name}/access` | `{"restricted", "users": [...], "service_principals": [...]}` (lists default `[]`, no other field) | The whole state at once, in one transaction; answers as the GET. `restricted: false` opens it and deletes its grants (names with it are `422 INVALID_PARAMETER`); `restricted: true` grants exactly the people in `users` and the principals in `service_principals` (lowercased; disabled accounts allowed; none means Engineers only). An unknown name, or one of the other kind, is `422 INVALID_PARAMETER` and changes nothing. One `collection.access` audit record with `restricted_before`, `restricted_after`, `added` and `removed`, and one API log line |
+| `GET /collections/{name}/access` | | `200 {"restricted", "users", "service_principals", "groups"}`, names sorted. No such collection: `404 COLLECTION_NOT_FOUND`; Weaviate unavailable: `503 SERVICE_UNAVAILABLE` |
+| `PUT /collections/{name}/access` | `{"restricted", "users": [...], "service_principals": [...], "groups": [...]}` (lists default `[]`, no other field; a body without `groups` grants no group) | The whole state at once, in one transaction; answers as the GET. `restricted: false` opens it and deletes its grants (names with it are `422 INVALID_PARAMETER`); `restricted: true` grants exactly the people in `users`, the principals in `service_principals` and the groups in `groups` (lowercased; disabled accounts allowed; none means Engineers only). An unknown name, one of the other kind, or a group that doesn't exist is `422 INVALID_PARAMETER` and changes nothing. One `collection.access` audit record with `restricted_before`, `restricted_after`, `added` and `removed` (each `{users, service_principals, groups}`), and one API log line |
 
 Both are Engineers' routes for a browser session only: a key gets `403 KEY_NOT_ALLOWED`, so a leaked key can't open a
 collection to another principal. The Collections page (§7.8) manages them.
+
+**Groups** (#784). Engineers make groups of people and service principals and grant restricted collections to them
+(`groups` in `PUT /collections/{name}/access`). A member may use a collection while both the group's grant and their
+membership hold. The state is in `auth.db` (schema version 5, tables `groups`, `group_members` and
+`collection_group_grants`); a store from before gains the empty tables on first open, so nothing changes on upgrade.
+A group name follows the username rule (3-32 characters: lowercase letters, digits, `.`, `_`, `-`; stored
+lowercased) in its own namespace; members are people and service principals of any role, enabled or disabled (a
+disabled account stays a member); a group can't be a member. Members and grants name the group's id, so a rename
+keeps them. Deleting a group removes its members and every collection grant to it in one transaction; a collection
+granted only to it stays restricted (Engineers and any other grants), so a delete never opens anything. Deleting,
+opening or discarding a collection drops its group grants with its other state. Every change applies to each
+session's and key's next request, as a grant does. A copy (an import under a new name, a staging or recovery copy)
+takes its source's group grants with its account grants; across a chain it keeps an account or a group only when
+every restricted collection in the chain grants that same account directly or that same group, so it is never wider
+than any of them, and a group grant stays a group grant (a membership change reaches the copy too). A failed create
+or import puts group grants back like account grants; a group deleted since is left out. A new collection starts
+with no group. Groups don't change roles, and the operator command has no group commands (Engineers reach every
+collection).
+
+| Route | Request | Success |
+|---|---|---|
+| `GET /auth/groups` | | `200 {"groups": [{"name", "created_at", "users", "service_principals"}, ...]}`, groups and names sorted |
+| `POST /auth/groups` | `{"name"}` | `201 {"group"}`, with no members |
+| `POST /auth/groups/{name}/rename` | `{"name"}` (the new name) | `200 {"group"}`; its own name changes nothing |
+| `PUT /auth/groups/{name}/members` | `{"users": [...], "service_principals": [...]}` (lists default `[]`, at most 1000 names of at most 64 characters, no other field) | `200 {"group"}`: the members are exactly those named |
+| `POST /auth/groups/{name}/delete` | | `200 {"name", "collections"}`: the collections whose grant to it was removed, sorted |
+
+All five are Engineers' routes for a browser session only (`403 KEY_NOT_ALLOWED` for a key); nothing under `/auth`
+uses DELETE. Refusals: a new name that breaks the rule `422 INVALID_GROUP_NAME`; a name another group has `409
+GROUP_EXISTS`; a group in the path that doesn't exist `404 GROUP_NOT_FOUND`; a member that is no person (in
+`users`) or no service principal (in `service_principals`) `422 INVALID_PARAMETER`, changing nothing. Each change
+and refusal is one API log line and an audit record (§3.1.9). The Groups page (§7.18) manages them.
 
 **Two-step verification** (#607). TOTP with an authenticator app; no SMS and no external service, so it works
 offline. Service keys are unchanged: they have no second factor and get `403 KEY_NOT_ALLOWED` on every `/auth/mfa`
@@ -1926,7 +1959,10 @@ code attempt that reaches a live challenge, never counted in a window: actor the
 `recovery`; a request with no live challenge writes nothing; the password step before it is `auth.login` with
 `details.mfa` `required`), `auth.mfa.enroll`, `auth.mfa.recovery-codes`, `auth.mfa.disable`;
 `admin.principal.create`, `admin.principal.set-role`, `admin.principal.disable`, `admin.principal.enable`,
-`admin.key.issue`, `admin.key.revoke`; `audit.view`, `audit.download`; `operator.bootstrap`, `operator.create-user`,
+`admin.key.issue`, `admin.key.revoke`; groups for collection access (#784): `admin.group.create`,
+`admin.group.rename` (`target` the old name, `details.name` the new), `admin.group.members` (`added` and `removed`,
+each `{users, service_principals}`), `admin.group.delete` (`details.collections`: those whose grant to it was
+removed); `audit.view`, `audit.download`; `operator.bootstrap`, `operator.create-user`,
 `operator.reset-password`, `operator.set-role`, `operator.disable`, `operator.enable`, `operator.reset-mfa` (`python -m auth`; not `list`,
 not usage errors); `operator.load` (`python -m loader`, §2.6; not usage errors); `system.start` (each API start, after the job records are loaded, with `question_text_logged`,
 `max_bytes` and `keep`); document preparation (§3.1.11): `prepare.upload` (names, count, bytes), `prepare.start`
@@ -3230,6 +3266,7 @@ Developer also Data and Tune, an Engineer also Admin.
 | Admin | Collections | ✓ | — | — |
 | Admin | Users | ✓ | — | — |
 | Admin | Service keys | ✓ | — | — |
+| Admin | Groups | ✓ | — | — |
 | Admin | Audit | ✓ | — | — |
 | Admin | Health | ✓ | — | — |
 | Account (labelled with the username and role badge) | Account | ✓ | ✓ | ✓ |
@@ -3457,7 +3494,7 @@ A retained session can be loaded/refreshed by its session ID, including when its
 - "New Collection" button → modal with fields: name, index type, distance metric, HNSW params.
 - A refused create (for example `409 COLLECTION_EXISTS`, a 422 or a 503) keeps the modal open and shows the API's message inside it, as an alert. The message clears on Cancel, when the modal is opened again, or when a create succeeds (#379).
 - Delete button per row → confirmation modal with collection name typed to confirm. Calls `DELETE /collections/{name}?confirm=true`.
-- Access (#606): the dialog reads the state when it opens; until that read succeeds the choice is unknown and Save is disabled, and a read answering after the Engineer changed something doesn't overwrite the change. An "Access" column shows "Open", "Restricted (n)" (n grants) or "—" when `GET /collections/{name}/access` failed for that row. An "Access" button per row opens a dialog: Open or Restricted, and when restricted the people (`GET /auth/users`) and service principals (`GET /auth/service-principals`) as checkboxes, disabled ones marked. Save calls `PUT /collections/{name}/access`; a refused save keeps the dialog open with the API's message as an alert.
+- Access (#606): the dialog reads the state when it opens; until that read succeeds the choice is unknown and Save is disabled, and a read answering after the Engineer changed something doesn't overwrite the change. An "Access" column shows "Open", "Restricted (n)" (n grants: people, service principals and groups) or "—" when `GET /collections/{name}/access` failed for that row. An "Access" button per row opens a dialog: Open or Restricted, and when restricted the people (`GET /auth/users`), service principals (`GET /auth/service-principals`) and groups (`GET /auth/groups`, #784; each "name (n members)", "None" when there are none) as checkboxes, disabled accounts marked. The three lists are read when the dialog opens, numbered with the opening, so an earlier opening's late answer or error never reaches it; a failed groups read says "Could not load the groups:" with the reason. Save calls `PUT /collections/{name}/access`; a refused save keeps the dialog open with the API's message as an alert.
 - A refused delete keeps the modal open and shows the API's message inside it, as an alert: for `409 COLLECTION_BUSY`, for example, "An ingest job is running for this collection (…)". The collection stays listed; the message clears on Cancel, when the modal is opened again, or when a delete succeeds.
 
 ### 7.9 Health Dashboard Page
@@ -3697,6 +3734,23 @@ The Import page shows a link "Prepare documents first" to `/prepare` beside the 
 - An error shows the API's message as an alert. The secret and the codes are kept only in the page's memory, never
   in browser storage.
 
+### 7.18 Groups Page (#784)
+
+**Route:** `/groups`  
+**Roles:** Engineer only (others are sent to `/qa`); in the Admin menu after Service keys, also in query-only mode
+
+- A short explanation: a group holds people and service principals; a restricted collection granted to it (Access
+  on the Collections page) is usable by its members; changes apply to the next request.
+- A form with the name and "Create group"; the name rule is shown under it.
+- A table of the groups from `GET /auth/groups`: name, people, service principals, and per row "Members", "Rename"
+  and "Delete". "Members" opens a dialog with the people (`GET /auth/users`) and service principals (`GET
+  /auth/service-principals`) as checkboxes, disabled ones marked, and Save (`PUT /auth/groups/{name}/members`).
+  "Rename" opens a dialog with the new name (`POST /auth/groups/{name}/rename`). "Delete" asks first, saying that
+  every collection grant to the group is removed and a collection granted only to it stays restricted (`POST
+  /auth/groups/{name}/delete`).
+- A refused action shows the API's message as an alert, inside the dialog when one is open; a list that can't be
+  loaded says "Could not load the groups:" with the reason.
+
 ## 8. Configuration Defaults and Constraints
 
 The table gives API request bounds; narrower UI sliders are presentation choices. Internal import/rebuild preserves positive stored HNSW construction/connections settings and stored `ef=-1` (dynamic) or positive values beyond new-request limits. Index/distance enums and numeric type validation still apply; no clamping or migration is performed.
@@ -3906,6 +3960,7 @@ rag-docker/
 │   │   │   ├── HealthPage.tsx
 │   │   │   ├── UsersPage.tsx          # Engineers manage accounts (#25)
 │   │   │   ├── ServiceKeysPage.tsx    # Engineers manage service principals and keys (#25)
+│   │   │   ├── GroupsPage.tsx         # Engineers manage groups for collection access (#784)
 │   │   │   └── AuditPage.tsx          # Engineers read the audit log (#29)
 │   │   ├── components/
 │   │   │   ├── NavBar.tsx
@@ -4737,6 +4792,17 @@ Two-step verification (#607). These are ticked once the tests reviewer's full `s
   import (#792), and the matrix rows (suite 17); the Collections page's Access cases in
   `scripts/verify/browser/ui_controls.js` (suite 06), including a late answer for an earlier opening (#788), an
   earlier opening's failed read and its late lists of people and service principals (#792).*
+- [x] Groups for collection access (#784): Engineers create, rename and delete groups and set their members (people
+  and service principals) in browser sessions only; a collection granted to a group is listed and usable by its
+  members while the grant and the membership hold, and by no one else; a change applies to the next request;
+  deleting a group removes its grants and never opens a collection; a rename keeps members and grants; a deleted
+  collection drops its group grants; copies, imports and failed creates carry group grants under the account rules
+  (narrowest across a chain, never wider); every change and refusal is audited; the Collections page's Access
+  dialog offers groups and the Groups page manages them.
+  *Evidence: `scripts/tests/test_collection_access.py` `GroupRuleTests`, `GroupAccessRouteTests`,
+  `GroupRouteTests`, `GroupCopyTests` (suite 17), which fail on the code before #784; `test_auth.py` and
+  `test_query_only.py` for the routes' policy; `auth_stack.py collection-access` (its group case) and the matrix
+  rows (suite 17); `scripts/verify/browser/ui_controls.js` Access (#784) and Groups page cases (suite 06).*
 
 ### 10.7 Audit log (#29)
 

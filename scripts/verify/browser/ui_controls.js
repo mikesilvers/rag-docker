@@ -22,11 +22,13 @@ const CITATIONS = [
   { source_file: 'beta.txt', chunk_index: 0, score: null, excerpt: 'Second excerpt.' },
 ];
 // Answers for the pages a case may pass through; a case adds or overrides routes.
-const OPEN = { restricted: false, users: [], service_principals: [] };
+const OPEN = { restricted: false, users: [], service_principals: [], groups: [] };
 const base = (extra = {}) => ({
   'GET /api/collections': json(200, { collections: COLS }),
   // Each collection's access on the Collections page (#606): open unless a case says otherwise.
   'GET /api/collections/*': json(200, OPEN),
+  // The groups the Access dialog offers (#784): none unless a case says otherwise.
+  'GET /api/auth/groups': json(200, { groups: [] }),
   'GET /api/retrieval/config/*': call => json(200, retrievalConfig(call.path.split('/').pop())),
   'GET /api/packages': json(200, { packages: [] }),
   'GET /api/tune/*': call => json(200, { collection: call.path.split('/').pop(), fidelity: 'with-sources', source_document_count: 2, can_rechunk: true, can_reembed: true, can_reindex: true, note: '' }),
@@ -108,7 +110,7 @@ function collectionsCases() {
       await waitFor(s.page, () => !document.querySelector('.fixed.inset-0'), 'the dialog to close');
       const puts = callsTo(s, 'PUT', '/api/collections/' + B + '/access');
       assert.equal(puts.length, 2);
-      assert.deepEqual(puts[1].body, { restricted: true, users: ['vfy-developer'], service_principals: ['vfy-svc'] });
+      assert.deepEqual(puts[1].body, { restricted: true, users: ['vfy-developer'], service_principals: ['vfy-svc'], groups: [] });
       await waitText(s.page, 'Restricted (2)');
     } },
     { name: 'Access (#606): when the dialog cannot read the state, the choice stays unknown and Save is disabled', open: open({
@@ -154,7 +156,7 @@ function collectionsCases() {
         const puts = s.calls.filter(call => call.method === 'PUT');
         assert.equal(puts.length, 1);
         assert.equal(puts[0].path, '/api/collections/' + B + '/access');
-        assert.deepEqual(puts[0].body, { restricted: true, users: ['vfy-developer'], service_principals: [] });
+        assert.deepEqual(puts[0].body, { restricted: true, users: ['vfy-developer'], service_principals: [], groups: [] });
       } };
     })(),
     (() => {
@@ -222,6 +224,40 @@ function collectionsCases() {
         assert.equal(principalsReads, 2);
       } };
     })(),
+    { name: 'Access (#784): groups are offered with their member counts, counted in the column, and a ticked group is sent', open: open({
+      ['GET /api/collections/' + A + '/access']: json(200, { restricted: true, users: ['vfy-developer'], service_principals: [], groups: ['vfy-team'] }),
+      'GET /api/auth/users': json(200, { users: [] }),
+      'GET /api/auth/service-principals': json(200, { principals: [] }),
+      'GET /api/auth/groups': json(200, { groups: [
+        { name: 'vfy-solo', created_at: '2026-01-02T12:00:00Z', users: ['vfy-developer'], service_principals: [] },
+        { name: 'vfy-team', created_at: '2026-01-02T12:00:00Z', users: ['vfy-developer', 'vfy-off'], service_principals: ['vfy-svc'] },
+      ] }),
+      'PUT /api/collections/*': call => json(200, call.body),
+    }), async run(s) {
+      await waitText(s.page, 'Restricted (2)');
+      await (await s.page.$$('tbody button'))[0].click();   // row A: Access
+      await waitText(s.page, 'Access to ' + A);
+      await waitText(s.page, 'vfy-solo (1 member)');
+      await waitText(s.page, 'vfy-team (3 members)');
+      const groups = () => s.page.evaluate(() => [...[...document.querySelectorAll('.fixed fieldset')][2].querySelectorAll('input[type=checkbox]')].map(b => b.checked));
+      assert.deepEqual(await groups(), [false, true]);
+      await (await s.page.$$('.fixed fieldset'))[2].$$('input[type=checkbox]').then(b => b[0].click());
+      assert.deepEqual(await groups(), [true, true]);
+      await press(s.page, 'Save');
+      await waitFor(s.page, () => !document.querySelector('.fixed.inset-0'), 'the dialog to close');
+      const puts = callsTo(s, 'PUT', '/api/collections/' + A + '/access');
+      assert.deepEqual(puts.map(c => c.body), [{ restricted: true, users: ['vfy-developer'], service_principals: [], groups: ['vfy-team', 'vfy-solo'] }]);
+      await waitText(s.page, 'Restricted (3)');
+    } },
+    { name: 'Access (#784): a failed groups read shows its message in the dialog', open: open({
+      'GET /api/auth/users': json(200, { users: [] }),
+      'GET /api/auth/service-principals': json(200, { principals: [] }),
+      'GET /api/auth/groups': apiError(500, 'INTERNAL_ERROR', 'Synthetic groups failure.'),
+    }), async run(s) {
+      await waitText(s.page, A);
+      await (await s.page.$$('tbody button'))[0].click();
+      await waitText(s.page, 'Could not load the groups: Synthetic groups failure.');
+    } },
     { name: 'New Collection modal starts with HNSW, Cosine and the three HNSW sliders at their defaults and bounds', open: open(), async run(s) {
       await waitText(s.page, A);
       await press(s.page, '+ New Collection');
@@ -417,7 +453,7 @@ function navigationCases() {
 function navMenuCases() {
   const DATA = { key: 'data', label: 'Data', entries: ['Import', 'Prepare', 'Transfer'] };
   const TUNE = { key: 'tune', label: 'Tune', entries: ['Chunking', 'Retrieval', 'Gold Standard'] };
-  const ADMIN = { key: 'admin', label: 'Admin', entries: ['Collections', 'Users', 'Service keys', 'Audit', 'Health'] };
+  const ADMIN = { key: 'admin', label: 'Admin', entries: ['Collections', 'Users', 'Service keys', 'Groups', 'Audit', 'Health'] };
   const account = (username, badge) => ({ key: 'account', label: `${username} ${badge}`, entries: ['Account', 'Change password', 'Log out'] });
   const want = {
     end_user: [account('vfy-end-user', 'End User')],
@@ -688,7 +724,7 @@ function usersCases() {
   return [
     { name: 'Engineer\'s Admin menu has Users, which opens the Users page', open: { role: 'engineer', path: '/qa', routes: usersApi() }, async run(s) {
       await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
-      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Prepare', 'Transfer', 'Chunking', 'Retrieval', 'Gold Standard', 'Collections', 'Users', 'Service keys', 'Audit', 'Health']);
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Prepare', 'Transfer', 'Chunking', 'Retrieval', 'Gold Standard', 'Collections', 'Users', 'Service keys', 'Groups', 'Audit', 'Health']);
       await chooseFromMenu(s.page, 'admin', 'Users');
       await waitPath(s.page, '/users');
       await waitText(s.page, 'vfy-developer');
@@ -1342,10 +1378,10 @@ function auditCases() {
     return routes;
   };
   return [
-    { name: 'Engineer\'s Admin menu has Audit after Service keys, which opens the page', open: { role: 'engineer', path: '/qa', routes: auditApi() }, async run(s) {
+    { name: 'Engineer\'s Admin menu has Audit after Groups, which opens the page', open: { role: 'engineer', path: '/qa', routes: auditApi() }, async run(s) {
       await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
       const admin = (await readNav(s.page)).menus.find(m => m.key === 'admin').entries;
-      assert.equal(admin.indexOf('Audit'), admin.indexOf('Service keys') + 1);
+      assert.equal(admin.indexOf('Audit'), admin.indexOf('Groups') + 1);
       await chooseFromMenu(s.page, 'admin', 'Audit');
       await waitPath(s.page, '/audit');
       await waitText(s.page, 'nightly (key keyid0000001)');
@@ -1586,7 +1622,7 @@ function queryOnlyCases() {
     { name: 'Query-only Engineer: the nav shows the Query-only tag and Q&A, Transfer and the Admin pages, without Import, Prepare, Chunking, Retrieval or Gold Standard', open: qo('engineer', '/qa'), async run(s) {
       await ready(s.page);
       assert.equal(await tag(s.page), 'Query-only');
-      assert.deepEqual(await nav(s.page), ['Q&A', 'Transfer', 'Collections', 'Users', 'Service keys', 'Audit', 'Health']);
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Transfer', 'Collections', 'Users', 'Service keys', 'Groups', 'Audit', 'Health']);
     } },
     { name: 'Query-only Developer: the nav shows the tag, Q&A and Transfer, and no Tune menu', open: qo('developer', '/qa'), async run(s) {
       await ready(s.page);
@@ -1633,8 +1669,108 @@ function queryOnlyCases() {
       await waitText(s.page, A);
       await ready(s.page);
       assert.equal(await tag(s.page), null);
-      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Prepare', 'Transfer', 'Chunking', 'Retrieval', 'Gold Standard', 'Collections', 'Users', 'Service keys', 'Audit', 'Health']);
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Prepare', 'Transfer', 'Chunking', 'Retrieval', 'Gold Standard', 'Collections', 'Users', 'Service keys', 'Groups', 'Audit', 'Health']);
       assert.equal(await s.page.evaluate(() => [...document.querySelectorAll('main button')].some(b => b.textContent.trim() === '+ New Collection')), true);
+    } },
+  ];
+}
+
+// The Groups page (#784): Engineers manage groups for collection access. The
+// API is stubbed with a small in-memory list.
+function groupsCases() {
+  const group = (name, users = [], service_principals = []) => ({ name, created_at: '2026-10-01T12:00:00Z', users, service_principals });
+  const person = name => ({ username: name, role: 'developer', enabled: name !== 'vfy-off', must_change_password: false, created_at: '2026-01-02T12:00:00Z' });
+  const groupsApi = (extra = {}) => {
+    const list = [group('vfy-team', ['vfy-developer'], ['vfy-svc'])];
+    const find = call => list.find(g => g.name === decodeURIComponent(call.path.split('/')[4]));
+    return base({
+      'GET /api/auth/groups': () => json(200, { groups: JSON.parse(JSON.stringify(list)) }),
+      'GET /api/auth/users': json(200, { users: [person('vfy-developer'), person('vfy-off')] }),
+      'GET /api/auth/service-principals': json(200, { principals: [{ name: 'vfy-svc', role: 'end_user', enabled: true, created_at: '2026-01-02T12:00:00Z', keys: [] }] }),
+      'POST /api/auth/groups': call => {
+        if (list.some(g => g.name === call.body.name.toLowerCase())) return apiError(409, 'GROUP_EXISTS', `A group named '${call.body.name.toLowerCase()}' already exists.`);
+        const g = group(call.body.name.toLowerCase());
+        list.push(g);
+        return json(201, { group: g });
+      },
+      'POST /api/auth/groups/*': call => {
+        const g = find(call), action = call.path.split('/')[5];
+        if (!g) return apiError(404, 'GROUP_NOT_FOUND', 'There is no group.');
+        if (action === 'rename') { g.name = call.body.name.toLowerCase(); return json(200, { group: g }); }
+        list.splice(list.indexOf(g), 1);
+        return json(200, { name: g.name, collections: [A] });
+      },
+      'PUT /api/auth/groups/*': call => {
+        const g = find(call);
+        g.users = [...call.body.users].sort(); g.service_principals = [...call.body.service_principals].sort();
+        return json(200, { group: g });
+      },
+      ...extra,
+    });
+  };
+  const open = (extra = {}) => ({ role: 'engineer', path: '/groups', routes: groupsApi(extra) });
+  const rowButton = (page, name, label) => page.evaluate((n, l) => {
+    const b = [...document.querySelectorAll(`tr[data-group="${n}"] button`)].find(x => x.textContent.trim() === l);
+    if (!b) return false; b.click(); return true;
+  }, name, label);
+  return [
+    { name: 'Engineer\'s Admin menu has Groups after Service keys, which opens the page', open: { role: 'engineer', path: '/qa', routes: groupsApi() }, async run(s) {
+      await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
+      const admin = (await readNav(s.page)).menus.find(m => m.key === 'admin').entries;
+      assert.equal(admin.indexOf('Groups'), admin.indexOf('Service keys') + 1);
+      await chooseFromMenu(s.page, 'admin', 'Groups');
+      await waitPath(s.page, '/groups');
+      await waitText(s.page, 'vfy-team');
+    } },
+    ...['developer', 'end_user'].map(role => ({ name: `${role === 'developer' ? 'Developer' : 'End User'} has no Groups link and is sent from /groups to Q&A`, open: { role, path: '/groups', routes: base() }, async run(s) {
+      await waitText(s.page, 'Ask a Question');
+      await waitPath(s.page, '/qa');
+      assert.equal((await nav(s.page)).includes('Groups'), false);
+      assert.equal(callsTo(s, 'GET', '/api/auth/groups').length, 0);
+    } })),
+    { name: 'Groups page: create (a refused name shows the message), members, rename and delete (asks first)', open: open(), async run(s) {
+      await waitText(s.page, 'vfy-team');
+      const row = await s.page.evaluate(() => [...document.querySelector('tr[data-group="vfy-team"]').cells].slice(0, 3).map(c => c.textContent.trim()));
+      assert.deepEqual(row, ['vfy-team', 'vfy-developer', 'vfy-svc']);
+      await fill(s.page, '#new-group-name', 'VFY-Team');
+      await press(s.page, 'Create group');
+      await waitText(s.page, "A group named 'vfy-team' already exists.");
+      await fill(s.page, '#new-group-name', 'vfy-legal');
+      await press(s.page, 'Create group');
+      await waitFor(s.page, () => !!document.querySelector('tr[data-group="vfy-legal"]'), 'the new group');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/groups').map(c => c.body), [{ name: 'VFY-Team' }, { name: 'vfy-legal' }]);
+      assert.equal(await rowButton(s.page, 'vfy-legal', 'Members'), true);
+      await waitText(s.page, 'Members of vfy-legal');
+      await waitText(s.page, 'vfy-off (disabled)');
+      const boxes = await s.page.$$('.fixed input[type=checkbox]');
+      await boxes[1].click();   // vfy-off
+      await boxes[2].click();   // vfy-svc
+      await press(s.page, 'Save');
+      await waitFor(s.page, () => !document.querySelector('.fixed.inset-0'), 'the dialog to close');
+      assert.deepEqual(callsTo(s, 'PUT', '/api/auth/groups/vfy-legal/members').map(c => c.body), [{ users: ['vfy-off'], service_principals: ['vfy-svc'] }]);
+      assert.equal(await rowButton(s.page, 'vfy-legal', 'Rename'), true);
+      await waitText(s.page, 'Rename vfy-legal');
+      await fill(s.page, '.fixed input', 'vfy-counsel');
+      await press(s.page, 'Rename', '.fixed button');
+      await waitFor(s.page, () => !!document.querySelector('tr[data-group="vfy-counsel"]'), 'the renamed group');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/groups/vfy-legal/rename').map(c => c.body), [{ name: 'vfy-counsel' }]);
+      assert.equal(await rowButton(s.page, 'vfy-counsel', 'Delete'), true);
+      await waitText(s.page, 'Delete group vfy-counsel?');
+      await waitText(s.page, 'stays restricted');
+      assert.equal(callsTo(s, 'POST', '/api/auth/groups/vfy-counsel/delete').length, 0);   // asked first
+      await press(s.page, 'Delete', '.fixed button');
+      await waitFor(s.page, () => !document.querySelector('tr[data-group="vfy-counsel"]'), 'the group to go');
+      assert.equal(callsTo(s, 'POST', '/api/auth/groups/vfy-counsel/delete').length, 1);
+    } },
+    { name: 'Groups page: a refused rename keeps the dialog open with the message', open: open({
+      'POST /api/auth/groups/*': apiError(409, 'GROUP_EXISTS', "A group named 'vfy-x' already exists."),
+    }), async run(s) {
+      await waitText(s.page, 'vfy-team');
+      assert.equal(await rowButton(s.page, 'vfy-team', 'Rename'), true);
+      await fill(s.page, '.fixed input', 'vfy-x');
+      await press(s.page, 'Rename', '.fixed button');
+      await waitText(s.page, "A group named 'vfy-x' already exists.");
+      assert.equal(await modalOpen(s.page), true);
     } },
   ];
 }
@@ -1649,6 +1785,7 @@ async function runUiControlTests(browser, baseUrl, reporter) {
   await run('Users page: Engineers manage accounts (#25)', usersCases());
   await run('Two-step verification: account page, login code, forced set-up, Users page (#607)', mfaCases());
   await run('Service keys page: Engineers manage service principals and keys (#25)', serviceKeysCases());
+  await run('Groups page: Engineers manage groups for collection access (#784)', groupsCases());
   await run('Audit page: Engineers read the audit log (#29)', auditCases());
   await run('Prepare page: list, preview, upload, jobs, deletes and import (#638)', prepareCases());
   await run('Q&A input, citations toggle, answer display and End User view (#400)', qaCases());

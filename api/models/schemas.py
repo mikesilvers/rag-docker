@@ -88,17 +88,19 @@ class CollectionsResponse(BaseModel):
 
 class CollectionAccessRequest(BaseModel):
     """PUT /collections/{name}/access (#606): the whole state at once. Open
-    takes no names; restricted grants exactly the people and service
-    principals named (none: Engineers only)."""
+    takes no names; restricted grants exactly the people, service principals
+    and groups (#784) named (none: Engineers only). A body without `groups`
+    grants no group."""
     model_config = ConfigDict(extra="forbid")
     restricted: bool
     users: list[Annotated[str, Field(max_length=64)]] = Field(default_factory=list, max_length=1000)
     service_principals: list[Annotated[str, Field(max_length=64)]] = Field(default_factory=list, max_length=1000)
+    groups: list[Annotated[str, Field(max_length=64)]] = Field(default_factory=list, max_length=1000)
 
     @model_validator(mode="after")
     def _names_only_when_restricted(self):
-        if not self.restricted and (self.users or self.service_principals):
-            raise ValueError("an open collection takes no users or service principals")
+        if not self.restricted and (self.users or self.service_principals or self.groups):
+            raise ValueError("an open collection takes no users, service principals or groups")
         return self
 
 
@@ -106,6 +108,7 @@ class CollectionAccessResponse(BaseModel):
     restricted: bool
     users: list[str]
     service_principals: list[str]
+    groups: list[str]
 
 
 # ── Ingest ────────────────────────────────────────────────────────────────────
@@ -784,6 +787,43 @@ class PrincipalCreateRequest(BaseModel):
 class KeyIssueRequest(BaseModel):
     label: str = Field(default="", max_length=64)
     days: StrictInt = Field(default=90, ge=1, le=365)
+
+
+# Groups for collection access (#784).
+
+class Group(BaseModel):
+    name: str
+    created_at: str
+    users: list[str]
+    service_principals: list[str]
+
+
+class GroupList(BaseModel):
+    groups: list[Group]
+
+
+class GroupResult(BaseModel):
+    group: Group
+
+
+class GroupCreateRequest(BaseModel):
+    name: str   # no length cap: the route refuses any name breaking the rule as INVALID_GROUP_NAME
+
+
+class GroupRenameRequest(BaseModel):
+    name: str   # the new name; refused as INVALID_GROUP_NAME when it breaks the rule
+
+
+class GroupMembersRequest(BaseModel):
+    """PUT /auth/groups/{name}/members: the whole member list at once."""
+    model_config = ConfigDict(extra="forbid")
+    users: list[Annotated[str, Field(max_length=64)]] = Field(default_factory=list, max_length=1000)
+    service_principals: list[Annotated[str, Field(max_length=64)]] = Field(default_factory=list, max_length=1000)
+
+
+class GroupDeleteResult(BaseModel):
+    name: str
+    collections: list[str]
 
 
 # ── Error ─────────────────────────────────────────────────────────────────────

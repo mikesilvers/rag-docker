@@ -115,6 +115,10 @@ ACTIONS: dict[tuple[str, str], str] = {
     ("POST", "/auth/service-principals/{name}/enable"): "admin.principal.enable",
     ("POST", "/auth/service-principals/{name}/keys"): "admin.key.issue",
     ("POST", "/auth/service-principals/{name}/keys/{key_id}/revoke"): "admin.key.revoke",
+    ("POST", "/auth/groups"): "admin.group.create",                        # #784
+    ("POST", "/auth/groups/{name}/rename"): "admin.group.rename",
+    ("PUT", "/auth/groups/{name}/members"): "admin.group.members",
+    ("POST", "/auth/groups/{name}/delete"): "admin.group.delete",
     ("GET", "/audit"): "audit.view",
     ("GET", "/audit.csv"): "audit.download",
 }
