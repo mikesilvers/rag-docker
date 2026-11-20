@@ -1183,13 +1183,13 @@ Give each archive followed by its own key file:
 scripts/restore.sh ~/rag-docker-backups/rag-docker-20261120T153000Z/weaviate_data-20261120T153000Z.tgz.age /path/to/weaviate_data-20261120T153000Z.key ~/rag-docker-backups/rag-docker-20261120T153000Z/auth_data-20261120T153000Z.tgz.age /path/to/auth_data-20261120T153000Z.key
 ```
 
-Each archive restores the volume its name starts with. The script first decrypts every archive with its key and reads it to the end. A missing key file, a wrong key, or a damaged or incomplete archive stops it there, with `Nothing was stopped, emptied or restored.` Only then does it list the volumes that will be **emptied and replaced**, ask you to confirm (or take `--prefix <name> --yes`), stop the stack's running containers, and restore each volume, decrypting as it reads. What changed in those volumes since the backup is lost. If a restore fails part-way, it stops at that volume, which may be partly restored. The archives are unchanged, so fix the cause and run it again.
+Each archive restores the volume its name starts with. The script first decrypts every archive with its key and reads it to the end. A missing key file, a wrong key, or a damaged or incomplete archive stops it there, with `Nothing was stopped, emptied or restored.` Only then does it list the volumes that will be **emptied and replaced**, ask you to confirm (or take `--prefix <name> --yes`), stop the stack's running containers, and restore each volume, decrypting as it reads. What changed in those volumes since the backup is lost. Each archive is first extracted into a staging folder inside its volume, and the volume's old contents are replaced only once that has succeeded, so a restore whose extraction fails (a full disk, an archive changed since the check) stops at that volume and leaves it unchanged. That needs free Docker disk space for the volume's old and restored contents together. Volumes restored before it stay restored. The archives are unchanged, so fix the cause and run it again.
 
 The volumes must exist. On a machine where the stack has never run, create them first, without starting anything: `docker compose create` (in LAN mode, `docker compose -f docker-compose.yml -f docker-compose.lan.yml create`).
 
 ### The age image
 
-The scripts run age and tar in a small image, `rag-docker-age`, built from `scripts/age/Dockerfile`: alpine 3.24.4, pinned by its digest, plus Alpine's `age` package, pinned to an exact version. The first backup or restore builds it, which needs the network once: on a machine that will later be offline, make a first backup while it is online. If Alpine has replaced that package version, the build fails and no backup is written; the pin in `scripts/age/Dockerfile` then needs updating.
+The scripts run age and tar in a small image, `rag-docker-age`, built from `scripts/age/Dockerfile`: alpine 3.24.4, pinned by its digest, plus Alpine's `age` package, pinned to an exact version. An install from the offline bundle (`package-offline.sh`) already has it: the bundle carries it. On any other install the first backup or restore builds it, which needs the network once: on a machine that will later be offline, make a first backup while it is online. If Alpine has replaced that package version, the build fails and no backup is written; the pin in `scripts/age/Dockerfile` then needs updating.
 
 A backup is a standard age file, so you can also check one by hand with your own `age` tool:
 
@@ -1204,6 +1204,11 @@ rag-docker/
 ├── package.sh            # Builds a source-only zip (~1.3 MB; target needs internet)
 ├── package-offline.sh    # Builds a self-contained offline bundle (~4.6 GB)
 ├── install-offline.sh    # Installs from that bundle with no network access
+├── scripts/
+│   ├── backup.sh         # Encrypted volume backup, a new age key per volume (#848)
+│   ├── restore.sh        # Restores it; checks every archive with its key first (#848)
+│   ├── backup-common.sh  # Shared by the two: volumes, prefix, the age image
+│   └── age/Dockerfile    # The age image: pinned alpine plus a pinned age package
 ├── api/                  # FastAPI backend
 │   ├── Dockerfile
 │   ├── .dockerignore
@@ -1551,7 +1556,7 @@ internet access.
 | | `package.sh` | `package-offline.sh` |
 |---|---|---|
 | Archive size | ~1.3 MB | **~4.6 GB** |
-| Contains | source only | source + all 5 images + model weights |
+| Contains | source only | source + all 5 images + the backup scripts' age image + model weights |
 | Target needs internet | **yes** (~8–10 GB downloaded) | **no** |
 | First-run time on target | 10–20 min (downloads + build) | a few min (decompress + load only) |
 | Docker disk on target | 20 GB | ~12 GB (no build cache needed) |
@@ -1628,7 +1633,9 @@ bash package-offline.sh              # writes rag-docker-offline.tar (~7.7 GB)
 
 Its source tree is the same as `package.sh`'s: the files git tracks in the
 current commit, so run it in a git checkout too. It runs `docker save` on all
-five images (~2.5 GB compressed) and exports the
+five images (~2.5 GB compressed), and on the small age image that
+`scripts/backup.sh` and `scripts/restore.sh` run in (built first if this machine
+doesn't have it, which needs the network), and exports the
 Ollama model weights from the `ollama_models` volume (~5.2 GB). Expect a few
 minutes; saving the image layers is the slow part. It stops if the volume doesn't
 hold every model the stack pulls (an install from before 1.2.1 may hold only
