@@ -143,7 +143,7 @@ async function sleep(ms) { await new Promise(r => setTimeout(r, ms)); }
 const passwords = page => page.evaluate(() => [...document.querySelectorAll('input[type=password]')].map(i => i.value));
 const typePassword = (page, index, value) => setValue(page, `() => document.querySelectorAll('input[type=password]')[${index}]`, value);
 const encryptionChoices = page => page.evaluate(() => [...document.querySelectorAll('input[type=radio][name=encryption]')]
-  .map(i => ({ value: i.value, checked: i.checked, label: i.closest('label').querySelector('div div').textContent })));
+  .map(i => ({ value: i.value, checked: i.checked, label: i.closest('label').querySelector(':scope > div > div').textContent })));
 const chooseEncryption = (page, value) => page.evaluate(v => {
   const input = document.querySelector(`input[type=radio][name=encryption][value=${v}]`);
   if (!input) return false; input.click(); return true;

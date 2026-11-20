@@ -32335,7 +32335,8 @@ def check_login_logout(operator_ok):
     body = json.loads(raw)
     expect(status == 200 and body == {"username": "vfy-developer", "role": "developer", "must_change_password": False,
                                       "kind": "user", "mfa_enrolled": False, "mfa_required": False,
-                                      "mfa_enrollment_required": False, "query_only": False},
+                                      "mfa_enrollment_required": False, "query_only": False,
+                                      "lan_mode": False},
            "GET /auth/me answered {} {}".format(status, body))
     status, _, _ = code("POST", "/auth/logout", token=token)
     expect(status == 200, "logout answered {}".format(status))
@@ -49356,9 +49357,46 @@ kimp=$(jfield "['job_id']" < /tmp/vfy_key_imp.json)
 check_eq "#676: import with the key file completes" "$(wait_for_job "/import/job/$kimp" 1800)" "completed"
 kcoll=$(api_get "/import/job/$kimp" | jfield "['collection']")
 [ -n "$kcoll" ] && [ "$kcoll" != "None" ] && drop_collection "$kcoll"
+# A wrong key (reviewer, #676): the first package's key on the second package
+# fails the job DECRYPT_FAILED (reason key), names no key, and touches nothing.
+state_before=$(enc_state)
+ksum() { python3 -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$EXPORTS/$KPKG2"; }
+ksum_before=$(ksum)
+python3 - "$KPKG2" /tmp/vfy_key.txt > /tmp/vfy_key_wrong_body.json <<'ENDPY'
+import json, sys
+print(json.dumps({"filename": sys.argv[1], "on_conflict": "replace", "key": open(sys.argv[2]).read()}))
+ENDPY
+api_post "/import" "@/tmp/vfy_key_wrong_body.json" > /tmp/vfy_key_wrong.json
+kwjob=$(jfield "['job_id']" < /tmp/vfy_key_wrong.json)
+wait_for_job "/import/job/$kwjob" 900 >/dev/null
+api_get "/import/job/$kwjob" > /tmp/vfy_key_wrong_job.json
+python3 - /tmp/vfy_key_wrong_job.json > /tmp/vfy_key_wrong.txt 2>&1 <<'ENDPY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(d["status"], d["error_code"], d["error_detail"], d.get("encryption"))
+sys.exit(0 if d["status"] == "failed" and d["error_code"] == "DECRYPT_FAILED"
+         and d["error_detail"] == {"reason": "key"} and d.get("encryption") == "key"
+         and "AGE-SECRET-KEY" not in json.dumps(d) else 1)
+ENDPY
+check "#676: a wrong key fails the import DECRYPT_FAILED (reason key) and the job names no key" $? "$(tail -1 /tmp/vfy_key_wrong.txt)"
+[ "$(enc_state)" = "$state_before" ] && [ "$(ksum)" = "$ksum_before" ]
+check "#676: ... and touches nothing: collections, their counts and the package file unchanged" $?
+rm -f /tmp/vfy_key_wrong_body.json
+
+# The package's full download leaves its key (reviewer, #676): each file is
+# deleted by its own download, so downloading the package first never loses the key.
+check_eq "#676: the second package downloads" "$(curl -s -o /dev/null -m 600 -w '%{http_code}' "$API/packages/$KPKG2")" "200"
+[ ! -e "$EXPORTS/$KPKG2" ] && [ -e "$EXPORTS/$KKEY2" ]
+check "#676: the package's full download deletes the package and keeps its key file" $?
+check_eq "#676: ... and the export job still says its key is on the server" \
+  "$(api_get "/export/job/$kjob2" | jfield "['key_on_server']")" "True"
+check_eq "#676: the key file still downloads after its package" \
+  "$(curl -s -o /dev/null -m 120 -w '%{http_code}' "$API/packages/$KKEY2")" "200"
+[ ! -e "$EXPORTS/$KKEY2" ]
+check "#676: ... and its full download deletes it" $?
 rm -f /tmp/vfy_key.txt /tmp/vfy_key_import_body.json
 # A full download deletes each remaining file (#677, #676): that is the clean-up.
-for f in "$KPKG" "$KPKG2" "$KKEY2"; do curl -s -o /dev/null -m 600 "$API/packages/$f"; done
+curl -s -o /dev/null -m 600 "$API/packages/$KPKG"
 
 # ── verified recovery across an API restart (#43, #44; opt-in: restarts the API) ──
 RP="${PREFIX}BatchRecovery"
@@ -58809,7 +58847,7 @@ async function sleep(ms) { await new Promise(r => setTimeout(r, ms)); }
 const passwords = page => page.evaluate(() => [...document.querySelectorAll('input[type=password]')].map(i => i.value));
 const typePassword = (page, index, value) => setValue(page, `() => document.querySelectorAll('input[type=password]')[${index}]`, value);
 const encryptionChoices = page => page.evaluate(() => [...document.querySelectorAll('input[type=radio][name=encryption]')]
-  .map(i => ({ value: i.value, checked: i.checked, label: i.closest('label').querySelector('div div').textContent })));
+  .map(i => ({ value: i.value, checked: i.checked, label: i.closest('label').querySelector(':scope > div > div').textContent })));
 const chooseEncryption = (page, value) => page.evaluate(v => {
   const input = document.querySelector(`input[type=radio][name=encryption][value=${v}]`);
   if (!input) return false; input.click(); return true;
