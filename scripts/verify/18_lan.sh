@@ -103,6 +103,8 @@ lan origin
 check "a same-origin change over HTTPS is accepted, another origin's refused 403 CROSS_ORIGIN_REFUSED" $?
 lan server-tokens
 check "nginx sends no version: the Server header is plain nginx on an API answer and on its own 421 page (#555)" $?
+lan export
+check "LAN mode refuses an unencrypted export 400 ENCRYPTION_REQUIRED, and the user answer says lan_mode (#676)" $?
 lan refusals
 check "the API refuses LAN mode with one line when AUTH_COOKIE_SECURE is false or no Engineer exists" $?
 lan rate-limit

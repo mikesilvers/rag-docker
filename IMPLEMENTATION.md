@@ -28809,6 +28809,7 @@ mode and a non-boolean `RAG_LAN_MODE`. Only in a `--lan` run does it check the r
 for (localhost, 127.0.0.1 and the test names; another `Host` gets 421, #664),
 TLS versions and HTTP/2, the single loopback binding, the `Secure` cookie, the origin rule over HTTPS,
 a `Server` header with no nginx version (`server_tokens off`),
+`lan_mode` in the user answer and an unencrypted export refused `400 ENCRYPTION_REQUIRED` (#676),
 the API's refusal in one-off containers (`docker compose run --rm
 --no-deps`, no ports) and nginx's login rate limit (logins sent without
 waiting until one is refused `429 LOGIN_RATE_LIMITED`, #577); it also prints
@@ -29538,9 +29539,9 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `ui_ingest_check.py` | the checks of suite 22, one per subcommand, on the host, and its cleanup (#641) |
 | `23_llm_split.sh` | the build and answer models (#671), full runs only: with `BUILD_LLM_MODEL` set to a small model, preparation and gold standard use it and query uses the answer model |
 | `llm_split.py` | helper for suite 23, run in the API container: pulls the small model, runs the three tasks through the services' code and prints the models Ollama reports answering each (#671) |
-| `24_query_only.sh` | §2.6 and §10.11 — query-only mode (#670): the overlay resolved without starting it; registers `../tests/test_query_only.py`; the start-up refusal of a non-boolean `RAG_QUERY_ONLY`; the loader's refusal on a full instance; with `stack.sh run --query-only`, build and export, `stack.sh query-only-mode`, then the load, the refusals, access and Q&A on the query-only instance |
+| `24_query_only.sh` | §2.6 and §10.11 — query-only mode (#670): the overlay resolved without starting it; registers `../tests/test_query_only.py`; the start-up refusal of a non-boolean `RAG_QUERY_ONLY`; the loader's refusal on a full instance; with `stack.sh run --query-only`, build and export, `stack.sh query-only-mode`, then the load, the refusals, access and Q&A on the query-only instance, and a key package loaded with its key file on standard input and refused `KEY_REQUIRED` without it (#676) |
 | `query_only_config.py` | host-side, standard library: `docker-compose.yml` with and without `docker-compose.query-only.yml` as `docker compose config` resolves them; only the api's `RAG_QUERY_ONLY` may differ (#670) |
-| `../tests/test_query_only.py` | API image, no network (also on the host): `RAG_QUERY_ONLY` parsing, the refused and kept routes, the refusals through the app and their order, `query_only` in the user answers, the loader (usage, refusals, lock, passphrase, results `success`/`refused`/`failed`/`interrupted`, the Ctrl-C handler) and the access of a collection it creates (#670) |
+| `../tests/test_query_only.py` | API image, no network (also on the host): `RAG_QUERY_ONLY` parsing, the refused and kept routes, the refusals through the app and their order, `query_only` in the user answers, `lan_mode` in the user answers (#676), the loader (usage, refusals, lock, passphrase, a key package's key file on standard input with `KEY_REQUIRED` and `KEY_INVALID` (#676), results `success`/`refused`/`failed`/`interrupted`, the Ctrl-C handler) and the access of a collection it creates (#670) |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
 | `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
 | `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530); the nginx tag in SPECIFICATIONS.md's compose copy and 11.3 image list matches docker-compose.yml (#665), registered by infrastructure |
@@ -29751,6 +29752,16 @@ encrypted path everywhere: the listing (header check only), the import refusals 
 passphrase travels as a function argument to the worker thread and is never put in a job
 record; the request models hold it as `SecretStr`.
 
+Since #676 the module also writes and reads files for a new X25519 key: `generate_identity`,
+the key file in age's identity layout (`identity_file`, `parse_identity`), the `X25519` stanza
+on both sides, and `header_kind`, which tells a key package from a passphrase one by its header
+alone. Export encrypts to a new key by default and writes `<package>.key` (0600) beside the
+package; import and the query-only loader choose the secret by the header (`KEY_REQUIRED`,
+`KEY_INVALID`, `KEY_NOT_EXPECTED`). `test_export_encryption.py` runs the 68 testkit vectors that
+carry an X25519 key and an independent X25519 decryption, and checks the key build, the key
+file, the export choices (LAN mode's `ENCRYPTION_REQUIRED`), the import refusals and that no key
+reaches a job record, log or response.
+
 `scripts/tests/test_export_encryption.py`, run by `05_transfer.sh` in the API image with no
 network, checks the module against the vendored C2SP CCTV vectors
 (`scripts/tests/fixtures/age-testkit`, with their source in `SOURCE`) and an independent
@@ -29790,11 +29801,20 @@ Suite 05's live checks run through the proxy on the verify stack, with fixtures 
   keeps an unrecorded one;
 - an End User is refused `403`.
 
+The same file covers a key export's key file (#676): its name rule, a full download of the key
+deleting the key only, a package download leaving the key, expiry deleting both, an unrecorded
+key file and a restricted collection's key answering `404 PACKAGE_NOT_FOUND`. Suite 05's block
+"a key export (#676)" then checks on the verify stack that a default export is a key export with
+`<package>.key` at mode 600 and no plain archive in `./exports` while it runs, that two exports
+have different keys, that import without the key is refused `400 KEY_REQUIRED`, that the key's
+full download deletes the key and keeps the package, and that import with the key file's text
+completes.
+
 ## Transfer page polling and failure checks
 
 `browser/transfer_page.js`, registered in `06_ui.sh` through `ui_criteria.js`, renders the
 Transfer page with every API call stubbed in the browser and the page's 2 s poll delay cut to
-20 ms (#382). Twenty-three cases: for each half, a failed poll (a proxy 502) is shown and retried
+20 ms (#382). Twenty-seven cases: for each half, a failed poll (a proxy 502) is shown and retried
 with the button still busy and cleared by the next good poll; 30 failures in a row stop polling,
 show the last error and enable the button again, and a new start clears the message; a poll in
 flight when the page is left schedules no further poll. An export start answered after the page
@@ -29803,9 +29823,13 @@ is left starts no polling. A 409 `SOURCE_INDEX_INVALID`, 503 or 404 from `/tune`
 longer selected is ignored. A failed export shows its `error_code`, and a failed package list
 is shown without the empty-folder hint until a good Refresh. Three cases cover encryption (#27):
 an export passphrase holds Export until it has 12 characters and matches its confirmation, is
-sent only when the box is checked, and both fields clear once the export starts; an encrypted
+sent only when "Passphrase" is chosen, and both fields clear once the export starts; an encrypted
 package is labelled, asks for its passphrase, sends it and clears it, and a plain package sends
-none. Four cases cover downloading a package (#677):
+none. Five cases cover the key export (#676): the three choices with a new key first and chosen,
+"Not encrypted" sending `encryption: "none"`, no "Not encrypted" in LAN mode, Download key
+offered before the package's Download with the store-apart warning and gone once the key is
+downloaded, and a key package asking for its key file, read in the browser and sent as `key`;
+the key is never shown as text. Four cases cover downloading a package (#677):
 - a finished export offers a Download link to its package with "Expires" in local time, and none
   when it has no expiry;
 - the package list says when a package exported here expires, and its Download link follows the
@@ -35276,6 +35300,8 @@ lan origin
 check "a same-origin change over HTTPS is accepted, another origin's refused 403 CROSS_ORIGIN_REFUSED" $?
 lan server-tokens
 check "nginx sends no version: the Server header is plain nginx on an API answer and on its own 421 page (#555)" $?
+lan export
+check "LAN mode refuses an unencrypted export 400 ENCRYPTION_REQUIRED, and the user answer says lan_mode (#676)" $?
 lan refusals
 check "the API refuses LAN mode with one line when AUTH_COOKIE_SECURE is false or no Engineer exists" $?
 lan rate-limit
@@ -35409,7 +35435,7 @@ if __name__ == "__main__":
 ```python
 """LAN mode on the verify project (#26). Host-side, standard library, Python 3.9+.
 
-    python3 lan_stack.py https|hosts|tls|bindings|cookie|origin|server-tokens|refusals|rate-limit|address
+    python3 lan_stack.py https|hosts|tls|bindings|cookie|origin|server-tokens|export|refusals|rate-limit|address
 
 Run by 18_lan.sh in a `stack.sh run --lan`, which brings the verify project up
 in LAN mode with TLS on 127.0.0.1:<verify port> only, copies the certificate
@@ -35433,6 +35459,9 @@ printing what failed:
   server-tokens
             the Server header is exactly "nginx" on an API answer and on
             nginx's own 421 page, whose body names no version either (#555)
+  export    LAN mode exports only encrypted packages (#676): the user answer
+            says lan_mode, and POST /export with encryption "none" is refused
+            400 ENCRYPTION_REQUIRED before anything else is checked
   refusals  a one-off api container of the LAN configuration (no ports, the
             running project untouched) refuses to start, with one line, when
             AUTH_COOKIE_SECURE is false and when its account store is empty
@@ -35657,6 +35686,18 @@ def check_origin():
     assert status == 401, "the session still works after logout ({})".format(status)
 
 
+def check_export():
+    token, _ = login()
+    cookie = "{}={}".format(auth_setup.COOKIE, token)
+    status, body, _ = request("GET", "/auth/me", headers={"Cookie": cookie})
+    assert status == 200 and (body or {}).get("lan_mode") is True, \
+        "GET /auth/me answered {} with lan_mode {!r}".format(status, (body or {}).get("lan_mode"))
+    status, body, _ = request("POST", "/export", {"collection": "VfyLanNoSuch", "encryption": "none"},
+                              {"Cookie": cookie, "Origin": origin()})
+    code = ((body or {}).get("error") or {}).get("code")
+    assert (status, code) == (400, "ENCRYPTION_REQUIRED"), "an unencrypted export got {} {}".format(status, code)
+
+
 def one_off(*env):
     """A one-off api container of the LAN configuration: (exit status, its output lines)."""
     args = ["docker", "compose", "run", "--rm", "--no-deps", "-T"]
@@ -35709,7 +35750,7 @@ def check_address():
 
 CHECKS = {"https": check_https, "hosts": check_hosts, "tls": check_tls, "bindings": check_bindings,
           "cookie": check_cookie, "origin": check_origin, "server-tokens": check_server_tokens,
-          "refusals": check_refusals,
+          "export": check_export, "refusals": check_refusals,
           "rate-limit": check_rate_limit, "address": check_address}
 
 
@@ -35912,10 +35953,32 @@ sys.exit(0 if r.get('answer', '').strip() and r.get('citations') else 1)"
   check "an End User asks a question on the loaded collection and gets an answer with citations" $? "$(head -c 300 /tmp/vfy_qo.json)"
 fi
 
-api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_qo.json
+# The default export, encrypted to a new key (#676).
+api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_qo.json
 ejob=$(jfield "['job_id']" < /tmp/vfy_qo.json)
 check_eq "export keeps working in query-only mode" "$(wait_for_job "/export/job/$ejob" 1800)" "completed"
 check_eq "the package list keeps working" "$(api_code "$API/packages")" "200"
+
+section "Load a key package with its key file (#676)"
+kpkg=$(api_get "/export/job/$ejob" | jfield "['filename']")
+kkey=$(api_get "/export/job/$ejob" | jfield "['key_filename']")
+check_eq "the default export is encrypted with a new key" "$(api_get "/export/job/$ejob" | jfield "['encryption']")" "key"
+loader -- "$kpkg"
+rc=$?
+[ "$rc" = 1 ] && grep -q "KEY_REQUIRED" "$OUT"
+check "the loader refuses a key package with no key on standard input (exit 1, KEY_REQUIRED)" $? "exit $rc: $(tail -2 "$OUT")"
+check_eq "the refusal is an operator.load audit record" "$(last_load)" "refused KEY_REQUIRED $kpkg"
+check_eq "the key file downloads" "$(curl -s -o /tmp/vfy_qo_key.txt -m 120 -w '%{http_code}' "$API/packages/$kkey")" "200"
+_rag_require_lock_owner
+(cd "$REPO_ROOT" && docker compose exec -T api python -m loader "$kpkg" --on-conflict rename) \
+  </tmp/vfy_qo_key.txt >"$OUT" 2>&1
+rc=$?
+check_eq "the loader loads the key package with its key file on standard input (exit 0)" "$rc" "0"
+grep -q "AGE-SECRET-KEY" "$OUT"
+[ "$?" = 1 ]
+check "the loader never prints the key" $?
+rm -f /tmp/vfy_qo_key.txt
+curl -s -o /dev/null -m 600 "$API/packages/$kpkg"
 
 summary
 ```
@@ -49216,6 +49279,74 @@ retention exists "$NPKG"
 check "#677: ... and the package stays" $?
 retention remove "$NPKG"
 
+# ── a key export: encrypted by default, a new key each time (#676) ───────────
+# A default export writes <package>.tar.gz.age and <package>.key (0600) and
+# never a plain archive; each export has its own key; import needs the key
+# file's text; a full download of the key deletes the key and keeps the package.
+key_export() {   # key_export <outfile>: start a default export, print its job id
+  api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > "$1"
+  python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['job_id'])" "$1"
+}
+plain_before=$(ls -A "$EXPORTS" | grep -E '\.tar\.gz$' | sort)
+kjob=$(key_export /tmp/vfy_key_exp.json)
+plain_during=""
+for _ in $(seq 1 3000); do
+  plain_during="$plain_during $(comm -13 <(printf '%s\n' "$plain_before") <(ls -A "$EXPORTS" | grep -E '\.tar\.gz$' | sort) | tr '\n' ' ')"
+  st=$(api_get "/export/job/$kjob" | jfield "['status']")
+  [ "$st" = "completed" ] || [ "$st" = "failed" ] && break
+  sleep 0.2
+done
+check_eq "#676: a default export completes" "$st" "completed"
+[ -z "$(echo "$plain_during" | tr -d ' ')" ]
+check "#676: no unencrypted archive appears in ./exports while it runs" $? "$plain_during"
+api_get "/export/job/$kjob" > /tmp/vfy_key_job.json
+KPKG=$(jfield "['filename']" < /tmp/vfy_key_job.json)
+KKEY=$(jfield "['key_filename']" < /tmp/vfy_key_job.json)
+check_eq "#676: ... encrypted with a new key" "$(jfield "['encryption']" < /tmp/vfy_key_job.json)" "key"
+check_eq "#676: ... its key file is <package>.key" "$KKEY" "$KPKG.key"
+check_eq "#676: ./exports holds exactly the package and its key file for it" \
+  "$(ls -A "$EXPORTS" | grep -F "${KPKG%.tar.gz.age}" | sort | tr '\n' ' ')" "$KPKG $KKEY "
+check_eq "#676: the key file's mode is 600" \
+  "$(cd "$REPO_ROOT" && docker compose exec -T api stat -c %a "/app/exports/$KKEY" | tr -d '\r')" "600"
+kpub=$(cd "$REPO_ROOT" && docker compose exec -T api grep '^# public key: ' "/app/exports/$KKEY" | tr -d '\r')
+
+kjob2=$(key_export /tmp/vfy_key_exp2.json)
+check_eq "#676: a second default export completes" "$(wait_for_job "/export/job/$kjob2" 1800)" "completed"
+api_get "/export/job/$kjob2" > /tmp/vfy_key_job2.json
+KPKG2=$(jfield "['filename']" < /tmp/vfy_key_job2.json); KKEY2=$(jfield "['key_filename']" < /tmp/vfy_key_job2.json)
+kpub2=$(cd "$REPO_ROOT" && docker compose exec -T api grep '^# public key: ' "/app/exports/$KKEY2" | tr -d '\r')
+[ -n "$kpub" ] && [ -n "$kpub2" ] && [ "$kpub" != "$kpub2" ]
+check "#676: each export has its own key" $? "$kpub / $kpub2"
+
+code=$(post_code "/import" "{\"filename\":\"$KPKG\",\"on_conflict\":\"rename\"}" /tmp/vfy_key_nokey.json)
+check_eq "#676: import without the key is refused 400" "$code" "400"
+check_eq "#676: ... KEY_REQUIRED" "$(jfield "['error']['code']" < /tmp/vfy_key_nokey.json)" "KEY_REQUIRED"
+
+kcode=$(curl -s -o /tmp/vfy_key.txt -m 120 -w '%{http_code}' "$API/packages/$KKEY")
+check_eq "#676: GET /packages/<package>.key downloads the key file" "$kcode" "200"
+grep -q '^AGE-SECRET-KEY-1' /tmp/vfy_key.txt
+check "#676: ... an age key file" $?
+[ ! -e "$EXPORTS/$KKEY" ] && [ -e "$EXPORTS/$KPKG" ]
+check "#676: the key's full download deletes the key and keeps the package" $?
+api_get "/packages" | python3 -c "
+import json, sys
+p = next(p for p in json.load(sys.stdin)['packages'] if p['filename'] == sys.argv[1])
+sys.exit(0 if p['encryption'] == 'key' and p['key_on_server'] is False else 1)" "$KPKG"
+check "#676: GET /packages says the package is a key package whose key is no longer on the server" $?
+
+python3 - "$KPKG" /tmp/vfy_key.txt > /tmp/vfy_key_import_body.json <<'ENDPY'
+import json, sys
+print(json.dumps({"filename": sys.argv[1], "on_conflict": "rename", "key": open(sys.argv[2]).read()}))
+ENDPY
+api_post "/import" "@/tmp/vfy_key_import_body.json" > /tmp/vfy_key_imp.json
+kimp=$(jfield "['job_id']" < /tmp/vfy_key_imp.json)
+check_eq "#676: import with the key file completes" "$(wait_for_job "/import/job/$kimp" 1800)" "completed"
+kcoll=$(api_get "/import/job/$kimp" | jfield "['collection']")
+[ -n "$kcoll" ] && [ "$kcoll" != "None" ] && drop_collection "$kcoll"
+rm -f /tmp/vfy_key.txt /tmp/vfy_key_import_body.json
+# A full download deletes each remaining file (#677, #676): that is the clean-up.
+for f in "$KPKG" "$KPKG2" "$KKEY2"; do curl -s -o /dev/null -m 600 "$API/packages/$f"; done
+
 # ── verified recovery across an API restart (#43, #44; opt-in: restarts the API) ──
 RP="${PREFIX}BatchRecovery"
 # Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
@@ -61469,7 +61600,7 @@ function transferCases() {
       await waitFor(s.page, () => window.__forms !== undefined, 'page');
       await new Promise(r => setTimeout(r, 300));
       const posts = callsTo(s, 'POST', '/api/export');
-      assert.deepEqual(posts.map(c => c.body), [{ collection: A, include_models: false }, { collection: A, include_models: true }]);
+      assert.deepEqual(posts.map(c => c.body), [{ collection: A, include_models: false, encryption: 'key' }, { collection: A, include_models: true, encryption: 'key' }]);
     } },
     (() => {
       let phase = 'running';

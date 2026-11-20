@@ -77,7 +77,7 @@ def run(api, collection, exports, repo_root):
         loaded = request('/retrieval/config/' + collection)
         expect('legacy ef: the Retrieval page can still load the saved settings',
                loaded['ef'] == 10000 and loaded['top_k'] == 7, loaded)
-        job = wait('/export/job/' + request('/export', {'collection': collection,
+        job = wait('/export/job/' + request('/export', {'collection': collection, 'encryption': 'none',
                                                         'include_models': False})['job_id'])
         expect('legacy ef: export completes', job['status'] == 'completed', job)
         package = exports / job['filename']
@@ -139,7 +139,7 @@ def run(api, collection, exports, repo_root):
                                ([], ['not a JSON object'])]:
             write_saved(value)
             before = listing()
-            job = wait('/export/job/' + request('/export', {'collection': collection,
+            job = wait('/export/job/' + request('/export', {'collection': collection, 'encryption': 'none',
                                                             'include_models': False})['job_id'])
             error = job.get('error') or ''
             expect(f'invalid saved settings {value!r}: export fails', job['status'] == 'failed', job)

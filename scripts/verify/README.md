@@ -277,6 +277,7 @@ mode and a non-boolean `RAG_LAN_MODE`. Only in a `--lan` run does it check the r
 for (localhost, 127.0.0.1 and the test names; another `Host` gets 421, #664),
 TLS versions and HTTP/2, the single loopback binding, the `Secure` cookie, the origin rule over HTTPS,
 a `Server` header with no nginx version (`server_tokens off`),
+`lan_mode` in the user answer and an unencrypted export refused `400 ENCRYPTION_REQUIRED` (#676),
 the API's refusal in one-off containers (`docker compose run --rm
 --no-deps`, no ports) and nginx's login rate limit (logins sent without
 waiting until one is refused `429 LOGIN_RATE_LIMITED`, #577); it also prints
@@ -1006,9 +1007,9 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `ui_ingest_check.py` | the checks of suite 22, one per subcommand, on the host, and its cleanup (#641) |
 | `23_llm_split.sh` | the build and answer models (#671), full runs only: with `BUILD_LLM_MODEL` set to a small model, preparation and gold standard use it and query uses the answer model |
 | `llm_split.py` | helper for suite 23, run in the API container: pulls the small model, runs the three tasks through the services' code and prints the models Ollama reports answering each (#671) |
-| `24_query_only.sh` | §2.6 and §10.11 — query-only mode (#670): the overlay resolved without starting it; registers `../tests/test_query_only.py`; the start-up refusal of a non-boolean `RAG_QUERY_ONLY`; the loader's refusal on a full instance; with `stack.sh run --query-only`, build and export, `stack.sh query-only-mode`, then the load, the refusals, access and Q&A on the query-only instance |
+| `24_query_only.sh` | §2.6 and §10.11 — query-only mode (#670): the overlay resolved without starting it; registers `../tests/test_query_only.py`; the start-up refusal of a non-boolean `RAG_QUERY_ONLY`; the loader's refusal on a full instance; with `stack.sh run --query-only`, build and export, `stack.sh query-only-mode`, then the load, the refusals, access and Q&A on the query-only instance, and a key package loaded with its key file on standard input and refused `KEY_REQUIRED` without it (#676) |
 | `query_only_config.py` | host-side, standard library: `docker-compose.yml` with and without `docker-compose.query-only.yml` as `docker compose config` resolves them; only the api's `RAG_QUERY_ONLY` may differ (#670) |
-| `../tests/test_query_only.py` | API image, no network (also on the host): `RAG_QUERY_ONLY` parsing, the refused and kept routes, the refusals through the app and their order, `query_only` in the user answers, the loader (usage, refusals, lock, passphrase, results `success`/`refused`/`failed`/`interrupted`, the Ctrl-C handler) and the access of a collection it creates (#670) |
+| `../tests/test_query_only.py` | API image, no network (also on the host): `RAG_QUERY_ONLY` parsing, the refused and kept routes, the refusals through the app and their order, `query_only` in the user answers, `lan_mode` in the user answers (#676), the loader (usage, refusals, lock, passphrase, a key package's key file on standard input with `KEY_REQUIRED` and `KEY_INVALID` (#676), results `success`/`refused`/`failed`/`interrupted`, the Ctrl-C handler) and the access of a collection it creates (#670) |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
 | `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
 | `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530); the nginx tag in SPECIFICATIONS.md's compose copy and 11.3 image list matches docker-compose.yml (#665), registered by infrastructure |
@@ -1219,6 +1220,16 @@ encrypted path everywhere: the listing (header check only), the import refusals 
 passphrase travels as a function argument to the worker thread and is never put in a job
 record; the request models hold it as `SecretStr`.
 
+Since #676 the module also writes and reads files for a new X25519 key: `generate_identity`,
+the key file in age's identity layout (`identity_file`, `parse_identity`), the `X25519` stanza
+on both sides, and `header_kind`, which tells a key package from a passphrase one by its header
+alone. Export encrypts to a new key by default and writes `<package>.key` (0600) beside the
+package; import and the query-only loader choose the secret by the header (`KEY_REQUIRED`,
+`KEY_INVALID`, `KEY_NOT_EXPECTED`). `test_export_encryption.py` runs the 68 testkit vectors that
+carry an X25519 key and an independent X25519 decryption, and checks the key build, the key
+file, the export choices (LAN mode's `ENCRYPTION_REQUIRED`), the import refusals and that no key
+reaches a job record, log or response.
+
 `scripts/tests/test_export_encryption.py`, run by `05_transfer.sh` in the API image with no
 network, checks the module against the vendored C2SP CCTV vectors
 (`scripts/tests/fixtures/age-testkit`, with their source in `SOURCE`) and an independent
@@ -1258,11 +1269,20 @@ Suite 05's live checks run through the proxy on the verify stack, with fixtures 
   keeps an unrecorded one;
 - an End User is refused `403`.
 
+The same file covers a key export's key file (#676): its name rule, a full download of the key
+deleting the key only, a package download leaving the key, expiry deleting both, an unrecorded
+key file and a restricted collection's key answering `404 PACKAGE_NOT_FOUND`. Suite 05's block
+"a key export (#676)" then checks on the verify stack that a default export is a key export with
+`<package>.key` at mode 600 and no plain archive in `./exports` while it runs, that two exports
+have different keys, that import without the key is refused `400 KEY_REQUIRED`, that the key's
+full download deletes the key and keeps the package, and that import with the key file's text
+completes.
+
 ## Transfer page polling and failure checks
 
 `browser/transfer_page.js`, registered in `06_ui.sh` through `ui_criteria.js`, renders the
 Transfer page with every API call stubbed in the browser and the page's 2 s poll delay cut to
-20 ms (#382). Twenty-three cases: for each half, a failed poll (a proxy 502) is shown and retried
+20 ms (#382). Twenty-seven cases: for each half, a failed poll (a proxy 502) is shown and retried
 with the button still busy and cleared by the next good poll; 30 failures in a row stop polling,
 show the last error and enable the button again, and a new start clears the message; a poll in
 flight when the page is left schedules no further poll. An export start answered after the page
@@ -1271,9 +1291,13 @@ is left starts no polling. A 409 `SOURCE_INDEX_INVALID`, 503 or 404 from `/tune`
 longer selected is ignored. A failed export shows its `error_code`, and a failed package list
 is shown without the empty-folder hint until a good Refresh. Three cases cover encryption (#27):
 an export passphrase holds Export until it has 12 characters and matches its confirmation, is
-sent only when the box is checked, and both fields clear once the export starts; an encrypted
+sent only when "Passphrase" is chosen, and both fields clear once the export starts; an encrypted
 package is labelled, asks for its passphrase, sends it and clears it, and a plain package sends
-none. Four cases cover downloading a package (#677):
+none. Five cases cover the key export (#676): the three choices with a new key first and chosen,
+"Not encrypted" sending `encryption: "none"`, no "Not encrypted" in LAN mode, Download key
+offered before the package's Download with the store-apart warning and gone once the key is
+downloaded, and a key package asking for its key file, read in the browser and sent as `key`;
+the key is never shown as text. Four cases cover downloading a package (#677):
 - a finished export offers a Download link to its package with "Expires" in local time, and none
   when it has no expiry;
 - the package list says when a package exported here expires, and its Download link follows the

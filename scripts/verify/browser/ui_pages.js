@@ -247,7 +247,7 @@ function transferCases() {
       await waitFor(s.page, () => window.__forms !== undefined, 'page');
       await new Promise(r => setTimeout(r, 300));
       const posts = callsTo(s, 'POST', '/api/export');
-      assert.deepEqual(posts.map(c => c.body), [{ collection: A, include_models: false }, { collection: A, include_models: true }]);
+      assert.deepEqual(posts.map(c => c.body), [{ collection: A, include_models: false, encryption: 'key' }, { collection: A, include_models: true, encryption: 'key' }]);
     } },
     (() => {
       let phase = 'running';

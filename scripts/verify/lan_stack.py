@@ -1,6 +1,6 @@
 """LAN mode on the verify project (#26). Host-side, standard library, Python 3.9+.
 
-    python3 lan_stack.py https|hosts|tls|bindings|cookie|origin|server-tokens|refusals|rate-limit|address
+    python3 lan_stack.py https|hosts|tls|bindings|cookie|origin|server-tokens|export|refusals|rate-limit|address
 
 Run by 18_lan.sh in a `stack.sh run --lan`, which brings the verify project up
 in LAN mode with TLS on 127.0.0.1:<verify port> only, copies the certificate
@@ -24,6 +24,9 @@ printing what failed:
   server-tokens
             the Server header is exactly "nginx" on an API answer and on
             nginx's own 421 page, whose body names no version either (#555)
+  export    LAN mode exports only encrypted packages (#676): the user answer
+            says lan_mode, and POST /export with encryption "none" is refused
+            400 ENCRYPTION_REQUIRED before anything else is checked
   refusals  a one-off api container of the LAN configuration (no ports, the
             running project untouched) refuses to start, with one line, when
             AUTH_COOKIE_SECURE is false and when its account store is empty
@@ -248,6 +251,18 @@ def check_origin():
     assert status == 401, "the session still works after logout ({})".format(status)
 
 
+def check_export():
+    token, _ = login()
+    cookie = "{}={}".format(auth_setup.COOKIE, token)
+    status, body, _ = request("GET", "/auth/me", headers={"Cookie": cookie})
+    assert status == 200 and (body or {}).get("lan_mode") is True, \
+        "GET /auth/me answered {} with lan_mode {!r}".format(status, (body or {}).get("lan_mode"))
+    status, body, _ = request("POST", "/export", {"collection": "VfyLanNoSuch", "encryption": "none"},
+                              {"Cookie": cookie, "Origin": origin()})
+    code = ((body or {}).get("error") or {}).get("code")
+    assert (status, code) == (400, "ENCRYPTION_REQUIRED"), "an unencrypted export got {} {}".format(status, code)
+
+
 def one_off(*env):
     """A one-off api container of the LAN configuration: (exit status, its output lines)."""
     args = ["docker", "compose", "run", "--rm", "--no-deps", "-T"]
@@ -300,7 +315,7 @@ def check_address():
 
 CHECKS = {"https": check_https, "hosts": check_hosts, "tls": check_tls, "bindings": check_bindings,
           "cookie": check_cookie, "origin": check_origin, "server-tokens": check_server_tokens,
-          "refusals": check_refusals,
+          "export": check_export, "refusals": check_refusals,
           "rate-limit": check_rate_limit, "address": check_address}
 
 
