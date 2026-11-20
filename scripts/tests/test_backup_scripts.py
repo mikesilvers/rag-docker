@@ -156,8 +156,9 @@ class ScriptTests(unittest.TestCase):
     def script(self, name, *args, env=None):
         # HOME is the test's own; the docker CLI keeps finding its context
         # (Docker Desktop's socket is named in ~/.docker) through DOCKER_CONFIG.
-        environment = dict(os.environ, HOME=str(self.home),
-                           DOCKER_CONFIG=os.environ.get('DOCKER_CONFIG', os.path.expanduser('~/.docker')))
+        environment = dict(os.environ, HOME=str(self.home))
+        if 'DOCKER_CONFIG' not in os.environ:
+            environment['DOCKER_CONFIG'] = os.path.expanduser('~/.docker')
         environment.pop('COMPOSE_PROJECT_NAME', None)
         environment.update(env or {})
         result = subprocess.run(['bash', str(self.checkout / 'scripts' / name)] + list(args), cwd=str(self.tmp),
