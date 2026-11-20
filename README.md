@@ -779,6 +779,8 @@ replaces a changed file instead of rewriting it, so a running proxy keeps readin
 
 Run these commands in the `rag-docker` folder. Your collections, accounts and downloaded models are kept: they live in Docker volumes that these steps don't touch. There are two ways to get the new code: the latest release, for normal use, or `develop`, for testing.
 
+Back up first: [Backing up and restoring](#backing-up-and-restoring) makes an encrypted copy of your data that you can restore if the update goes wrong.
+
 Coming from 1.1.0? Follow [Upgrading from 1.1.0 to 1.2.0](#upgrading-from-110-to-120) first: it includes these steps.
 
 Coming from 1.2.0? Read [Upgrading to 1.2.1](#upgrading-to-121-the-new-answering-model) first: the first start downloads a new answering model.
@@ -936,6 +938,8 @@ Follow these steps once, to move an instance from 1.1.0 to 1.2.0. The first star
    Go on only if the last loop prints a line for each of the three volumes and no error. `backup FAILED` means that copy didn't complete, and an earlier backup of that volume is unchanged: fix the cause (a wrong `P`, or disk space) and rerun the block. `no such volume` means `P` is wrong: set it again and rerun the block. `1 entries` means that volume is empty (the backup holds only `./`); if it should hold data, `P` names another project's volumes, so stop and check it.
 
    The throwaway container is alpine 3.24.4, pinned by its digest; Docker downloads it (a few MB) if this machine doesn't have it. git ignores the `backups/` folder: switching to another branch or tag leaves the backups in place, and they don't go into packages.
+
+   These `.tgz` files are **not encrypted**: anyone who can read them can read your documents, password hashes and sessions. Delete them (`rm -r backups`) once 1.2.0 runs and you no longer need to roll back. This block is for a 1.1.0 instance, which doesn't have the backup scripts; for later updates, use [Backing up and restoring](#backing-up-and-restoring), which encrypts every backup.
 
 3. **Check your local compose override, if you keep one.** Carry over the new settings in `docker-compose.yml`, all with working defaults: `MAX_ZIP_EXPANDED_BYTES`, `MAX_ZIP_MEMBERS`, `MAX_ZIP_MEMBER_RATIO`, `MAX_PACKAGE_EXPANDED_BYTES`, `MAX_PACKAGE_MEMBERS`, `AUTH_COOKIE_SECURE`, `AUDIT_LOG_QUESTIONS`, `AUDIT_LOG_MAX_BYTES`, `AUDIT_LOG_KEEP`, `PREPARATION_DIR`, `MAX_PREPARATION_BYTES`, `HF_HUB_OFFLINE` and `TRANSFORMERS_OFFLINE`. If it publishes the proxy on an address other than `127.0.0.1`, switch to LAN mode (`docker-compose.lan.yml`) instead. Do that after step 6: LAN mode won't start without an AI Engineer.
 
@@ -1140,7 +1144,62 @@ Six named Docker volumes persist data across restarts:
 | `rag_preparation` | The preparation area (#638): raw documents uploaded on **Data → Prepare** and their prepared parts, until deleted. At most `MAX_PREPARATION_BYTES`. Not part of collection export packages |
 | `auth_data` | Accounts, password hashes, sessions and the login throttle (`auth.db`, SQLite, #25); two-step verification (#607): sealed TOTP secrets, recovery-code hashes and the switch in `auth.db`, and the sealing key `mfa.key` |
 
-Run `docker compose down -v` to delete all volumes and start fresh. Updating keeps every volume; see [Don't run these](#dont-run-these) for the commands that delete them.
+LAN mode adds a seventh, `lan_certs`: the certificate and key it serves ([Sharing with your office](#sharing-with-your-office)).
+
+Run `docker compose down -v` to delete all volumes and start fresh. Updating keeps every volume; see [Don't run these](#dont-run-these) for the commands that delete them. To keep a copy of them, see [Backing up and restoring](#backing-up-and-restoring).
+
+## Backing up and restoring
+
+`scripts/backup.sh` makes an encrypted backup of the stack's data, and `scripts/restore.sh` puts it back. Run them in the `rag-docker` folder.
+
+**What is backed up.** Every named volume except `ollama_models`, which holds only models the stack downloads again: `weaviate_data`, `ingest_uploads`, `rag_sources`, `rag_preparation`, `auth_data`, and `lan_certs` if you have used LAN mode. A volume that doesn't exist is skipped, with a message.
+
+### Making a backup
+
+```bash
+scripts/backup.sh
+```
+
+The script:
+
+1. finds the volume prefix: the compose project name, usually the folder name (`rag-docker`, so the volumes are `rag-docker_weaviate_data` and so on). If no volume has that prefix, it stops and lists the prefixes that have rag-docker volumes; pass the right one with `--prefix <name>`;
+2. lists each volume it found with the number of files and folders in it (`(empty)` for an empty one: if a volume should hold data, the prefix is wrong) and asks you to confirm;
+3. stops the stack's running containers. It never removes a container or a volume;
+4. writes each volume to `<volume>-<timestamp>.tgz.age` in a new folder, `~/rag-docker-backups/<prefix>-<timestamp>/`, encrypted with [age](https://age-encryption.org) to **a new key pair for that volume alone**. The secret key goes in `<volume>-<timestamp>.key` beside it. Nothing unencrypted is written: tar and age run in a container, and only the encrypted stream reaches the disk. Each archive is decrypted and read back once before the script counts it as done;
+5. leaves the stack stopped and prints the command to start it again (`docker compose up -d`, or with the two `-f` options in LAN mode).
+
+Options:
+
+- `--dir <folder>` puts the backup folder somewhere else, for example an external disk. A folder inside the `rag-docker` checkout is refused, except under its `backups/` folder, which git ignores.
+- `--prefix <name> --yes` runs without asking, for a scheduled backup. `--yes` works only with `--prefix`, so a detected prefix is always confirmed.
+
+The backup folder is created readable by you only (mode 0700), and every file in it 0600.
+
+**Keep the keys apart from the backups.** An archive opens only with its own `.key` file, and anyone who has both can read everything in that volume, password hashes and sessions included. Move the `.key` files somewhere else, such as another disk or a password manager. Without its key an archive can't be restored. git ignores `*.key` files.
+
+**Delete backups you no longer need**, with their keys: `rm -r ~/rag-docker-backups/<prefix>-<timestamp>`.
+
+### Restoring
+
+Give each archive followed by its own key file:
+
+```bash
+scripts/restore.sh ~/rag-docker-backups/rag-docker-20261120T153000Z/weaviate_data-20261120T153000Z.tgz.age /path/to/weaviate_data-20261120T153000Z.key ~/rag-docker-backups/rag-docker-20261120T153000Z/auth_data-20261120T153000Z.tgz.age /path/to/auth_data-20261120T153000Z.key
+```
+
+Each archive restores the volume its name starts with. The script first decrypts every archive with its key and reads it to the end. A missing key file, a wrong key, or a damaged or incomplete archive stops it there, with `Nothing was stopped, emptied or restored.` Only then does it list the volumes that will be **emptied and replaced**, ask you to confirm (or take `--prefix <name> --yes`), stop the stack's running containers, and restore each volume, decrypting as it reads. What changed in those volumes since the backup is lost. If a restore fails part-way, it stops at that volume, which may be partly restored. The archives are unchanged, so fix the cause and run it again.
+
+The volumes must exist. On a machine where the stack has never run, create them first, without starting anything: `docker compose create` (in LAN mode, `docker compose -f docker-compose.yml -f docker-compose.lan.yml create`).
+
+### The age image
+
+The scripts run age and tar in a small image, `rag-docker-age`, built from `scripts/age/Dockerfile`: alpine 3.24.4, pinned by its digest, plus Alpine's `age` package, pinned to an exact version. The first backup or restore builds it, which needs the network once: on a machine that will later be offline, make a first backup while it is online. If Alpine has replaced that package version, the build fails and no backup is written; the pin in `scripts/age/Dockerfile` then needs updating.
+
+A backup is a standard age file, so you can also check one by hand with your own `age` tool:
+
+```bash
+age -d -i weaviate_data-20261120T153000Z.key weaviate_data-20261120T153000Z.tgz.age | tar tzf -
+```
 
 ## Project structure
 

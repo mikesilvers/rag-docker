@@ -21,6 +21,9 @@ ingest-inbox/*
 !ingest-inbox/.gitkeep
 # Volume backups made by the README's "Upgrading from 1.1.0 to 1.2.0" (#679).
 backups/
+# Key files of encrypted volume backups (scripts/backup.sh, #848): each opens
+# one backup, so never commit one.
+*.key
 
 # ── Secrets ──────────────────────────────────────────────────────────────────
 # Your own certificate and key for LAN mode (#26); the folder itself is kept so
