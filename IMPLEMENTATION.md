@@ -18525,13 +18525,21 @@ def get_summary(
 ```markdown
 ## Encryption
 
-A package is encrypted only when it was exported with a passphrase. Its name
-then ends in `.tar.gz.age`: it is an [age](https://age-encryption.org) file that
-only that passphrase opens, whether through import here or with `age -d`. The
-passphrase can't be recovered, and without it the package can't be opened. Send
-it by a different channel than the file.
+A package whose name ends in `.tar.gz.age` is encrypted. It is an
+[age](https://age-encryption.org) file, opened in one of two ways:
 
-A package whose name ends in `.tar.gz` is not encrypted. Nothing in it is
+- **With its own key** (the default since 1.3.1). Each export is encrypted to a
+  new key made for that package alone, and the key is written to a separate key
+  file, `<package>.key`. The key file opens the package, through import or with
+  `age -d -i <package>.key <package>`, and nothing else. It can be downloaded
+  from the server once, and it can't be recovered. Store it apart from the
+  package: anyone who has both can read it.
+- **With a passphrase**, chosen when it was exported. Import it with that
+  passphrase, or open it with `age -d`. The passphrase can't be recovered either.
+  Send it by a different channel than the file.
+
+A package whose name ends in `.tar.gz` is not encrypted. It was exported with
+encryption turned off on purpose (LAN mode doesn't allow that). Nothing in it is
 protected: `sources/` holds the original documents byte for byte, and
 `chunks.jsonl` holds their text. If the corpus contains confidential or personal
 material, the package does too. Move and store it accordingly.
@@ -18568,8 +18576,9 @@ Check any machine with `docker compose exec ollama ollama list`.
 
 ````markdown
 ```
-ragpkg-<collection>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz
-ragpkg-<collection>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz.age    (exported with a passphrase)
+ragpkg-<collection>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz          (not encrypted)
+ragpkg-<collection>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz.age      (encrypted with a new key, the default, or a passphrase)
+ragpkg-<collection>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz.age.key  (the key file of a package encrypted with a key)
 ```
 
 The collection name in the filename is lowercased and stripped of punctuation,
@@ -18973,8 +18982,9 @@ if __name__ == "__main__":
 ```markdown
 # Moving a RAG between machines
 
-A collection can be exported as a single `.tar.gz` (or, with a passphrase, an
-encrypted `.tar.gz.age`) and imported somewhere else —
+A collection can be exported as a single encrypted `.tar.gz.age` (with a new key
+of its own by default, or with a passphrase; or, outside LAN mode, as a plain
+`.tar.gz`) and imported somewhere else —
 another laptop, a customer's machine, an air-gapped network. The package carries
 the chunks and their vectors, the settings the collection was tuned with, a
 standalone query script and, when the originals were retained, the source
@@ -18988,9 +18998,12 @@ Everything below is rendered from the same templates that generate the
 Both directions use `./exports/` in the project directory, which is a bind mount
 rather than a Docker volume so you can pick files up and drop them in directly.
 
-- **Exporting** writes the package there.
+- **Exporting** writes the package there, and for a package encrypted with a key,
+  its key file beside it.
 - **Importing** reads from there: copy a package in first, then import by filename,
-  with its passphrase when the package is encrypted.
+  with its key file or its passphrase when the package is encrypted. The key file
+  is never copied into `./exports/` on the importing side: its text is sent with
+  the import.
 
 `GET /api/packages` lists what is currently in that directory, including files it
 cannot read — those are shown rather than hidden, so nothing disappears silently.
