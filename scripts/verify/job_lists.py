@@ -82,6 +82,10 @@ def main(argv):
         status, raw, _ = code("POST", "/collections", {"name": name}, token=dev)
         expect(status == 201, "creating {} answered {} {}".format(name, status, error_code(raw)))
         name = json.loads(raw)["name"]
+        # The new collection is the Developer's alone (#606); the key's principal is granted it too.
+        status, raw, _ = code("PUT", "/collections/{}/access".format(name),
+                              {"restricted": True, "users": [DEVELOPER], "service_principals": [principal]}, token=admin)
+        expect(status == 200, "granting {} answered {} {}".format(name, status, error_code(raw)))
 
         status, mine = upload(name, "vfy-jobs-dev.txt", b"A note the Developer imports.\n" * 20, token=dev)
         expect(status == 202, "the Developer's upload answered {} {}".format(status, mine))

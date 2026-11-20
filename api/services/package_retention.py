@@ -1,0 +1,381 @@
+"""Export packages don't stay on the server (#677).
+
+A finished export package in `./exports` holds a whole collection, so every copy
+left there is data at rest. Two things remove a package this instance exported:
+
+- **A full download** through `GET /packages/{filename}` (routers/transfer.py)
+  deletes it once its last byte has been handed to the connection. An
+  interrupted download keeps it, so it can be retried.
+- **Expiry.** A package nobody downloads is deleted `EXPORT_RETENTION_HOURS`
+  (1 to 720, default 24) after its export finished. The sweep runs at start-up
+  and then every 15 minutes (`sweeper`, started by main.py).
+
+**Which packages.** Only packages this instance exported: when an export
+finishes, its filename and finish time are recorded in
+`<UPLOAD_DIR>/exported_packages.json`, never in `./exports`. A package copied
+into `./exports` to be imported, or one that was there before this record
+existed, is never recorded, so neither a download nor the sweep deletes it.
+A package copied straight from the host folder is still deleted after the expiry.
+
+**Busy.** While an import of a package runs, or a download of it is in progress,
+a download is refused (409 PACKAGE_BUSY) and the sweep skips it until its next
+run. Claiming a download and the sweep's check-and-delete take the same lock.
+
+**One way to delete.** `delete` removes the package, its companion files (none
+yet; #676's key file will be one) and its record entry, and writes one
+`package.delete` audit record. `may_sweep` alone decides whether the sweep may
+delete a package, so a later "keep" flag changes only that function.
+
+**The record.** Each entry is `{"finished_at": ..., "collection": ...}`: the
+collection is the one exported, so an encrypted package exported here follows
+that collection's access (routers/transfer.py `_hidden`, #794). An entry written
+before #794 is a bare finish time and is read with no collection. A recorded
+name outside the download rule (`valid_name`) is ignored and logged, so a
+tampered record can't name a file outside the exports folder. Replaced whole (a
+temporary file renamed into place) under a lock. One that can't be read is
+never overwritten: it is moved aside to `exported_packages.json.corrupt-<time>`
+and logged, the packages it named are no longer expired (delete them by hand),
+and a new record starts. If it can't be moved, writes refuse until it is dealt
+with.
+
+**Imports.** An import claims its package (importer.start_import_job) under
+this module's lock too, so a sweep or a post-download deletion can't remove a
+package between its busy check and the unlink while an import starts. Both
+claims run in a worker thread through `run_claim`, which releases what a claim
+took when the request waiting for it is cancelled (#794).
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+import stat
+import tempfile
+import threading
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from config import settings
+
+_log = logging.getLogger(__name__)
+
+RECORD_NAME = "exported_packages.json"
+SWEEP_INTERVAL_S = 15 * 60
+# The names a download serves: what exports write (packager.package_stem). The
+# `ragpkg-` prefix rules out a leading `.` and the class rules out `/`.
+NAME = re.compile(r"ragpkg-[A-Za-z0-9._-]+\.tar\.gz(?:\.age)?")
+_TIME = "%Y-%m-%dT%H:%M:%SZ"
+
+_lock = threading.RLock()
+_downloading: set[str] = set()
+# Releases of claims whose request was cancelled, kept until they finish.
+_settling: set = set()
+# An unreadable record that couldn't be moved aside: writes refuse meanwhile.
+_stuck = False
+# Recorded names outside the download rule already logged by this process
+# (#798): each is logged once, not on every read. Changed under `_lock` only.
+_reported: set[str] = set()
+
+
+def lock():
+    """The lock an import's claim, the download slot and every deletion share."""
+    return _lock
+
+
+def valid_name(name) -> bool:
+    return isinstance(name, str) and NAME.fullmatch(name) is not None
+
+
+def _exports() -> Path:
+    return Path(settings.exports_dir)
+
+
+def _path() -> Path:
+    return Path(settings.upload_dir) / RECORD_NAME
+
+
+# ── the record ───────────────────────────────────────────────────────────────
+
+def _set_aside(path: Path) -> None:
+    """Move an unreadable record aside so nothing overwrites it, and say so."""
+    global _stuck
+    aside = path.with_name(path.name + ".corrupt-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
+    try:
+        os.replace(path, aside)
+    except OSError:
+        _stuck = True
+        _log.exception("Could not read %s, nor move it aside; it is left as it is, packages are "
+                       "not recorded until it is removed, and the ones it named don't expire", path)
+        return
+    _stuck = False
+    _log.error("Could not read %s; it was moved to %s and a new record starts. The packages it "
+               "named won't expire: delete them from ./exports by hand", path, aside)
+
+
+def _entry(value) -> dict | None:
+    """One entry as read: a bare finish time (before #794) or an object with
+    `finished_at` and `collection`. None when it is neither."""
+    if isinstance(value, str):
+        return {"finished_at": value, "collection": None}
+    if isinstance(value, dict) and isinstance(value.get("finished_at"), str):
+        collection = value.get("collection")
+        if collection is None or isinstance(collection, str):
+            return {"finished_at": value["finished_at"], "collection": collection or None}
+    return None
+
+
+def _read() -> dict[str, dict]:
+    """Recorded filename -> `{"finished_at", "collection"}`. Missing is empty; an
+    unreadable record is moved aside (`_set_aside`) and taken as empty. A name
+    outside the download rule is left out and logged (#794), once per process
+    (#798): nothing deletes, expires or serves it as recorded, and reads never
+    rewrite the record, so the next export or deletion writes it out."""
+    path = _path()
+    with _lock:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError):
+            _set_aside(path)
+            return {}
+        packages = data.get("packages") if isinstance(data, dict) else None
+        entries = {k: _entry(v) for k, v in packages.items()} if isinstance(packages, dict) else None
+        if entries is None or not all(isinstance(k, str) and v is not None for k, v in entries.items()):
+            _set_aside(path)
+            return {}
+        for name in [k for k in entries if not valid_name(k)]:
+            if name not in _reported:
+                _reported.add(name)
+                _log.warning("The record of exported packages names %r, which isn't a package name; "
+                             "it is ignored", name)
+            del entries[name]
+        return entries
+
+
+def _write(entries: dict[str, dict]) -> None:
+    path = _path()
+    if _stuck and os.path.lexists(path):
+        raise RuntimeError(f"{path} is unreadable and couldn't be moved aside; it isn't overwritten")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix="." + RECORD_NAME + ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"packages": entries}, fh, indent=1, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def record_export(filename: str, finished: datetime, collection: str | None = None) -> None:
+    """Record a package this instance exported, with the collection it holds
+    (#794). Raises when it can't be written."""
+    with _lock:
+        entries = _read()
+        entries[filename] = {"finished_at": finished.astimezone(timezone.utc).strftime(_TIME),
+                             "collection": collection}
+        _write(entries)
+
+
+def _drop(filename: str) -> None:
+    entries = _read()
+    if entries.pop(filename, None) is not None:
+        _write(entries)
+
+
+def _forget(filename: str) -> None:
+    """`_drop`, never raising: a deletion is audited and a sweep goes on even
+    when the record can't be rewritten (#794). The entry is left; once its file
+    is gone, a later sweep drops it."""
+    try:
+        _drop(filename)
+    except Exception:                                 # noqa: BLE001 - logged; the record is retried later
+        _log.exception("Could not remove %s from the record of exported packages; a later sweep "
+                       "drops it", filename)
+
+
+def _expiry(finished_at: str) -> datetime | None:
+    try:
+        finished = datetime.strptime(finished_at, _TIME).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return finished + timedelta(hours=settings.export_retention_hours)
+
+
+def _format(when: datetime | None) -> str | None:
+    return when.strftime(_TIME) if when is not None else None
+
+
+def expires_at(filename: str) -> str | None:
+    """When a recorded package expires (UTC), or None for one not recorded."""
+    entry = _read().get(filename)
+    return _format(_expiry(entry["finished_at"])) if entry is not None else None
+
+
+def expiries() -> dict[str, str | None]:
+    """Every recorded package's `expires_at`, from one read (the listing)."""
+    return {name: _format(_expiry(entry["finished_at"])) for name, entry in _read().items()}
+
+
+def recorded(filename: str) -> bool:
+    return filename in _read()
+
+
+def recorded_collections() -> dict[str, str | None]:
+    """Every recorded package's collection (None when not recorded with one),
+    from one read (routers/transfer.py `_hidden`, #794)."""
+    return {name: entry["collection"] for name, entry in _read().items()}
+
+
+def companions(filename: str) -> list[str]:
+    """Files deleted with a package. None yet: #676's key file will be one."""
+    return []
+
+
+# ── busy, and the download slot ──────────────────────────────────────────────
+
+def busy(filename: str) -> bool:
+    """A download of it is in progress, or an import of it runs."""
+    from services import importer                     # importer imports nothing from here
+    with _lock:
+        return filename in _downloading or importer.package_busy(filename)
+
+
+def claim(filename: str) -> bool:
+    """Take the download slot; False when the package is busy."""
+    with _lock:
+        if busy(filename):
+            return False
+        _downloading.add(filename)
+        return True
+
+
+def release(filename: str) -> None:
+    with _lock:
+        _downloading.discard(filename)
+
+
+async def run_claim(claim, undo):
+    """Run `claim()` in a worker thread and return its result (#794). If the
+    awaiting task is cancelled meanwhile, the thread still finishes; `undo`
+    is then called, in a worker thread, with what it returned, so a claim never
+    outlives a cancelled request. An exception from `claim` propagates."""
+    task = asyncio.ensure_future(asyncio.to_thread(claim))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        def settle(done):
+            if done.cancelled() or done.exception() is not None:
+                return
+            follow = asyncio.ensure_future(asyncio.to_thread(undo, done.result()))
+            _settling.add(follow)
+            follow.add_done_callback(_settling.discard)
+        task.add_done_callback(settle)
+        raise
+
+
+def may_sweep(filename: str, finished_at: str, now: datetime) -> bool:
+    """The one place that decides the sweep may delete a package: it has
+    expired and isn't busy (#677). A "keep" flag would be checked here."""
+    expiry = _expiry(finished_at)
+    return expiry is not None and expiry <= now and not busy(filename)
+
+
+# ── deleting ─────────────────────────────────────────────────────────────────
+
+def _remove_regular(path: Path) -> bool | None:
+    """Unlink a regular file, never following a link. True when removed, None
+    when it is missing, False when something else has the name (kept)."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        return False
+    path.unlink()
+    return True
+
+
+def delete(filename: str, reason: str, scope=None) -> bool:
+    """Delete a recorded package, its companions and its entry, and write its
+    `package.delete` record. `scope` is the downloading request's (reason
+    `downloaded`); without one the actor is the system (reason `expired`).
+    True when the package was deleted."""
+    from services import audit
+    root = _exports()
+    with _lock:
+        try:
+            removed = _remove_regular(root / filename)
+        except OSError:
+            _log.exception("Could not delete package %s (%s); it is kept and tried again", filename, reason)
+            return False
+        if removed is None:
+            _forget(filename)
+            return False
+        if removed is False:
+            _log.warning("%s in the exports folder is not a regular file; it is left as it is "
+                         "and no longer expired", filename)
+            _forget(filename)
+            return False
+        for name in companions(filename):
+            try:
+                if _remove_regular(root / name) is False:
+                    _log.warning("Companion %s of %s is not a regular file; left as it is", name, filename)
+            except OSError:
+                _log.exception("Could not delete %s, a companion of %s", name, filename)
+        _forget(filename)
+    audit.package_deleted(filename, reason, scope)
+    return True
+
+
+def after_download(filename: str, scope) -> bool:
+    """After a complete download: delete the package when this instance
+    exported it and no import of it has started meanwhile."""
+    from services import importer
+    with _lock:
+        if not recorded(filename) or importer.package_busy(filename):
+            return False
+        return delete(filename, "downloaded", scope)
+
+
+def sweep(now: datetime | None = None) -> list[str]:
+    """Delete the recorded packages that have expired. Busy ones wait for the
+    next run; an entry whose file is gone is dropped. Returns the deleted names."""
+    now = now or datetime.now(timezone.utc)
+    deleted = []
+    with _lock:
+        for filename, entry in sorted(_read().items()):
+            finished_at = entry["finished_at"]
+            expiry = _expiry(finished_at)
+            if expiry is None or expiry > now:
+                continue
+            if not os.path.lexists(_exports() / filename):
+                _forget(filename)
+                continue
+            if not may_sweep(filename, finished_at, now):
+                continue
+            if delete(filename, "expired"):
+                deleted.append(filename)
+    return deleted
+
+
+async def sweeper() -> None:
+    """Sweep at once (the start-up run), then every SWEEP_INTERVAL_S."""
+    while True:
+        try:
+            deleted = await asyncio.to_thread(sweep)
+            if deleted:
+                _log.warning("Deleted %d expired export package(s) nobody downloaded within "
+                             "EXPORT_RETENTION_HOURS (%d h): %s", len(deleted),
+                             settings.export_retention_hours, ", ".join(deleted))
+        except Exception:                             # noqa: BLE001 - the next run tries again
+            _log.exception("The sweep of expired export packages failed")
+        await asyncio.sleep(SWEEP_INTERVAL_S)

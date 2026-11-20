@@ -6,6 +6,7 @@
     docker compose exec api python -m auth set-role USERNAME ROLE
     docker compose exec api python -m auth disable USERNAME
     docker compose exec api python -m auth enable USERNAME
+    docker compose exec api python -m auth reset-mfa USERNAME
     docker compose exec api python -m auth list
 
 ROLE is end_user, developer or engineer. bootstrap, create-user and
@@ -14,8 +15,15 @@ shown nowhere else, and the user must change it at their first login. Each
 action writes one line to standard error. Exit status: 0 done, 1 refused,
 2 usage error.
 
-The last enabled engineer can't be disabled or demoted. A lockout is recovered
-with create-user, enable or reset-password.
+The last enabled engineer can't be disabled or demoted. An account a user is
+locked out of (lost password, disabled) is recovered with create-user, enable
+or reset-password; these don't lift a login throttle, which ends by itself
+after 15 minutes.
+
+reset-mfa (#607) is the last-resort recovery of two-step verification: it
+deletes the user's secret and recovery codes and ends their sessions, so their
+next login asks for no code (and, while MFA is required for everyone, for a new
+set-up). It works for an engineer's own account too, which the app refuses.
 
 Service principals (API keys, PR 3) are created and given keys by Engineers in
 the app; this command issues no key. `list` shows principals too, marked
@@ -77,9 +85,11 @@ def main(argv=None) -> int:
     p = commands.add_parser("set-role", help="change a user's role")
     p.add_argument("username")
     p.add_argument("role")
-    p = commands.add_parser("disable", help="disable an account and end its sessions")
+    p = commands.add_parser("disable", help="disable an account (a user's sessions end, a service account's keys stop working)")
     p.add_argument("username")
     p = commands.add_parser("enable", help="enable a disabled account")
+    p.add_argument("username")
+    p = commands.add_parser("reset-mfa", help="remove a user's two-step verification and end their sessions")
     p.add_argument("username")
     commands.add_parser("list", help="list the accounts")
     args = parser.parse_args(argv)
@@ -102,10 +112,17 @@ def main(argv=None) -> int:
         elif args.command == "set-role":
             store.set_role(username, role)
             _say(f"set-role: {username!r} is now {role}")
+        elif args.command == "reset-mfa":
+            store.reset_mfa(username)
+            _say(f"reset-mfa: two-step verification of {username!r} removed; their sessions ended")
         elif args.command in ("disable", "enable"):
             store.set_enabled(username, args.command == "enable")
-            _say(f"{args.command}: {username!r} {args.command}d"
-                 + ("; their sessions ended" if args.command == "disable" else ""))
+            ended = ""
+            if args.command == "disable":
+                # A service principal has no sessions: disabling it stops its keys (#553).
+                service = store.get_user(username).kind == "service"
+                ended = "; its keys stop working" if service else "; their sessions ended"
+            _say(f"{args.command}: {username!r} {args.command}d{ended}")
         else:
             for user in store.list_users(kind=None):
                 created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(user.created_at))

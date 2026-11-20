@@ -36,6 +36,10 @@ python3 "$REPO_ROOT/scripts/tests/test_suite_registration.py"
 check "the verify suites run the test files #386 registered" $?
 python3 "$REPO_ROOT/scripts/tests/test_dependency_floors.py"
 check "pinned dependencies are at or above their patched versions (#522)" $?
+python3 "$REPO_ROOT/scripts/tests/test_ui_dependencies.py"
+check "the embedded ui/package.json copy in IMPLEMENTATION.md matches the file (#532)" $?
+python3 "$REPO_ROOT/scripts/tests/test_tailwind_output.py"
+check "the built UI CSS keeps the Tailwind 4 rules the migration relies on (#773)" $?
 python3 "$REPO_ROOT/scripts/tests/test_weaviate_pin.py"
 check "the Weaviate pin is the same everywhere and Dependabot leaves it alone (#530)" $?
 python3 "$REPO_ROOT/scripts/tests/test_upgrade_backup.py"
@@ -60,13 +64,17 @@ check_eq "  ... with its Allow header, POST" \
   "$(printf '%s\n' "$wrong_method" | awk 'tolower($1)=="allow:" {print $2}')" "POST"
 check_eq "  ... in the envelope, code METHOD_NOT_ALLOWED" \
   "$(printf '%s\n' "$wrong_method" | sed '1,/^$/d' | jfield "['error']['code']")" "METHOD_NOT_ALLOWED"
-# /health's 503 body for a missing model or an unreachable dependency, which the
-# Health page reads to show the failing services (#375).
+# /health/details' 503 body for a missing model or an unreachable dependency, which
+# the Health page reads to show the failing services (#375), and the public
+# /health's status-only body (#750).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_health.py)
-check "/health answers 503 with the per-service body when a dependency is down (#375)" $?
+check "/health/details answers 503 with the per-service body when a dependency is down (#375); /health only the status (#750)" $?
 # The collection registry is written atomically and kept when it can't be read (#388).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_collection_registry.py)
 check "the collection registry is written atomically and kept when unreadable (#388)" $?
+# The Authlib installed in the built API image is the one api/requirements.txt pins (#565).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_installed_authlib.py)
+check "the Authlib installed in the API image is the version api/requirements.txt pins (#565)" $?
 
 RAG_INFRA_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rag-infra.XXXXXX") || exit 2
 export RAG_INFRA_TMP
@@ -168,7 +176,7 @@ unhealthy=$( (cd "$REPO_ROOT" && docker compose ps --format '{{.Status}}') | gre
 check_eq "no service reports unhealthy" "$unhealthy" "0"
 
 # ── health endpoint reports each dependency ──────────────────────────────────
-api_get "/health" > "$RAG_INFRA_TMP/vfy_health.json"
+api_get "/health/details" > "$RAG_INFRA_TMP/vfy_health.json"
 check_eq "health status is ok" "$(jfield "['status']" < "$RAG_INFRA_TMP/vfy_health.json")" "ok"
 python3 -c "
 import json,sys,os; d=json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_health.json'))
@@ -178,6 +186,13 @@ ok = (s['weaviate']['status']=='ok' and s['ollama']['llm']['status']=='ok'
       and all(v['latency_ms'] >= 0 for v in (s['weaviate'], s['ollama']['llm'], s['ollama']['embed'])))
 sys.exit(0 if ok else 1)"
 check "per-service status and latency are reported" $?
+python3 -c "
+import json,sys,os; o=json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_health.json'))['services']['ollama']
+b=o.get('build_llm') or {}
+ok = (b.get('status')=='ok' and isinstance(b.get('latency_ms'), int) and b.get('model')==o['llm']['model']
+      and o.get('same_model') is True)
+sys.exit(0 if ok else 1)"
+check "health reports the build model, the same as the answer model by default, with same_model true (#671)" $?
 
 # ── memory resource reporting (Issue #98) ────────────────────────────────────
 # Advisory only (see the comment in api/routers/health.py), so it never
@@ -187,7 +202,7 @@ check "per-service status and latency are reported" $?
 check_eq "the recommended minimum defaults to 12.0 GB" \
   "$(jfield "['resources']['memory']['recommended_minimum_gb']" < "$RAG_INFRA_TMP/vfy_health.json")" "12.0"
 # Whether this machine meets it depends on its Docker allocation, so check the
-# status agrees with the allocation /health reports, not that it is 'ok'.
+# status agrees with the allocation /health/details reports, not that it is 'ok'.
 python3 -c "
 import json, os
 m = json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_health.json'))['resources']['memory']
@@ -198,7 +213,7 @@ check "the memory status agrees with the reported allocation" $?
 # Raise the recommendation past the actual allocation (in-process only --
 # neither the running server nor docker-compose.yml is touched) and confirm
 # the status flips and a note is attached. The override comes from the
-# allocation /health reported, never a constant: a fixed 13 GB stayed 'ok' on
+# allocation /health/details reported, never a constant: a fixed 13 GB stayed 'ok' on
 # any host giving Docker 12.35 GB or more (#536).
 python3 "$REPO_ROOT/scripts/tests/test_memory_override.py"
 check "the memory override always exceeds the reported allocation (#536)" $?

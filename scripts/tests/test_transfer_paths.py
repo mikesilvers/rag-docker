@@ -217,10 +217,11 @@ class PackageListTests(RouteTestCase):
         self.assertEqual(response.json()["packages"], [
             {"filename": good.name, "size_bytes": good.stat().st_size, "collection": "Corpus",
              "chunk_count": 12, "fidelity": "with-sources",
-             "created_at": "2026-10-21T08:00:00Z", "readable": True, "encrypted": False},
+             "created_at": "2026-10-21T08:00:00Z", "readable": True, "encrypted": False,
+             "expires_at": None},           # not exported here (#677)
             {"filename": junk.name, "size_bytes": junk.stat().st_size, "collection": None,
              "chunk_count": None, "fidelity": None, "created_at": None, "readable": False,
-             "encrypted": False},
+             "encrypted": False, "expires_at": None},
         ])
 
 

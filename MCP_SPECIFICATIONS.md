@@ -297,7 +297,9 @@ One LLM call; expect it to be slow. `readOnlyHint: false`,
 ### 4.5 Diagnostics
 
 **`rag_health`** — no input. `readOnlyHint: true`.
-Returns overall status plus Weaviate, LLM and embedding status. MUST succeed as a
+Returns the API's public `GET /health`: the overall status, `ok` or `degraded` (#750). The per-service
+detail, the model names and the memory report are at `GET /health/details`, for a Developer or AI Engineer
+session or key, which the MCP server doesn't have until #39. MUST succeed as a
 tool call even when the API reports `degraded` (HTTP 503) — a degraded stack is
 information, not a tool failure. Only an unreachable API is a tool error.
 

@@ -244,6 +244,13 @@ DEFAULTS = {"collection": "Coll", "retrieval_mode": "hnsw", "top_k": 5, "alpha":
 
 
 class RetrievalConfigFileTests(ApiTestCase):
+    def setUp(self):
+        super().setUp()
+        # The settings routes answer 404 for a collection that doesn't exist (#606).
+        patcher = patch.object(wc, "collection_exists", AsyncMock(return_value=True))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def saved_file(self):
         return retrieval_config._dir() / "Coll.json"
 
@@ -420,7 +427,7 @@ class MetricsRouteTests(ApiTestCase):
         self.assert_error(response, 422, "INVALID_PARAMETER")
 
 
-# ── /health probes (PL:A3, PL:A5) ────────────────────────────────────────────
+# ── /health probes (PL:A3, PL:A5), read from /health/details (#750) ──────────
 
 class HealthProbeTests(ApiTestCase):
     def ollama_ok(self):
@@ -457,7 +464,7 @@ class HealthProbeTests(ApiTestCase):
         with self.ollama_ok(), patch.object(wc, "_check_health_sync", hang), \
                 patch.object(ollama_client, "check_health", ollama_check):
             started = time.monotonic()
-            response = self.client.get("/health")
+            response = self.client.get("/health/details")
             elapsed = time.monotonic() - started
         self.assertEqual(len(hung), 2, "the Weaviate check never hung, or Ollama wasn't probed")
         # The Weaviate probe gave up about 4 s after the hung call began.
@@ -503,7 +510,7 @@ class HealthProbeTests(ApiTestCase):
         # PL:A5: the memory report is advisory.
         with self.meminfo(error=PermissionError(13, "Permission denied")), self.ollama_ok(), \
                 patch.object(wc, "check_health", AsyncMock(return_value=True)):
-            response = self.client.get("/health")
+            response = self.client.get("/health/details")
         self.assertEqual(response.status_code, 200, response.text)
         body = response.json()
         self.assertEqual(body["status"], "ok")

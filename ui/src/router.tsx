@@ -4,6 +4,7 @@ import NavBar from './components/NavBar'
 import LoginPage from './pages/LoginPage'
 import SetupRequiredPage from './pages/SetupRequiredPage'
 import ChangePasswordPage from './pages/ChangePasswordPage'
+import AccountPage from './pages/AccountPage'
 import QAPage from './pages/QAPage'
 import ImportPage from './pages/ImportPage'
 import PreparePage from './pages/PreparePage'
@@ -19,7 +20,7 @@ import TransferPage from './pages/TransferPage'
 import HelpTransferPage from './pages/HelpTransferPage'
 
 // What the API says decides what is shown (#25): set up, logged in, a password
-// change due, and the role. Hiding a page is a convenience; the API refuses
+// change due, a two-step verification set-up due (#607), and the role. Hiding a page is a convenience; the API refuses
 // what the role can't do whatever the UI shows.
 export default function AppRouter() {
   const { state } = useAuth()
@@ -47,7 +48,20 @@ export default function AppRouter() {
       </Routes>
     )
   }
+  // Two-step verification is required for everyone and this user hasn't set
+  // it up: only the account page, until they do (#607).
+  if (state.user.mfa_enrollment_required) {
+    return (
+      <Routes>
+        <Route path="/account" element={<AccountPage forced />} />
+        <Route path="*" element={<Navigate to="/account" replace />} />
+      </Routes>
+    )
+  }
   const role = state.user.role
+  // Query-only mode (#670): the pages that change data aren't routed; the API
+  // refuses their writes whatever the UI shows.
+  const queryOnly = state.user.query_only === true
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -57,14 +71,19 @@ export default function AppRouter() {
           <Route path="/" element={<Navigate to="/qa" replace />} />
           <Route path="/login" element={<Navigate to="/qa" replace />} />
           <Route path="/qa" element={<QAPage />} />
+          <Route path="/account" element={<AccountPage />} />
           <Route path="/account/password" element={<ChangePasswordPage />} />
           {role !== 'end_user' && (
             <>
-              <Route path="/import" element={<ImportPage />} />
-              <Route path="/prepare" element={<PreparePage />} />
-              <Route path="/chunking" element={<ChunkingPage />} />
-              <Route path="/retrieval" element={<RetrievalPage />} />
-              <Route path="/goldstandard" element={<GoldStandardPage />} />
+              {!queryOnly && (
+                <>
+                  <Route path="/import" element={<ImportPage />} />
+                  <Route path="/prepare" element={<PreparePage />} />
+                  <Route path="/chunking" element={<ChunkingPage />} />
+                  <Route path="/retrieval" element={<RetrievalPage />} />
+                  <Route path="/goldstandard" element={<GoldStandardPage />} />
+                </>
+              )}
               <Route path="/transfer" element={<TransferPage />} />
               <Route path="/help/transfer" element={<HelpTransferPage />} />
             </>

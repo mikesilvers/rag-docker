@@ -46,7 +46,7 @@ PROTECTED = (
     ("GET", "/packages"), ("GET", "/help/transfer"),
     ("POST", "/tune/rechunk"), ("POST", "/tune/reembed"), ("POST", "/tune/reindex"),
     ("GET", "/tune/job/nope"), ("GET", f"/tune/{X}"),
-    ("GET", "/metrics/latency"),
+    ("GET", "/metrics/latency"), ("GET", "/health/details"),
     ("GET", "/docs"), ("GET", "/docs/oauth2-redirect"), ("GET", "/redoc"), ("GET", "/openapi.json"),
     ("GET", "/auth/users"), ("POST", "/auth/users"), ("POST", "/auth/users/nobody/reset-password"),
     ("POST", "/auth/users/nobody/role"), ("POST", "/auth/users/nobody/disable"),
@@ -55,6 +55,10 @@ PROTECTED = (
     ("POST", "/auth/service-principals/nobody/role"), ("POST", "/auth/service-principals/nobody/disable"),
     ("POST", "/auth/service-principals/nobody/enable"), ("POST", "/auth/service-principals/nobody/keys"),
     ("POST", "/auth/service-principals/nobody/keys/nokey/revoke"),
+    # Two-step verification (#607): the user's own routes and the Engineer's.
+    ("GET", "/auth/mfa"), ("POST", "/auth/mfa/enroll"), ("POST", "/auth/mfa/enroll/confirm"),
+    ("POST", "/auth/mfa/recovery-codes"), ("POST", "/auth/mfa/disable"), ("POST", "/auth/mfa/policy"),
+    ("POST", "/auth/users/nobody/reset-mfa"),
 )
 
 

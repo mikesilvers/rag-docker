@@ -35,6 +35,8 @@ import uuid
 from pathlib import Path
 from contextlib import nullcontext
 
+from auth import access
+from auth import store as auth_store
 from config import settings
 from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN
 from services import age_stream
@@ -181,12 +183,14 @@ def _mark_finished(collection: str) -> None:
     collection_recovery._sync_dir(_markers_dir())
 
 
-# Extraction workspaces created by an import or a re-chunk, and an ingest's
-# upload staging (#377). Each removes its own directory in a `finally`, which a
-# hard kill skips -- twelve of these were found holding 152 MB after the kill
-# tests, a with-models package would leave 2.3 GB behind each time, and an
-# ingest up to 512 MB of upload plus 2 GiB of extracted ZIP members.
-_WORKDIR_PREFIXES = ("import-", "rechunk-", "batch-verify-", "ingest-", "prepare-")
+# Extraction workspaces created by an import or a re-chunk, an ingest's upload
+# staging (#377), and an export's staging (#549). Each removes its own directory
+# in a `finally`, which a hard kill skips -- twelve of these were found holding
+# 152 MB after the kill tests, a with-models package would leave 2.3 GB behind
+# each time, and an ingest up to 512 MB of upload plus 2 GiB of extracted ZIP
+# members.
+_WORKDIR_PREFIXES = ("import-", "rechunk-", "batch-verify-", "ingest-", "prepare-",
+                     "export-")
 # Document preparation also writes two temporary files there (#640): the ZIP of
 # a multi-part prepared download (prepare-*.zip) and a decompressed .json.gz
 # (prepare-*.json). They are removed as regular files, besides as directories.
@@ -299,6 +303,30 @@ def canonical(name: str) -> str:
 def _package_key(filename: str) -> str:
     """The package the worker opens, so every spelling of one file is one key."""
     return Path(filename).name
+
+
+def _claim_package(key: str, filename: str) -> None:
+    """Claim the package for this import, or refuse while another import has it.
+    Taken under package_retention's lock as well (that lock, then _lock), so an
+    expiry sweep or a post-download deletion never removes a package between its
+    busy check and the unlink while an import starts (#677)."""
+    from services import package_retention
+    with package_retention.lock(), _lock:
+        if key in _active:
+            raise ImportInProgressError(filename)
+        _active.add(key)
+
+
+def _release_package(key: str) -> None:
+    with _lock:
+        _active.discard(key)
+
+
+def package_busy(filename: str) -> bool:
+    """Whether an import of this package is running (#677: a download is
+    refused, and the expiry sweep waits, meanwhile)."""
+    with _lock:
+        return _package_key(filename) in _active
 
 
 def _claim_target(job_id: str, target: str, instead_of: str | None = None) -> str:
@@ -432,6 +460,8 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
     Absent, bundled       -> install, then verify Ollama actually reports it.
     Absent, unbundled     -> EMBEDDING_MODEL_MISSING.
     Namespaced name       -> ask Ollama; it can't be checked or installed here.
+    The LLM is this instance's answer model; the build model is neither checked
+    nor installed (#671).
     """
     notes: list[str] = []
     if not model_bundle.store_available():
@@ -440,7 +470,9 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
         return notes
 
     embed_model = settings.embed_model
-    llm_model = settings.llm_model
+    # Only the answer model: a query needs it; the build model is recorded in
+    # the manifest for information and never checked or installed (#671).
+    llm_model = settings.answer_model
     # `name:tag`; a folder counts only for the tag it holds (#487).
     bundled = model_bundle.bundled_models(pkg, manifest)
 
@@ -813,6 +845,57 @@ def _build(target: str, pkg: Path, manifest: dict, progress, instance: str | Non
         raise
 
 
+def exists_fail_closed(name: str) -> bool:
+    """Whether a collection exists; Weaviate failing to answer counts as
+    existing, so the access checks below fail closed."""
+    try:
+        return wc._collection_exists_sync(name)
+    except Exception:                                 # noqa: BLE001
+        _log.exception("Could not check whether %r exists for a package's access check", name)
+        return True
+
+
+def package_source(original: str) -> str:
+    """Whose access a package of `original` follows (#606): the collection
+    itself, or for a staging or recovery copy that no longer exists here, the
+    nearest collection it was made from that exists here, or the original
+    (auth.access.package_source, #792)."""
+    return access.package_source(original, exists_fail_closed)
+
+
+def _refused(owner, source: str) -> bool:
+    """True when the package's collection (`package_source`) exists here, is
+    restricted, and the job's owner may not use it (#606). For an existing
+    staging or recovery copy that means the copy or any collection it was made
+    from (access.scope, #788, #792)."""
+    names = access.scope(source)
+    if owner is None or not any(auth_store.collection_access(n).restricted for n in names):
+        return False
+    return exists_fail_closed(source) and not all(auth_store.owner_has_access(owner, n) for n in names)
+
+
+def _start_access(owner, source: str, target: str, operator: bool = False):
+    """A collection this import creates (#606): when the package's collection
+    (`package_source`) exists here, the new one gets its state, and for a
+    staging or recovery copy the narrowest of the copy's and every
+    collection's it was made from (#788, #792), so an import can't open what
+    any of them restricts; otherwise it starts restricted to the job's owner.
+    Written before any data; returns (the state replaced, the state written)
+    for auth_store.put_back. A job with no owner (a direct call in tests)
+    records nothing and returns None. A load by the operator (`python -m
+    loader`, #670) has no owner either: every collection it creates starts
+    restricted with no grants (Engineers only, until one opens or grants it),
+    and never copies an existing collection's state, a rename or a staging
+    copy's package included (maintainer, 2026-11-18)."""
+    if operator:
+        return auth_store.restrict_to(target, None)
+    if owner is None:
+        return None
+    if source != target and exists_fail_closed(source):
+        return auth_store.copy_collection_access(source, target, access.scope(source)[1:])
+    return auth_store.restrict_to(target, auth_store.user_id_for(owner))
+
+
 @telemetry.traced("rag.import")
 def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = None) -> None:
     job = _jobs[job_id]
@@ -825,6 +908,8 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
     # set is not by itself evidence that anything survived to recover.
     staged = False
     ownership: dict | None = None
+    new_access = None    # (collection, state replaced, state written) when this job set one (#606)
+    built = False        # this job's build of the target finished
 
     def progress(n: int) -> None:
         job["chunks_written"] = n
@@ -843,6 +928,13 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
         _check_embedding(manifest)                                  # check 4
 
         original = manifest["collection"]["name"]
+        # A package of a collection its owner may not use is refused as if it
+        # weren't there, before the job names the collection anywhere (#606).
+        source = package_source(original) if isinstance(original, str) and original else None
+        if source and _refused(job.get("owner"), source):
+            job["access_refused"] = True
+            raise PackageError("PACKAGE_UNREADABLE",
+                               f"No package named '{archive.name}' in the exports directory.")
         id8 = packager.sha256_file(pkg / "manifest.json")[:8]
         job["collection"] = original
         job["fidelity"] = manifest.get("fidelity")
@@ -892,6 +984,15 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
                 raise PackageError("COLLECTION_DELETING", collection_writes.deleting_message(target),
                                    {"collection": target}) from None
 
+            # A collection this import creates gets its access state before any
+            # data is written; a replace keeps the target's (#606).
+            if not exists or on_conflict != "replace":
+                states = _start_access(job.get("owner"), source or target, target,
+                                       operator=job.get("operator") is True)
+                if states is not None:
+                    before, written = states
+                    new_access = (target, written, before)       # put_back's (collection, expected, previous)
+
             if exists and on_conflict == "replace":
                 # Prove the package inserts cleanly before destroying anything.
                 ownership = collection_recovery.begin(target, "import", wc.get_client())
@@ -918,6 +1019,7 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
             instance = _mark_started(target, expected, job_id, lambda: _package_records(pkg, manifest))
             marked = target
             written = _build(target, pkg, manifest, progress, instance)
+            built = True
             _mark_finished(target)
             marked = None
             job.setdefault("restored_sessions", [])
@@ -966,6 +1068,23 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
                 _mark_finished(marked)
             except Exception:
                 _log.exception("Could not finish import marker for %r; startup will retry", marked)
+        if new_access and not built and job.get("status") == "failed":
+            # The state this job wrote goes back to what it replaced, unless a
+            # create of the same name wrote its own since (#606), but only once
+            # the collection is known to be gone: a build whose cleanup failed
+            # (cleanup_pending), or a create Weaviate applied but answered with
+            # an error, leaves a partial collection, which keeps the
+            # restriction (#788). A collection it did build keeps its state.
+            if ((job.get("error_detail") or {}).get("cleanup_pending")
+                    or exists_fail_closed(new_access[0])):
+                _log.warning("Import into %r failed but the collection may still exist; "
+                             "its access state stays", new_access[0])
+            else:
+                try:
+                    auth_store.put_back(*new_access)
+                except Exception:                         # noqa: BLE001
+                    _log.exception("Could not put back the access state of %r after a failed import",
+                                   new_access[0])
         if ownership and ownership["state"] == "scratch":
             try:
                 collection_recovery.discard(ownership, wc.get_client())
@@ -996,10 +1115,11 @@ async def start_import_job(filename: str, on_conflict: str, passphrase: str | No
                               f"'{key}' is not encrypted, so it takes no passphrase. "
                               "Anyone with the file can read it.")
     job_id = str(uuid.uuid4())[:8]
-    with _lock:
-        if key in _active:
-            raise ImportInProgressError(filename)
-        _active.add(key)
+    # Off the event loop: the claim waits while a sweep holds the retention lock
+    # (#677). A cancellation while it runs still releases it (#794).
+    from services import package_retention
+    await package_retention.run_claim(lambda: _claim_package(key, filename),
+                                      lambda _: _release_package(key))
 
     # The first write is durable, so it runs off the event loop (#309). A start
     # cancelled meanwhile releases its guard; the store removes the record.
@@ -1023,8 +1143,7 @@ async def start_import_job(filename: str, on_conflict: str, passphrase: str | No
             "owner": owner,                     # who started it, for the job lists (#617)
         })
     except BaseException:
-        with _lock:
-            _active.discard(key)
+        _release_package(key)
         raise
     asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, filename, on_conflict,
                                           passphrase))

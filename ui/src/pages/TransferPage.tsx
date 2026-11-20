@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom'
 import {
   api, CollectionInfo, ExportJob, ExportJobEntry, ImportJob, ImportJobEntry, PackageSummary, TuneOptions,
 } from '../api/client'
-import { useRole } from '../context/AuthContext'
+import { useAuth, useRole } from '../context/AuthContext'
 import JobList, { JobRow, newestToOpen, useJobList } from '../components/JobList'
 
 // A transfer job is running until it completes or fails (#617).
@@ -24,6 +24,11 @@ function sizeLabel(bytes: number | null): string {
   if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB`
   if (bytes >= 1e3) return `${(bytes / 1e3).toFixed(0)} KB`
   return `${bytes} B`
+}
+
+// A package's expiry (#677) in the viewer's local time.
+function expiresLabel(iso: string): string {
+  return new Date(iso).toLocaleString()
 }
 
 const CONFLICT = [
@@ -54,6 +59,8 @@ function message(e: unknown): string {
 
 export default function TransferPage() {
   const { role } = useRole()
+  // Query-only mode (#670): no import here; packages are loaded on the host.
+  const queryOnly = useAuth().user?.query_only === true
   // Running and recent exports and imports, in one list (#617). Each panel
   // opens its own newest job on the first answer, unless it already has one.
   const exportJobs = useJobList<ExportJobEntry>(loadExportJobs, transferRunning)
@@ -97,6 +104,11 @@ export default function TransferPage() {
   const importTimer = useRef<number | null>(null)
   const exportPoll = useRef(0)
   const importPoll = useRef(0)
+  // Downloads being watched (#677): a full download deletes a package exported
+  // here, so the list is re-read until it is gone. `gone` holds the packages
+  // seen to go, so the finished export stops offering its Download.
+  const downloadWatches = useRef(new Map<string, number>())
+  const [gone, setGone] = useState<Set<string>>(new Set())
 
   const loadPackages = useCallback(() => {
     api.getPackages().then(r => {
@@ -118,8 +130,33 @@ export default function TransferPage() {
       importPoll.current += 1
       if (exportTimer.current) window.clearTimeout(exportTimer.current)
       if (importTimer.current) window.clearTimeout(importTimer.current)
+      downloadWatches.current.forEach(id => window.clearInterval(id))
+      downloadWatches.current.clear()
     }
   }, [loadPackages])
+
+  // After a Download click: re-read the package list every 3 s, for at most 10
+  // minutes, until the package isn't listed any more. A package not exported
+  // here stays listed, and its watch just ends at the limit (#677).
+  const watchDownload = useCallback((name: string) => {
+    const watches = downloadWatches.current
+    if (watches.has(name)) return
+    const started = Date.now()
+    const stop = () => { window.clearInterval(watches.get(name)); watches.delete(name) }
+    watches.set(name, window.setInterval(() => {
+      if (!alive.current || Date.now() - started > 10 * 60 * 1000) { stop(); return }
+      api.getPackages().then(r => {
+        if (!alive.current) return
+        setPackages(r.packages)
+        setPackagesError('')
+        if (!r.packages.some(p => p.filename === name)) {
+          stop()
+          setGone(g => new Set(g).add(name))
+          setFilename(f => (f === name ? '' : f))
+        }
+      }, () => {})
+    }, 3000))
+  }, [])
 
   // Fidelity is shown before the export runs, so the choice is informed rather
   // than discovered afterwards in the manifest. A lookup that fails says so
@@ -309,6 +346,8 @@ export default function TransferPage() {
       </div>
       <p className="text-sm text-gray-500 mb-6">
         Packages are written to and read from <code>./exports</code> in the project directory.
+        A package exported here is deleted from there once it has been fully downloaded, or when it
+        expires if nobody downloads it. Packages copied in to be imported are left alone.
       </p>
 
       <JobList rows={jobRows} showOwner={role === 'engineer'}
@@ -354,7 +393,7 @@ export default function TransferPage() {
           <span>
             Include the models
             <span className="block text-xs text-gray-500">
-              Bundles the embedding model and the LLM, taking the package to roughly 2.3 GB.
+              Bundles the embedding model and the answering LLM, taking the package to roughly 2.3 GB.
               Needed only when the target machine has never pulled them.
             </span>
           </span>
@@ -410,6 +449,21 @@ export default function TransferPage() {
                 </span>
               </p>
             )}
+            {exportJob.status === 'completed' && exportJob.filename && gone.has(exportJob.filename) && (
+              <p className="mt-2 text-gray-500 text-xs">Downloaded and deleted from ./exports.</p>
+            )}
+            {exportJob.status === 'completed' && exportJob.filename && !gone.has(exportJob.filename) && (
+              <p className="mt-2 flex items-center gap-3">
+                <a href={api.packageDownloadUrl(exportJob.filename)} download
+                   onClick={() => watchDownload(exportJob.filename as string)}
+                   className="bg-blue-600 text-white px-3 py-1 rounded text-xs hover:bg-blue-700">
+                  Download
+                </a>
+                {exportJob.expires_at && (
+                  <span className="text-gray-500 text-xs">Expires {expiresLabel(exportJob.expires_at)}</span>
+                )}
+              </p>
+            )}
             {exportJob.status === 'failed' && (
               <p className="text-red-600">
                 {exportJob.error_code && <code className="text-xs mr-2">{exportJob.error_code}</code>}
@@ -425,11 +479,23 @@ export default function TransferPage() {
 
       {/* ── Import ─────────────────────────────────────────────────────── */}
       <section className="bg-white border rounded p-4">
-        <h2 className="font-medium mb-3">Import a package</h2>
+        <h2 className="font-medium mb-3">{queryOnly ? 'Packages in ./exports' : 'Import a package'}</h2>
+        {queryOnly && (
+          <p className="text-xs text-gray-500 mb-3">
+            This instance is query-only. An operator loads a package on the host
+            with <code>python -m loader</code> (README, "Query-only mode").
+          </p>
+        )}
 
         <div className="flex items-center justify-between mb-1">
           <label className="block text-sm font-medium">Package in ./exports</label>
-          <button onClick={loadPackages} className="text-xs text-blue-600 hover:underline">Refresh</button>
+          <span className="flex items-center gap-3">
+            {filename
+              ? <a href={api.packageDownloadUrl(filename)} download onClick={() => watchDownload(filename)}
+                   className="text-xs text-blue-600 hover:underline">Download</a>
+              : <button disabled className="text-xs text-gray-400">Download</button>}
+            <button onClick={loadPackages} className="text-xs text-blue-600 hover:underline">Refresh</button>
+          </span>
         </div>
         <select
           value={filename}
@@ -445,6 +511,7 @@ export default function TransferPage() {
                 : p.readable
                 ? ` — ${p.collection}, ${p.chunk_count} chunks, ${p.fidelity}, ${sizeLabel(p.size_bytes)}`
                 : ' — unreadable'}
+              {p.expires_at ? `, expires ${expiresLabel(p.expires_at)}` : ''}
             </option>
           ))}
         </select>
@@ -455,6 +522,7 @@ export default function TransferPage() {
           </p>
         )}
 
+        {!queryOnly && (<>
         {selectedEncrypted && (
           <div className="mb-3">
             <label className="block text-sm font-medium mb-1">Passphrase</label>
@@ -516,6 +584,7 @@ export default function TransferPage() {
             ))}
           </div>
         )}
+        </>)}
       </section>
     </div>
   )

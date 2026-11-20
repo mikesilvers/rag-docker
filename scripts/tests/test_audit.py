@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -36,7 +37,7 @@ from pydantic import ValidationError
 import config
 from config import settings
 from main import app
-from auth import passwords, policy, store
+from auth import mfa, passwords, policy, store
 from services import audit, jobstore
 
 ORIGIN = "http://testserver"
@@ -246,6 +247,57 @@ class MiddlewareTests(AuditTestCase):
         text = self.raw()
         for secret in (password, "wrong-password-1"):
             self.assertNotIn(secret, text)
+
+    def test_second_factor_records(self):
+        # S10 of RD-117 (#607): each code attempt is its own record with the
+        # user as actor, never counted in a window, and no code is written.
+        dev = store.get_user("dev")
+        secret, _ = store.start_enrollment(dev.id, "dev")
+        token = store.create_session(dev.id)
+        codes = store.confirm_enrollment(store.authenticate(token), mfa.code_at(secret, int(time.time() // 30) - 1))
+        login = self.client.post("/auth/login", json={"username": "dev", "password": self.passwords["developer"]})
+        self.assertEqual(login.json(), {"mfa_required": True})
+        started = self.last("auth.login")
+        self.assertEqual((started["actor"], started["result"], started["details"]), ("dev", "success", {"mfa": "required"}))
+        challenge = login.cookies.get(store.MFA_COOKIE)
+        self.client.cookies.clear()
+        for _ in range(2):
+            self.client.post("/auth/login/mfa", json={"code": "zzzz-zzzz-zzzz-zzzz"},
+                             headers={"Cookie": f"{store.MFA_COOKIE}={challenge}"})
+        # Non-ASCII digits are a wrong code like any other, with its record (#607 review).
+        self.client.post("/auth/login/mfa", json={"code": "\u0661\u0662\u0663\u0664\u0665\u0666"},
+                         headers={"Cookie": f"{store.MFA_COOKIE}={challenge}"})
+        failed = [r for r in self.records() if r["action"] == "auth.mfa"]
+        self.assertEqual(len(failed), 3)
+        for item in failed:
+            self.assertEqual((item["actor"], item["actor_kind"], item["role"], item["result"], item["status_code"],
+                              item["details"]),
+                             ("dev", "user", "developer", "refused", 401, {"method": "recovery", "code": "MFA_FAILED"}))
+        self.client.post("/auth/login/mfa", json={"code": codes[0]}, headers={"Cookie": f"{store.MFA_COOKIE}={challenge}"})
+        ok = self.last("auth.mfa")
+        self.assertEqual((ok["actor"], ok["result"], ok["details"]), ("dev", "success", {"method": "recovery"}))
+        # No live challenge: nobody is named and nothing is written.
+        count = len(self.records())
+        self.client.post("/auth/login/mfa", json={"code": "123456"}, headers={"Cookie": f"{store.MFA_COOKIE}=nope"})
+        self.assertEqual(len(self.records()), count)
+        text = self.raw()
+        for value in [secret, challenge, "zzzz-zzzz-zzzz-zzzz"] + codes:
+            self.assertNotIn(value, text)
+
+    def test_enrollment_reset_and_switch_records(self):
+        eng = self.session("eng")
+        started = self.client.post("/auth/mfa/enroll", headers=eng).json()
+        self.client.post("/auth/mfa/enroll/confirm", headers=eng,
+                         json={"code": mfa.code_at(started["secret"], int(time.time() // 30))})
+        enrolled = self.last("auth.mfa.enroll")
+        self.assertEqual((enrolled["actor"], enrolled["result"]), ("eng", "success"))
+        self.client.post("/auth/mfa/policy", headers=eng, json={"required": True})
+        switched = self.last("admin.mfa.policy")
+        self.assertEqual((switched["actor"], switched["result"], switched["details"]), ("eng", "success", {"required": True}))
+        self.client.post("/auth/users/dev/reset-mfa", headers=eng)
+        reset = self.last("admin.user.reset-mfa")
+        self.assertEqual((reset["actor"], reset["target"], reset["result"]), ("eng", "dev", "success"))
+        self.assertNotIn(started["secret"], self.raw())
 
     def test_logout_and_password_change(self):
         headers = self.session("user")
@@ -499,6 +551,9 @@ class CommandTests(AuditTestCase):
         self.assertIn("code", self.last("operator.bootstrap")["details"])
         reset = self.run_auth("reset-password", "admin")
         self.assertEqual(self.last("operator.reset-password")["target"], "admin")
+        self.assertEqual(self.run_auth("reset-mfa", "admin").returncode, 0)          # #607
+        mfa_reset = self.last("operator.reset-mfa")
+        self.assertEqual((mfa_reset["actor"], mfa_reset["target"], mfa_reset["result"]), ("operator", "admin", "success"))
         count = len(self.records())
         self.run_auth("list")
         self.run_auth("set-role", "!!", "developer")                   # usage error
@@ -677,21 +732,31 @@ class ReviewerCoverageTests(AuditTestCase):
             "admin.principal.enable", "admin.key.issue", "admin.key.revoke", "audit.view", "audit.download",
             # Document preparation (#638).
             "prepare.upload", "prepare.start", "prepare.cancel", "prepare.import", "prepare.download",
-            "prepare.delete"})
+            "prepare.delete",
+            # Downloading an export package (#677).
+            "package.download",
+            # Two-step verification (#607).
+            "auth.mfa", "auth.mfa.enroll", "auth.mfa.recovery-codes", "auth.mfa.disable", "admin.user.reset-mfa",
+            "admin.mfa.policy",
+            # Per-collection access (#606); its refusals elsewhere are written directly.
+            "collection.access"})
         # Not recorded (D3): other GETs, job polling, gold-standard generate/edit/regenerate.
         # A preparation job's cancel is an action, not polling (#638).
         for method, path in audit.ACTIONS:
             self.assertFalse(method == "GET" and path not in (
                 "/goldstandard/download/{filename}", "/audit", "/audit.csv",
-                "/prepare/documents/{document_id}/raw", "/prepare/documents/{document_id}/prepared"), path)
+                "/prepare/documents/{document_id}/raw", "/prepare/documents/{document_id}/prepared",
+                "/packages/{filename}"), path)
             if path != "/prepare/job/{job_id}/cancel":
                 self.assertNotIn("/job/", path)
             self.assertFalse(path.startswith("/goldstandard/") and path not in (
                 "/goldstandard/save", "/goldstandard/download/{filename}"), path)
 
     def test_successful_config_saves_and_password_change(self):
+        # The settings routes answer 404 for a collection that doesn't exist (#606).
         with patch("services.ingest_config.save", lambda cfg: cfg), \
-                patch("services.retrieval_config.save", lambda cfg: cfg):
+                patch("services.retrieval_config.save", lambda cfg: cfg), \
+                patch("services.weaviate_client.collection_exists", AsyncMock(return_value=True)):
             self.assertEqual(self.client.post("/ingest/config", headers=self.session("dev"),
                                               json={"collection": "Docs"}).status_code, 201)
             self.assertEqual(self.client.post("/retrieval/config", headers=self.session("dev"),
@@ -777,9 +842,10 @@ class ReviewerConcurrencyTests(AuditTestCase):
     ROUNDS = int(os.environ.get("RAG_AUDIT_ROUNDS", "3"))
     MAX, KEEP = 4096, 1000                            # rotate every ~20 records; delete nothing
 
-    def writers(self, records_per_thread=150, threads=4, child_records=150):
+    def writers(self, records_per_thread=150, threads=4, child_records=150, hold=None):
         """Start 4 threads and a second process appending padded, numbered
-        records; returns a function that waits for them all."""
+        records; returns a function that waits for them all. `hold`, when
+        given, is called by each thread once, after half its records (#790)."""
         script = ("import sys; sys.path.insert(0, sys.argv[1]);"
                   "from services import audit\n"
                   f"for n in range({child_records}): audit.record('query', result='success',"
@@ -790,6 +856,8 @@ class ReviewerConcurrencyTests(AuditTestCase):
 
         def write(t):
             for n in range(records_per_thread):
+                if hold and n == records_per_thread // 2:
+                    hold()
                 audit.record("query", result="success", details={"t": t, "n": n, "pad": "w" * 150})
 
         pool = [threading.Thread(target=write, args=(t,)) for t in range(threads)]
@@ -813,34 +881,58 @@ class ReviewerConcurrencyTests(AuditTestCase):
     def test_full_reads_while_writers_rotate_are_whole_prefixes(self):
         # A read holds every record up to some point, each once, newest first:
         # exactly the oldest-first prefix of the final log, reversed.
-        partial = 0                                   # reads made while the writers ran
+        partial = 0                                   # reads, other than the held one, made while the writers ran
+        THREADS = 4
         for round_ in range(self.ROUNDS):
             with self.subTest(round=round_), self.settings_patch():
                 for path in self.audit_dir.glob("audit.jsonl*"):
                     path.unlink()
                 self.seed()
                 reads, done = [], threading.Event()
+                arrived, count = threading.Lock(), [0]
+                all_held, released = threading.Event(), threading.Event()
+                held_read, stuck = [], []
+
+                def hold():
+                    # Each thread stops after half its records until the reader has finished a
+                    # read it started while all four were stopped (#790): that read can't hold
+                    # the threads' second halves, so every round has a partial read.
+                    with arrived:
+                        count[0] += 1
+                        if count[0] == THREADS:
+                            all_held.set()
+                    if not released.wait(timeout=60):
+                        stuck.append(True)
 
                 def reader():
                     while not done.is_set() or len(reads) < 3:
+                        held = all_held.is_set() and not released.is_set()
                         reads.append([item["id"] for item in audit.newest_first()])
+                        if held and not released.is_set():
+                            held_read.append(reads[-1])
+                            released.set()
 
                 watcher = threading.Thread(target=reader)
-                wait = self.writers()
+                wait = self.writers(threads=THREADS, hold=hold)
                 watcher.start()
                 wait()
                 done.set()
                 watcher.join()
                 final = [r["id"] for r in self.records()]                 # oldest first
+                self.assertFalse(stuck, "the reader didn't finish a read while the writer threads were held")
+                self.assertEqual(len(held_read), 1)
+                self.assertLess(len(held_read[0]), len(final),
+                                "the read made while the writer threads were held isn't partial")
                 self.assertEqual(len(final), 60 + 4 * 150 + 150)
                 self.assertEqual(len(set(final)), len(final))
                 self.assertGreater(len(list(self.audit_dir.glob("audit.jsonl.*"))), 20)   # it rotated a lot
-                partial += sum(1 for ids in reads if len(ids) < len(final))
+                partial += sum(1 for ids in reads if len(ids) < len(final) and ids is not held_read[0])
                 for n, ids in enumerate(reads):
                     self.assertEqual(list(reversed(ids)), final[:len(ids)],
                                      f"read {n} of {len(reads)} ({len(ids)} records) isn't a whole prefix: "
                                      f"{len(ids) - len(set(ids))} duplicate(s)")
-        self.assertGreater(partial, 0, "no read overlapped the writers, so the race wasn't exercised")
+        self.assertGreater(partial, 0, "no read other than the held one overlapped the writers, "
+                                       "so the race wasn't exercised")
 
     def test_paging_with_the_cursor_while_writers_rotate(self):
         # Paging back from the first page with `before` while records are added
@@ -961,7 +1053,7 @@ class LoginCoalescingTests(AuditTestCase):
         self.now += 5
         self.failed_login("Nobody")
         self.now += 60
-        self.failed_login("Nobody")                                   # the closed window's count goes first
+        self.failed_login("Nobody")                           # the closed window's count goes first
         items = self.logins()
         self.assertEqual([r["details"].get("count") for r in items], [None, 1, None])
         self.assertEqual(len(audit._logins), 1)

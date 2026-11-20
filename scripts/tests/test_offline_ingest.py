@@ -172,7 +172,7 @@ class OfflineIngestTests(unittest.TestCase):
             return '{"title": "Leave policy", "summary": "How leave is approved and recorded."}'
 
         async def models():
-            return {settings.llm_model}
+            return {settings.build_model}
 
         for name, text in (("minutes.txt", OVERTIME), ("policy.md", MARKDOWN)):
             with self.subTest(name=name):

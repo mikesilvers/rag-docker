@@ -3,14 +3,20 @@
 const assert = require('node:assert/strict');
 const { makeReporter, stubAuth } = require('./lib');
 
-const HEALTH = '/api/health', METRICS = '/api/metrics/latency';
+const HEALTH = '/api/health/details', METRICS = '/api/metrics/latency';
 const UNREADABLE = 'Service health could not be read: The server sent a response the UI could not read.';
 const service = (status, latency_ms, model) => model ? { status, latency_ms, model } : { status, latency_ms };
-const healthBody = (embed = 'ok') => ({
-  status: embed === 'ok' ? 'ok' : 'degraded',
+const healthBody = (embed = 'ok', build = null) => ({
+  status: embed === 'ok' && (!build || build.status === 'ok') ? 'ok' : 'degraded',
   services: {
     weaviate: service('ok', 11),
-    ollama: { llm: service('ok', 22, 'phi3.5'), embed: service(embed, 33, 'nomic-embed-text') },
+    // One LLM by default; `build` gives a different build model (#671).
+    ollama: {
+      llm: service('ok', 22, 'phi3.5'),
+      build_llm: build ? service(build.status, 44, build.model) : service('ok', 22, 'phi3.5'),
+      embed: service(embed, 33, 'nomic-embed-text'),
+      same_model: !build,
+    },
   },
   resources: { memory: { status: 'ok', allocated_gb: 11.67, recommended_minimum_gb: 12.0 } },
 });
@@ -92,6 +98,8 @@ const cards = page => page.evaluate(() => [...document.querySelectorAll('span.ro
   colour: dot.classList.contains('bg-red-500') ? 'red' : dot.classList.contains('bg-green-500') ? 'green' : '?',
 })).map(c => `${c.label.split(' ')[0]}=${c.colour}`).join(', '));
 const ALL_GREEN = 'Weaviate=green, LLM=green, Embed=green';
+const labels = page => page.evaluate(() => [...document.querySelectorAll('span.rounded-full.w-2')]
+  .map(dot => (dot.parentElement.textContent || '').trim()));
 const EMBED_RED = 'Weaviate=green, LLM=green, Embed=red';
 const charts = n => `Latency Trends (${n} queries in ring buffer)`;
 const healthAlert = t => (t.match(/Service health could not be read:.{0,80}/) || [''])[0];
@@ -164,6 +172,28 @@ async function runHealthPageTests(browser, base, reporter) {
       await release(page, METRICS, 3, { body: metricsBody(5) });
       await release(page, METRICS, 2, { body: metricsBody(3) });
       await assertCharts(page, 5);
+    }],
+    // #671: one LLM card when the models are the same, an answer card and a build card otherwise.
+    ['one model shows one LLM card that builds and answers', async page => {
+      await load(page, 1, OK, { body: metricsBody(1) });
+      assert.deepEqual(await labels(page), ['Weaviate', 'LLM (phi3.5), builds and answers', 'Embed (nomic-embed-text)']);
+    }],
+    ['two models show an answer card and a build card', async page => {
+      await load(page, 1, { status: 200, body: healthBody('ok', { status: 'ok', model: 'qwen2.5:0.5b' }) }, { body: metricsBody(1) });
+      assert.deepEqual(await labels(page), ['Weaviate', 'Answer LLM (phi3.5)', 'Build LLM (qwen2.5:0.5b)', 'Embed (nomic-embed-text)']);
+      assert.equal(await cards(page), 'Weaviate=green, Answer=green, Build=green, Embed=green');
+      const t = await text(page);
+      assert.ok(t.includes('44ms') && t.includes('22ms'), t.slice(0, 300));
+    }],
+    ['a missing build model (503) shows only the build card red', async page => {
+      await load(page, 1, { status: 503, body: healthBody('ok', { status: 'error', model: 'qwen2.5:0.5b' }) }, { body: metricsBody(1) });
+      assert.equal(healthAlert(await text(page)), '');
+      assert.equal(await cards(page), 'Weaviate=green, Answer=green, Build=red, Embed=green');
+    }],
+    ['a health body without build_llm is unreadable, not a page error', async page => {
+      const body = healthBody(); delete body.services.ollama.build_llm;
+      await load(page, 1, { status: 200, body }, { body: metricsBody(1) });
+      await assertUnreadable(page, UNREADABLE);
     }],
     ['a late older metrics success after a newer failure is shown', async page => {
       await refresh(page, 2);

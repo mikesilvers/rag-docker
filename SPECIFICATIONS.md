@@ -24,6 +24,14 @@ services:
   weaviate:
     # 1.27.0 is the minimum supported by weaviate-client 4.23.1 (pinned in
     # api/requirements.txt); 1.25.x fails at connect with WeaviateStartUpError.
+    # Use the plain X.Y.Z tag: it is the multi-arch image. The suffixed tags,
+    # such as 1.40.2-9858973.arm64, carry one platform only (#527, #530), so
+    # Dependabot ignores Weaviate (.github/dependabot.yml) and it is upgraded
+    # by hand. The main stack's images are pinned by tag, not digest (decided
+    # on #544): weaviate and ollama to exact versions, nginx to the 1.29-alpine
+    # tag, which moves with patch and Alpine rebuilds and which Dependabot
+    # updates. The opt-in telemetry collector (docker-compose.telemetry.yml) is
+    # the exception: it is pinned by digest.
     image: semitechnologies/weaviate:1.40.2
     environment:
       QUERY_DEFAULTS_LIMIT: 25
@@ -78,13 +86,20 @@ services:
     # Windows machine in the transfer path can all drop it), which would
     # otherwise fail with "permission denied" on a fresh install.
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    # The LLMs (#671), set once; the api merges the same block. Each of
+    # BUILD_LLM_MODEL and ANSWER_LLM_MODEL falls back to LLM_MODEL when empty.
+    environment: &llm-models
+      LLM_MODEL: llama3.1:8b
+      BUILD_LLM_MODEL: ""
+      ANSWER_LLM_MODEL: ""
     volumes:
       - ollama_models:/root/.ollama
       - ./ollama/entrypoint.sh:/entrypoint.sh:ro
+      - ./ollama/models.sh:/models.sh:ro
     networks: [rag-internal]
     healthcheck:
-      # The ollama image has no curl/wget; the CLI is the only probe available.
-      test: ["CMD-SHELL", "ollama list | grep -q llama3.1:8b && ollama list | grep -q nomic-embed-text"]
+      # Healthy once `ollama list` has every model ollama/models.sh resolves (#671).
+      test: ["CMD", "bash", "/models.sh", "present"]
       interval: 20s
       timeout: 15s
       retries: 20
@@ -108,13 +123,13 @@ services:
       WEAVIATE_PORT: 8080
       OLLAMA_HOST: ollama
       OLLAMA_PORT: 11434
-      LLM_MODEL: llama3.1:8b
+      <<: *llm-models        # LLM_MODEL, BUILD_LLM_MODEL, ANSWER_LLM_MODEL (#671)
       EMBED_MODEL: nomic-embed-text
       UPLOAD_DIR: /app/uploads
       SOURCES_DIR: /app/sources
       EXPORTS_DIR: /app/exports
       OLLAMA_MODELS_DIR: /ollama
-      # Shown by /health and compared against the memory Docker actually
+      # Shown by /health/details and compared against the memory Docker actually
       # provides. Raise this if you allocate more to Docker Desktop.
       RECOMMENDED_MEMORY_GB: 12
       # The most one upload's ZIPs may expand to in all, gzipped members'
@@ -239,30 +254,33 @@ ollama serve &
 OLLAMA_PID=$!
 # Wait for server to be ready
 until ollama list > /dev/null 2>&1; do sleep 2; done   # no curl in this image
-# Pull models if not already cached in volume (a model counts as cached only when
-# a NAME in `ollama list` is exactly its name, or its name with :latest)
-ollama pull llama3.1:8b
-ollama pull nomic-embed-text
+# The models: the answer LLM, the build LLM when it is a different model, and
+# nomic-embed-text, resolved by ollama/models.sh from LLM_MODEL, BUILD_LLM_MODEL
+# and ANSWER_LLM_MODEL (#671). Each is pulled unless already cached in the volume
+# (a model counts as cached only when a NAME in `ollama list` is exactly its
+# name, or its name with :latest)
+. "$(dirname "$0")/models.sh"
+for model in $(models); do ollama pull "$model"; done   # with skip, timeout and retry in the real script
 wait $OLLAMA_PID
 ```
 
-The Ollama healthcheck is extended to verify both models are present, not merely that the server is running:
+The Ollama healthcheck is extended to verify every resolved model is present, not merely that the server is running:
 
 ```yaml
 healthcheck:
-  test: ["CMD-SHELL", "ollama list | grep -q llama3.1:8b && ollama list | grep -q nomic-embed-text"]
+  test: ["CMD", "bash", "/models.sh", "present"]
   interval: 20s
   timeout: 15s
   retries: 20
   start_period: 1800s
 ```
 
-`start_period: 1800s` gives the model pull time to complete on first run before health retries begin counting as failures: about 5.2 GB (#647), so a link down to about 23 Mbps finishes inside it, and ollama is marked unhealthy only after about 37 minutes. Docker still runs the check every 20 s during the start period and marks the container healthy at the first pass, so a start with the models present is as fast as before. `scripts/verify/stack.sh` waits up to two 900 s rounds for the stack, which together cover the start period. The API service's `depends_on: { ollama: service_healthy }` ensures no API traffic flows until both models are confirmed present.
+`start_period: 1800s` gives the model pull time to complete on first run before health retries begin counting as failures: about 5.2 GB (#647), so a link down to about 23 Mbps finishes inside it, and ollama is marked unhealthy only after about 37 minutes. Docker still runs the check every 20 s during the start period and marks the container healthy at the first pass, so a start with the models present is as fast as before. `scripts/verify/stack.sh` waits up to two 900 s rounds for the stack, which together cover the start period. The API service's `depends_on: { ollama: service_healthy }` ensures no API traffic flows until every resolved model is confirmed present.
 
 ### 2.4 Startup Sequence
 
 1. Weaviate starts with a 180-second healthcheck start period for cold Raft replay → healthcheck passes (ready endpoint returns 200)
-2. Ollama starts → pulls models (llama3.1:8b, nomic-embed-text) → healthcheck passes
+2. Ollama starts → pulls each distinct model `ollama/models.sh` resolves (the answer and build LLMs, llama3.1:8b by default, and nomic-embed-text) → healthcheck passes
 3. API starts → verifies both downstream connections → healthcheck passes
 4. UI starts (static build, no runtime deps)
 5. Nginx proxy starts
@@ -293,7 +311,8 @@ Engineer is created in the default mode before switching.
 
 **TLS server** (`proxy/nginx.lan.conf`): one server, `listen 443 ssl`, `http2 on`, TLS 1.2 and 1.3 only, Mozilla's
 intermediate cipher list for TLS 1.2, `ssl_prefer_server_ciphers off`, session tickets off, no
-`Strict-Transport-Security` header, the pair at `/etc/nginx/certs/live/{cert,key}.pem`, and the shared routes.
+`Strict-Transport-Security` header, `server_tokens off` (no nginx version in responses), the pair at
+`/etc/nginx/certs/live/{cert,key}.pem`, and the shared routes.
 
 **Certificate step** (`api/tls_cert.py`, run by `tls-init` on every start in LAN mode):
 
@@ -332,6 +351,82 @@ which the login page shows; the API never sees the attempt, so it writes no audi
 pass through. Where every client shares one address (Docker Desktop, LAN mode included; above), the limit is
 shared by all of them.
 
+### 2.6 Query-only Mode (#670)
+
+A query-only instance answers questions on collections built and exported elsewhere and can't change them. It is
+opt-in: only `docker compose -f docker-compose.yml -f docker-compose.query-only.yml ...` turns it on, alone or with
+LAN mode's file (`-f docker-compose.yml -f docker-compose.lan.yml -f docker-compose.query-only.yml`); without the
+override the stack is exactly as in §2.1. It may run on another machine; nothing connects it to the build instance,
+and packages move by file copy.
+
+**File:** `docker-compose.query-only.yml`. Over the base file it sets only `RAG_QUERY_ONLY: "true"` on the api (the
+base file sets `"false"`). It changes no other service, setting, port, volume or model.
+
+**The setting** (`api/config.py`): `RAG_QUERY_ONLY`, exactly `true` or `false`, default `false`; anything else stops
+the API at start-up with `Settings refused: RAG_QUERY_ONLY must be exactly true or false` (#555). No route or page
+changes it.
+
+**Refused routes** (`api/auth/policy.py` `QUERY_ONLY_REFUSED`). With the mode on, the authentication middleware
+answers `403 QUERY_ONLY` "This instance is query-only: its collections can't be created, changed or deleted here.
+Collections are loaded on the host with `python -m loader`." to: `POST /collections`, `DELETE /collections/{name}`,
+`POST /ingest/upload`, `POST /ingest/config`, `POST /retrieval/config`, `POST /goldstandard/generate`, `POST
+/goldstandard/regenerate`, `PATCH /goldstandard/session/{session_id}/pair/{pair_id}`, `POST /goldstandard/save`,
+`POST /import`, `POST /prepare/upload`, `DELETE /prepare/documents/{document_id}`, `DELETE
+/prepare/documents/{document_id}/prepared`, `POST /prepare/jobs`, `POST /prepare/job/{job_id}/cancel`, `POST
+/prepare/import`, `POST /tune/rechunk`, `POST /tune/reembed` and `POST /tune/reindex`. The check comes after every
+other refusal of a session or a key (§3.1.8), so a caller refused today is refused the same way, and before the route
+reads the body. The refusal carries its principal, so it is audited as the route's action, result `refused`.
+
+**Kept** (`QUERY_ONLY_KEPT`): every other route that changes state, that is the `/auth` routes, `POST /query`,
+`POST /export`, `GET /packages/{filename}` (and its delete of a package exported here, #677) and `PUT
+/collections/{name}/access`, plus every read. A host test fails when a state-changing route is in neither set.
+
+**The flag.** Every `AuthUser` answer (`POST /auth/login`, `POST /auth/login/mfa`, `GET /auth/me`, `POST
+/auth/password`) carries `query_only`. `GET /auth/status` and `GET /health` don't. The UI (§7.2) hides the Import,
+Prepare, Chunking, Retrieval and Gold Standard pages from the menus and the router, shows a "Query-only" tag, keeps
+the Transfer page's export and package list (with Download) under "Packages in ./exports" without its import
+controls, and keeps the Collections page's list and Access without "+ New Collection" and Delete.
+
+**The loader** (`api/loader.py`), the operator's way to load a package:
+`docker compose exec api python -m loader PACKAGE [--on-conflict abort|rename|replace]`.
+
+- `PACKAGE` is a file name in `./exports` (`/app/exports`), `ragpkg-*.tar.gz` or `ragpkg-*.tar.gz.age`; anything else,
+  a `/` included, is a usage error. `--on-conflict` defaults to `abort` and means what it means for `POST /import`.
+- Refusals, before the package is read: `NOT_QUERY_ONLY` (the instance isn't query-only), `LOAD_IN_PROGRESS` (another
+  load holds `loader.lock` in `UPLOAD_DIR`, a non-blocking exclusive `flock` held for the whole load),
+  `PACKAGE_NOT_FOUND` (not a regular file in `./exports`), `PASSPHRASE_REQUIRED` (an encrypted package and an empty
+  passphrase).
+- It runs the import code of `POST /import` (`services/importer.py`) in its own process, so every check of §6.2 and
+  §6.3 of `RAG_EXPORT_SPECIFICATIONS.md` applies, the embedding model and dimensions included (#390), bundled models
+  are installed and the sidecars restored. Its job record stays in its own memory; the API's job lists don't show it.
+  Under the lock and before the load it runs the import's sweep of an interrupted import, as the API does at start-up.
+- An encrypted package's passphrase is read from the terminal without echo, or as the first line of standard input
+  when that isn't a terminal; never an argument, never printed or recorded.
+- Every collection it creates starts restricted with no grants (Engineers only, until one opens or grants it): a
+  `rename`, or a package of a staging or recovery copy whose base exists here, too. It never copies another
+  collection's state (maintainer, 2026-11-18). `replace` keeps the target's state; a failed load puts back the state
+  it wrote. It is never refused a package for collection access.
+- While any load runs, whatever its mode, a question or export of its collection can meet it half-built or fail: the
+  API's in-process guards don't see the loader's process.
+- Ctrl-C: a SIGINT handler writes the `operator.load` record with result `interrupted` (`details.code`
+  `INTERRUPTED`), restores SIG_DFL and sends SIGINT again, so the process ends as a kill would and the import's
+  `finally` never retires the marker of a half-built collection. The next load's sweep removes a half-built
+  collection a marker owns; the work folder (`import-*` in `UPLOAD_DIR`) and a `replace`'s scratch staging collection
+  stay until the API's next start. A `replace` builds the package into a recovery collection before it deletes the
+  old collection, so one stopped after that delete leaves the target missing or partial, with the package's data (not
+  the old collection's) in the retained recovery collection; loading the package again with `--on-conflict replace`
+  restores the target. A Ctrl-C after the run's own record is written writes no second record; the handler's kill is
+  in a `finally`, and its line is written with `os.write`.
+- Output: one `loader: ` line per step on standard error (the package and mode, `chunks written: N` at most every 5
+  seconds while it changes, then the collection, chunks, fidelity and notes, or `load refused: CODE: message` / `load
+  failed: CODE: message`). Exit 0 loaded, 1 refused or failed, 2 usage error.
+- Audit: each run past the arguments writes `operator.load` (§3.1.9), actor `operator`, `target` the package,
+  `collection` the collection loaded into (or the package's, when a failure knows it), result `success`, `refused`
+  (a refusal before the load), `failed` (the import job failed) or `interrupted` (Ctrl-C), `details` `on_conflict`,
+  `encrypted`, and `chunks` or `code`.
+
+**Verify.** `scripts/verify/stack.sh run --query-only` (§10.11).
+
 ---
 
 ## 3. API Service Specification
@@ -363,6 +458,16 @@ the state (re-ingesting, saving the settings again) puts it under the stored nam
 GET /health
 ```
 
+Needs no login: the container healthcheck, `stack.sh`, CI and the verify wait loops read it. It answers
+only the overall status (#750): **200** `{"status": "ok"}`, or **503** `{"status": "degraded"}` when any
+downstream service is unreachable, by the same rule and checks as `GET /health/details` below.
+
+```
+GET /health/details
+```
+
+The full report, for Developers and AI Engineers, with a session or a service key (#750).
+
 **Response 200:**
 ```json
 {
@@ -371,7 +476,9 @@ GET /health
     "weaviate": { "status": "ok", "latency_ms": 1 },
     "ollama": {
       "llm": { "status": "ok", "latency_ms": 5, "model": "llama3.1:8b" },
-      "embed": { "status": "ok", "latency_ms": 5, "model": "nomic-embed-text" }
+      "build_llm": { "status": "ok", "latency_ms": 5, "model": "llama3.1:8b" },
+      "embed": { "status": "ok", "latency_ms": 5, "model": "nomic-embed-text" },
+      "same_model": true
     }
   },
   "resources": {
@@ -385,6 +492,10 @@ GET /health
 ```
 
 **Response 503** if any downstream service is unreachable. Individual service `status` is `"ok"` or `"error"`.
+
+`llm` is the answer model (`ANSWER_LLM_MODEL`), `build_llm` the build model (`BUILD_LLM_MODEL`), each
+falling back to `LLM_MODEL` (#671); a missing one of either makes the response 503. `same_model` is true when
+they are one model (`x` and `x:latest` are); it never affects the status.
 
 **Weaviate is probed through the client, not over plain HTTP.** A bare `GET
 /v1/.well-known/ready` cannot detect a client/server version mismatch: the server
@@ -419,7 +530,9 @@ unhealthy and take the whole stack down over a tuning warning.
 GET /collections
 ```
 
-Returns all Weaviate collections with stats. `created_at` is tracked by the API service (written to `{UPLOAD_DIR}/collection_registry.json` on each `POST /collections` call) since Weaviate does not expose a native collection creation timestamp.
+Returns the Weaviate collections the caller may use, with stats: Engineers see all; anyone else sees the open collections and the restricted ones granted to them (per-collection access, §3.1.8, #606). `created_at` is tracked by the API service (written to `{UPLOAD_DIR}/collection_registry.json` on each `POST /collections` call) since Weaviate does not expose a native collection creation timestamp.
+
+A collection created with `POST /collections` starts restricted to the account that created it (the person, or a key's service principal); `DELETE /collections/{name}` also deletes its restriction and grants. `GET /collections/{name}/access` and `PUT /collections/{name}/access` read and set who may use it (§3.1.8).
 
 **Response 200:**
 ```json
@@ -929,7 +1042,7 @@ shorten repeated headers or keys, or split the file` (§5.1.1).
 GET /ingest/config/{collection}
 ```
 
-Returns the saved default chunking configuration for a collection. If no configuration has been saved yet, returns the system defaults.
+Returns the saved default chunking configuration for a collection. If no configuration has been saved yet, returns the system defaults. A collection that doesn't exist, or one the caller may not use (§3.1.8, #606), is `404 COLLECTION_NOT_FOUND`; before #606 a missing collection got the defaults. `503 SERVICE_UNAVAILABLE` when Weaviate can't say whether it exists.
 
 **Response 200:**
 ```json
@@ -952,7 +1065,7 @@ Returns the saved default chunking configuration for a collection. If no configu
 POST /ingest/config
 ```
 
-Saves (upserts) a default chunking configuration for a collection. Creates the config entry on first call; overwrites on subsequent calls. Used by the Chunking Config page. Does not re-process existing documents.
+Saves (upserts) a default chunking configuration for a collection. Creates the config entry on first call; overwrites on subsequent calls. Used by the Chunking Config page. Does not re-process existing documents. A collection that doesn't exist, or one the caller may not use, is `404 COLLECTION_NOT_FOUND` and nothing is saved (#606; before it, settings were saved for any name).
 
 **Request body:** same schema as the GET response above, including `collection` (which selects the target) but excluding `is_default` (server-computed).
 
@@ -1089,10 +1202,10 @@ Ollama are available."
 not returned. Any other failure in the pipeline answers `500 INTERNAL_ERROR` (§3.2).
 
 **RAG pipeline (internal steps):**
-1. Reformat user question for retrieval using the LLM, `llama3.1:8b` by default (Section 6.1 prompt).
+1. Reformat user question for retrieval using the answer LLM (`ANSWER_LLM_MODEL`, else `LLM_MODEL`; `llama3.1:8b` by default) (Section 6.1 prompt).
 2. Embed reformulated question — **only for `hnsw` and `flat` modes**: call Ollama `/api/embeddings` directly; for `hybrid` and `semantic` modes, Weaviate handles query embedding internally via `text2vec-ollama`.
 3. Retrieve top_k chunks from Weaviate using the specified retrieval mode and its parameters.
-4. Pass original question + retrieved chunks to the LLM for synthesis (Section 6.2 or 6.3 prompt).
+4. Pass original question + retrieved chunks to the answer LLM for synthesis (Section 6.2 or 6.3 prompt).
 5. Format response according to `response_format`.
 
 ---
@@ -1103,7 +1216,9 @@ GET /retrieval/config/{collection}
 
 Returns the saved retrieval configuration for a collection. If nothing has been
 saved, returns the system defaults rather than a 404, so a caller never has to
-special-case a new collection.
+special-case a new collection. A collection that doesn't exist, or one the caller
+may not use (§3.1.8, #606), is `404 COLLECTION_NOT_FOUND` (before #606 a missing
+collection got the defaults); `503 SERVICE_UNAVAILABLE` when Weaviate can't say.
 
 **Response 200:**
 ```json
@@ -1161,7 +1276,9 @@ carries the settings it was tuned with.
 
 Config is persisted to `{UPLOAD_DIR}/retrieval_configs/{collection}.json`, written
 atomically with the same unique-temporary-file and serialized-publication contract
-as ingest settings above. Deleting a collection deletes its retrieval config.
+as ingest settings above. Deleting a collection deletes its retrieval config. Saving
+for a collection that doesn't exist, or one the caller may not use, is
+`404 COLLECTION_NOT_FOUND` and saves nothing (#606).
 
 ---
 
@@ -1380,9 +1497,9 @@ Exports are written to `{UPLOAD_DIR}/goldstandard_exports/{filename}`, a folder 
 }
 ```
 
-- `answer`: the LLM-generated answer (may have been edited by the reviewer)
+- `answer`: the answer the build LLM (`BUILD_LLM_MODEL`) generated (may have been edited by the reviewer)
 - `ground_truth`: the human-verified correct answer; initially identical to `answer` from generation, but the reviewer may have edited it separately via the PATCH endpoint before export
-- `contexts`: the source chunk(s) passed to the LLM during generation — used by RAGAS to evaluate context precision and recall
+- `contexts`: the source chunk(s) passed to the build LLM during generation — used by RAGAS to evaluate context precision and recall
 
 The file is a JSON array of these objects.
 
@@ -1467,17 +1584,18 @@ objects as the aggregate stat row.
 
 #### 3.1.8 Authentication and the endpoint/role matrix (#25)
 
-Every route needs an account, except `GET /health` (unchanged, for container healthchecks), `GET /auth/status`
-and `POST /auth/login`. Roles are ordered `end_user` < `developer` < `engineer`; a role may do everything a lower
+Every route needs an account, except `GET /health` (unchanged, for container healthchecks), `GET /auth/status`,
+`POST /auth/login` and `POST /auth/login/mfa` (the code step of a login with two-step verification, #607). Roles are ordered `end_user` < `developer` < `engineer`; a role may do everything a lower
 one may. The role of a request is the one stored for its user at that moment, never anything the client sends.
 
 | Needs | Routes |
 |---|---|
-| nothing | `GET /health`, `GET /auth/status`, `POST /auth/login` |
+| nothing | `GET /health`, `GET /auth/status`, `POST /auth/login`, `POST /auth/login/mfa` |
 | any session (also one with a password change due) | `GET /auth/me`, `POST /auth/logout`, `POST /auth/password` |
+| any session, after a due password change (also one with a two-step set-up due) | `GET /auth/mfa`, `POST /auth/mfa/enroll`, `POST /auth/mfa/enroll/confirm`, `POST /auth/mfa/recovery-codes`, `POST /auth/mfa/disable` |
 | `end_user` | `GET /collections`, `POST /query`, `GET /retrieval/config/{collection}` |
-| `developer` | `POST /collections`; `POST /ingest/upload`, `GET /ingest/job/{job_id}`, `GET /ingest/jobs`, `GET /ingest/config/{collection}`, `POST /ingest/config`; `POST /retrieval/config`; `POST /goldstandard/generate`, `GET /goldstandard/session/{session_id}`, `GET /goldstandard/sessions`, `PATCH /goldstandard/session/{session_id}/pair/{pair_id}`, `POST /goldstandard/regenerate`, `POST /goldstandard/save`, `GET /goldstandard/download/{filename}`; `POST /export`, `GET /export/job/{job_id}`, `GET /export/jobs`, `POST /import`, `GET /import/job/{job_id}`, `GET /import/jobs`, `GET /packages`, `GET /help/transfer`; `GET /tune/{collection}`; document preparation (§3.1.11): `POST /prepare/upload`, `GET /prepare/documents`, `GET /prepare/documents/{document_id}`, `GET /prepare/documents/{document_id}/raw`, `GET /prepare/documents/{document_id}/prepared`, `DELETE /prepare/documents/{document_id}`, `DELETE /prepare/documents/{document_id}/prepared`, `POST /prepare/jobs`, `GET /prepare/jobs`, `GET /prepare/job/{job_id}`, `POST /prepare/job/{job_id}/cancel`, `POST /prepare/import` |
-| `engineer` | `DELETE /collections/{name}`; `POST /tune/rechunk`, `POST /tune/reembed`, `POST /tune/reindex`, `GET /tune/job/{job_id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; FastAPI's `GET /docs`, `GET /docs/oauth2-redirect`, `GET /redoc`, `GET /openapi.json`; account administration: `GET /auth/users`, `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `POST /auth/users/{username}/role`, `POST /auth/users/{username}/disable`, `POST /auth/users/{username}/enable`; service principals and keys: `GET /auth/service-principals`, `POST /auth/service-principals`, `POST /auth/service-principals/{name}/role`, `POST /auth/service-principals/{name}/disable`, `POST /auth/service-principals/{name}/enable`, `POST /auth/service-principals/{name}/keys`, `POST /auth/service-principals/{name}/keys/{key_id}/revoke`; the audit log (§3.1.9): `GET /audit`, `GET /audit.csv` |
+| `developer` | `GET /health/details`; `POST /collections`; `POST /ingest/upload`, `GET /ingest/job/{job_id}`, `GET /ingest/jobs`, `GET /ingest/config/{collection}`, `POST /ingest/config`; `POST /retrieval/config`; `POST /goldstandard/generate`, `GET /goldstandard/session/{session_id}`, `GET /goldstandard/sessions`, `PATCH /goldstandard/session/{session_id}/pair/{pair_id}`, `POST /goldstandard/regenerate`, `POST /goldstandard/save`, `GET /goldstandard/download/{filename}`; `POST /export`, `GET /export/job/{job_id}`, `GET /export/jobs`, `POST /import`, `GET /import/job/{job_id}`, `GET /import/jobs`, `GET /packages`, `GET /packages/{filename}` (#677), `GET /help/transfer`; `GET /tune/{collection}`; document preparation (§3.1.11): `POST /prepare/upload`, `GET /prepare/documents`, `GET /prepare/documents/{document_id}`, `GET /prepare/documents/{document_id}/raw`, `GET /prepare/documents/{document_id}/prepared`, `DELETE /prepare/documents/{document_id}`, `DELETE /prepare/documents/{document_id}/prepared`, `POST /prepare/jobs`, `GET /prepare/jobs`, `GET /prepare/job/{job_id}`, `POST /prepare/job/{job_id}/cancel`, `POST /prepare/import` |
+| `engineer` | `DELETE /collections/{name}`; per-collection access (#606, browser sessions only): `GET /collections/{name}/access`, `PUT /collections/{name}/access`; `POST /tune/rechunk`, `POST /tune/reembed`, `POST /tune/reindex`, `GET /tune/job/{job_id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; FastAPI's `GET /docs`, `GET /docs/oauth2-redirect`, `GET /redoc`, `GET /openapi.json`; account administration: `GET /auth/users`, `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `POST /auth/users/{username}/role`, `POST /auth/users/{username}/disable`, `POST /auth/users/{username}/enable`, `POST /auth/users/{username}/reset-mfa`, `POST /auth/mfa/policy`; service principals and keys: `GET /auth/service-principals`, `POST /auth/service-principals`, `POST /auth/service-principals/{name}/role`, `POST /auth/service-principals/{name}/disable`, `POST /auth/service-principals/{name}/enable`, `POST /auth/service-principals/{name}/keys`, `POST /auth/service-principals/{name}/keys/{key_id}/revoke`; the audit log (§3.1.9): `GET /audit`, `GET /audit.csv` |
 
 The matrix is one table in `api/auth/policy.py`. A route without an entry is refused for everyone (`403
 FORBIDDEN`), and a registered check fails when a route lacks an entry or an entry names no route. Jobs and
@@ -1490,8 +1608,11 @@ is never received.
 **Refusals**, the first that applies answering: `503 SETUP_REQUIRED` (no account exists yet); `401
 AUTH_REQUIRED` (no valid session); `403 CROSS_ORIGIN_REFUSED` (a cookie-authenticated `POST`, `PUT`, `PATCH` or
 `DELETE` whose `Origin` names another host or port than its `Host`, or that has no `Origin` and no `Sec-Fetch-Site:
-same-origin`); `403 PASSWORD_CHANGE_REQUIRED` (a generated password is due for change; only the session routes
-answer); `403 FORBIDDEN` (the role is too low; `detail: {"required_role": ...}`). The API has no CORS middleware
+same-origin`; also a cookie-authenticated `GET` of a route that changes state, `GET /packages/{filename}` (#794),
+whose `Sec-Fetch-Site` is present and neither `same-origin` nor `none`); `403 PASSWORD_CHANGE_REQUIRED` (a generated password is due for change; only the session routes
+answer); `403 MFA_ENROLLMENT_REQUIRED` (two-step verification is required for everyone and the user hasn't set it
+up; only the session routes and the user's own `/auth/mfa` routes answer); `403 FORBIDDEN` (the role is too low; `detail: {"required_role": ...}`); `403 QUERY_ONLY` (query-only mode, §2.6,
+and a route that changes a collection or its data). The API has no CORS middleware
 and sends no `Access-Control-*` headers. A request with an `Authorization` header is a service key request and
 has its own refusals (**Service keys**, below).
 
@@ -1506,9 +1627,9 @@ No route deletes an account: accounts are disabled, so a username is never reuse
 and the login throttle, so all survive an API restart. The cookie `rag_session` holds a random 256-bit token; the
 store keeps its SHA-256. Cookie attributes: `HttpOnly`, `SameSite=Strict`, `Path=/`, `Max-Age=604800` (it
 survives closing the browser), and `Secure` when `AUTH_COOKIE_SECURE=true`. A session ends after 12 hours without
-a request or 7 days after login, whichever is first; an ended session is deleted. Every request re-reads the
-user: a role change applies to the next request; disabling an account, resetting its password and logging out
-delete its sessions.
+a request or 7 days after login, whichever is first; an ended session is deleted when it is next presented, and
+each login also deletes every session that has ended by time. Every request re-reads the user: a role change
+applies to the next request; disabling an account, resetting its password and logging out delete its sessions.
 
 **Login throttling.** Failed logins are counted per (username as typed, lowercased; client address, `X-Real-IP`
 from nginx). Five within 15 minutes throttle the pair for 15 minutes: its logins answer `429 LOGIN_THROTTLED`
@@ -1522,24 +1643,26 @@ to 10 a minute per client address with a burst of 5 (`429 LOGIN_RATE_LIMITED`, �
 | Route | Request | Success |
 |---|---|---|
 | `GET /auth/status` | | `200 {"setup_required": bool}` |
-| `POST /auth/login` | `{"username", "password"}` | `200 {"username", "role", "must_change_password"}` and the cookie. Every failure (unknown user, wrong password, disabled account, malformed username) is the same `401 LOGIN_FAILED` "The username or password is incorrect.", checked against a hash either way so the time doesn't differ |
-| `GET /auth/me` | | `200 {"username", "role", "must_change_password", "kind"}`; `kind` is `user` for a session and `service` for an API key (whose `must_change_password` is `false`) |
+| `POST /auth/login` | `{"username", "password"}` | `200 {"username", "role", "must_change_password", "query_only", "mfa_enrolled", "mfa_required", "mfa_enrollment_required"}` (`query_only`: §2.6, in every user answer) and the cookie; for a user with two-step verification, `200 {"mfa_required": true}` and the challenge cookie instead (**Two-step verification**, below). Every failure (unknown user, wrong password, disabled account, malformed username) is the same `401 LOGIN_FAILED` "The username or password is incorrect.", checked against a hash either way so the time doesn't differ |
+| `GET /auth/me` | | `200 {"username", "role", "must_change_password", "query_only", "kind", "mfa_enrolled", "mfa_required", "mfa_enrollment_required"}`; `kind` is `user` for a session and `service` for an API key (whose `must_change_password` and MFA fields are `false`); `mfa_required` is the switch, `mfa_enrollment_required` that it is on and the user isn't enrolled |
 | `POST /auth/logout` | | `200 {"status": "logged_out"}`; the session is deleted and the cookie expired |
-| `POST /auth/password` | `{"current_password", "new_password"}` | `200 {"status": "changed", "username", "role", "must_change_password": false}`; the user's other sessions end, this one stays. A wrong current password is `403 PASSWORD_INCORRECT`; a new one breaking the rules, or equal to the current one (so a generated password can't be kept), is `422 INVALID_PASSWORD` naming the rule |
+| `POST /auth/password` | `{"current_password", "new_password"}` | `200 {"status": "changed", "username", "role", "must_change_password": false, "query_only"}`; the user's other sessions end, this one stays. A wrong current password is `403 PASSWORD_INCORRECT`; a new one breaking the rules, or equal to the current one (so a generated password can't be kept), is `422 INVALID_PASSWORD` naming the rule |
 
 **Account administration** (engineers only). `User` is `{"username", "role", "enabled", "must_change_password",
-"created_at"}` (`created_at` in ISO 8601 UTC); it never holds a password, hash or session. A `{username}` in a path
+"created_at", "mfa_enrolled"}` (`created_at` in ISO 8601 UTC); it never holds a password, hash or session. A `{username}` in a path
 is lowercased; one that doesn't exist, or breaks the username rule, is `404 USER_NOT_FOUND`. A role other than
 `end_user`, `developer` or `engineer`, or a missing field, is `422 INVALID_PARAMETER`.
 
 | Route | Request | Success |
 |---|---|---|
 | `GET /auth/users` | | `200 {"users": [User, ...]}`, by username |
-| `POST /auth/users` | `{"username", "role"}` | `201 {"user": User, "password"}`: an enabled account with a generated password, to be changed at first login. A username breaking the rule is `422 INVALID_USERNAME`; one that exists (ignoring case) is `409 USER_EXISTS` |
+| `POST /auth/users` | `{"username", "role"}` | `201 {"user": User, "password"}`: an enabled account with a generated password, to be changed at first login. A username breaking the rule, whatever its length, is `422 INVALID_USERNAME`; one that exists (ignoring case) is `409 USER_EXISTS` |
 | `POST /auth/users/{username}/reset-password` | | `200 {"user": User, "password"}`: a new generated password, to be changed at next login; the user's sessions end. The engineer's own account is `409 SELF_RESET_REFUSED` (use `POST /auth/password`, which needs the current password) |
 | `POST /auth/users/{username}/role` | `{"role"}` | `200 {"user": User}`; existing sessions take the role on their next request |
 | `POST /auth/users/{username}/disable` | | `200 {"user": User}`; the user's sessions end and their logins fail with `LOGIN_FAILED` |
 | `POST /auth/users/{username}/enable` | | `200 {"user": User}`; the user can log in again with their current password |
+| `POST /auth/users/{username}/reset-mfa` | | `200 {"user": User}`: the user's two-step secret, recovery codes and challenges are deleted and all their sessions end (also when they weren't enrolled). The engineer's own account is `409 SELF_MFA_RESET_REFUSED` (another engineer, or the operator's `reset-mfa`) |
+| `POST /auth/mfa/policy` | `{"required": bool}` | `200 {"required"}`: requires two-step verification for everyone, or stops requiring it. Turning it on while the engineer isn't enrolled is `409 MFA_ENROLL_FIRST`; setting the current value changes nothing |
 
 A generated password (as the operator command's) is in its `201` or `200` answer only, sent with
 `Cache-Control: no-store`, and nowhere else. Demoting or disabling the last enabled engineer is `409
@@ -1570,7 +1693,7 @@ unrevoked, unexpired ones. Refusals, first that applies: `503 SETUP_REQUIRED`; `
 invalid, expired or revoked." for every reason; `403 KEY_NOT_ALLOWED` on every `/auth/users...` and
 `/auth/service-principals...` route, `POST /auth/logout`, `POST /auth/password`, `GET /audit` and `GET
 /audit.csv`, whatever the role; `403
-FORBIDDEN` when the role is too low. A key request has no origin check and no password-change check. Public
+FORBIDDEN` when the role is too low; `403 QUERY_ONLY` in query-only mode (§2.6). A key request has no origin check and no password-change check. Public
 routes ignore the header. Failed key requests are neither logged one by one nor throttled.
 
 **Service principal and key administration** (engineers' sessions only). `Principal` is `{"name", "role",
@@ -1581,7 +1704,7 @@ routes ignore the header. Failed key requests are neither logged one by one nor 
 | Route | Request | Success |
 |---|---|---|
 | `GET /auth/service-principals` | | `200 {"principals": [Principal, ...]}`, by name |
-| `POST /auth/service-principals` | `{"name", "role"}` | `201 {"principal"}`. A name breaking the rule is `422 INVALID_USERNAME`; one a person or principal holds is `409 PRINCIPAL_EXISTS` |
+| `POST /auth/service-principals` | `{"name", "role"}` | `201 {"principal"}`. A name breaking the rule, whatever its length, is `422 INVALID_USERNAME`; one a person or principal holds is `409 PRINCIPAL_EXISTS` |
 | `POST /auth/service-principals/{name}/role` | `{"role"}` | `200 {"principal"}`; its keys take the role on their next request |
 | `POST /auth/service-principals/{name}/disable` | | `200 {"principal"}`; its keys fail until it is enabled |
 | `POST /auth/service-principals/{name}/enable` | | `200 {"principal"}` |
@@ -1596,6 +1719,125 @@ enabled. The account routes stay for people: `GET /auth/users` lists no principa
 `/auth/users/{username}/...` path is `404 USER_NOT_FOUND`, and `POST /auth/users` with a principal's name is
 `409 USER_EXISTS`.
 
+**Per-collection access** (#606). A collection is *open* or *restricted*. A restricted collection may be used
+only by Engineers and the accounts granted it: people and service principals (a key acts as its principal, so all
+of a principal's keys share its grants). Grants are per account; there are no groups. A granted account does on the
+collection everything its role allows; an ungranted one can do nothing with it. Engineers reach every collection.
+The state is in `auth.db` (schema version 4, tables `restricted_collections` and `collection_grants`, keyed by the
+stored collection name): a store from before #606 gains the empty tables on first open, so every existing
+collection stays open. A staging or recovery collection of a rebuild or import (`<target>__tuning_<token>`,
+`<target>__importing_<token>`) gets its target's access when its ownership is recorded, before it is created, under
+its own name, and keeps that state as its own; discarding or deleting the copy drops it. A kept copy can itself be
+rebuilt, so a copy's target may be a copy too: the copy's *chain* is the copy, its target, that one's target and so
+on, down to the original collection, and a new copy gets the narrowest state across its target's chain (#792). While
+any collection in its chain has a state too, anyone but an Engineer may use the copy (query it, see it listed, export
+it, import its package) only when they may use every one (#788, #792), so restricting or narrowing the original
+reaches its existing copies and their copies, including ones kept from before #606 with no state of their own.
+Deleting a collection drops its state, so it then narrows nothing; a re-created one's state narrows its copies
+again. A state kept for a name that
+doesn't exist (a create or import that failed while the collection might exist, below) narrows that name's copies
+too; it only ever narrows. The rule is read on every request, so a change applies to
+each session's and key's next request; no session ends and a running job finishes. Grants stay when an account is
+disabled or its role changes; an Engineer demoted to a lower role is then bound by them.
+
+- **New collections.** `POST /collections` restricts the new collection to the creating account, Engineers
+  included. The restriction is written before the collection is created: if that write fails nothing is created
+  (`500 CREATE_FAILED`); if the create fails, the state it replaced is put back, but only while the state is still
+  the one it wrote, so a create and an import of the same new name at once never leave it open or give one the
+  other's grants, and only when Weaviate answers that the collection doesn't exist: one it applied but answered with
+  an error, or whose existence it can't confirm, keeps the restriction (#788). An import does the same with the
+  state it writes, and also keeps it when its build's cleanup of the partial collection failed (`cleanup_pending`).
+  An import that creates a collection under a new name (`rename`) copies its source collection's state
+  (open stays open; restricted copies the grants), and for a package of an existing staging or recovery copy the
+  narrowest across the copy's chain (restricted when any is, to the accounts granted every restricted one, #792); one
+  that creates its package's own name, which doesn't exist here, restricts it to the job's owner. An import `replace` and tuning keep the target's state.
+  `DELETE /collections/{name}` deletes the state, so a later collection of the same name starts afresh.
+- **Refusal.** A caller without access gets the answer given for something that doesn't exist, so the name isn't
+  confirmed: `404 COLLECTION_NOT_FOUND` on `POST /query`, `GET`/`POST /retrieval/config`, `GET`/`POST
+  /ingest/config`, `POST /ingest/upload`, `POST /prepare/import`, `POST /goldstandard/generate`, `POST /export` and
+  `GET /tune/{collection}`; `404 SESSION_NOT_FOUND` on the gold-standard session routes (`GET
+  /goldstandard/session/{session_id}`, `PATCH .../pair/{pair_id}`, `POST /goldstandard/regenerate`, `POST
+  /goldstandard/save`) for a session of such a collection; `404 JOB_NOT_FOUND` on `GET /ingest/job/{job_id}`, `GET
+  /export/job/{job_id}` and `GET /import/job/{job_id}` for a job naming one (an import job names its collection
+  once its package is read). The check runs before Weaviate is asked. `GET /collections` lists only usable
+  collections. Accepted: a Developer can still learn that a name exists where names must be unique, since
+  `POST /collections` with it answers `409 COLLECTION_EXISTS` and an import with `on_conflict: abort` fails on it;
+  the content stays closed.
+- **Gold-standard files.** `POST /goldstandard/save` records which collection each file came from in
+  `{UPLOAD_DIR}/goldstandard_export_collections.json`, outside the served folder, before it writes the file. `GET
+  /goldstandard/download/{filename}` checks it (`404 FILE_NOT_FOUND` without access); a file with no recorded
+  collection (saved before #606, or placed by hand) is served to Engineers only.
+- **Packages.** A package's collection is the name in its manifest; for a staging or recovery copy that no longer
+  exists here, the nearest collection in its chain that exists here, or the original when none does (#792). An
+  encrypted package's manifest can't be read, so one exported here has the collection recorded at its export (#794);
+  one recorded without a collection (before #794) is listed and served to Engineers only, and one copied in names no
+  collection. An encrypted package exported here that is missing from the record (its record write failed at
+  export, or an unreadable record was moved aside) is treated as copied in (#798). `GET /packages` hides a package
+  whose collection exists here and is
+  restricted, from a caller without access to it (Weaviate not answering counts as existing); for an existing copy,
+  access means access to every collection in its chain. The listing and the import job use the same rule. An import job refuses a package of such
+  a collection, for encrypted packages too once decrypted, before anything is created or replaced: the job fails
+  with the answer a missing package gives (`PACKAGE_UNREADABLE`, "No package named '<file>' in the exports
+  directory.") and names no collection.
+- **The Prepare area** (§3.1.11). A prepared document whose imports are all into collections the caller may not
+  use is hidden from them: left out of `GET /prepare/documents`, `404 DOCUMENT_NOT_FOUND` on its detail, raw and
+  prepared downloads and deletes, and an unknown id to `POST /prepare/jobs` and `POST /prepare/import` (`all: true`
+  doesn't select it). A document with at least one import into a collection the caller may use stays visible
+  everywhere, with its import records for the other collections left out. Preparation job records (`GET
+  /prepare/job/{job_id}`, `GET /prepare/jobs`) leave hidden documents out of `document_ids`, `names`, `current`
+  and `errors`; their counters stay. Engineers see every document and record; a document with no imports is
+  shared as before.
+- **Audit** (§3.1.9). A refusal on an audited route is that route's record, result `refused`, with
+  `details.reason: "collection_access"`; on another route, a `collection.access.refused` record (status 404,
+  `details.route`, `details.code`). A refused import's end record has result `refused` and the reason. A filtered
+  listing writes nothing. The MCP server (parked) needs no change: it reaches data only through these routes.
+
+| Route | Request | Success |
+|---|---|---|
+| `GET /collections/{name}/access` | | `200 {"restricted", "users", "service_principals"}`, names sorted. No such collection: `404 COLLECTION_NOT_FOUND`; Weaviate unavailable: `503 SERVICE_UNAVAILABLE` |
+| `PUT /collections/{name}/access` | `{"restricted", "users": [...], "service_principals": [...]}` (lists default `[]`, no other field) | The whole state at once, in one transaction; answers as the GET. `restricted: false` opens it and deletes its grants (names with it are `422 INVALID_PARAMETER`); `restricted: true` grants exactly the people in `users` and the principals in `service_principals` (lowercased; disabled accounts allowed; none means Engineers only). An unknown name, or one of the other kind, is `422 INVALID_PARAMETER` and changes nothing. One `collection.access` audit record with `restricted_before`, `restricted_after`, `added` and `removed`, and one API log line |
+
+Both are Engineers' routes for a browser session only: a key gets `403 KEY_NOT_ALLOWED`, so a leaked key can't open a
+collection to another principal. The Collections page (§7.8) manages them.
+
+**Two-step verification** (#607). TOTP with an authenticator app; no SMS and no external service, so it works
+offline. Service keys are unchanged: they have no second factor and get `403 KEY_NOT_ALLOWED` on every `/auth/mfa`
+route and on `reset-mfa`.
+
+- *Codes.* RFC 6238 with HMAC-SHA1, 6 digits, a 30-second step and a 160-bit random secret. A code counts for the
+  step before, the current one or the one after, and only for a step later than the last one the user's account
+  accepted, so no code works twice. A *recovery code* is 80 random bits shown as `xxxx-xxxx-xxxx-xxxx` (case,
+  spaces and `-` ignored); a user has 10, each works once in place of a code at login or for turning off, and they
+  are stored only as SHA-256.
+- *At rest.* `auth.db` (schema 3: tables `mfa`, `mfa_pending`, `recovery_codes`, `mfa_challenges`, `settings`;
+  an existing store gains them on first open with nobody enrolled and the switch off) holds each TOTP secret sealed
+  with AES-256-GCM, the user id as associated data, under a 32-byte key in `AUTH_DIR/mfa.key` (mode 0600, created
+  on first need). A copied `auth.db` alone reveals no secret. A secret that can't be unsealed (the key file lost or
+  replaced) never verifies: its user logs in with a recovery code, or is reset.
+- *Login.* For an enrolled user a right password opens no session: `POST /auth/login` answers `200
+  {"mfa_required": true}` and sets `rag_mfa` (a random 256-bit token, stored as SHA-256; HttpOnly,
+  SameSite=Strict, Path=/, Max-Age=300, Secure as `rag_session`), and the pair's earlier login failures stay
+  counted. `POST /auth/login/mfa {"code"}` (a TOTP code or a recovery code, at most 64 characters) then needs a
+  challenge under 5 minutes old with fewer than 5 codes tried, else `401 MFA_CHALLENGE_INVALID` "Your sign-in
+  expired. Log in again." (also once the user is disabled or reset). Each code counts against the login throttle of
+  the username and address before it is checked (`429 LOGIN_THROTTLED`). A wrong code is `401 MFA_FAILED` "The code
+  is incorrect.", for both kinds; a right one deletes the challenge, expires `rag_mfa` and answers as a login
+  without two-step verification, session cookie included. nginx limits `/api/auth/login/mfa` in the login's zone,
+  with its 16k body limit.
+- *The user's own routes.*
+
+| Route | Request | Success |
+|---|---|---|
+| `GET /auth/mfa` | | `200 {"enrolled", "enrolled_at", "required", "recovery_codes_remaining"}` |
+| `POST /auth/mfa/enroll` | | `200 {"secret", "otpauth_uri"}`, `Cache-Control: no-store`: a pending secret for 10 minutes, replacing an earlier one. Enrolled: `409 MFA_ALREADY_ENROLLED` |
+| `POST /auth/mfa/enroll/confirm` | `{"code"}` | `200 {"recovery_codes", "status"}`, `Cache-Control: no-store`: the secret becomes the user's, 10 recovery codes are made, and the user's other sessions end. No set-up in progress (or older than 10 minutes): `409 MFA_ENROLLMENT_NOT_STARTED`; a wrong code `422 MFA_CODE_INCORRECT` (the set-up stays) |
+| `POST /auth/mfa/recovery-codes` | `{"code"}` | `200 {"recovery_codes", "status"}`, `Cache-Control: no-store`: a new set replacing the old one, for a current TOTP code. A wrong code is `403 MFA_CODE_INCORRECT` and counts against the throttle; not enrolled `409 MFA_NOT_ENROLLED` |
+| `POST /auth/mfa/disable` | `{"password", "code"}` | `200 {"status"}`: the secret and recovery codes are deleted; sessions stay. Needs the current password and a TOTP or recovery code (either wrong: `403 MFA_DISABLE_INCORRECT`, counted against the throttle). While two-step verification is required: `409 MFA_REQUIRED`; not enrolled `409 MFA_NOT_ENROLLED` |
+
+- *Required for everyone.* While an engineer has it on (`POST /auth/mfa/policy`, only in the app), a session of a
+  user who isn't enrolled, existing sessions included, reaches only the session routes and the user's own
+  `/auth/mfa` routes; everything else is `403 MFA_ENROLLMENT_REQUIRED`. A due password change comes first.
+
 **Operator command**, inside the api container: `docker compose exec api python -m auth <subcommand>`.
 
 | Subcommand | Effect |
@@ -1605,6 +1847,7 @@ enabled. The account routes stay for people: `GET /auth/users` lists no principa
 | `reset-password USERNAME` | New generated password; the user's sessions end |
 | `set-role USERNAME ROLE` | Applies to existing sessions on their next request |
 | `disable USERNAME` / `enable USERNAME` | Disabling ends the user's sessions |
+| `reset-mfa USERNAME` | Removes the user's two-step verification (secret, recovery codes) and ends their sessions; the last-resort recovery, also for an engineer's own account. Refused (exit 1) for a service principal or an unknown name |
 | `list` | Username, role, enabled, password change due (`service account` for a service principal), created; never a password, hash or key |
 
 `bootstrap`, `create-user` and `reset-password` print a generated password (24 characters, 144 random bits)
@@ -1622,13 +1865,15 @@ is a single-file bind mount, and a proxy still running the old copy sends `Host`
 cookie-authenticated change fails the origin check with `403 CROSS_ORIGIN_REFUSED`.
 
 **Logging.** One `WARNING` line per login attempt (success, failure, throttled) on logger `auth`, with the
-username and client address; never a password, token or cookie. One `WARNING` line per account administration
+username and client address; never a password, token or cookie. Likewise one per second-factor attempt (accepted,
+failed, throttled) and per two-step set-up, regeneration, turn-off, reset and switch change, never a secret or code. One `WARNING` line per account administration
 change (create, reset, role, disable, enable) naming the engineer, the change and the account, and one per refusal
 (`INVALID_USERNAME`, `USER_EXISTS`, `USER_NOT_FOUND`, `LAST_ENGINEER`, `SELF_RESET_REFUSED`) saying why; never a
 password. One `WARNING` line per service principal or key change (create, role, disable, enable, key issued, key
 revoked) naming the engineer, the principal and the key id (and the role or expiry), and one per refusal
 (`INVALID_USERNAME`, `PRINCIPAL_EXISTS`, `PRINCIPAL_NOT_FOUND`, `KEY_NOT_FOUND`); never a key or its hash.
-Successful key requests aren't logged one by one (`last_used_at` records them). The telemetry route vocabulary gains the eighteen `/auth` routes as labels.
+A refused username or name longer than 256 characters is logged, and recorded as the audit target, cut to its first 256 characters.
+Successful key requests aren't logged one by one (`last_used_at` records them). The telemetry route vocabulary gains the `/auth` routes as labels (eighteen, and eight more with two-step verification, #607).
 These lines are unchanged by the audit log (§3.1.9), which records the same events durably.
 
 #### 3.1.9 Audit log (#29)
@@ -1663,13 +1908,23 @@ built yet; it is to include this folder.
 | `details` | The action's other parameters (below); `code`: the error envelope's code on a non-2xx answer |
 
 **Actions.** `auth.login` (success, failure, throttled), `auth.logout`, `auth.password`; `query`;
-`collection.create`, `collection.delete`; `ingest`, `ingest.config`; `retrieval.config`; `export`, `import`;
+`collection.create`, `collection.delete`; per-collection access (#606): `collection.access` (`restricted_before`,
+`restricted_after`, `added`, `removed`), `collection.access.refused` (a refused collection on a route with no action
+of its own); `ingest`, `ingest.config`; `retrieval.config`; `export`, `import`; export packages (#677):
+`package.download` (each `GET` or `HEAD` of `/packages/{filename}`, `details.file`; `details.completed` for a `GET`,
+`details.head: true` for a `HEAD`) and `package.delete`
+(each deletion of a package, `details.file` and `details.reason` `downloaded`, with the downloading caller as actor,
+or `expired`, actor `system`; written directly, not by a request);
 `tune.rechunk`, `tune.reembed`, `tune.reindex`; `goldstandard.save`, `goldstandard.download`; `admin.user.create`,
-`admin.user.reset-password`, `admin.user.set-role`, `admin.user.disable`, `admin.user.enable`;
+`admin.user.reset-password`, `admin.user.set-role`, `admin.user.disable`, `admin.user.enable`,
+`admin.user.reset-mfa`, `admin.mfa.policy` (`details.required`); two-step verification (#607): `auth.mfa` (each
+code attempt that reaches a live challenge, never counted in a window: actor the user, `details.method` `totp` or
+`recovery`; a request with no live challenge writes nothing; the password step before it is `auth.login` with
+`details.mfa` `required`), `auth.mfa.enroll`, `auth.mfa.recovery-codes`, `auth.mfa.disable`;
 `admin.principal.create`, `admin.principal.set-role`, `admin.principal.disable`, `admin.principal.enable`,
 `admin.key.issue`, `admin.key.revoke`; `audit.view`, `audit.download`; `operator.bootstrap`, `operator.create-user`,
-`operator.reset-password`, `operator.set-role`, `operator.disable`, `operator.enable` (`python -m auth`; not `list`,
-not usage errors); `system.start` (each API start, after the job records are loaded, with `question_text_logged`,
+`operator.reset-password`, `operator.set-role`, `operator.disable`, `operator.enable`, `operator.reset-mfa` (`python -m auth`; not `list`,
+not usage errors); `operator.load` (`python -m loader`, §2.6; not usage errors); `system.start` (each API start, after the job records are loaded, with `question_text_logged`,
 `max_bytes` and `keep`); document preparation (§3.1.11): `prepare.upload` (names, count, bytes), `prepare.start`
 (the ids or `all`; the job's `accepted` and end records), `prepare.cancel`, `prepare.import` (collection and part
 names; the ingest job's records), `prepare.download` and `prepare.delete` (two routes each, `target` the
@@ -1678,12 +1933,13 @@ polling, no gold-standard generate, edit or regenerate.
 
 **When.** A request to an audited route writes one record once its answer has been sent, so a page or CSV never
 holds its own `audit.view` or `audit.download`. A refusal by the authentication middleware is recorded only when it
-is a 403 for an identified principal (`FORBIDDEN`, `KEY_NOT_ALLOWED`, `CROSS_ORIGIN_REFUSED`,
+is a 403 for an identified principal (`FORBIDDEN`, `KEY_NOT_ALLOWED`, `CROSS_ORIGIN_REFUSED`, `QUERY_ONLY`,
 `PASSWORD_CHANGE_REQUIRED`); `401 AUTH_REQUIRED`, `401 KEY_INVALID` and `503 SETUP_REQUIRED` write nothing. A
 failed or throttled login has actor `null`, kind `anonymous` and the typed username as `target`. Repeated ones are
-counted (#577): a failure is written at once and opens a 60-second window for its key (the typed username
-lowercased, the client address and the status, 401 or 429); further failures with that key in the window aren't
-written; when it closes, one more record with the first one's fields carries `details.count` (how many) and
+counted (#577): a failure is written at once and, once that record is written, opens a 60-second window for its
+key (the typed username lowercased, the client address and the status, 401 or 429); a failure whose record wasn't
+written opens none, so the key's next failure is written too (#598). Further failures with that key in the window
+aren't written; when it closes, one more record with the first one's fields carries `details.count` (how many) and
 `details.last_attempt` (the last one's time, as `time`). The API writes closed windows within about a second and
 open ones at shutdown; a kill loses the open counts. At most 1,000 windows are open; past that, failures are
 written one by one. A job (ingest,
@@ -1788,12 +2044,15 @@ restores, whatever the package carries (`RAG_EXPORT_SPECIFICATIONS.md` §4.2).
 #### 3.1.11 Document preparation (#638)
 
 A preparation area where raw documents are made to follow the corpus rules (#615), stored on the
-instance and imported with one action. Code does the rule work exactly; the local LLM (`LLM_MODEL`) only
+instance and imported with one action. Code does the rule work exactly; the build LLM (`BUILD_LLM_MODEL`, else `LLM_MODEL`) only
 removes headers, footers, page numbers and boilerplate, and writes a title and summary, for PDF, DOCX, TXT and
 MD parts. CSV and JSON parts are labelled from their data, with no LLM call (#648). One area for the
 instance, in the `rag_preparation` volume (`PREPARATION_DIR`, `/app/preparation`); documents stay until
 deleted. Every route is `developer` (§3.1.8); documents are shared, each showing its owner, and any caller
-with access may delete any document.
+with access may delete any document, except that a document whose imports are all into collections the caller may
+not use is hidden from them and refused as an unknown document (`404 DOCUMENT_NOT_FOUND`), audited; a document with
+at least one import into a collection they may use stays visible without the other import records; job records
+leave hidden documents out; Engineers see everything (per-collection access, §3.1.8, #606).
 
 **Storage limit.** `MAX_PREPARATION_BYTES` (default 21474836480, 20 GiB; at least 1048576 or the API
 refuses to start): the most the area's files may hold, raw and prepared together. A best-effort cap
@@ -1865,7 +2124,7 @@ before the job, as they do at API startup after an interrupted job.
    header (the header: longer than half a part) fails the document; reading stops as soon as a row's raw text
    passes twice that, so an unclosed quote or a file with no line breaks is never held whole.
 4. *Clean* (PDF, DOCX, TXT, MD only) with §6.5: each part in windows of whole lines up to 3,000 characters
-   (a longer line is not sent); the LLM names the lines to remove and code removes them, never rewriting.
+   (a longer line is not sent); the build LLM names the lines to remove and code removes them, never rewriting.
    Each call has 120 s and is sent again once if it fails or times out; an unusable answer is asked again
    once. A window keeps its code-only text, recorded `{"window", "reason"}` on its part, when the lines named
    hold over 20 % of its characters (`removed-too-much`), include one over 200 characters
@@ -1956,6 +2215,8 @@ Standard error codes:
 | `CONFIRMATION_REQUIRED` | 400 | Destructive operation called without `?confirm=true` |
 | `INVALID_PATH` | 400 | Gold-standard export name breaks the name rule (1-128 ASCII letters, digits, `_`, `-`, `.` or spaces, ending in `.json`), or the name in the exports folder is not a regular file |
 | `FILE_NOT_FOUND` | 404 | Requested download file does not exist |
+| `PACKAGE_NOT_FOUND` | 404 | `GET /packages/{filename}`: no such package in `./exports`, a name outside the rule, or one the caller may not see (#677) |
+| `PACKAGE_BUSY` | 409 | `GET /packages/{filename}`: an import of the package runs or another download of it is in progress (#677) |
 | `EXPORTS_FOLDER_INVALID` | 409 | Gold-standard save or download refused: `goldstandard_exports` in `UPLOAD_DIR` is a file or a symbolic link, not a directory; move or rename it |
 | `PAIR_NOT_FOUND` | 404 | pair_id not found within the given session |
 | `SESSION_BUSY` | 409 | Operation not allowed while session is still generating |
@@ -1963,14 +2224,15 @@ Standard error codes:
 | `SETUP_REQUIRED` | 503 | No account exists yet; run `python -m auth bootstrap` (§3.1.8) |
 | `AUTH_REQUIRED` | 401 | No valid session: none, unknown, ended or of a disabled user |
 | `FORBIDDEN` | 403 | The user's role is too low (`detail.required_role`), or the route has no policy entry |
-| `CROSS_ORIGIN_REFUSED` | 403 | A cookie-authenticated change from another origin |
+| `CROSS_ORIGIN_REFUSED` | 403 | A cookie-authenticated change from another origin, or a download of a package (`GET /packages/{filename}`) whose `Sec-Fetch-Site` is present and neither `same-origin` nor `none` (#794) |
 | `PASSWORD_CHANGE_REQUIRED` | 403 | A generated password must be changed first; only `/auth/me`, `/auth/logout` and `/auth/password` answer |
+| `QUERY_ONLY` | 403 | Query-only mode (`RAG_QUERY_ONLY=true`, §2.6): the route creates, changes or deletes a collection or its data; collections are loaded with `python -m loader` |
 | `LOGIN_FAILED` | 401 | Login refused; the same answer for every cause |
-| `LOGIN_THROTTLED` | 429 | Five failed logins for this username and address within 15 minutes; wait 15 minutes |
+| `LOGIN_THROTTLED` | 429 | Five failed logins or wrong current passwords for this username and address within 15 minutes; wait 15 minutes |
 | `LOGIN_RATE_LIMITED` | 429 | From nginx, not the API: more than 10 logins a minute (burst 5) from this client address; wait a minute (#577) |
 | `PASSWORD_INCORRECT` | 403 | The current password given to `POST /auth/password` is wrong |
 | `INVALID_PASSWORD` | 422 | The new password breaks a rule; the message names it |
-| `INVALID_USERNAME` | 422 | `POST /auth/users`: the username breaks the rule; the message states it |
+| `INVALID_USERNAME` | 422 | `POST /auth/users` or `POST /auth/service-principals`: the name breaks the rule; the message states it |
 | `USER_EXISTS` | 409 | `POST /auth/users`: an account with this username exists |
 | `USER_NOT_FOUND` | 404 | No account has the username in the path |
 | `LAST_ENGINEER` | 409 | The change would demote or disable the last enabled engineer |
@@ -1995,8 +2257,8 @@ langchain-text-splitters>=0.3
 sentence-transformers>=3.0
 python-multipart>=0.0.9
 aiofiles>=23.0
-opentelemetry-sdk==1.45.1
-opentelemetry-exporter-otlp-proto-http==1.45.1
+opentelemetry-sdk==1.45.2
+opentelemetry-exporter-otlp-proto-http==1.45.2
 ```
 
 **Dependency pinning (normative).** The list above is *intent*, held in
@@ -2008,7 +2270,7 @@ newer Weaviate server than the one pinned here, breaking every collection call
 while the stack still reported healthy.
 
 The SDK and OTLP HTTP exporter entries in `api/requirements.in` are required
-for enabled telemetry startup; lock regeneration must retain both at 1.45.1
+for enabled telemetry startup; lock regeneration must retain both at 1.45.2
 and resolve their transitive dependencies.
 
 Regenerate the lock from the repo root using the procedure at the top of
@@ -2072,7 +2334,7 @@ Long-running, so it follows the same job-and-poll shape as `/ingest/upload`.
 { "collection": "Policies", "include_models": false }
 ```
 
-`include_models: true` bundles the embedding model and the LLM into the package
+`include_models: true` bundles the embedding model and the answer LLM (never the build LLM) into the package
 (`RAG_EXPORT_SPECIFICATIONS.md` §6.3), taking it from roughly 80 KB to ~2.3 GB.
 The job reports `models_bundled` — what the package actually carries, which is
 `false` with an explanation in `warnings` if the request could not be honoured.
@@ -2157,9 +2419,11 @@ start it again (#521). Export, import and tune job records persist
 across an API restart like ingest's (§3.1.3); a job the restart interrupted reads `failed`
 with `error_code` `INTERRUPTED` and an `error` saying the API restarted while it was running. A failed build leaves nothing
 behind: the staging directory and the partial archive are both removed, and the
-collection's export slot is released. A build interrupted by a restart leaves them in
-`EXPORTS_DIR` (`.build-*`, and `.<stem>.tar.gz.partial` or, encrypted, `.<stem>.tar.gz.age.partial`) until the next startup removes them,
-before the first request; completed packages are never touched (#377).
+collection's export slot is released. A build interrupted by a restart leaves its staging
+directory in `UPLOAD_DIR` (`export-*`, #549) and its partial archive in `EXPORTS_DIR`
+(`.<stem>.tar.gz.partial` or, encrypted, `.<stem>.tar.gz.age.partial`) until the next startup
+removes them, before the first request, with any `.build-*` staging left in `EXPORTS_DIR` by
+earlier versions; completed packages are never touched (#377).
 
 `warnings` is non-fatal. It records, for example, chunks whose `source_sha256`
 could not be resolved to exactly one retained document that the package carries;
@@ -2206,7 +2470,7 @@ the file's name in `./exports` is compared, so `x.tar.gz`, `./x.tar.gz` and
 
 Everything else — unreadable archive, a wrong passphrase or a damaged encrypted
 package (`DECRYPT_FAILED`, with `error_detail.reason` `passphrase`, `header`,
-`payload` or `work_factor`, the last for a scrypt work factor above 20 or not written as one or two decimal digits, refused before any key derivation; a file cut inside the payload nonce is `payload`; nothing is touched), bad digest, embedding mismatch, name
+`payload` or `work_factor`, the last for a scrypt work factor above 20 (a decimal of any length), refused before any key derivation; a work factor not written as a decimal without a sign or leading zero is a malformed header, `PACKAGE_UNREADABLE` (#549); a file cut inside the payload nonce is `payload`; nothing is touched), bad digest, embedding mismatch, name
 collision, a target being deleted (`COLLECTION_DELETING`, §3.1.2), another import
 into the same target collection (`IMPORT_IN_PROGRESS`) — is reported through the
 job rather than this response, because none of it is knowable without reading the
@@ -2408,11 +2672,17 @@ dropped in to be imported.
       "fidelity": "with-sources",
       "created_at": "2026-09-18T15:31:27Z",
       "readable": true,
-      "encrypted": false
+      "encrypted": false,
+      "expires_at": "2026-09-19T15:31:40Z"
     }
   ]
 }
 ```
+
+`expires_at` (UTC, #677) is when a package this instance exported is deleted if
+nobody downloads it, and `null` for any other package (one copied in to be
+imported, or one exported before #677). `GET /export/job/{job_id}` carries the same
+field for a `completed` job while its package is still recorded.
 
 Encrypted packages (`ragpkg-*.tar.gz.age`, #27) are listed too, with
 `encrypted: true` and `collection`, `chunk_count`, `fidelity` and `created_at`
@@ -2444,6 +2714,61 @@ other packages (#451).
 
 The package format itself — filename convention, layout, manifest and
 `chunks.jsonl` — is specified in `RAG_EXPORT_SPECIFICATIONS.md` §4.
+
+---
+
+```
+GET /packages/{filename}
+HEAD /packages/{filename}
+```
+
+Downloads one package from `./exports` (#677), for the Developer role and above
+(people and service keys).
+
+- **Which file.** `filename` is `ragpkg-` followed by letters, digits, `.`, `_`
+  or `-`, ending in `.tar.gz` or `.tar.gz.age`, naming a regular file in the
+  exports folder (never a link). Anything else answers `404 PACKAGE_NOT_FOUND`.
+- **Access.** The listing's rule (§3.1.8): a package `GET /packages` hides from
+  the caller answers `404 PACKAGE_NOT_FOUND` too, and the refusal is audited
+  (`details.reason` `collection_access`, with the package's collection). An
+  encrypted package exported here follows the collection recorded at its export,
+  and one recorded without a collection is served to Engineers only (#794); an
+  encrypted package copied in and an unreadable package name no collection, so
+  any Developer may download them.
+- **Origin.** A cookie-authenticated `GET` whose `Sec-Fetch-Site` is present and
+  neither `same-origin` nor `none` is refused `403 CROSS_ORIGIN_REFUSED` (#794),
+  as it may delete the package. `HEAD`, service keys and requests without
+  `Sec-Fetch-Site` aren't checked.
+- **Busy.** While an import of the same file runs, or another download of it is
+  in progress: `409 PACKAGE_BUSY`.
+- **Response 200.** The file, streamed: `Content-Type: application/octet-stream`,
+  `Content-Length`, `Content-Disposition: attachment`, `Cache-Control: no-store`
+  and `X-Accel-Buffering: no` (nginx passes it on as the client takes it). No
+  `Range` support. `HEAD` answers the headers only and deletes nothing; its
+  `package.download` record has `details.head: true` and no `completed`.
+- **Deletion after the download.** A download is complete when every byte has
+  been handed to the connection and no disconnect was seen before the last
+  message. After a complete download of a package this instance exported, the
+  package is deleted from `./exports`. A package not exported here is served and
+  kept, an interrupted download keeps the package, and so does an import of it
+  that started during the download. The server can't know that the client kept
+  every byte, so the user compares the file's size with `size_bytes`.
+
+**The record and the expiry.** When an export finishes, its package's name,
+finish time and collection are recorded in `<UPLOAD_DIR>/exported_packages.json`
+(never in `./exports`), as `{"packages": {"<file>": {"finished_at": "<UTC>",
+"collection": "<name>"}}}`; an entry written before #794 is a bare finish time and
+is read with no collection. A recorded name outside the download's filename rule
+is ignored and logged. Only recorded packages are deleted after a download or
+expired. A
+recorded package expires `EXPORT_RETENTION_HOURS` after its export finished (whole
+hours, 1-720, default 24; any other value stops the API; expiry can't be turned
+off). A sweep runs at start-up, after the job records are loaded, and then every
+15 minutes: it deletes expired recorded packages, skips busy ones until its next
+run, and drops the entry of one whose file is gone. A record that can't be read is
+moved aside to `exported_packages.json.corrupt-<time>` and logged, never
+overwritten; the packages it named no longer expire. Every deletion writes a
+`package.delete` audit record.
 
 ---
 
@@ -2682,7 +3007,7 @@ file, asking whether its name already has chunks (#22, §3.1.3), fails.
 
 ## 6. LLM Prompt Specifications
 
-All prompts use Ollama's `/api/chat` endpoint with `model: llama3.1:8b` (the `LLM_MODEL` setting; phi3.5 until 1.2.1, #647).
+All prompts use Ollama's `/api/chat` endpoint. The query prompts (6.1-6.3) send the answer model, `ANSWER_LLM_MODEL`; the gold standard and preparation prompts (6.4-6.6) send the build model, `BUILD_LLM_MODEL` (#671). Each falls back to `LLM_MODEL`, which is `llama3.1:8b` by default (phi3.5 until 1.2.1, #647).
 
 ### 6.1 Query Reformulation Prompt
 
@@ -2810,8 +3135,9 @@ whose header fits in 2,000 characters. Retry text:
 
 ## 7. Web UI Specification
 
-**Framework:** React 18 + Vite 5  
-**Component library:** shadcn/ui + Tailwind CSS  
+**Framework:** React 18 + Vite 8  
+**Component library:** shadcn/ui + Tailwind CSS 4  
+**Browsers:** Safari 16.4, Chrome 111, Firefox 128 or newer, the floor Tailwind CSS 4 sets. The UI uses Tailwind 4's default colour palette, font stack and form-field styles (RD-157)  
 **State management:** React Context + useReducer (no external state library)  
 **Routing:** React Router v6
 
@@ -2823,12 +3149,13 @@ them in browser storage; the session is the HttpOnly cookie. On load it asks `GE
 | State | Shown |
 |---|---|
 | Setup required | "Not set up yet" with the command `docker compose exec api python -m auth bootstrap <username>`, and nothing else |
-| No valid session | The login page at `/login` (any other path redirects there): username, password, "Log in". A failure shows the API's message (the generic `LOGIN_FAILED`, or "wait" when throttled) and clears the password. Success opens `/qa` |
+| No valid session | The login page at `/login` (any other path redirects there): username, password, "Log in". A failure shows the API's message (the generic `LOGIN_FAILED`, or "wait" when throttled) and clears the password. Success opens `/qa`. For a user with two-step verification (#607) the page then asks for "Authentication code" (from the app, or a recovery code) with "Verify" and "Back"; a wrong code shows the API's message and clears the field, `MFA_CHALLENGE_INVALID` returns to the password step, and success opens `/qa` |
 | Password change due | Only the password page at `/account/password`: current password, new password, the new one again, "Change password" and "Log out". A mismatch is caught before sending; the API's rule message is shown; success opens `/qa` |
-| Logged in | The pages of the user's role (§7.2) and `/account/password`, where a change says the other sessions were logged out |
+| Two-step set-up due (#607) | After a due password change: only the account page at `/account` (§7.17), with "Log out"; once set up and the recovery codes put away, `/qa` |
+| Logged in | The pages of the user's role (§7.2), `/account` (§7.17) and `/account/password`, where a change says the other sessions were logged out |
 
-Any API answer `401 AUTH_REQUIRED` returns the UI to the login page, and `403 PASSWORD_CHANGE_REQUIRED` to the
-password page.
+Any API answer `401 AUTH_REQUIRED` returns the UI to the login page, `403 PASSWORD_CHANGE_REQUIRED` to the
+password page, and `403 MFA_ENROLLMENT_REQUIRED` to the account page.
 
 | Role | Label |
 |---|---|
@@ -2862,11 +3189,15 @@ Developer also Data and Tune, an Engineer also Admin.
 | Admin | Service keys | ✓ | — | — |
 | Admin | Audit | ✓ | — | — |
 | Admin | Health | ✓ | — | — |
-| Account (labelled with the username and role badge) | Change password | ✓ | ✓ | ✓ |
+| Account (labelled with the username and role badge) | Account | ✓ | ✓ | ✓ |
+| Account | Change password | ✓ | ✓ | ✓ |
 | Account | Log out | ✓ | ✓ | ✓ |
 
+- **Query-only mode** (#670, §2.6). When the user answer's `query_only` is true, Import, Prepare, Chunking,
+  Retrieval and Gold Standard are hidden for every role (so Tune isn't shown) and not routed, and a "Query-only" tag
+  follows "RAG Platform".
 - **Current page.** The current page's entry has `aria-current="page"` and is highlighted, and so is
-  the button of the menu that holds it (`/account/password` highlights the account menu). A page with
+  the button of the menu that holds it (`/account` and `/account/password` highlight the account menu). A page with
   no entry, such as `/help/transfer`, highlights nothing.
 - **Menus.** Each menu follows the WAI-ARIA menu button pattern: a button with `aria-haspopup="menu"`,
   `aria-expanded` and, while open, `aria-controls` naming a `role="menu"` element labelled by the
@@ -3083,6 +3414,7 @@ A retained session can be loaded/refreshed by its session ID, including when its
 - "New Collection" button → modal with fields: name, index type, distance metric, HNSW params.
 - A refused create (for example `409 COLLECTION_EXISTS`, a 422 or a 503) keeps the modal open and shows the API's message inside it, as an alert. The message clears on Cancel, when the modal is opened again, or when a create succeeds (#379).
 - Delete button per row → confirmation modal with collection name typed to confirm. Calls `DELETE /collections/{name}?confirm=true`.
+- Access (#606): the dialog reads the state when it opens; until that read succeeds the choice is unknown and Save is disabled, and a read answering after the Engineer changed something doesn't overwrite the change. An "Access" column shows "Open", "Restricted (n)" (n grants) or "—" when `GET /collections/{name}/access` failed for that row. An "Access" button per row opens a dialog: Open or Restricted, and when restricted the people (`GET /auth/users`) and service principals (`GET /auth/service-principals`) as checkboxes, disabled ones marked. Save calls `PUT /collections/{name}/access`; a refused save keeps the dialog open with the API's message as an alert.
 - A refused delete keeps the modal open and shows the API's message inside it, as an alert: for `409 COLLECTION_BUSY`, for example, "An ingest job is running for this collection (…)". The collection stays listed; the message clears on Cancel, when the modal is opened again, or when a delete succeeds.
 
 ### 7.9 Health Dashboard Page
@@ -3090,7 +3422,7 @@ A retained session can be loaded/refreshed by its session ID, including when its
 **Route:** `/health`  
 **Roles:** Engineer only
 
-- Service status cards: Weaviate, Ollama LLM, Ollama Embed. Each shows status (green/red), latency (ms). A service is red when its `status` isn't `ok`. `GET /health` answers 503 with the same per-service body when a dependency is down; the page reads that body, so the failing services show red (#375).
+- Service status cards: Weaviate, the Ollama LLMs (one "LLM, builds and answers" card when `same_model` is true, otherwise an "Answer LLM" card from `llm` and a "Build LLM" card from `build_llm`), Ollama Embed. Each shows status (green/red), latency (ms). A service is red when its `status` isn't `ok`. `GET /health/details` answers 503 with the same per-service body when a dependency is down; the page reads that body, so the failing services show red (#375).
 - When health can't be read (no answer from the API, a proxy error page, any other error without a health body, or a 200 without a health body (#415)), the page shows "Service health could not be read:" with the reason, as an alert, and no service cards, so an earlier green result never stays up. The next successful load clears it.
 - Latency trend charts (from the `history` field of `GET /metrics/latency`, bounded by `history_limit`, default 100): line chart of `total_ms` over time alongside `retrieval_ms` and `llm_ms`. Summary stat row shows P50/P95/P99 for each component from the `retrieval_latency`, `llm_latency` and `total_latency` objects.
 - Health and latency metrics load separately: a degraded or failed health call doesn't stop the charts from loading. A failed metrics call keeps the charts last shown.
@@ -3179,15 +3511,27 @@ page renders as one undifferentiated block.
 **Roles:** Engineer only (others are sent to `/qa`)
 
 - A table of every account from `GET /auth/users`: username (the engineer's own marked "(you)"), a role selector,
-  Enabled or Disabled, the password state ("Change due" or "Set"), and the creation date. If the list can't be
+  Enabled or Disabled, the password state ("Change due" or "Set"), two-step verification ("On" or "Off", #607),
+  and the creation date. If the list can't be
   loaded the page says "Could not load the users:" with the reason, as an alert.
 - A form with username, role (End User by default) and "Create user". The username rule is shown under it.
 - Each row: changing the role selector sends the role change; "Disable" or "Enable"; and "Reset password", except
-  on the engineer's own row, which says to use Change password instead.
+  on the engineer's own row, which says to use Change password instead; and "Reset two-step" on a row whose user
+  has two-step verification on, except the engineer's own (#607).
+- A checkbox "Require two-step verification for everyone" (#607), checked from `GET /auth/me`'s `mfa_required`; a
+  refusal (`MFA_ENROLL_FIRST`) shows the API's message as an alert.
 - After a create or a reset, a panel shows the username and the generated password, says it is shown only once and
   must be changed at first login, and has "Done", which removes it. The password is kept only in the page's memory.
 - A refused change shows the API's message as an alert and reloads the list. After a change to the engineer's own
   account the UI re-reads `GET /auth/me`: a demoted engineer leaves the page, a disabled one is logged out.
+- "Reset password", "Reset two-step", "Disable" and a role change ask first, in the browser's confirmation dialog
+  (#551, #779); "Enable" doesn't. Cancelling sends nothing, and a cancelled role selector shows the current role
+  again. On the engineer's own row: "Change your own role to <Role>? You will lose access to the Users page." and
+  "Disable your own account? You will be logged out and can't log in again until another AI Engineer enables you."
+  On other rows: "Change the role of <name> to <Role>?", "Disable <name>? Their sessions end and they can't log in
+  until enabled." and "Reset the password of <name>? Their sessions end and they must change the new password at
+  their next login." and "Reset the two-step verification of <name>? Their sessions end and they must log in again
+  with their password alone." (the button isn't on the engineer's own row, so it has no own-row wording).
 
 ### 7.13 Service Keys Page (#25)
 
@@ -3256,7 +3600,7 @@ nothing about jobs is kept in browser storage.
 **Route:** `/prepare`, in the Data menu after Import
 **Roles:** Engineer, Developer
 
-- What the page does (code does the rule work, the LLM only cleans and titles PDF, DOCX, TXT and MD; CSV and JSON
+- What the page does (code does the rule work, the build LLM only cleans and titles PDF, DOCX, TXT and MD; CSV and JSON
   are labelled from their data), and a note that preparation and
   ingest share the local LLM service, so either is slower while the other runs.
 - An upload zone for the §3.1.11 types, refusing a selection over 512 MB before sending; the answer's skipped
@@ -3275,6 +3619,24 @@ nothing about jobs is kept in browser storage.
 - A refusal shows the API's message as an alert.
 
 The Import page shows a link "Prepare documents first" to `/prepare` beside the corpus rules link.
+
+### 7.17 Account Page (#607)
+
+**Route:** `/account`  
+**Roles:** All (also the only page while a two-step set-up is due, §7.1)
+
+- The heading "Account", the username and a link to Change password (`/account/password`); the account menu's
+  "Account" entry opens it.
+- A "Two-step verification" section from `GET /auth/mfa`:
+  - Off: a short explanation and "Set up" (while required for everyone: that it is required). "Set up" shows a QR
+    code of the `otpauth://` URI, drawn in the browser by the pinned npm package `qrcode-generator`, the secret as
+    text for manual entry, a code field, "Confirm" and "Cancel".
+  - After "Confirm": the 10 recovery codes, said to be shown only once, and "Done", which removes them.
+  - On: since when, how many of the 10 recovery codes are left, "Regenerate recovery codes" (a current code; the
+    new set is shown once in the same way) and, only while it isn't required, "Turn off" (password and a code from
+    the app or a recovery code).
+- An error shows the API's message as an alert. The secret and the codes are kept only in the page's memory, never
+  in browser storage.
 
 ## 8. Configuration Defaults and Constraints
 
@@ -3312,7 +3674,7 @@ Optional telemetry (#282) is configured by API container environment settings, n
 | `RAG_OTEL_HEADERS_FILE` | none | Mounted JSON regular file with `Authorization` and/or `X-Api-Key`; at most 8 KiB, 2 KiB per value; requires an HTTPS endpoint |
 | `RAG_OTEL_CA_FILE` | none (bundled roots) | Mounted PEM CA bundle (a regular file); at most 1 MiB; must load as a CA bundle; replaces the bundled roots; requires an HTTPS endpoint (#356) |
 | `RAG_OTEL_SERVICE_NAME` | `rag-api` | 1–64 ASCII letters, digits, `.`, `_` or `-`, starting with a letter or digit |
-| `RAG_OTEL_SERVICE_VERSION` | `1.2.2` | As `RAG_OTEL_SERVICE_NAME` |
+| `RAG_OTEL_SERVICE_VERSION` | `1.3.0` | As `RAG_OTEL_SERVICE_NAME` |
 | `RAG_OTEL_ENVIRONMENT` | `development` | As `RAG_OTEL_SERVICE_NAME` |
 | `RAG_OTEL_TRACES`, `RAG_OTEL_LOGS`, `RAG_OTEL_METRICS` | `true` | Exact `true` or `false` |
 | `RAG_OTEL_SAMPLE_RATIO` | `1.0` | Finite 0–1 |
@@ -3337,6 +3699,17 @@ LAN mode (#26, §2.5) adds one API container setting and two read by `docker-com
 | `RAG_LAN_MODE` | `false` | Exactly `true` or `false`; anything else fails API startup. `true` only through `docker-compose.lan.yml`; then the API refuses to start unless `AUTH_COOKIE_SECURE` is `true` and an enabled human AI Engineer exists |
 | `RAG_LAN_HOSTNAMES` | empty | Comma-separated DNS names and IP addresses for the self-signed certificate; required unless `proxy/certs` holds `cert.pem` and `key.pem` |
 | `RAG_LAN_PORT` | `443` | The host port of LAN mode's TLS publication, on every interface |
+
+Query-only mode (#670, §2.6) adds one API container setting:
+
+| Setting | Default | Accepted values |
+|---|---|---|
+| `RAG_QUERY_ONLY` | `false` | Exactly `true` or `false`; anything else fails API startup. `true` through `docker-compose.query-only.yml`; then the routes of §2.6 answer `403 QUERY_ONLY` and `python -m loader` loads packages |
+
+An invalid API container setting (any setting of `api/config.py`, such as `AUTH_COOKIE_SECURE`, `RAG_LAN_MODE`,
+`AUDIT_LOG_QUESTIONS` or `MAX_ZIP_MEMBERS`) stops API startup: the API writes one line per invalid setting to standard
+error, `Settings refused: <reason>`, without the value given and with no traceback, and exits 1 (#555). Telemetry
+settings fail as described above.
 
 ---
 
@@ -3421,7 +3794,7 @@ rag-docker/
 │   │   ├── importer.py          # Import job: validation order, conflicts, atomicity
 │   │   ├── model_bundle.py      # Ollama manifest + blob copy, both directions
 │   │   ├── tuning.py            # Re-chunk / re-embed / re-index, staged rebuilds
-│   │   ├── system_info.py       # VM memory reporting for /health
+│   │   ├── system_info.py       # VM memory reporting for /health/details
 │   │   └── goldstandard.py      # Generation, session management
 │   ├── models/
 │   │   └── schemas.py           # Pydantic request/response models
@@ -3995,7 +4368,7 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       *Three services — Weaviate, LLM and Embed, each with its model name and
       latency. Polling measured at 30s intervals.*
 - [x] Health dashboard shows a degraded 503 body with the failing services red, loads the latency metrics while health is degraded or can't be read, and shows a message, with no stale cards, when health can't be read.
-      *Evidence: `scripts/verify/browser/ui_criteria.js` (suite 06) stubs `/api/health` with a
+      *Evidence: `scripts/verify/browser/ui_criteria.js` (suite 06) stubs `/api/health/details` with a
       degraded 503, a proxy 502, a refused connection and a 503 without a health body; its checks
       fail on the code before #375. `scripts/tests/test_health.py` (suite 01) checks the 503 body
       for a missing model and an unreachable Ollama or Weaviate.
@@ -4095,6 +4468,15 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       *`scripts/verify/browser/ui_criteria.js` (suite 06), section "running and recent jobs (#617)",
       the checks marked (#629), for the export and the import panel.*
 
+- [x] The web UI supports Safari 16.4, Chrome 111 and Firefox 128 or newer, the floor Tailwind CSS 4
+      sets, and uses Tailwind 4's default colour palette, font stack and form-field styles (#773,
+      RD-157, §7). The built CSS keeps what the Tailwind 4 migration relies on: the `prose` and
+      `prose-sm` rules, `relative`, `hover` on every device (no `@media (hover: hover)`), and the
+      `@source` globs, which are v3's `content` globs with automatic detection off.
+      *`scripts/tests/test_tailwind_output.py` (suite 01) builds the CSS from `ui/package-lock.json`
+      and checks each of these. The browser floor itself is §7's statement: no suite runs an older
+      browser (the browser suites drive one Chromium).*
+
 ### 10.5 Infrastructure
 
 - [x] A restart restores a Raft snapshot and its later operations, preserving objects and deleted collections; the check reports elapsed restart seconds.
@@ -4103,8 +4485,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 - [x] Job records persist under `{UPLOAD_DIR}/jobs/{kind}/`: status changes and terminal records are written at once and atomically, progress at most once a second but never left unwritten, a failed write never fails the job, startup marks jobs left `queued` or `running` as interrupted, unreadable records are kept and logged, and the newest 200 per kind are kept, at startup and while the API runs, never removing an unfinished job (#23, #309). The first record is written off the event loop, and a start cancelled during it leaves no record or guard (#309).
   *Evidence: `test_jobstore.py` (35 cases in the API image, run by `02_ingest.sh`), including a real lifespan run over a stored running job, the four job starts and their cancellation, retention ordered by real writes, an abandoned first write that fails, a second export start waiting for the first one's record (#326), and that wait's error paths and its bound with `EXPORT_STARTING` (#338); with `RAG_ALLOW_RESTART=1`, live restarts of ingest (`partial` and `failed`), export and import jobs.*
 
-- [x] At startup, before the first request, what a killed job left behind is removed (#377): an interrupted ingest's upload staging (`{UPLOAD_DIR}/ingest-*`), document preparation's temporary files (`{UPLOAD_DIR}/prepare-*.zip` and `prepare-*.json`, regular files only; #640), and an interrupted export's `.build-*` directory and `.<stem>.tar.gz.partial` archive (`.<stem>.tar.gz.age.partial` for an encrypted export, #27) in `EXPORTS_DIR`. Only those names at the top of each folder, and only a real directory or regular file as the name says, are removed: completed packages, look-alike names and anything in a sub-folder are kept, and a symlink is never followed. What is removed is logged by name and size; a removal that fails is logged and not reported as removed. An export sweep that fails is logged and startup carries on, with the ingest staging still swept (#423).
-  *Evidence: `test_startup_sweep.py` (15 cases in the API image, run by `02_ingest.sh`), including preparation's `prepare-*.zip` and `prepare-*.json` files removed while other suffixes, links and sub-folders are kept (#640), a real lifespan run that removes both kinds and logs them, and one whose export sweep raises: the error is logged, the API still starts and the ingest staging is removed (#423). With `RAG_ALLOW_RESTART=1`, `02_ingest.sh` checks that its two killed ingests' `ingest-*` staging existed before the restart and is gone after it (#423), and `05_transfer.sh` that the killed export's build directory and temporary archive are gone after its restart, with the completed package kept.*
+- [x] At startup, before the first request, what a killed job left behind is removed (#377): an interrupted ingest's upload staging (`{UPLOAD_DIR}/ingest-*`), document preparation's temporary files (`{UPLOAD_DIR}/prepare-*.zip` and `prepare-*.json`, regular files only; #640), and an interrupted export's staging directory (`{UPLOAD_DIR}/export-*`, #549, or `.build-*` in `EXPORTS_DIR` left by earlier versions), and its `.<stem>.tar.gz.partial` archive (`.<stem>.tar.gz.age.partial` for an encrypted export, #27) in `EXPORTS_DIR`. Only those names at the top of each folder, and only a real directory or regular file as the name says, are removed: completed packages, look-alike names and anything in a sub-folder are kept, and a symlink is never followed. What is removed is logged by name and size; a removal that fails is logged and not reported as removed. An export sweep that fails is logged and startup carries on, with the ingest staging still swept (#423).
+  *Evidence: `test_startup_sweep.py` (16 cases in the API image, run by `02_ingest.sh`), including an export's staging created as `export-*` in `UPLOAD_DIR` and removed there, and an encrypted export's `.tar.gz.age.partial` archive removed while look-alikes are kept (#549), preparation's `prepare-*.zip` and `prepare-*.json` files removed while other suffixes, links and sub-folders are kept (#640), a real lifespan run that removes both kinds and logs them, and one whose export sweep raises: the error is logged, the API still starts and the ingest staging is removed (#423). With `RAG_ALLOW_RESTART=1`, `02_ingest.sh` checks that its two killed ingests' `ingest-*` staging existed before the restart and is gone after it (#423), and `05_transfer.sh` that the killed export's staging directory and temporary archive are gone after its restart, with the completed package kept. `test_export_encryption.py` (suite 05) also checks that the sweep removes an encrypted export's partial archive and keeps packages (`test_the_startup_sweep_removes_encrypted_partials_only`).*
 
 
 - [x] Weaviate cold startup has a 180-second healthcheck start period; restart limits reject invalid or overlong values before arithmetic.
@@ -4134,6 +4516,10 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       *Evidence: `scripts/tests/test_export_encryption.py` in the built API image with `--network none` (suite 05): the age module passes every applicable C2SP CCTV age vector (vendored in `scripts/tests/fixtures/age-testkit`) and an independent decryption written from the age specification, and runs an encrypted export and two imports through the router with tracing on to check no span or telemetry log record holds the passphrase; suite 05 exports the transfer collection encrypted, checks the file header and work factor, validates the decrypted package with `validate_package.py` and checks the listing entry; `browser/transfer_page.js` (suite 06) checks the passphrase rules, what the page sends and that it clears the fields.*
 - [x] Import of a `.tar.gz.age` package decrypts it as a stream while unpacking it, checking each member before extraction and authenticating the file to its end; a wrong passphrase, a damaged or truncated file or a scrypt work factor above 20 (refused before any key derivation) fails the job `DECRYPT_FAILED` (with `error_detail.reason`) and a file without a valid age passphrase header `PACKAGE_UNREADABLE`, before any collection, marker, setting or session is touched and with the package file unchanged; an encrypted package without a passphrase is refused 400 `PASSPHRASE_REQUIRED` and a passphrase for any other package 400 `PASSPHRASE_NOT_EXPECTED`, before any job (#27).
       *Evidence: `scripts/tests/test_export_encryption.py` (suite 05) through `packager.open_package`, `importer._run` and the API; suite 05 imports the encrypted export with a wrong passphrase against the existing collection (`replace`) and checks the collections, their counts, the package file and the import work directories are unchanged, checks both 400 refusals, then imports it with the right passphrase (`rename`) with every chunk.*
+- [x] A package this instance exported doesn't stay in `./exports` (#677): `GET /packages/{filename}` (Developer and above, the listing's access rule) streams it and deletes it after a complete download, while an interrupted download, `HEAD` and a package not exported here keep it; `409 PACKAGE_BUSY` while an import of it runs or another download is in progress; a sweep at start-up and every 15 minutes deletes recorded packages older than `EXPORT_RETENTION_HOURS` (1-720, default 24) and skips busy ones; `GET /packages` and the export job status carry `expires_at`; downloads and deletions are audited as `package.download` and `package.delete`; an unreadable record is moved aside, never overwritten.
+      *Evidence: `scripts/tests/test_package_download.py` (suite 05): the route's bytes, headers and refusals, deletion only of a recorded package, an interrupted download driven directly, the record, the sweep and its 15-minute interval, a real API start-up sweeping an expired package, an invalid setting stopping the API, the import claim under the shared lock, and the audit records; suite 05's live checks through the proxy (a full download deletes, an interrupted one keeps, the sweep deletes a recorded package and keeps one copied in, an End User is refused); `browser/transfer_page.js` (suite 06): the Download links, "Expires" in local time and the page catching up after a download.*
+- [x] Packages exported here are tied to their collection and the deleting download is hardened (#794): each export records its collection in `exported_packages.json`, and an entry written before #794 (a bare finish time) is still read, with no collection; an encrypted package exported here follows its recorded collection's access rule in `GET /packages` and `GET /packages/{filename}` (Weaviate not answering counts as the collection existing), and one recorded with no collection is listed and served to Engineers only; `GET /packages/{filename}` is for the Developer role and above, people and service keys alike; a cookie-authenticated `GET /packages/{filename}` whose `Sec-Fetch-Site` is present and neither `same-origin` nor `none` is refused `403 CROSS_ORIGIN_REFUSED`, while `HEAD`, service keys and requests without the header aren't checked; `HEAD` writes `package.download` with `details.head: true` and no `completed`; recorded names outside the download rule are ignored, never deleted, and logged once per process (#798); a deletion is audited and the sweep goes on when the record can't be rewritten; an import claim or download slot is released when its request is cancelled during the claim.
+      *Evidence: `scripts/tests/test_package_download.py` (host and suite 05): `RecordTests` (the record's shape, entries before #794, wrongly typed entries, names outside the rule logged once), `EncryptedAccessTests` (restricted, open, no recorded collection, copied in, a collection gone, Weaviate failing, an End User), `DeletionRecordTests`, `SameOriginTests` (the `Sec-Fetch-Site` cases, `HEAD`, service keys, the listing), `HeadRecordTests` and `CancelledClaimTests`; suite 17's `matrix` and `key-matrix` checks (the `GET /packages/{filename}` row for every role and key) and `origin` check (the `Sec-Fetch-Site` cases through the proxy) in `scripts/verify/auth_stack.py`.*
 - [x] `GET /ingest/config` returns `is_default: true` for a collection with no saved config; `is_default: false` after saving one.
 - [x] `GET /retrieval/config/{collection}` answers 200 with the defaults and `is_default: true`, and logs a warning naming the collection, when the saved file can't be read, isn't JSON, holds JSON that isn't an object, has a field the response can't carry (a wrong type, a fractional or nested `top_k`, a `NaN` or infinite `alpha`) or holds the response-only key `is_default`; missing fields are filled from the defaults, and coercible and out-of-range values are still served as saved (#439, #477).
       *Evidence: `RetrievalConfigFileTests` in `scripts/tests/test_api_paths.py`, in the built API image with `--network none` (suite 01, through `16_api_paths.sh`), sends each saved file through the app; its non-object, wrong-type and fractional or nested checks fail on the code before #439, and its non-finite `alpha` and `is_default` checks fail on the code before #477.*
@@ -4144,10 +4530,12 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 - [x] Resolved Compose configuration and live Docker bindings contain exactly one published TCP port, on the proxy at host address `127.0.0.1`, targeting container port 80. A missing or all-interface host address fails verification. A different free host port preserves loopback and matches `RAG_EXPECTED_PROXY_PORT` (default `8080`); verified at `18080` on a disposable deployment.
 - [x] LAN mode is opt-in (#26, §2.5): only `docker-compose.lan.yml` turns it on; with it the proxy publishes exactly one port, `0.0.0.0:443->443/tcp` (`RAG_LAN_PORT` changes the host port), nothing on port 80; the api runs with `RAG_LAN_MODE=true` and `AUTH_COOKIE_SECURE=true`; `tls-init` runs in the API image and the proxy waits for it to complete successfully; nginx's LAN configuration and the certificate volume are mounted read-only. Without the override the default publication and routes are unchanged.
   *Evidence: `scripts/verify/lan_config.py` (suite 18, every run) resolves the real override with `docker compose config`, starting nothing, at the default port and at `RAG_LAN_PORT=8443`; suite 01's binding checks still pass on the base file.*
-- [x] With `RAG_LAN_MODE=true` the API exits 1 before any other import, startup work or request, with exactly one `LAN mode refused:` line on standard error and no traceback, when `AUTH_COOKIE_SECURE` isn't `true` (checked first) or no enabled human AI Engineer exists (an End User, a Developer, a disabled Engineer or an engineer-role service principal doesn't count); `RAG_LAN_MODE` accepts exactly `true` or `false` (#26).
-  *Evidence: `scripts/tests/test_lan_mode.py` in the built API image with `--network none` (suite 18), including `import main` in a subprocess for each refusal and an AST check that `lan_mode.enforce()` is `main.py`'s first statement; in a `stack.sh run --lan`, one-off api containers of the LAN configuration refuse with `AUTH_COOKIE_SECURE=false` and with an empty account store while the running project stays healthy.*
-- [x] LAN mode's nginx serves one TLS server on container port 443 with HTTP/2, TLS 1.2 and 1.3 only, Mozilla's intermediate ciphers, no session tickets and no HSTS header, routing exactly as the default server through the shared `locations.conf` (#26).
-  *Evidence: `test_lan_mode.py` checks both configurations; in a `stack.sh run --lan`, suite 18 checks that TLS 1.2 and 1.3 connect, TLS 1.1 is refused and ALPN picks `h2`, that the only live binding is `127.0.0.1:<verify port>->443/tcp` and plain HTTP to it gets no API answer, and that a cookie-authenticated change over HTTPS from `https://localhost:<port>` is accepted and from another origin refused `403 CROSS_ORIGIN_REFUSED`.*
+- [x] With `RAG_LAN_MODE=true` the API exits 1 before any other import, startup work or request, with exactly one `LAN mode refused:` line on standard error and no traceback, when `AUTH_COOKIE_SECURE` isn't `true` (checked first) or no enabled human AI Engineer exists (an End User, a Developer, a disabled Engineer or an engineer-role service principal doesn't count); `RAG_LAN_MODE` accepts exactly `true` or `false`, and any other value is refused at startup with one `Settings refused:` line (#26, #555).
+  *Evidence: `scripts/tests/test_lan_mode.py` in the built API image with `--network none` (suite 18), including `import main` in a subprocess for each refusal and an AST check that `lan_mode.enforce()` is `main.py`'s first statement; in every run, suite 18 starts one-off api containers of the running verify project (`docker compose run --rm --no-deps`) and checks that each refuses with one line and no traceback with `AUTH_COOKIE_SECURE=false`, with an empty account store and with a non-boolean `RAG_LAN_MODE`; in a `stack.sh run --lan`, `lan_stack.py refusals` checks that one-off api containers of the LAN configuration refuse with `AUTH_COOKIE_SECURE=false` and with an empty account store while the running project stays healthy.*
+- [x] An invalid API container setting (any setting of `api/config.py`) stops API startup: the API exits 1 with one `Settings refused: <reason>` line per invalid setting on standard error, without the value given and with no traceback (#555).
+  *Evidence: `scripts/tests/test_lan_mode.py` `MainImportTests` in the built API image (suite 18) imports `main` in a subprocess with invalid settings, including a validator's own message used as is next to a type error prefixed with its setting, and checks that no value is printed; suite 18's every-run one-off api container check refuses a non-boolean `RAG_LAN_MODE`.*
+- [x] LAN mode's nginx serves one TLS server on container port 443 with HTTP/2, TLS 1.2 and 1.3 only, Mozilla's intermediate ciphers, no session tickets and no HSTS header, no nginx version (`server_tokens off`), routing exactly as the default server through the shared `locations.conf` (#26).
+  *Evidence: `test_lan_mode.py` checks both configurations and pins `server_tokens off`; in a `stack.sh run --lan`, suite 18 checks that TLS 1.2 and 1.3 connect, TLS 1.1 is refused and ALPN picks `h2`, that the only live binding is `127.0.0.1:<verify port>->443/tcp` and plain HTTP to it gets no API answer, that a cookie-authenticated change over HTTPS from `https://localhost:<port>` is accepted and from another origin refused `403 CROSS_ORIGIN_REFUSED`, and that the `Server` header is exactly `nginx` on an API answer and on nginx's own 421 page (`lan_stack.py server-tokens`).*
 - [x] The certificate step uses `proxy/certs/cert.pem` and `key.pem` when both are present, refuses one alone, an unparsable file or a non-matching key, and warns on an expired certificate; otherwise it generates a self-signed certificate for `RAG_LAN_HOSTNAMES` plus `localhost` (refusing an empty value or an invalid entry), valid 825 days, reused until it is unreadable, mismatched, expired, names other hosts or replaces removed bring-your-own files; the pair is switched atomically with the key at mode 0600 (#26).
   *Evidence: `test_lan_mode.py` (suite 18) covers each case and a failed write; in a `stack.sh run --lan`, suite 18 verifies `/api/health` over HTTPS against the generated certificate with the name `localhost` and checks its names and 825-day validity.*
 - [x] In LAN mode a login over HTTPS sets the session cookie `Secure`, `HttpOnly` and `SameSite=Strict` (#26, #25 Q12).
@@ -4171,8 +4559,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   *Evidence: `scripts/tests/test_auth_enforcement.py` in the API image (suite 17), which fails on the code before #25; `auth_stack.py matrix` for no session and each harness role on the running stack (suite 17), against the matrix written out in the check, not read from the API; `test_auth.py` checks that every app route has exactly one policy entry and every entry a route, and that a route without one is refused.*
 - [x] Before bootstrap every protected route and the login answer `503 SETUP_REQUIRED`; `bootstrap` works once and is then refused; `create-user` is refused before it; generated passwords are printed alone on standard output and must be changed at first login, when only the session routes answer; the last enabled engineer can't be disabled or demoted; usage errors exit 2.
   *Evidence: `test_auth.py` (store and `python -m auth` in a subprocess); suite 17 on the stack: `bootstrap` refused, forced change on created accounts.*
-- [x] Login, `GET /auth/me` and logout; the cookie's attributes; a session survives an API restart (with `RAG_ALLOW_RESTART=1`) and ends after 12 hours idle or 7 days; a password reset or disable ends the user's sessions at once, and a role change applies to an existing session's next request; the own password change needs the current password, follows the rules, and ends the user's other sessions.
-  *Evidence: `test_auth.py` (expiry with a patched clock); suite 17 on the stack, with throwaway `vfy-t-*` accounts and a session aged in the store.*
+- [x] Login, `GET /auth/me` and logout; the cookie's attributes; a session survives an API restart (with `RAG_ALLOW_RESTART=1`) and ends after 12 hours idle or 7 days; each login deletes every session that has ended by time, anyone's; a malformed earlier cookie doesn't hide the session; a password reset or disable ends the user's sessions at once, and a role change applies to an existing session's next request; the own password change needs the current password, follows the rules, and ends the user's other sessions.
+  *Evidence: `test_auth.py` (expiry with a patched clock; `test_a_new_session_sweeps_the_ended_ones`, `test_a_malformed_earlier_cookie_does_not_hide_the_session`, `RouteTests.test_a_login_sweeps_other_users_ended_sessions` for the login route across users, `test_an_empty_or_unreadable_session_cookie_is_no_session`); suite 17 on the stack, with throwaway `vfy-t-*` accounts and a session aged in the store.*
 - [x] A cookie-authenticated change from another origin, or with neither `Origin` nor `Sec-Fetch-Site: same-origin`, is refused `403 CROSS_ORIGIN_REFUSED`; the API sends no `Access-Control-*` headers; every login failure is the same `401 LOGIN_FAILED`; five failures for a username and address within 15 minutes throttle the pair for 15 minutes, for unknown usernames too, attempts are counted before they are checked, a wrong current password on `POST /auth/password` counts too, and the throttle survives a restart; a path with a control character (`%0A`) is refused `404` before its body is read; a password change to the current password is refused; the API log has one line per login and no password or session token.
   *Evidence: `test_auth.py`; suite 17 on the stack; suite 01's CORS check.*
 - [x] The verify harness gets its test credentials without committing, printing or passing them on a command line or in the environment: one account per role, generated passwords replaced at first login, kept in a 0600 file in a 0700 folder of the user's own outside the checkout, with the operator command run only on the verify project.
@@ -4182,15 +4570,23 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   login; a reset does the same, ends the user's sessions, and is refused for the engineer's own account; a role
   change applies to an existing session's next request; disabling ends the user's sessions and refuses their login,
   and enabling restores it; the last enabled engineer can't be demoted or disabled, also by themselves; no route
-  deletes an account; each change and refusal is one API log line with no password.
-  *Evidence: `test_auth.py` `AdminRouteTests` and the policy checks (suite 17); `auth_stack.py matrix` with the six
-  routes for every role and `auth_stack.py admin-accounts` on the running stack, with a throwaway `vfy-t-*`
-  account and the API log searched for the generated passwords (suite 17). These checks fail on the code before
-  PR 2 of #25, which has no such routes.*
-- [x] The Users page: an engineer-only entry in the nav's Admin menu and route; the account list; create and reset show the generated
-  password once until "Done"; no reset on the own row; role change, disable and enable; a refusal's message.
+  deletes an account; each change and refusal is one API log line with no password. A username breaking the rule is
+  `422 INVALID_USERNAME` whatever its length, its refusal logged and audited cut to 256 characters.
+  *Evidence: `test_auth.py` `AdminRouteTests`, `StoreTests.test_two_last_engineer_changes_at_once_leave_one_engineer`
+  (two last-engineer changes at the same time leave one engineer) and the policy checks (suite 17);
+  `auth_stack.py matrix` with the six routes for every role and `auth_stack.py admin-accounts` on the running stack,
+  with a throwaway `vfy-t-*` account and the API log searched for the generated passwords (suite 17). These checks
+  fail on the code before PR 2 of #25, which has no such routes.*
+- [x] The Users page: an engineer-only entry in the nav's Admin menu and route; the account list; create and reset
+  show the generated password once until "Done"; no reset on the own row; role change, disable and enable; reset
+  password, reset two-step, disable and a role change ask first (the own row says what it does to the engineer), a
+  cancel sends nothing, and enable doesn't ask; a refusal's message; after a change to their own account a demoted
+  engineer leaves the page and a disabled one is logged out.
   *Evidence: `scripts/verify/browser/ui_controls.js` (suite 06), with every API call answered by request
-  interception; `ui_criteria.js` checks the real engineer's nav includes Users.*
+  interception, including the cases of an engineer who demotes or disables themselves and the two confirmation
+  cases (the wording of each, enable not asking, a cancel sending nothing) and the two-step cases in
+  `mfaCases` for Reset two-step (its wording, and a cancel sending nothing); `ui_criteria.js` checks the real
+  engineer's nav includes Users.*
 - [x] Service keys: only engineers' sessions reach the principal and key routes; a key is issued only to a service
   principal, shown once (`Cache-Control: no-store`) and stored only as its SHA-256; a principal can't log in; a key
   works only as `Authorization: Bearer`, with its principal's current role and no `Origin`, and never on account,
@@ -4199,6 +4595,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   principal get `401 KEY_INVALID`; a key in a URL is no credential; expiry is 1-365 days, 90 by default; principals
   share the name pool and don't count for the last-engineer rule; the operator command lists principals, refuses
   their password reset and issues no key; each change and refusal is one API log line, and no key reaches the log.
+  A principal name follows the username rule: one breaking it is `422 INVALID_USERNAME` whatever its length, its
+  refusal logged and audited cut to 256 characters.
   *Evidence: `test_auth.py` `KeyFormatTests`, `KeyStoreTests`, `KeyMiddlewareTests`, `PrincipalRouteTests`, the
   `CommandTests` principal case and the policy checks (suite 17); `test_auth_enforcement.py` with the seven routes;
   `auth_stack.py matrix` with the seven routes for every role, `auth_stack.py key-matrix` with a key of each role,
@@ -4209,6 +4607,66 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   message.
   *Evidence: `scripts/verify/browser/ui_controls.js` (suite 06), with every API call answered by request
   interception; `ui_criteria.js` checks the real engineer's nav includes Service keys.*
+
+Two-step verification (#607). These are ticked once the tests reviewer's full `stack.sh run` on the change passes.
+
+- [ ] Codes are RFC 6238 (SHA-1, 6 digits, 30 s, a 160-bit secret), accepted one step either side and never twice;
+  a recovery code is 80 bits, works once and is stored only as SHA-256; a TOTP secret is stored only sealed with
+  AES-256-GCM under `AUTH_DIR/mfa.key` (0600), and one sealed for another user or under another or a lost key never
+  verifies; an existing store gains the schema 3 tables with nobody enrolled.
+  *Evidence: `scripts/tests/test_auth.py` `MfaUnitTests` (the RFC 6238 Appendix B vectors) and `MfaStoreTests`
+  (suite 17).*
+- [ ] A right password for an enrolled user opens no session and sets the 5-minute `rag_mfa` challenge; the code
+  step accepts a TOTP or recovery code, counts each against the login throttle (a right password doesn't clear
+  earlier failures), allows 5 codes per challenge, refuses an expired, used-up or reset user's challenge with `401
+  MFA_CHALLENGE_INVALID`, a wrong code with the same `401 MFA_FAILED` for both kinds, and opens a session for a
+  right one; nginx limits the code step in the login's zone.
+  *Evidence: `test_auth.py` `MfaLoginTests` (suite 17); `auth_stack.py mfa` on the running stack: set-up, password
+  then code, a used code and a used recovery code refused, and no secret or code in the API log (suite 17).*
+- [ ] Set-up shows the secret once (`no-store`), needs a code from the app, makes 10 recovery codes shown once and
+  ends the user's other sessions; regeneration needs a current TOTP code; a user turns it off with their password
+  and a code only while it isn't required; an engineer resets another user's set-up, ending their sessions, but not
+  their own; the operator command's `reset-mfa` does it for anyone; with the switch on (only for an enrolled
+  engineer), an unenrolled user's sessions reach only the session and `/auth/mfa` routes (`403
+  MFA_ENROLLMENT_REQUIRED`), after a due password change; API keys can't use any of it and aren't gated.
+  *Evidence: `test_auth.py` `MfaStoreTests`, `MfaRouteTests`, `CommandTests.test_reset_mfa` and the policy checks;
+  `test_auth_enforcement.py` with the seven new protected routes; `auth_stack.py matrix` and `key-matrix` with the
+  engineer routes and `auth_stack.py mfa` with an Engineer's reset (suite 17).*
+- [ ] Every enrollment, regeneration, turn-off, reset (engineer and operator) and switch change is an audit record,
+  and each second-factor attempt on a live challenge is its own record with the user as actor and the method, never
+  a code or secret.
+  *Evidence: `scripts/tests/test_audit.py` `MiddlewareTests.test_second_factor_records`,
+  `test_enrollment_reset_and_switch_records` and `CommandTests` (suite 19).*
+- [ ] The UI: the login's code step; the Account page (account menu "Account") with the QR code drawn in the
+  browser, the secret as text, the recovery codes shown once, regeneration and turn-off; the forced set-up page; the
+  Users page's Two-step column, "Reset two-step" (which asks first, #779) and the switch.
+  *Evidence: `scripts/verify/browser/ui_controls.js` "Two-step verification" cases (suite 06), with every API call
+  answered by request interception.*
+
+- [x] Per-collection access (#606): a restricted collection is hidden from `GET /collections` and refused, as if
+  missing, on every route that names it (query, settings, ingest, prepare import, gold standard, export, tune
+  options, job and session lookups, gold-standard downloads) to accounts and keys not granted it, and usable by
+  granted ones and Engineers; a new collection is restricted to its creator; a delete drops the state; existing
+  collections stay open after the upgrade; the settings routes answer `404` for a missing collection; packages of
+  restricted collections are hidden and their import fails as a missing package (encrypted ones once decrypted, and
+  a package of a discarded staging copy as the nearest collection in its chain that exists here, or the original);
+  an imported copy takes its source's access (an existing staging copy's package the narrowest across the copy's
+  chain); a new staging copy of a kept copy takes the narrowest state across its target's chain; a staging or
+  recovery copy, or a copy of one, is usable only by those who may use every collection in its chain that has a
+  state (#788, #792), and a deleted collection's state no longer narrows it; creation is fail-closed and a failed create or import puts back only its own state, and only when the
+  collection is known not to exist (a pending cleanup, an applied create or an unanswered check keeps the
+  restriction); documents in the Prepare area imported only into
+  collections the caller can't use are hidden and refused, a document with a usable import stays visible without
+  the other import records, and job records leave hidden documents out; only Engineers' sessions read or change access; every
+  change and refusal is audited.
+  *Evidence: `scripts/tests/test_collection_access.py` (suite 17), which fails on the code before #606, and its
+  #788 cases on the code before #788, with the #792 cases `NestedCopyTests`, the fail-closed import test
+  `test_a_failed_build_with_no_answer_on_existence_keeps_its_access` and
+  `test_package_source_asks_in_chain_order_and_never_about_the_original`; `auth_stack.py collection-access`, with
+  its Prepare-area document check (#788), which first shows a second Developer sees the document before the
+  import (#792), and the matrix rows (suite 17); the Collections page's Access cases in
+  `scripts/verify/browser/ui_controls.js` (suite 06), including a late answer for an earlier opening (#788), an
+  earlier opening's failed read and its late lists of people and service principals (#792).*
 
 ### 10.7 Audit log (#29)
 
@@ -4227,7 +4685,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   start-record`, `sessions`, `query`, `jobs`, `refused` and `admin` on the running stack (suite 19).*
 - [x] Logins beyond 10 a minute per address (burst 5) are refused by nginx with 429 `LOGIN_RATE_LIMITED`, and the
   refusal isn't recorded.
-  *Evidence: `auth_stack.py` login-rate-limit (suite 17); `test_lan_mode.py` `NginxTests`.*
+  *Evidence: `auth_stack.py` login-rate-limit (suite 17); `lan_stack.py rate-limit` over HTTPS (suite 18, `--lan`);
+  `browser/ui_criteria.js` "login rate limit on the login page (#577)" (suite 06); `test_lan_mode.py` `NginxTests`.*
 - [x] Repeated failed logins for one key within 60 s write one record, then one record with `details.count`. Open
   counts are written at shutdown, and at most 1,000 windows are tracked.
   *Evidence: `test_audit.py` `LoginCoalescingTests`; `audit_stack.py` coalesced-logins (suite 19).*
@@ -4326,6 +4785,78 @@ the documents and phrases read from the verify project's Weaviate (`ui_ingest_we
       *Evidence: `22_ui_ingest.sh`, one check per case and condition. Each check was shown to fail when its
       condition breaks, a job answer stubbed to fail among them, in a run of a changed copy of the suite.*
 
+### 10.10 Build and answer models (#671)
+
+The build LLM (`BUILD_LLM_MODEL`) prepares documents and writes gold standard pairs; the answer LLM
+(`ANSWER_LLM_MODEL`) answers questions; each falls back to `LLM_MODEL`, then `llama3.1:8b` (§6, §8). These
+are ticked once the tests reviewer's full `stack.sh run` on the change passes.
+
+- [ ] Each setting replaces `LLM_MODEL` for its task, an empty value counts as not set, and with neither set
+      both are `LLM_MODEL` (by default `llama3.1:8b`).
+      *Evidence: `scripts/tests/test_health.py` `ModelSettingsTests` (suite 01); `scripts/tests/test_ollama_entrypoint.py`
+      `ModelSettingsTests` for `ollama/models.sh` (run on the host by `16_api_paths.sh`, through suite 01).*
+- [ ] Preparation and gold standard generation call the build model, query the answer model: in a full run,
+      with `BUILD_LLM_MODEL=qwen2.5:0.5b` and the answer model as compose sets it, Ollama reports only
+      `qwen2.5:0.5b` answering preparation's and gold standard's calls and only the answer model answering
+      query's. Every other check runs on one model.
+      *Evidence: `scripts/verify/23_llm_split.sh` (full runs only); `test_prepare.py` (suite 21),
+      `test_goldstandard_api_paths.py` (suite 09, through 04) and `test_retrieval_controls.py` (suite 11).*
+- [ ] `/api/health/details` (a Developer or AI Engineer session) reports `llm` (the answer model), `build_llm` and `same_model`, and the public `/api/health` answers only `{"status": ...}`; a missing build or answer
+      model answers 503 `degraded` on both; `same_model` never affects the status. The Health page shows one LLM card
+      ("builds and answers") when `same_model` is true, otherwise an Answer LLM card and a Build LLM card, and
+      treats a body without `build_llm` as unreadable.
+      *Evidence: `scripts/tests/test_health.py` `TwoModelsTests` (suite 01); suite 01's real-stack check that
+      health reports `build_llm`, the same model as `llm`, with `same_model` true by default;
+      `browser/health_page.js` (suite 06).*
+- [ ] Ollama pulls each distinct model `ollama/models.sh` resolves, the answer model first, and its healthcheck
+      passes only when every one is listed by exact name; `package-offline.sh` and the CI model cache key read
+      the same names through `ollama/compose-models.sh`, so the default key is unchanged.
+      `package-offline.sh` finds each model's manifest by the name mapping of §11.3.
+      *Evidence: `test_ollama_entrypoint.py` (`test_a_name_with_a_space_or_glob_character_is_refused`,
+      `test_the_entrypoint_stops_on_a_bad_name_before_any_pull`), `test_distribution.py`
+      (`test_the_model_check_finds_library_and_namespaced_models`,
+      `test_the_model_check_looks_under_a_models_own_host`, `test_the_model_check_follows_ollamas_name_parse`,
+      `test_a_host_model_name_reaches_the_check_unchanged`,
+      `test_unreadable_model_settings_stop_before_anything_is_saved`), `test_ci_workflow.py` and
+      `test_collector.py` (suites 01 and 05); the stack's own start-up waits on that healthcheck.*
+- [ ] Packages record `answer_llm` and `build_llm` and keep `llm` as the answer model, at `package_format` 1;
+      `include_models` bundles the answer model, never the build model; import checks and installs only the
+      answer model (`RAG_EXPORT_SPECIFICATIONS.md` E42, E43).
+      *Evidence: `scripts/tests/test_retrieval_import.py` (suite 05) and `validate_package.py` on a real
+      export (suite 05).*
+
+### 10.11 Query-only mode (#670)
+
+A query-only instance answers questions on loaded collections and can't change them (§2.6). These are ticked once
+the tests reviewer's full `stack.sh run` and `stack.sh run --query-only` on the change pass.
+
+- [ ] `docker-compose.query-only.yml` changes only the api's `RAG_QUERY_ONLY`, from `"false"` to `"true"`;
+      `RAG_QUERY_ONLY` accepts exactly `true` or `false`, and the API image refuses another value at start-up with one
+      line and no traceback.
+      *Evidence: `query_only_config.py`, `test_query_only.py` `SettingTests` and the start-up refusal (suite 24, every
+      run).*
+- [ ] With the mode on, each of the 19 routes of §2.6 answers `403 QUERY_ONLY`, to a session and to a key, after
+      every other refusal (`401`, `CROSS_ORIGIN_REFUSED`, `FORBIDDEN`, `KEY_INVALID` unchanged) and without reading the
+      body; every other state-changing route is kept, and a new one fails the test until it is classified; the
+      refusal is audited with its principal; every user answer carries `query_only`.
+      *Evidence: `test_query_only.py` `PolicyTests` and `AppTests` (suite 24, in the API image); in a `stack.sh run
+      --query-only`, suite 24 sends each route to the query-only instance.*
+- [ ] `python -m loader` loads a package from `./exports` on a query-only instance only, one at a time, with the
+      import's checks (another embedding model is refused `EMBEDDING_MISMATCH` and creates nothing), exits 0, 1 or 2,
+      reads an encrypted package's passphrase from the terminal or standard input only, and writes one `operator.load`
+      record per run past its arguments (`success`, `refused`, `failed` or `interrupted`); every collection it
+      creates, a rename included, is restricted with no grants.
+      *Evidence: `test_query_only.py` `LoaderTests` and `AccessTests`; in every run suite 24 checks the refusal on a
+      full instance; in a `stack.sh run --query-only` it loads the package, checks the refused load, `COLLECTION_EXISTS`
+      on a second load, and that the End User sees the collection only after the Engineer opens it.*
+- [ ] Two instances, as two machines: a collection built and exported on the default instance, its package copied
+      into the empty exports folder of a query-only instance with its own volumes, loaded there and asked a question by
+      an End User, with an answer and citations; export and the package list keep working there.
+      *Evidence: suite 24 in a `stack.sh run --query-only` (the question outside `RAG_SKIP_SLOW=1`).*
+- [ ] The UI hides Import, Prepare, Chunking, Retrieval and Gold Standard and the Transfer page's import controls
+      and the Collections page's create and delete in query-only mode, and is unchanged otherwise.
+      *Evidence: the UI build (`tsc && vite build`) and review; `GET /auth/me`'s `query_only` in suite 24.*
+
 ## 11. Host Requirements and Distribution
 
 ### 11.1 Host requirements
@@ -4340,7 +4871,7 @@ the documents and phrases read from the verify project's Weaviate (`ui_ingest_we
 
 Memory and swap are set in **Docker Desktop → Settings → Resources**, not in
 `docker-compose.yml`; a compose `mem_limit` caps a container and cannot raise the
-VM ceiling. `/health` reports the allocated figure against
+VM ceiling. `/health/details` reports the allocated figure against
 `RECOMMENDED_MEMORY_GB` (§3.1.1) so a misconfigured host is visible rather than
 presenting as mysterious timeouts.
 
@@ -4378,7 +4909,7 @@ rag-docker/
 ├── install-offline.sh
 └── offline/
     ├── images.tar.gz            # docker save of all 5 images (~2.5 GB)
-    └── ollama_models.tar.gz     # llama3.1:8b + nomic-embed-text (~5.2 GB)
+    └── ollama_models.tar.gz     # the LLMs (llama3.1:8b by default) + nomic-embed-text (~5.2 GB)
 ```
 
 Before saving any image, `package-offline.sh` MUST check that the
@@ -4386,6 +4917,23 @@ Before saving any image, `package-offline.sh` MUST check that the
 pulls, and stop naming the missing ones otherwise (#647): a bundle without one
 would make the offline target try to download it. It exports the whole volume,
 so a model left in it (phi3.5, after an upgrade to 1.2.1) goes in too.
+
+The check looks for each model's manifest at `models/manifests/<path>/<tag>` in
+the volume, and reads the model name from the right, as Ollama does (#772,
+#824): the tag is what follows the last `:` of the last path segment, else
+`latest`, so a port in a registry host is not a tag.
+
+| Shape | Example | `<path>` under `models/manifests/` |
+|---|---|---|
+| One segment | `llama3.1:8b` | `registry.ollama.ai/library/llama3.1` (tag `8b`) |
+| Two segments | `someone/assistant`, `hf.co/model` | `registry.ollama.ai/someone/assistant`; a dot in the first segment doesn't make it a host |
+| Three segments, a registry host first | `hf.co/user/model:Q4_K_M`, `reg.example:5000/u/m:tag` | `hf.co/user/model`, `reg.example:5000/u/m`: the host's own directory |
+| Four or more | `a/b/c/d` | the name as given, as for three; not an Ollama name, so it is reported missing unless stored there |
+
+A model name MUST have only letters, digits and `. _ : / -`, MUST NOT contain
+`..`, and MUST NOT start with `/` or `-`. `ollama/models.sh` and
+`ollama/compose-models.sh` refuse any other name for the answer and build model
+settings, and `package-offline.sh` then stops before saving anything (#772).
 
 The image list MUST match the images `docker compose config` resolves. It is
 `rag-docker-api:latest`, `rag-docker-ui:latest`,
@@ -4427,7 +4975,7 @@ bash install-offline.sh
 A rebuild from these documents is correct when:
 
 - `docker compose up -d` starts five services and all three healthchecked ones report healthy.
-- `curl http://localhost:8080/api/health` returns 200 with `resources.memory.status: ok`.
+- `curl http://localhost:8080/api/health` returns 200 `{"status": "ok"}`, and `GET /api/health/details` with a Developer or AI Engineer session reports `resources.memory.status: ok`.
 - `GET /api/collections` returns 200 (not 500 — that indicates a client/server version mismatch).
 - A create → ingest → query round-trip returns a non-empty answer with at least one citation.
 - `docker compose down && docker compose up -d` succeeds twice in a row.
@@ -4622,7 +5170,9 @@ trace continuity. Full default and enabled runs and their actual limitations are
 required; a resolved Compose file alone is not runtime acceptance.
 
 Collector verification binds exact harness-owned assets across alternate checkouts
-and pins verification protocol/version/export budgets. Disabled-mode observation
+and pins verification protocol/version/export budgets. An evaluator-supplied
+`--telemetry-pin` (same repository, tag and digest only, outside the checkout) may
+set the expected Collector image. Disabled-mode observation
 requires termination of previous producer, Collector queues and capture handlers.
 Malformed decoded evidence is incomplete acceptance; malformed archive metadata
 and incomplete TAR framing are rejected before offline reconstruction.

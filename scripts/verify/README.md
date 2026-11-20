@@ -9,6 +9,7 @@ bash scripts/verify/stack.sh run                    # everything, ~20 min plus s
 RAG_SKIP_SLOW=1 bash scripts/verify/stack.sh run    # skip LLM work, ~8 min, start-up included
 bash scripts/verify/stack.sh run 02 04              # only the named suites
 bash scripts/verify/stack.sh run --lan              # LAN mode, TLS on loopback only (#26)
+bash scripts/verify/stack.sh run --query-only       # query-only mode on a second instance (#670)
 ```
 
 Exits non-zero if any check fails.
@@ -39,9 +40,10 @@ request comes from one address, so the harness waits for a slot instead of faili
 refuses with `429 LOGIN_RATE_LIMITED` is sent again every 6.5 s for up to 5 minutes, by
 `auth_setup.request` and `paced` (used by `auth_stack.py`'s `code`, `audit_stack.py` and
 `lan_stack.py`) and by `browser/lib.js`'s `login`; `browser/ui_criteria.js`'s §10.4 login through
-the login form is submitted once more after 6.5 s when the page shows nginx's refusal. The API's
-own `429 LOGIN_THROTTLED` and every other answer reach the check at once. Suites that log in often
-take longer for it.
+the login form is submitted once more after 6.5 s when the page shows nginx's refusal, printing a
+line when it retries. That check answers the form's first login itself with nginx's refusal, so the
+retry runs in every run (#598). The API's own `429 LOGIN_THROTTLED` and every other answer reach
+the check at once. Suites that log in often take longer for it.
 
 `require_stack` then logs `vfy-engineer` in, into the curl cookie jar
 `$RAG_AUTH_DIR/engineer.jar` (0600), exported as `RAG_AUTH_JAR`. `lib.sh` defines `curl` as a
@@ -125,6 +127,37 @@ and 4 min 10 s in a full run (the Prepare case about 25 s), most of it the large
 2.5 min). Splitting it through `overlap` at chunk size 50 instead embedded about 11,200 chunks and took
 26.5 min, which is why it uses `fixed` with the merge.
 
+`23_llm_split.sh` checks that each task uses its own LLM (#671): preparation and gold standard
+generation the build model, query the answer model. It runs only in a full run (`RAG_SKIP_SLOW`
+unset); every other check stays on one model. It ingests the fixtures' `policies.txt` into
+`VfyLlmSplit`, then runs `llm_split.py` in the api container with `BUILD_LLM_MODEL=qwen2.5:0.5b`
+set for that process only, the answer model left as compose sets it, so neither the API nor the
+compose settings change. `llm_split.py` pulls `qwen2.5:0.5b` into the verify project's Ollama, then
+prepares a short text (`preparation.prepare_document`, with the chat and model list
+`preparation_jobs` uses), generates one gold standard pair (`goldstandard._generate_pair`) and runs
+one query (`rag_pipeline.run_query`) on the collection, recording the model Ollama reports in each
+chat reply. The checks: preparation and gold standard were answered only by `qwen2.5:0.5b`, query
+only by the answer model. Preparation writes to a temporary folder and the pair isn't stored; the
+small model is deleted from Ollama and the collection dropped at the end.
+
+`24_query_only.sh` checks query-only mode (#670, SPECIFICATIONS.md §2.6 and §10.11). In every run:
+`query_only_config.py` resolves `docker-compose.yml` with and without `docker-compose.query-only.yml` through
+`docker compose config` (nothing started) and checks that only the api's `RAG_QUERY_ONLY` changes, from `"false"` to
+`"true"`; `../tests/test_query_only.py` runs in the API image with no network (the setting, the classification of
+every state-changing route, the `403 QUERY_ONLY` refusals and their order, the user answers' `query_only`, the
+loader and the access of a collection it creates); a one-off api container refuses `RAG_QUERY_ONLY=yes` with one
+line; and on the default instance `python -m loader` refuses with `NOT_QUERY_ONLY` (exit 1, an `operator.load`
+record) and a path is a usage error (exit 2). The rest needs `stack.sh run --query-only`, which runs this suite
+alone: it ingests the fixtures' `policies.txt` into `VfyQueryOnly` and exports it, then `stack.sh query-only-mode`
+starts the project again in query-only mode with empty volumes and only that package in its exports folder (the
+second machine). There, after the test accounts are made again, it checks `GET /auth/me`'s `query_only`, a load
+with `EMBED_MODEL` set to another model for that process (refused `EMBEDDING_MISMATCH`, no collection), the load
+(exit 0, the exported chunk count, an `operator.load` record), a second load (`COLLECTION_EXISTS`), that the End
+User doesn't see the loaded collection until the Engineer opens it (`PUT .../access`, kept), each of the 19 refused
+routes (`403 QUERY_ONLY`), a Developer's delete (`FORBIDDEN`) and no session (`401`), outside `RAG_SKIP_SLOW=1` an
+End User's question with an answer and citations, and an export and the package list. The project is removed when
+the run ends. Two stacks never run at once, so Docker's memory holds one answer model.
+
 ## Entry point and verify project
 
 `stack.sh` runs everything on compose project `rag-verify`, a disposable copy of
@@ -135,9 +168,10 @@ against" below).
 
 | Command | What it does |
 |---|---|
-| `stack.sh run [--checkout DIR] [--telemetry \| --lan] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
-| `stack.sh up [--checkout DIR] [--pull] [--telemetry \| --lan]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. `--telemetry` brings it up in the same telemetry configuration as `run --telemetry` (see "Optional Collector acceptance") and also prints `COMPOSE_PROFILES`, `RAG_VERIFY_HARNESS`, `RAG_VERIFY_CHECKOUT` and `RAG_VERIFY_OTEL_ENABLED`. |
+| `stack.sh run [--checkout DIR] [--telemetry [--telemetry-pin FILE] \| --lan \| --query-only] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
+| `stack.sh up [--checkout DIR] [--pull] [--telemetry [--telemetry-pin FILE] \| --lan \| --query-only]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. `--telemetry` brings it up in the same telemetry configuration as `run --telemetry` (see "Optional Collector acceptance") and also prints `COMPOSE_PROFILES`, `RAG_VERIFY_HARNESS`, `RAG_VERIFY_CHECKOUT`, `RAG_VERIFY_OTEL_ENABLED` and `RAG_VERIFY_TELEMETRY_PIN`. `--telemetry-pin FILE` supplies a reviewed collector pin (see "Evaluating a collector pin change"). |
 | `stack.sh down` | Removes the project: its containers, network, volumes, images and exports folder. |
+| `stack.sh query-only-mode --package NAME [--checkout DIR]` | Only for `24_query_only.sh`, under the inherited lock of a `run --query-only` (#670): keeps package NAME aside, removes the project's containers, network and volumes (not its images or the model copy), puts the package back alone in an empty exports folder, and starts the project again from the checkout's `docker-compose.query-only.yml`, after the configuration check and without a build, as a second instance on another machine would be. |
 
 `--checkout` is the checkout to build and test; the default is the one holding
 `stack.sh`. The overlay `docker-compose.verify.yml` and `stack.sh` itself always
@@ -235,10 +269,14 @@ would fail by design). `--lan` can't be combined with `--telemetry`.
 `lan_config.py` (`docker compose config` of the base file plus
 `docker-compose.lan.yml`, under the project name `rag-lan-config`, with no
 `.env`; nothing is created) and runs `../tests/test_lan_mode.py` in the API
-image. Only in a `--lan` run does it check the running LAN project through
+image. It also checks, in one-off api containers of the running verify project
+(default or LAN configuration; `docker compose run --rm --no-deps`), that the API refuses with one line and
+no traceback for a non-Secure cookie in LAN mode, an empty account store in LAN
+mode and a non-boolean `RAG_LAN_MODE`. Only in a `--lan` run does it check the running LAN project through
 `lan_stack.py`: HTTPS with the generated certificate, the hosts nginx answers
 for (localhost, 127.0.0.1 and the test names; another `Host` gets 421, #664),
 TLS versions and HTTP/2, the single loopback binding, the `Secure` cookie, the origin rule over HTTPS,
+a `Server` header with no nginx version (`server_tokens off`),
 the API's refusal in one-off containers (`docker compose run --rm
 --no-deps`, no ports) and nginx's login rate limit (logins sent without
 waiting until one is refused `429 LOGIN_RATE_LIMITED`, #577); it also prints
@@ -298,8 +336,9 @@ top of the main `README.md` shows its result on `develop`.
   failed.
 - **The model cache.** Even with `RAG_SKIP_SLOW=1`, ingest needs the embedding
   model, so Ollama starts with both models (about 5.2 GB). The cache key is
-  built from the models `ollama/entrypoint.sh` pulls
-  (`ollama-models-llama3.1:8b-nomic-embed-text`). On a hit, the cached models are
+  built from the models `ollama/entrypoint.sh` pulls, the names
+  `ollama/compose-models.sh` resolves from the LLM settings compose gives the
+  ollama service (#671) (`ollama-models-llama3.1:8b-nomic-embed-text` by default). On a hit, the cached models are
   copied into `rag-verify-ollama-models` before `up`, and Ollama pulls
   nothing. On a miss, Ollama pulls them; after `down`, the workflow copies the
   volume's `models/` folder out, only once every model's manifest is there,
@@ -345,7 +384,7 @@ Run `python3 scripts/tests/test_session_implementation.py` from the repository r
 
 Suite 05 also runs `scripts/tests/test_batch_implementation.py` on the host (Python and bash).
 
-`05_transfer.sh` registers the nine controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_export_snapshot.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_import_guard.py`, `test_batch_recovery.py`, `test_package_listing.py` and `test_export_encryption.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links. It also checks (#509) that export writes a `null` `source_sha256` for a chunk whose retained blob is missing on disk, and that import check 3a refuses a chunk whose non-null `source_sha256` isn't a digest of the package's source index (with or without `sources/`) as `PACKAGE_CORRUPT`, `detail` `{"file": "chunks.jsonl", "line": n}`, before the embedding check and any backend work.
+`05_transfer.sh` registers the ten controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_export_snapshot.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_import_guard.py`, `test_batch_recovery.py`, `test_package_listing.py`, `test_export_encryption.py` and `test_package_download.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links. It also checks (#509) that export writes a `null` `source_sha256` for a chunk whose retained blob is missing on disk, and that import check 3a refuses a chunk whose non-null `source_sha256` isn't a digest of the package's source index (with or without `sources/`) as `PACKAGE_CORRUPT`, `detail` `{"file": "chunks.jsonl", "line": n}`, before the embedding check and any backend work.
 
 `scripts/tests/test_export_snapshot.py` (#509, API container) drives `exporter._run` with the real `packager.build` and retained-source store and a mocked Weaviate backend whose iterator reads the stored chunks one at a time. A re-ingest that tries to commit new chunks and a new `doc.txt` source after the first chunk is streamed waits for the export: the package holds the old chunk text and the old source bytes and index, every chunk's `source_sha256` names a blob in `sources/`, and the re-ingest lands after the build. During an export, gold-standard generation preparation answers `COLLECTION_BUSY` (409) and a guarded chunk insert waits; an export started while another writer holds the guard reads `queued` until it is released; and the guard is free again after an export that succeeds, is refused (`PackageError`), fails or is cancelled. An export whose build is cancelled, or ended by another non-`Exception`, reads `failed` with an `error` naming the exception and saying it was cancelled, and the exception still propagates (#521). Orderings use events and the guard's waiter count. On the code before #509 the re-ingest, generation, insert, queued and guard-held checks fail; on the code before #521 the cancelled-status checks fail.
 
@@ -689,9 +728,11 @@ operation runs reliably long enough to interrupt, so `test_jobstore.py` covers i
 
 `scripts/tests/test_startup_sweep.py` (#377) checks the startup sweeps of what a killed job
 leaves behind, in disposable folders. In `UPLOAD_DIR`, ingest staging is created as
-`ingest-*` and removed with the `import-*`, `rechunk-*`, `batch-verify-*` and `prepare-*` work
-directories, and document preparation's `prepare-*.zip` and `prepare-*.json` temporary files (#640);
-in `EXPORTS_DIR`, `.build-*` directories and `.*.tar.gz.partial` files are removed. Only those
+`ingest-*` and export staging as `export-*` (#549), and both are removed with the `import-*`,
+`rechunk-*`, `batch-verify-*` and `prepare-*` work directories, and document preparation's
+`prepare-*.zip` and `prepare-*.json` temporary files (#640); in `EXPORTS_DIR`, `.build-*`
+directories (export staging from earlier versions) and `.*.tar.gz.partial` and
+`.*.tar.gz.age.partial` files are removed. Only those
 names, and only a real directory or regular file as the name says: completed packages,
 `ingest_configs/`, look-alike names, a file where a directory is expected and the reverse, and
 anything in a sub-folder are kept. A symlink is never followed, at the top or inside a
@@ -701,7 +742,7 @@ child process removes both kinds and logs them by name and size. A second one, w
 sweep fails, logs the error and still starts, with the ingest staging removed (#423).
 `02_ingest.sh` runs it in the API container. With `RAG_ALLOW_RESTART=1`, `02_ingest.sh` checks
 that its two killed ingests' `ingest-*` staging existed before its restart and is gone after it
-(#423), and `05_transfer.sh` checks after its export restart that the interrupted export's build
+(#423), and `05_transfer.sh` checks after its export restart that the interrupted export's staging
 directory and temporary archive are gone, without removing anything itself, and that the
 completed package from the top of the suite is still there.
 
@@ -895,11 +936,12 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps; the proxy answers `Host` localhost and 127.0.0.1 and refuses another with 421 (#664) |
 | `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
 | `../tests/test_package_archives.py` | host-side: `package.sh` and `package-offline.sh` in a scratch git repository with `docker` stubbed hold exactly the tracked files of `HEAD`, and refuse outside a git top level (#384), run in a checkout reached through a symlink, and ignore the user's system and global git config (#447); embedded copies; registered by suite 01 |
-| `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate, alone or together (#375, #415), and advisory memory (#415), registered by suite 01 |
+| `../tests/test_health.py` | controlled `/health/details` 503 body for a missing model and an unreachable Ollama or Weaviate, alone or together (#375, #415), and advisory memory (#415); the public `/health`'s status-only body and who may read the details (#750), registered by suite 01 |
+| `../tests/test_installed_authlib.py` | the Authlib installed in the built API image is the version `api/requirements.txt` pins (#565), run in the image with no network; registered by suite 01 |
 | `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388, #445): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged, the folder is fsynced after the replace, startup removes interrupted saves' temporary files; registered by suite 01 |
-| `memory_override.py` | helper for suite 01, on the host: the in-process `RECOMMENDED_MEMORY_GB` its memory checks raise past the allocation, derived from the `allocated_gb` `/health` reports, so the status flips to `below_recommended` on any host (#536) |
+| `memory_override.py` | helper for suite 01, on the host: the in-process `RECOMMENDED_MEMORY_GB` its memory checks raise past the allocation, derived from the `allocated_gb` `/health/details` reports, so the status flips to `below_recommended` on any host (#536) |
 | `../tests/test_memory_override.py` | host-side, standard library: the derived override makes `system_info.memory_info` report `below_recommended` with a note for allocations below and above the 12.35 GB a fixed 13 GB could flip, and no override without a usable allocation (#536); embedded copies; registered by suite 01 |
-| `17_auth.sh` | §10.6 — authentication (#25): the endpoint/role matrix, sessions, origin rules, throttling, the operator command, account administration, service API keys; registers `../tests/test_auth.py`, `../tests/test_auth_enforcement.py` and `../tests/test_verify_auth.py`; opt-in restart check |
+| `17_auth.sh` | §10.6 — authentication (#25): the endpoint/role matrix, sessions, origin rules, throttling, the operator command, account administration, service API keys, two-step verification (#607), per-collection access (#606); registers `../tests/test_auth.py`, `../tests/test_collection_access.py`, `../tests/test_auth_enforcement.py` and `../tests/test_verify_auth.py`; opt-in restart check |
 | `auth_setup.py` | the test accounts and their credentials file, and a role's login into a cookie jar; run by `lib.sh` (#25) |
 | `auth_stack.py` | the stack checks of `17_auth.sh`, one per subcommand (#25) |
 | `auth_headers.py` | the suite's session as `Cookie` and `Origin` headers, for the host-side Python helpers (#25) |
@@ -909,7 +951,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `18_lan.sh` | §2.5 and §10.5 — LAN mode (#26): the real override resolved without starting it; registers `../tests/test_lan_mode.py`; with `stack.sh run --lan`, the running LAN project on loopback |
 | `lan_config.py` | host-side, standard library: `docker-compose.lan.yml` as `docker compose config` resolves it, at the default port and `RAG_LAN_PORT=8443` (#26) |
 | `lan_stack.py` | the stack checks of `18_lan.sh` in a `--lan` run, one per subcommand (#26) |
-| `../tests/test_lan_mode.py` | API image, no network: `RAG_LAN_MODE` parsing, the startup refusal (also through `import main`), the certificate step, both nginx configurations, embedded copies (#26) |
+| `../tests/test_lan_mode.py` | API image, no network: `RAG_LAN_MODE` parsing, the startup refusal (also through `import main`), the certificate step, both nginx configurations, `lan_stack.py`'s rate-limit check against faked answers (#598), embedded copies (#26) |
 | `docker-compose.lan.verify.yml` | the harness overlay of a `--lan` run: TLS on loopback at the verify port, the verify image for `tls-init`, reserved test names (#26) |
 | `16_api_paths.sh` | ingest, query, metrics and health API paths (#399), run last by suite 01: `NO_SUPPORTED_FILES`, `JOB_NOT_FOUND`, schema rules, the proxy's `/api/` timeouts, `/metrics/latency`, a default query and its metric (LLM); opt-in restart and first-start checks |
 | `../tests/test_api_paths.py` | controlled ingest error, `/query` default, §6 prompt, query metric, retrieval-config file, `/metrics/latency` and `/health` probe regressions (#399), registered by `16_api_paths.sh` |
@@ -926,7 +968,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_goldstandard_review.py` | controlled PATCH/regenerate 404 codes for unknown sessions and pairs, and the empty-edit refusal (#381), registered by `04_goldstandard.sh` outside the slow gate |
 | `../tests/test_goldstandard_exports.py` | controlled gold-standard export folder, name rule, overwrite and refusal regressions (#370), exports-folder refusal and replace-not-follow write (#402), registered by `10_validity.sh` |
 | `../tests/test_session_validity.py` | controlled retained-session validity, historical export guard, durable pre-replacement stale markers, their rollback on abort and the real tuning abort branch (#93, #275), registered by `10_validity.sh` |
-| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E40, encrypted packages (#27); destructive replace fidelity, live metadata and model checks, controlled regressions and source drift; a lowercase-first collection name end to end (#372) |
+| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E40, encrypted packages (#27); destructive replace fidelity, live metadata and model checks, controlled regressions and source drift; a lowercase-first collection name end to end (#372); downloading a package and expiry (#677) |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
 | `../tests/test_zip_expansion.py` | controlled ZIP expansion-cap (1 MiB cap from env) and off-event-loop regressions, registered by ingest |
 | `../tests/test_zip_limits.py` | controlled ZIP member-count (cap of 20 from env), ratio, escaping-member and `detail` bound regressions (#28), registered by ingest |
@@ -945,12 +987,14 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
 | `../tests/test_batch_recovery_fixture.py` | controlled check that the import package `batch_recovery.py`'s `write_import_package` writes passes the importer's real digest and source checks; run in the API image with no network and the repository mounted read-only, registered by transfer |
 | `../tests/test_package_listing.py` | controlled package-listing regressions (#383): the listing reads each archive only up to its manifest, new archives put the manifest first, an oversized manifest and other unreadable files are listed `readable: false`, and so is a manifest with a wrongly typed listed value (#451); run in the API image with no network, registered by transfer |
+| `../tests/test_package_download.py` | controlled package download and expiry regressions (#677): the record of exported packages, `expires_at`, `GET /packages/{filename}` (deletion after a complete download only, HEAD, names, roles, access, busy), an interrupted download, the sweep and the audit records; registered by suite 05 |
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
 | `../tests/test_batch_implementation.py` | host-side: exact embedded source checks for `api/main.py`, the Weaviate client, the batch-write, recovery, import and tuning services and their verify scripts, and the restart-recovery block of `05_transfer.sh` with stubbed commands (refused-prefix skip, `RAG_ALLOW_RESTART`, the #152 refusal), registered by transfer |
 | `../tests/test_chunk_limits.py` / `../tests/test_insert_chunks.py` | controlled chunker per-file limits, chunk ceiling and semantic floor (#111) / insert batching and the "index not ready" retry, registered by ingest in the API image with the repository mounted (#386) |
 | `../tests/test_embed_batching.py` | controlled embedding writes (#613): a write that leaves vectors to Weaviate's `text2vec-ollama` uses `fixed_size(10, 1)` batches and one with every vector `dynamic()`; only objects whose embed request timed out in Weaviate are sent again, at most twice, with the write counts and rollback unchanged, and no other failure is retried. Registered by ingest in the API image with the repository mounted, after which ingest writes 45 vectorless chunks to a scratch `<prefix>EmbedBatch` collection on the real Weaviate and Ollama and checks they are all stored, through `fixed_size(10, 1)` and never `dynamic()`; the collection is removed afterwards |
 | `../tests/test_corpus_rules.py` | controlled: the corpus preparation rules the Import page offers (`ui/public/corpus-preparation-rules.md`) state every ingest limit as the chunker, the ingest pipeline, the settings defaults, the chunk-setting bounds, `docker-compose.yml` and the proxy define it, and no other number (#615), registered by ingest in the API image with the repository mounted |
 | `../tests/test_corpus_rules_estimates.py` | controlled: the chunk counts the corpus preparation rules give hold for the real chunker for every strategy, on files built at the rules' targets, which are never refused for the text or chunk limits (#615), registered by ingest in the API image with the repository mounted |
+| `../tests/test_scanned_pdf_ocr.py` | an image-only (scanned) PDF is read by OCR through the ingest pipeline's own parser, and the installed Pillow is the version `api/requirements.txt` pins (#522, #524); run in the built API image with no network, registered by suite 02 |
 | `../tests/test_model_bundle.py` | controlled bundled-model install safety, E21 and E22 with a temporary store, registered by transfer in the API image with the repository mounted (#386) |
 | `../tests/test_settings_validation.py` | controlled settings refusals before work, registered by settings in the API image with the repository mounted (#386) |
 | `../tests/test_retrieval_controls.py` | controlled collection list rows and retrieval-mode dispatch, registered by retrieval (suite 11) in the API image with the repository mounted (#386) |
@@ -960,11 +1004,18 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `browser/ui_ingest.js` | the browser side of suite 22: the Import and Prepare pages driven as a user does, the observations printed as one JSON line (#641) |
 | `ui_ingest_weaviate.py` | helper for suite 22, run in the API container: the `VfyUiIngest*` collections' documents and chunk text, read only (#641) |
 | `ui_ingest_check.py` | the checks of suite 22, one per subcommand, on the host, and its cleanup (#641) |
+| `23_llm_split.sh` | the build and answer models (#671), full runs only: with `BUILD_LLM_MODEL` set to a small model, preparation and gold standard use it and query uses the answer model |
+| `llm_split.py` | helper for suite 23, run in the API container: pulls the small model, runs the three tasks through the services' code and prints the models Ollama reports answering each (#671) |
+| `24_query_only.sh` | §2.6 and §10.11 — query-only mode (#670): the overlay resolved without starting it; registers `../tests/test_query_only.py`; the start-up refusal of a non-boolean `RAG_QUERY_ONLY`; the loader's refusal on a full instance; with `stack.sh run --query-only`, build and export, `stack.sh query-only-mode`, then the load, the refusals, access and Q&A on the query-only instance |
+| `query_only_config.py` | host-side, standard library: `docker-compose.yml` with and without `docker-compose.query-only.yml` as `docker compose config` resolves them; only the api's `RAG_QUERY_ONLY` may differ (#670) |
+| `../tests/test_query_only.py` | API image, no network (also on the host): `RAG_QUERY_ONLY` parsing, the refused and kept routes, the refusals through the app and their order, `query_only` in the user answers, the loader (usage, refusals, lock, passphrase, results `success`/`refused`/`failed`/`interrupted`, the Ctrl-C handler) and the access of a collection it creates (#670) |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
 | `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
 | `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530); the nginx tag in SPECIFICATIONS.md's compose copy and 11.3 image list matches docker-compose.yml (#665), registered by infrastructure |
 | `../tests/test_upgrade_backup.py` | host-only: the README's 1.1.0 → 1.2.0 upgrade blocks, run as written under bash, `zsh -c` and interactive zsh with comments off, against stub `docker`, `git` and `curl`; the stub docker accepts only mounts inside its temp directory and only the README's two container commands: no block holds a `#` comment line; the backup skips a missing volume (a wrong prefix) and counts only existing volumes' archives, and writes each copy to a `.tmp` file that replaces the archive only once `gzip -t` passes, so a failed or corrupt copy prints `backup FAILED` and keeps an earlier archive; the rollback is gated on `git checkout v1.1.0` and checks every archive (`gzip -t`, `tar tzf`) and volume before it empties any, and a failed restore stops before `compose up`; alpine is pinned by version and digest; git ignores `backups/` (#679, #693), registered by infrastructure |
 | `../tests/test_version_agreement.py` | host-only: the first-party version strings agree with each other, not with a fixed version: `ui/package.json`, the root versions in `ui/package-lock.json`, `mcp/mcpapp.py`, the two `service.version` defaults in `api/services/telemetry.py` and `RAG_OTEL_SERVICE_VERSION` in `docker-compose.telemetry.yml` and `docker-compose.telemetry.verify.yml` (#605, #656), registered by infrastructure |
+| `../tests/test_ui_dependencies.py` | host-only: the copy of `ui/package.json` embedded in `IMPLEMENTATION.md` (`### ui/package.json`) is the file, exactly, so a UI dependency bump that misses the copy fails (#532), registered by infrastructure |
+| `../tests/test_tailwind_output.py` | runs from the host, standard library plus the docker CLI: the built UI CSS keeps what the Tailwind 4 migration relies on (RD-157, #773): the `prose` and `prose-sm` rules, `relative`, `hover` on every device with no `@media (hover: hover)`, and the `@source` globs with automatic detection off (a sentinel `.jsx` file under `ui/src/` is scanned, a sentinel `.md` file is not). It builds a scratch copy of `ui/` with `npm ci --ignore-scripts` from the lock file and `vite build` in a throwaway container of the image `ui/Dockerfile` builds with (its `builder` stage), not on the host (#826), so it needs the network unless the image and the npm cache are present, and is skipped, with a message, only when the docker CLI is missing (a docker or build failure fails it); a second class reads `ui/src/index.css`, `NavBar.tsx` and `ui/Dockerfile` directly, and checks that the builder image is an image reference with a tag or a digest (a `--platform` flag, a digest pin and a registry with a port are accepted; a token starting with `-` is refused before it reaches `docker run`); a third checks, with a stub in place of docker, that a build step that times out has its named container removed (#841). Registered by infrastructure |
 | `15_transfer_paths.sh` | transfer and tuning paths with no check before (#387): import refusals, `on_conflict`, unknown job ids, `/packages`, the package file unchanged, export without the model store, `retrieve.py` (E8-E10), E11 retrieval, a re-chunk with no chunks; run by `05_transfer.sh` |
 | `transfer_packages.py` | helper for suite 15; writes one damaged copy of a package per refusal kind |
 | `../tests/test_package_refusals.py` | controlled import checks 1 and 2, collection-name and `chunks.jsonl` record refusals, registered by suite 15 |
@@ -1176,11 +1227,42 @@ secrecy rules above. Suite 05 then exports the transfer collection encrypted, va
 with `validate_package.py` in the API container (`RAG_PACKAGE_PASSPHRASE`), and checks a wrong
 passphrase, both refusals and a round trip on the live verify stack.
 
+## Downloading a package and expiry (#677)
+
+`scripts/tests/test_package_download.py`, run by `05_transfer.sh` in the API image with no
+network (or on the host with the API's dependencies), checks:
+
+- `EXPORT_RETENTION_HOURS` (1-720);
+- the record of exported packages (`<UPLOAD_DIR>/exported_packages.json`) and `expires_at` in
+  `GET /packages` and the export job status;
+- `GET /packages/{filename}`:
+  - the bytes and headers;
+  - the deletion of a recorded package after a complete download only;
+  - HEAD;
+  - bad names, folders and links answering `404 PACKAGE_NOT_FOUND`;
+  - an End User refused;
+  - the #606 access rule and its audit record;
+  - `409 PACKAGE_BUSY` during an import or another download;
+- a client that goes away keeping the package (the response driven directly);
+- the sweep (expired, fresh, busy, gone, a link);
+- the `package.download` and `package.delete` records.
+
+Suite 05's live checks run through the proxy on the verify stack, with fixtures from
+`package_retention_stack.py` in the API container:
+
+- a new export's listing entry has `expires_at`;
+- a full download returns every byte, removes the package from `./exports` and the listing, and
+  is audited as `package.download` (`completed: true`) and `package.delete` (`downloaded`, by the user);
+- a 64 MiB recorded package read at 1 MB/s for 2 seconds is kept, its record `completed: false`;
+- one sweep deletes a package recorded 25 hours ago (`package.delete`, `expired`, `system`) and
+  keeps an unrecorded one;
+- an End User is refused `403`.
+
 ## Transfer page polling and failure checks
 
 `browser/transfer_page.js`, registered in `06_ui.sh` through `ui_criteria.js`, renders the
 Transfer page with every API call stubbed in the browser and the page's 2 s poll delay cut to
-20 ms (#382). Seventeen cases: for each half, a failed poll (a proxy 502) is shown and retried
+20 ms (#382). Twenty-three cases: for each half, a failed poll (a proxy 502) is shown and retried
 with the button still busy and cleared by the next good poll; 30 failures in a row stop polling,
 show the last error and enable the button again, and a new start clears the message; a poll in
 flight when the page is left schedules no further poll. An export start answered after the page
@@ -1191,7 +1273,15 @@ is shown without the empty-folder hint until a good Refresh. Three cases cover e
 an export passphrase holds Export until it has 12 characters and matches its confirmation, is
 sent only when the box is checked, and both fields clear once the export starts; an encrypted
 package is labelled, asks for its passphrase, sends it and clears it, and a plain package sends
-none. Like `query_config.js`, it can run
+none. Four cases cover downloading a package (#677):
+- a finished export offers a Download link to its package with "Expires" in local time, and none
+  when it has no expiry;
+- the package list says when a package exported here expires, and its Download link follows the
+  selected package;
+- after a Download click the page re-reads the list, and once the package is gone it shows
+  "Downloaded and deleted from ./exports." instead of the link.
+
+Like `query_config.js`, it can run
 on its own against a UI with no backend (`RAG_UI_BASE`, `RAG_CHROMIUM_PATH`):
 
 ```bash
@@ -1253,7 +1343,9 @@ nothing reaches the backend or a model. 67 cases:
   (Ctrl+Enter, plain Enter, Ask disabled while empty or loading), the citations toggle, markdown,
   the latency and error lines and the End User view with `response_format`; the Retrieval page's
   saved and default texts, alpha slider and Save while loading; and the client's handling of
-  nginx's HTML 413, 502, 504 and 500 pages, a non-JSON 200 and a JSON message.
+  nginx's HTML 413, 502, 504 and 500 pages, a non-JSON 200 and a JSON message; and query-only
+  mode (#670): the "Query-only" tag, the nav and router without the pages that change data, the
+  Collections page without create and Delete, and the Transfer page without its import controls.
 - `ui_pages.js`: Gold Standard generate (selector, sample size, progress, confirm) and review
   (summary bar, approve, reject, regenerate, edit, failed action, export enabled); the Transfer
   export controls (collection selector, fidelity line, include-models payload, progress and
@@ -1301,15 +1393,17 @@ ingests under a lowercase-first name, reads the tuning options and exports under
 name, re-chunks under the lowercase name and, unless `RAG_SKIP_SLOW=1`, checks a query's
 metrics under both spellings.
 
-Suite 01 also runs `scripts/tests/test_health.py` the same way (#375). It sends `GET /health`
+Suite 01 also runs `scripts/tests/test_health.py` the same way (#375). It sends `GET /health/details`
 through the app with Ollama's `/api/tags` answered by an httpx mock transport and the Weaviate
 client check mocked, and checks the 503 `degraded` body: the LLM or embedding model missing
 from Ollama's list (that service `error`, the rest `ok`), Ollama unreachable (both models
 `error`), Weaviate not ready or unreachable (Weaviate `error`), Weaviate and Ollama down
 together (all three `error`), each with its latency, model names and `resources`; and 200
 `ok` when everything is up, also with memory below the recommendation or unreadable
-(`resources.memory.status` `below_recommended` or `unknown`; memory is advisory, #415). `browser/ui_criteria.js` (suite 06)
-stubs `/api/health` and checks that the Health page shows a degraded 503 body with the failing
+(`resources.memory.status` `below_recommended` or `unknown`; memory is advisory, #415). Without a
+session, `GET /health` answers only `{"status"}` by the same rule, and `/health/details` is 401;
+an End User gets 403 and a Developer the full body (#750). `browser/ui_criteria.js` (suite 06)
+stubs `/api/health/details` and checks that the Health page shows a degraded 503 body with the failing
 service red and the others green, that a proxy 502, a refused connection and a 503 without a
 health body each show "Service health could not be read:" with the reason and remove the
 earlier cards, that the next good load clears it, and that the latency metrics load on every
@@ -1491,3 +1585,37 @@ independent of ambient operator telemetry variables. Before disabled-mode counti
 the old API, Collector queues and capture handlers terminate; a fresh Collector
 and capture process isolate the zero-traffic observation from earlier exports.
 Malformed capture shapes fail as incomplete evidence, never partial success.
+
+### Evaluating a collector pin change (#532)
+
+The guard checks the `otel-collector` image against the harness's own
+`telemetry/image.json`, so a checkout that changes the collector pin (in
+`telemetry/image.json` or `docker-compose.telemetry.yml`) is refused by default,
+and no file in the checkout is ever read as a pin. To evaluate such a change,
+the evaluator supplies a reviewed pin with `--telemetry-pin FILE`, together with
+`--telemetry`, on `run` or `up`:
+
+```sh
+bash scripts/verify/stack.sh run --telemetry --telemetry-pin <bundle>/telemetry-pin.json --checkout <bundle>/merged 15
+```
+
+- The harness makes no registry lookup. Before the run, the evaluator checks the
+  PR's pin against the registry from the host (the tag resolves to the pinned
+  digest, and each architecture's config ID matches `image.json`), then copies
+  the PR's `telemetry/image.json` outside the checkout. If that check fails or
+  can't be done, there is no telemetry run.
+- `FILE` must be an existing file outside the checkout under test (after
+  resolving symlinks); otherwise `stack.sh` exits 2 before any Docker command.
+  The check compares by device and inode, so letter case on a case-insensitive
+  volume doesn't matter, and it refuses a file with a second hard link, since
+  that link could be a file in the checkout.
+- Its `image` must be `<repository>:<tag>@sha256:<digest>` with the harness
+  pin's repository, so only the tag and digest can change. Anything else (an
+  unreadable file, another form, another repository) is refused by the guard,
+  and nothing is built.
+- The same pin applies to suite 15's `telemetry-mode` calls, which inherit it
+  as `RAG_VERIFY_TELEMETRY_PIN`. `up` and `run` set that variable only from
+  the option; an ambient value is ignored. `telemetry-mode` checks the inherited
+  pin the same way as `--telemetry-pin`, before any Docker command.
+
+Without the option, the harness's own pin applies, as before.

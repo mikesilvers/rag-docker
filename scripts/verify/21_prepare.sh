@@ -4,7 +4,7 @@
 # The unit checks (U1-U14) run in the API image with no network and a stub LLM.
 # The stack checks (P1-P11) run on the verify project through prepare_stack.py,
 # one check each, as the harness Developer. P9-P11 prepare three small files with
-# the local LLM, one job at a time, so they run only in a full run
+# the build LLM, one job at a time, so they run only in a full run
 # (RAG_SKIP_SLOW unset). Documents this suite uploads are vfy-prepare-*, its
 # collections VfyPrepare*; both are removed at the end.
 cd "$(dirname "$0")" && . ./lib.sh
@@ -39,9 +39,9 @@ check "P7 cancelling an unknown job is 404" $?
 stack audit
 check "P8 the audit log records upload, download and delete with names and no document text" $?
 
-section "Preparation with the local LLM (P9-P11)"
+section "Preparation with the build LLM (P9-P11)"
 if [ "$SKIP_SLOW" = "1" ]; then
-  skip "P9-P11 prepare, import and download with the LLM" "RAG_SKIP_SLOW=1"
+  skip "P9-P11 prepare, import and download with the build LLM" "RAG_SKIP_SLOW=1"
 else
   stack prepare
   check "P9 the .txt becomes cleaned Markdown of source lines in order with its header, every window without a fallback losing at most 20 % of its characters; the .csv and .jsonl are unchanged and labelled from their data" $?

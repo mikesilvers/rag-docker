@@ -258,6 +258,8 @@ and on import.
   },
   "embedding": {"model": "nomic-embed-text", "dimensions": 768},
   "llm": {"model": "llama3.1:8b"},
+  "answer_llm": {"model": "llama3.1:8b"},
+  "build_llm": {"model": "llama3.1:8b"},
   "chunking": {"strategy": "overlap", "chunk_size": 1000, "chunk_overlap": 200},
   "fidelity": "with-sources",
   "models_bundled": false,
@@ -269,6 +271,12 @@ and on import.
 `collection.name` is authoritative. `embedding` is the field import checks
 hardest (§6.2).
 
+`answer_llm` and `build_llm` are the exporting instance's answer and build
+LLMs (#671); `llm` is the answer model, kept for older readers. Import reads
+none of them: it checks this instance's answer model, and the build model is
+for information only. `include_models` bundles the answer model, never the
+build model.
+
 `bundled_models` lists each model the package carries whole, as `name:tag`
 (a name with no tag is `name:latest`), sorted; it is `[]` when none is, and
 `models_bundled` is true exactly when it isn't empty (§6.3, #425, #487).
@@ -277,7 +285,10 @@ The package listing (`GET /packages`) shows `collection.name` and
 `collection.chunk_count`, `fidelity` and `created_at`, with the types above:
 `collection` an object, `chunk_count` an integer, the other three strings. A
 value that is absent or `null` is listed as `null`; any other type is not
-coerced, and the package is listed `readable: false` (#451).
+coerced, and the package is listed `readable: false` (#451). Each entry also
+carries `expires_at`, set only for a package this instance exported, and
+`GET /packages/{filename}` downloads a package and deletes one exported here once
+the download is complete (#677; `SPECIFICATIONS.md`, `GET /packages/{filename}`).
 
 `files` covers every file except `manifest.json`, `README.md` and `retrieve.py`.
 
@@ -329,19 +340,23 @@ the same passphrase.
   payload in 64 KiB plaintext chunks with ChaCha20-Poly1305, all as the age
   specification defines. The tar.gz writer streams through the encryptor into the
   temporary file: no unencrypted archive is written, and only one chunk is held in
-  memory. The package's files are still staged unencrypted in
-  `./exports/.build-*` while the export runs (§6.1), removed when it ends or by
-  the next start-up's sweep; moving that staging out of the bind mount is a
-  follow-up.
+  memory. The package's files are staged unencrypted in `{UPLOAD_DIR}/export-*`,
+  inside the API container's volume and never in the `./exports` bind mount,
+  while the export runs (§6.1), for every export, encrypted or not (#549); the
+  folder is removed when the export ends or by the next start-up's sweep, which
+  also removes `.build-*` staging left in `./exports` by earlier versions.
 - **Decryption** accepts only a header that parses under the age grammar and
   holds one stanza, of type `scrypt`, with a canonical 16-byte salt, a work
-  factor, and a 32-byte body. A work factor that is not one or two decimal digits
-  without a sign or leading zero is refused `DECRYPT_FAILED` (`reason`
-  `work_factor`) before it is converted, so no field length can cause an
-  unhandled error; a work factor
+  factor, and a 32-byte body. A work factor that is not a decimal without a sign
+  or leading zero (for example `0x12`, `018`, `+18` or `0`) makes the header
+  malformed and is refused `PACKAGE_UNREADABLE` (maintainer decision of
+  2026-11-16 on #549, under #27's decision 7). A work factor
   above 20 (about 1 GiB of scrypt memory; a maintainer decision on #27, below
-  age's own limit of 22, about 4 GiB) is refused `DECRYPT_FAILED` without
-  deriving anything, and at most one scrypt derivation runs at a time in the API.
+  age's own limit of 22, about 4 GiB), a decimal of more than two digits
+  included, is refused `DECRYPT_FAILED` (`reason` `work_factor`) without
+  deriving anything; a field longer than two digits is never converted, so no
+  field length can cause an unhandled error. At most one scrypt derivation runs
+  at a time in the API.
   The header MAC is checked before any plaintext is released, and every payload
   chunk is authenticated before it is; a file that ends inside the payload nonce,
   a truncated payload, a missing or
@@ -645,7 +660,8 @@ model, or a re-export from one (#390).
 ### 6.3 Bundled models
 
 `include_models` defaults to `false`. When `true`, `models/` contains the
-**embedding model and the LLM named in the manifest**, as the Ollama manifest and
+**embedding model and the answer LLM named in the manifest** (`llm` and
+`answer_llm`; the build LLM is never bundled, #671), as the Ollama manifest and
 blob files required to serve them, in a folder per name and tag,
 `models/<name>/<tag>/` (a name with no tag has tag `latest`):
 
@@ -675,14 +691,14 @@ A model is bundled whole or not at all. If any of its files can't be copied,
 the files of that model already copied are removed from the package and from
 `files`, and a warning names the model (#449). Import takes a model with a
 `models/<name>/<tag>/manifest.json` as bundled, so a partly copied model must
-never be left behind. A model used for both embedding and the LLM is copied
+never be left behind. A model used for both embedding and the answer LLM is copied
 once; the two are compared by name and tag, so `x` and `x:latest` are one
 model (#494).
 
-Two tags of one name (an embedding model `foo:a` and an LLM `foo:b`) are both
+Two tags of one name (an embedding model `foo:a` and an answer LLM `foo:b`) are both
 bundled, each in its own folder (#487). Import uses a folder only for the name
 and tag it holds: a package that bundles `bar:x` doesn't bundle `bar:y`, so an
-instance whose LLM is `bar:y` gets the "absent, not bundled" outcome below,
+instance whose answer LLM is `bar:y` gets the "absent, not bundled" outcome below,
 never `bar:x`'s files under the name `bar:y`.
 
 Packages built before #487 put a model in `models/<name>/`, without the tag.
@@ -703,10 +719,13 @@ Where the volume is not mounted, export records a warning and bundles nothing,
 and import reports that models were not checked rather than assuming.
 
 The embedding model is the one that matters: vectors are meaningless without the
-model that produced them. The LLM is included for completeness so a package can
-stand alone, and is the larger share of the ~2.5 GB.
+model that produced them. The answer LLM is included for completeness so a
+package can stand alone to answer questions, and is the larger share of the
+package's size; the build LLM, which only prepares documents and writes gold
+standard pairs, is not (#671).
 
-On import:
+On import, "the LLM" below is this instance's answer LLM (`ANSWER_LLM_MODEL`,
+else `LLM_MODEL`); the build LLM is neither checked nor installed (#671):
 
 | Target state | Behaviour |
 |---|---|
@@ -1059,7 +1078,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E5 | Export produces a file matching the §4.1 pattern in `./exports` |
 | E6 | Manifest digests match every file listed |
 | E7 | A collection with sources exports `fidelity: with-sources`; a pre-retention one exports `chunks-only` |
-| E8 | `python retrieve.py "question"` returns an answer with no third-party packages installed |
+| E8 | `python retrieve.py "question"` returns an answer with no third-party packages installed. The verify check proves retrieval rather than generated text: it checks exit 0 and the citation count (suite 15) |
 | E9 | `retrieve.py --top-k 10` overrides the baked default |
 | E10 | `retrieve.py` exits 3 with one sentence when the stack is down |
 | E11 | Import into a clean instance reproduces chunk count and answers equivalently |
@@ -1078,7 +1097,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E24 | Export, edit original, rename-import twice: all three session identities retain independent review/export state and reported import provenance |
 | E25 | With the embedding endpoint unavailable, reindex changes the physical index while preserving exact UUIDs/properties/vectors; completed jobs leave retained evaluation sessions unchanged; same-process ingestion is serialized, incompatible vectorizers are refused, and uncertain cutover retains durable recovery |
 | E26 | Importing when the installed embedding model's files don't match their checksums fails `MODEL_INTEGRITY_FAILED`, leaves the model's files untouched and says to restore or re-pull it |
-| E27 | With a namespaced `LLM_MODEL` (`user/model`), an import of a package without bundled models succeeds and notes the model |
+| E27 | With a namespaced answer LLM (`LLM_MODEL` with `ANSWER_LLM_MODEL` unset, `user/model`), an import of a package without bundled models succeeds and notes the model |
 | E28 | Digest-valid malformed retrieval settings are refused before live mutation in all conflict modes; valid historical settings round-trip, a legacy out-of-range integer `ef` imports as `null` with a note, and generated script defaults/metadata remain encoded typed literals. On export, a saved legacy out-of-range integer `ef` is written to the package as `null` with a warning and the saved settings are left alone; other invalid saved settings fail the export before any chunk is read, with an error naming the failing fields and the Retrieval page, and no package is published |
 | E29 | An imported source index with a non-digest identity or linked/mismatched blob fails `PACKAGE_CORRUPT` before live mutation; export and re-chunking refuse unsafe retained-source paths; import and replace-mode recovery ignore unindexed source blobs; invalid-index tune options return `SOURCE_INDEX_INVALID`, and an invalid-index re-chunk or re-embed with chunking parameters is refused with HTTP 409 `SOURCE_INDEX_INVALID` before any job is created (#389), while record-only tuning still works; missing-blob exports pass import preflight, with `null` for the chunks of the missing blob; a chunk whose non-null `source_sha256` isn't in the package's source index fails `PACKAGE_CORRUPT` naming `chunks.jsonl`, before live mutation (#509) |
 | E30 | Export refuses `EMBEDDING_MISMATCH` before streaming/bundling when the stored collection model is unknown, named-vector, or differs from the configured model; vectors are never relabeled from current environment settings |
@@ -1089,10 +1108,12 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E35 | Digest-valid malformed ingest settings (invalid JSON, a non-object, a wrong type or an invalid value) are refused `PACKAGE_CORRUPT`, naming `ingest_config.json`, before live mutation in all conflict modes, leaving the existing collection's settings unchanged; valid settings, including ones with missing or unknown fields, numeric strings and a `chunk_size`/`min_chunk_size` from before the chunk bounds, import and `GET /ingest/config/{collection}` returns them for the import target (#510), by `test_retrieval_import.py` |
 | E36 | An export holds its collection's writer guard for its whole run: a re-ingest that tries to commit mid-export waits, and the package holds the old chunks with the old source bytes, every non-null `source_sha256` naming a blob in it; gold-standard generation is refused `COLLECTION_BUSY` and guarded writers wait meanwhile; an export started while another writer holds the guard reads `queued`; the guard is released when the export completes, fails or is cancelled (#509); a cancelled export ends `failed` with an `error` saying so, and the cancellation still propagates (#521), by `test_export_snapshot.py` |
 | E37 | An export with a `passphrase` writes `<stem>.tar.gz.age`, an age v1 scrypt file at work factor 18 whose decryption satisfies §4.1 to §4.5 and that the listing shows `encrypted: true` with null metadata; the export and import jobs report `encrypted` and hold no passphrase (#27), by `test_export_encryption.py` and suite 05 |
-| E38 | Importing an encrypted package with a wrong passphrase fails `DECRYPT_FAILED` (`reason` `passphrase`), and a damaged or truncated file fails `DECRYPT_FAILED` or `PACKAGE_UNREADABLE` and a scrypt work factor above 20 (21 included) or not one or two decimal digits (thousands of digits included) fails `DECRYPT_FAILED` before any key derivation; a file cut inside the payload nonce fails `DECRYPT_FAILED`, with no collection, marker, setting, session or package file changed and no work directory left; the right passphrase imports it with every chunk (#27), by `test_export_encryption.py` and suite 05 |
+| E38 | Importing an encrypted package with a wrong passphrase fails `DECRYPT_FAILED` (`reason` `passphrase`), and a damaged or truncated file fails `DECRYPT_FAILED` or `PACKAGE_UNREADABLE` and a scrypt work factor above 20 (21, and decimals of thousands of digits, included) fails `DECRYPT_FAILED` before any key derivation, and one that is not a decimal without a sign or leading zero (`0x12`, `018`, `+18`, `0`) fails `PACKAGE_UNREADABLE` (#549); a file cut inside the payload nonce fails `DECRYPT_FAILED`, with no collection, marker, setting, session or package file changed and no work directory left; the right passphrase imports it with every chunk (#27), by `test_export_encryption.py` and suite 05 |
 | E39 | `POST /import` refuses an encrypted package without a passphrase `400 PASSPHRASE_REQUIRED` and a passphrase for any other package `400 PASSPHRASE_NOT_EXPECTED`, before any job; `POST /export` refuses a passphrase outside 12 to 1024 characters, and both refuse one with no UTF-8 form (a lone surrogate), `422 INVALID_PARAMETER` without echoing it; one bad encrypted file never fails `GET /packages` (#27) |
 | E40 | The age implementation passes every applicable C2SP CCTV age testkit vector, and its output decrypts with an independent decryption written from the age specification (#27), by `test_export_encryption.py` |
 | E41 | A package of more than `max_package_members` entries, directories included, fails `PACKAGE_TOO_MANY_MEMBERS`, folders implied by member paths counting once each (a directory member's own folder as its entry; a name with a `..` component is refused `PACKAGE_UNREADABLE` before its folders are counted), and one whose members add up to more than `max_package_expanded_bytes` fails `PACKAGE_TOO_LARGE`, each with its message and `detail`, for `.tar.gz` and `.tar.gz.age` packages alike; a package exactly at a cap imports; a member with a negative size is refused `PACKAGE_UNREADABLE` before its size is counted, and a sparse file (old GNU type `S`, PAX sparse 0.0, 0.1 or 1.0) is refused `PACKAGE_UNREADABLE`; a `.tar.gz` refusal extracts nothing and reads no header after the refusing member, a `.tar.gz.age` refusal leaves at most the cap's bytes, and the job creates no collection and leaves no work directory (#317), by `test_package_limits.py` with caps of 1 MiB and 20 entries set through the environment |
+| E42 | A package's `manifest.json` records `answer_llm` and `build_llm` as `{"model": <name>}`, with `llm` the same as `answer_llm`, at `package_format` 1; with a build model that differs from the answer model, `include_models: true` bundles the embedding and answer models only (#671), by `test_retrieval_import.py` and `validate_package.py` on a real export |
+| E43 | Import checks and installs only this instance's answer model: a build model that differs, absent or not, is neither checked, installed nor noted (#671), by `test_retrieval_import.py` |
 
 ---
 

@@ -26,10 +26,12 @@ export class ApiError extends Error {
   }
 }
 
-// The session ended (401 AUTH_REQUIRED) or a generated password must be changed
-// first (403 PASSWORD_CHANGE_REQUIRED), whichever call noticed it (#25). The
-// auth context listens and shows the login or password page.
-type AuthListener = (code: 'AUTH_REQUIRED' | 'PASSWORD_CHANGE_REQUIRED') => void
+// The session ended (401 AUTH_REQUIRED), a generated password must be changed
+// first (403 PASSWORD_CHANGE_REQUIRED), or two-step verification must be set
+// up first (403 MFA_ENROLLMENT_REQUIRED, #607), whichever call noticed it (#25).
+// The auth context listens and shows the login, password or account page.
+export type AuthProblem = 'AUTH_REQUIRED' | 'PASSWORD_CHANGE_REQUIRED' | 'MFA_ENROLLMENT_REQUIRED'
+type AuthListener = (code: AuthProblem) => void
 let authListener: AuthListener | null = null
 export function onAuthProblem(listener: AuthListener | null) { authListener = listener }
 
@@ -47,7 +49,9 @@ async function request<T>(method: string, path: string, body?: unknown, isFormDa
   try { data = text ? JSON.parse(text) : null } catch { /* not JSON; handled below */ }
   if (!res.ok) {
     const code: string | null = typeof data?.error?.code === 'string' ? data.error.code : null
-    if (code === 'AUTH_REQUIRED' || code === 'PASSWORD_CHANGE_REQUIRED') authListener?.(code)
+    if (code === 'AUTH_REQUIRED' || code === 'PASSWORD_CHANGE_REQUIRED' || code === 'MFA_ENROLLMENT_REQUIRED') {
+      authListener?.(code)
+    }
     throw new ApiError(data?.error?.message ?? PROXY_ERRORS[res.status] ?? `HTTP ${res.status}`, res.status, code)
   }
   if (data === null && text) throw new Error('The server sent a response the UI could not read.')
@@ -56,10 +60,11 @@ async function request<T>(method: string, path: string, body?: unknown, isFormDa
 
 function isHealthResult(data: any): data is HealthResult {
   const service = (s: any) => !!s && typeof s === 'object' && typeof s.status === 'string'
-  return service(data?.services?.weaviate) && service(data?.services?.ollama?.llm) && service(data?.services?.ollama?.embed)
+  return service(data?.services?.weaviate) && service(data?.services?.ollama?.llm)
+    && service(data?.services?.ollama?.build_llm) && service(data?.services?.ollama?.embed)
 }
 
-// GET /health answers 503 with the same per-service body when a dependency is
+// GET /health/details answers 503 with the same per-service body when a dependency is
 // down. request() throws on any non-2xx, so the Health page never saw which
 // service failed and could not show it red (#375). This call accepts a 200 or
 // a 503 that carries that body; every other error is thrown as request() would,
@@ -67,7 +72,7 @@ function isHealthResult(data: any): data is HealthResult {
 async function getHealthResult(): Promise<HealthResult> {
   let res: Response
   try {
-    res = await fetch(`${BASE}/health`)
+    res = await fetch(`${BASE}/health/details`)
   } catch {
     // fetch rejects only when no answer arrived; its own text ("Failed to fetch") says nothing.
     throw new Error('The API could not be reached. Check that the stack is running.')
@@ -89,7 +94,22 @@ export const api = {
   // sends with every same-origin request; the UI never sees or stores it.
   authStatus: () => request<{ setup_required: boolean }>('GET', '/auth/status'),
   me: () => request<AuthUser>('GET', '/auth/me'),
-  login: (username: string, password: string) => request<AuthUser>('POST', '/auth/login', { username, password }),
+  // For a user with two-step verification the password step answers
+  // {mfa_required: true} and sets a short-lived challenge cookie; loginMfa
+  // sends the code and opens the session (#607).
+  login: (username: string, password: string) =>
+    request<AuthUser | { mfa_required: true }>('POST', '/auth/login', { username, password }),
+  loginMfa: (code: string) => request<AuthUser>('POST', '/auth/login/mfa', { code }),
+  // The user's own two-step verification (#607). A secret or recovery codes are
+  // in one answer only; the Account page keeps them in memory until "Done".
+  mfaStatus: () => request<MfaStatus>('GET', '/auth/mfa'),
+  mfaEnroll: () => request<{ secret: string; otpauth_uri: string }>('POST', '/auth/mfa/enroll'),
+  mfaConfirm: (code: string) =>
+    request<{ recovery_codes: string[]; status: MfaStatus }>('POST', '/auth/mfa/enroll/confirm', { code }),
+  mfaRegenerate: (code: string) =>
+    request<{ recovery_codes: string[]; status: MfaStatus }>('POST', '/auth/mfa/recovery-codes', { code }),
+  mfaDisable: (password: string, code: string) =>
+    request<{ status: MfaStatus }>('POST', '/auth/mfa/disable', { password, code }),
   logout: () => request<{ status: string }>('POST', '/auth/logout'),
   changePassword: (current_password: string, new_password: string) =>
     request<{ status: string } & AuthUser>('POST', '/auth/password', { current_password, new_password }),
@@ -104,6 +124,9 @@ export const api = {
     request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/role`, { role }),
   disableUser: (username: string) => request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/disable`),
   enableUser: (username: string) => request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/enable`),
+  resetUserMfa: (username: string) =>
+    request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/reset-mfa`),
+  setMfaRequired: (required: boolean) => request<{ required: boolean }>('POST', '/auth/mfa/policy', { required }),
   // Service principals and their API keys (Engineers only, #25 PR 3).
   listPrincipals: () => request<{ principals: ServicePrincipal[] }>('GET', '/auth/service-principals'),
   createPrincipal: (name: string, role: Role) =>
@@ -126,6 +149,10 @@ export const api = {
   // Answers with the name as stored, first letter capitalised (#372).
   createCollection: (body: CreateCollectionBody) => request<{ name: string; status: string }>('POST', '/collections', body),
   deleteCollection: (name: string) => request('DELETE', `/collections/${name}?confirm=true`),
+  // Who may use a collection (#606), for Engineers: open, or restricted to the named accounts.
+  getCollectionAccess: (name: string) => request<CollectionAccess>('GET', `/collections/${encodeURIComponent(name)}/access`),
+  setCollectionAccess: (name: string, body: CollectionAccess) =>
+    request<CollectionAccess>('PUT', `/collections/${encodeURIComponent(name)}/access`, body),
 
   // Ingest — form field is "strategy"; job status URL is /ingest/job/{id}; config POST is /ingest/config
   uploadFiles: (form: FormData) => request<{ job_id: string; status: string; files_queued: number; collection: string }>('POST', '/ingest/upload', form, true),
@@ -173,6 +200,9 @@ export const api = {
   listExportJobs: () => request<{ jobs: ExportJobEntry[] }>('GET', '/export/jobs'),
   listImportJobs: () => request<{ jobs: ImportJobEntry[] }>('GET', '/import/jobs'),
   getPackages: () => request<{ packages: PackageSummary[] }>('GET', '/packages'),
+  // A plain link, sent with the session cookie. A full download deletes a
+  // package this instance exported (#677).
+  packageDownloadUrl: (filename: string) => `${BASE}/packages/${encodeURIComponent(filename)}`,
   getTuneOptions: (collection: string) => request<TuneOptions>('GET', `/tune/${collection}`),
   getTransferHelp: () => request<{ topic: string; markdown: string }>('GET', '/help/transfer'),
 
@@ -183,8 +213,17 @@ export const api = {
 
 // Types
 export type Role = 'engineer' | 'developer' | 'end_user'
-export interface AuthUser { username: string; role: Role; must_change_password: boolean; kind?: 'user' | 'service' }
-export interface AdminUser { username: string; role: Role; enabled: boolean; must_change_password: boolean; created_at: string }
+export interface AuthUser {
+  username: string; role: Role; must_change_password: boolean; kind?: 'user' | 'service'
+  // Two-step verification (#607): enrolled, required for everyone, and a set-up due because of it.
+  mfa_enrolled?: boolean; mfa_required?: boolean; mfa_enrollment_required?: boolean
+  // Query-only mode (#670): the pages that change data are hidden.
+  query_only?: boolean
+}
+export interface AdminUser {
+  username: string; role: Role; enabled: boolean; must_change_password: boolean; created_at: string; mfa_enrolled?: boolean
+}
+export interface MfaStatus { enrolled: boolean; enrolled_at: string | null; required: boolean; recovery_codes_remaining: number }
 export interface ServiceKey {
   id: string; label: string; created_at: string; expires_at: string
   revoked_at: string | null; last_used_at: string | null; status: 'active' | 'expired' | 'revoked'
@@ -194,6 +233,7 @@ export interface CollectionInfo {
   name: string; object_count: number; index_type: string; distance_metric: string; created_at: string | null
   hnsw_config?: { ef: number; efConstruction: number; maxConnections: number } | null
 }
+export interface CollectionAccess { restricted: boolean; users: string[]; service_principals: string[] }
 export interface CreateCollectionBody {
   name: string; index_type: string; distance_metric: string; hnsw_config: { efConstruction: number; maxConnections: number; ef: number }
 }
@@ -274,6 +314,9 @@ export interface ExportJob {
   fidelity: string | null; models_bundled: boolean | null; retrieve_script: boolean | null
   warnings: string[]; error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
   encrypted?: boolean
+  // When the package is deleted if nobody downloads it (UTC, #677); null once
+  // it has been downloaded or swept.
+  expires_at?: string | null
 }
 // passphrase: required for a .tar.gz.age package and refused for any other (#27).
 export interface ImportBody { filename: string; on_conflict: string; passphrase?: string }
@@ -323,6 +366,9 @@ export interface PackageSummary {
   filename: string; size_bytes: number; collection: string | null
   chunk_count: number | null; fidelity: string | null; created_at: string | null; readable: boolean
   encrypted?: boolean
+  // When a package this instance exported is deleted if nobody downloads it
+  // (UTC, #677); null for one copied in to be imported.
+  expires_at?: string | null
 }
 export interface TuneOptions {
   collection: string; fidelity: string; source_document_count: number
@@ -336,8 +382,12 @@ export interface HealthResult {
     // `ollama_embed` keys. Reading the flat names yielded undefined and threw
     // during render, which unmounted the whole app.
     ollama: {
+      // `llm` answers questions; `build_llm` prepares documents and writes gold
+      // standard pairs; `same_model` says they are one model (#671).
       llm: { status: string; latency_ms: number; model: string }
+      build_llm: { status: string; latency_ms: number; model: string }
       embed: { status: string; latency_ms: number; model: string }
+      same_model: boolean
     }
   }
   resources?: {

@@ -136,7 +136,7 @@ class DeletedRecoveryTests(unittest.TestCase):
         from services import collection_recovery as recovery,weaviate_client as wc,goldstandard as gs,ingest_config,retrieval_config
         self.recovery,self.wc=recovery,wc
         temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup);self.root=Path(temp.name);stack=ExitStack();self.addCleanup(stack.close)
-        for change in [patch.object(settings,'upload_dir',temp.name),patch.object(settings,'sources_dir',str(self.root/'sources')),patch.object(gs,'_sessions',{}),patch.object(ingest_config,'_DIR',None),patch.object(retrieval_config,'_DIR',None)]:stack.enter_context(change)
+        for change in [patch.object(settings,'upload_dir',temp.name),patch.object(settings,'auth_dir',str(self.root/'auth')),patch.object(settings,'sources_dir',str(self.root/'sources')),patch.object(gs,'_sessions',{}),patch.object(ingest_config,'_DIR',None),patch.object(retrieval_config,'_DIR',None)]:stack.enter_context(change)
         self.backend={'OwnedRecovery'}
         class Collections:
             def exists(inner,name):return writes.canonical(name) in self.backend

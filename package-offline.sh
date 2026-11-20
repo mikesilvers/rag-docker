@@ -11,9 +11,9 @@
 #     built with `git archive`, exactly as package.sh does. Untracked and
 #     ignored files and uncommitted changes are left out (#384).
 #   * all five Docker images, pre-built (docker save)
-#   * the Ollama model weights (llama3.1:8b + nomic-embed-text), the whole
-#     model volume: a model left in it, such as phi3.5 from before 1.2.1, is
-#     carried too
+#   * the Ollama model weights (by default llama3.1:8b + nomic-embed-text; a
+#     different build or answer LLM too, #671), the whole model volume: a model
+#     left in it, such as phi3.5 from before 1.2.1, is carried too
 #
 # About 7.7 GB (2.5 GB images + 5.2 GB model weights) with both models present,
 # estimated from the parts (4.6 GB was measured when the LLM was the 2.2 GB
@@ -64,18 +64,31 @@ docker volume inspect "$MODELVOL" >/dev/null 2>&1 \
 
 # The volume must hold every model ollama/entrypoint.sh pulls, or the offline
 # target would try to download the missing one (#647: an install from before
-# llama3.1:8b became the default holds only phi3.5). The names are read as the
-# CI model cache reads them; a manifest without a tag is under "latest".
-MODELS="$(sed -n 's/^pull_with_retry \([A-Za-z0-9._:-]*\)$/\1/p' ollama/entrypoint.sh | tr '\n' ' ')"
-[ -n "$MODELS" ] || { echo "ERROR: no pull_with_retry lines in ollama/entrypoint.sh." >&2; exit 1; }
+# llama3.1:8b became the default holds only phi3.5). The names are the ones the
+# entrypoint resolves from the LLM settings compose gives the ollama service
+# (#671), read as the CI model cache reads them. A name is read from the right,
+# as Ollama does (#772, #824): the tag is what follows the last ":" of the last
+# path segment, else "latest", so a port in a host is not a tag. A model with one
+# segment is under registry.ollama.ai/library/<name>, one with two (`user/model`,
+# and `hf.co/model`, whatever its first segment) under registry.ollama.ai/<user>/
+# <model>, and one with three or more, the first a host with its port if it has
+# one (`hf.co/user/model`), under that host's own manifest directory.
+MODELS="$(bash ollama/compose-models.sh)" \
+  || { echo "ERROR: could not read the model names (ollama/compose-models.sh)." >&2; exit 1; }
+MODELS="$(echo $MODELS)"   # one line, space-separated
 # shellcheck disable=SC2086  # one argument per model name
 MISSING="$(docker run --rm --network none --entrypoint sh \
   -v "$MODELVOL":/models:ro \
   ollama/ollama:0.3.14 \
   -c 'for m in "$@"; do
-        n=${m%%:*}; t=latest
-        case "$m" in *:*) t=${m#*:} ;; esac
-        [ -f "/models/models/manifests/registry.ollama.ai/library/$n/$t" ] || echo "$m"
+        n=$m; t=latest
+        case "${m##*/}" in *:*) n=${m%:*}; t=${m##*:} ;; esac
+        case "$n" in
+          */*/*) p=$n ;;
+          */*) p=registry.ollama.ai/$n ;;
+          *) p=registry.ollama.ai/library/$n ;;
+        esac
+        [ -f "/models/models/manifests/$p/$t" ] || echo "$m"
       done' sh $MODELS)" \
   || { echo "ERROR: could not read the models in volume '$MODELVOL'." >&2; exit 1; }
 if [ -n "$MISSING" ]; then

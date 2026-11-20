@@ -8,9 +8,16 @@ before the route runs, and never reads the body of a request it refuses.
 The refusals, in the order they apply:
   503 SETUP_REQUIRED          no account exists yet (python -m auth bootstrap)
   401 AUTH_REQUIRED           no valid session cookie
-  403 CROSS_ORIGIN_REFUSED    a cookie-authenticated POST/PUT/PATCH/DELETE from another origin
+  403 CROSS_ORIGIN_REFUSED    a cookie-authenticated POST/PUT/PATCH/DELETE from another origin,
+                              or a GET of a state-changing route (policy.STATE_CHANGING_GET)
+                              whose Sec-Fetch-Site is present and not same-origin or none (#794)
   403 PASSWORD_CHANGE_REQUIRED the user must change a generated password first
+  403 MFA_ENROLLMENT_REQUIRED two-step verification is required for everyone and
+                              the user hasn't set it up (#607); only the session
+                              routes and their own MFA routes answer
   403 FORBIDDEN               the user's role is too low
+  403 QUERY_ONLY              query-only mode (#670) and a route that changes a
+                              collection or its data (policy.QUERY_ONLY_REFUSED)
 
 A request with an `Authorization` header is a service key request (PR 3): the
 header alone decides and any cookie is ignored, with no fallback to it.
@@ -18,6 +25,7 @@ header alone decides and any cookie is ignored, with no fallback to it.
   401 KEY_INVALID             not one `Bearer <key>` header with a valid key (one answer for every reason)
   403 KEY_NOT_ALLOWED         a route keys can't use (policy.HUMAN_ONLY)
   403 FORBIDDEN               the principal's role is too low
+  403 QUERY_ONLY              as above
 It has no origin check (it carries no cookie, Q26) and no password change.
 
 Each 403 comes back with the principal it refused, which the audit log
@@ -29,12 +37,12 @@ app; test_auth.py fails when any route lacks an entry.
 from __future__ import annotations
 
 import asyncio
-from http.cookies import CookieError, SimpleCookie
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 
-from starlette.requests import Request
+from starlette.requests import Request, cookie_parser
 
+from config import settings
 from utils import api_error
 
 from . import keys, policy, store
@@ -63,13 +71,10 @@ def session_token(scope) -> str | None:
     raw = _header(scope, b"cookie")
     if not raw:
         return None
-    cookies = SimpleCookie()
-    try:
-        cookies.load(raw)
-    except CookieError:
-        return None
-    morsel = cookies.get(store.COOKIE)
-    return morsel.value if morsel else None
+    # starlette's parser, as Request.cookies uses: a malformed earlier cookie
+    # (another app on localhost) doesn't hide the session, as it did with
+    # http.cookies.SimpleCookie (#546).
+    return cookie_parser(raw).get(store.COOKIE) or None
 
 
 def same_origin(scope) -> bool:
@@ -139,32 +144,52 @@ class AuthMiddleware:
                              "`docker compose exec api python -m auth bootstrap <username>`."), None
         authorization = _headers(scope, b"authorization")
         if authorization:
-            return await self._check_key(access, template, authorization)
+            return await self._check_key(scope, access, template, authorization)
         principal = await asyncio.to_thread(store.authenticate, session_token(scope))
         if principal is None:
             return api_error(401, "AUTH_REQUIRED", "Log in to use this."), None
         if scope["method"] in UNSAFE and not same_origin(scope):
             return api_error(403, "CROSS_ORIGIN_REFUSED",
                              "This request came from another site and was refused."), principal
+        if (scope["method"] == "GET" and template in policy.STATE_CHANGING_GET
+                and _header(scope, b"sec-fetch-site") not in (None, "same-origin", "none")):
+            return api_error(403, "CROSS_ORIGIN_REFUSED",
+                             "This request came from another site and was refused."), principal
         if principal.must_change_password and access != policy.SESSION:
             return api_error(403, "PASSWORD_CHANGE_REQUIRED",
                              "Change your password before doing anything else."), principal
-        if access != policy.SESSION and policy.rank(principal.role) < policy.rank(access):
+        if principal.mfa_due and access not in (policy.SESSION, policy.MFA):
+            return api_error(403, "MFA_ENROLLMENT_REQUIRED",
+                             "Set up two-step verification before doing anything else."), principal
+        if access not in (policy.SESSION, policy.MFA) and policy.rank(principal.role) < policy.rank(access):
             return api_error(403, "FORBIDDEN", "Your role can't do this.",
                              detail={"required_role": access}), principal
-        return None, principal
+        return _query_only(scope, template), principal
 
-    async def _check_key(self, access, template, authorization):
+    async def _check_key(self, scope, access, template, authorization):
         key = keys.bearer(authorization[0]) if len(authorization) == 1 else None
         principal = await asyncio.to_thread(store.authenticate_key, key) if key else None
         if principal is None:
             return api_error(401, "KEY_INVALID", "The API key is invalid, expired or revoked."), None
         if template in policy.HUMAN_ONLY:
             return api_error(403, "KEY_NOT_ALLOWED", "API keys can't be used for this."), principal
-        if access != policy.SESSION and policy.rank(principal.role) < policy.rank(access):
+        if access not in (policy.SESSION, policy.MFA) and policy.rank(principal.role) < policy.rank(access):
             return api_error(403, "FORBIDDEN", "Your role can't do this.",
                              detail={"required_role": access}), principal
-        return None, principal
+        return _query_only(scope, template), principal
+
+
+QUERY_ONLY_MESSAGE = ("This instance is query-only: its collections can't be created, changed or deleted "
+                      "here. Collections are loaded on the host with `python -m loader`.")
+
+
+def _query_only(scope, template):
+    """The 403 QUERY_ONLY refusal (#670), or None. Checked last, so a caller
+    refused for any other reason is refused as before; read on each request."""
+    method = "GET" if scope["method"] == "HEAD" else scope["method"]
+    if settings.rag_query_only and (method, template) in policy.QUERY_ONLY_REFUSED:
+        return api_error(403, "QUERY_ONLY", QUERY_ONLY_MESSAGE)
+    return None
 
 
 class Unlisted(Exception):

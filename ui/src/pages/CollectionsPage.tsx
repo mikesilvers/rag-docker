@@ -1,7 +1,17 @@
-import { useState, useEffect } from 'react'
-import { api, CollectionInfo } from '../api/client'
+import { useState, useEffect, useRef } from 'react'
+import { api, AdminUser, CollectionAccess, CollectionInfo, ServicePrincipal } from '../api/client'
+import { useAuth } from '../context/AuthContext'
+
+// Who may use each collection (#606): "Open", "Restricted (n)" with n grants,
+// or a dash when the state couldn't be read.
+function accessLabel(a: CollectionAccess | null | undefined): string {
+  if (!a) return '—'
+  return a.restricted ? `Restricted (${a.users.length + a.service_principals.length})` : 'Open'
+}
 
 export default function CollectionsPage() {
+  // Query-only mode (#670): no create or delete; the list and access stay.
+  const queryOnly = useAuth().user?.query_only === true
   const [collections, setCollections] = useState<CollectionInfo[]>([])
   // A refused create is shown inside the New Collection modal, and a failed
   // list on the page; both were hidden or swallowed before (#379).
@@ -19,12 +29,89 @@ export default function CollectionsPage() {
   // Shown inside the delete dialog: the page-level error sits behind its
   // overlay, so a refused delete (409 while a job runs, #40) looked like nothing.
   const [deleteError, setDeleteError] = useState('')
+  // Per-collection access (#606): each row's state, and the Access dialog.
+  const [access, setAccess] = useState<Record<string, CollectionAccess | null>>({})
+  const [accessTarget, setAccessTarget] = useState('')
+  const [draft, setDraft] = useState<CollectionAccess>({ restricted: false, users: [], service_principals: [] })
+  const [people, setPeople] = useState<AdminUser[]>([])
+  const [principals, setPrincipals] = useState<ServicePrincipal[]>([])
+  const [accessError, setAccessError] = useState('')
+  // The dialog's own read of the state: until it succeeds the choice is
+  // unknown and Save stays disabled; once the Engineer changes something, a
+  // late answer doesn't overwrite the change. Each opening is numbered, and
+  // an answer to an earlier opening (another collection's, or one closed
+  // since) is ignored, so it can't become this dialog's draft (#788). The
+  // opening's lists of people and service principals are numbered the same
+  // way, so an earlier opening's late answer or error never reaches this one
+  // (#792).
+  const [accessLoaded, setAccessLoaded] = useState(false)
+  const touched = useRef(false)
+  const accessRead = useRef(0)
 
   async function load() {
     api.getCollections().then(r => {
       setCollections(r.collections)
       setListError('')
+      for (const c of r.collections) {
+        api.getCollectionAccess(c.name)
+          .then(a => setAccess(prev => ({ ...prev, [c.name]: a })))
+          .catch(() => setAccess(prev => ({ ...prev, [c.name]: null })))
+      }
     }).catch((e: unknown) => setListError(`Could not load the collections: ${e instanceof Error ? e.message : String(e)}`))
+  }
+
+  function openAccess(name: string) {
+    const ticket = ++accessRead.current
+    setAccessError('')
+    setAccessTarget(name)
+    setAccessLoaded(false)
+    touched.current = false
+    setDraft({ restricted: false, users: [], service_principals: [] })
+    api.getCollectionAccess(name).then(a => {
+      if (ticket !== accessRead.current) return
+      if (!touched.current) setDraft({ ...a })
+      setAccessLoaded(true)
+    }).catch((e: unknown) => {
+      if (ticket !== accessRead.current) return
+      setAccessError(`Could not read who may use this collection: ${e instanceof Error ? e.message : String(e)}`)
+    })
+    api.listUsers().then(r => {
+      if (ticket !== accessRead.current) return
+      setPeople(r.users)
+    }).catch((e: unknown) => {
+      if (ticket !== accessRead.current) return
+      setAccessError(`Could not load the people: ${e instanceof Error ? e.message : String(e)}`)
+    })
+    api.listPrincipals().then(r => {
+      if (ticket !== accessRead.current) return
+      setPrincipals(r.principals)
+    }).catch((e: unknown) => {
+      if (ticket !== accessRead.current) return
+      setAccessError(`Could not load the service principals: ${e instanceof Error ? e.message : String(e)}`)
+    })
+  }
+
+  function closeAccess() {
+    accessRead.current++
+    setAccessTarget('')
+    setAccessError('')
+  }
+
+  function toggle(list: 'users' | 'service_principals', name: string) {
+    touched.current = true
+    setDraft(d => ({ ...d, [list]: d[list].includes(name) ? d[list].filter(n => n !== name) : [...d[list], name] }))
+  }
+
+  async function saveAccess() {
+    if (!accessLoaded) return
+    const body = draft.restricted ? draft : { restricted: false, users: [], service_principals: [] }
+    try {
+      const saved = await api.setCollectionAccess(accessTarget, body)
+      setAccess(prev => ({ ...prev, [accessTarget]: saved }))
+      closeAccess()
+    } catch (e: unknown) {
+      setAccessError(e instanceof Error ? e.message : String(e))
+    }
   }
 
   useEffect(() => { load() }, [])
@@ -74,7 +161,9 @@ export default function CollectionsPage() {
     <div className="max-w-4xl mx-auto">
       <div className="flex justify-between items-center mb-6">
         <h1 className="text-2xl font-bold">Collections</h1>
-        <button onClick={openCreate} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">+ New Collection</button>
+        {!queryOnly && (
+          <button onClick={openCreate} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">+ New Collection</button>
+        )}
       </div>
       {listError && <p role="alert" className="text-red-600 text-sm mb-4">{listError}</p>}
       <table className="w-full text-sm border-collapse">
@@ -85,6 +174,7 @@ export default function CollectionsPage() {
             <th className="py-2">Index</th>
             <th className="py-2">Distance</th>
             <th className="py-2">Created</th>
+            <th className="py-2">Access</th>
             <th />
           </tr>
         </thead>
@@ -96,8 +186,12 @@ export default function CollectionsPage() {
               <td className="py-2">{c.index_type}</td>
               <td className="py-2">{c.distance_metric}</td>
               <td className="py-2 text-gray-500">{c.created_at ? new Date(c.created_at).toLocaleDateString() : '—'}</td>
-              <td className="py-2">
-                <button onClick={() => { setDeleteError(''); setDeleteTarget(c.name) }} className="text-red-400 hover:text-red-600 text-xs">Delete</button>
+              <td className="py-2">{accessLabel(access[c.name])}</td>
+              <td className="py-2 space-x-3">
+                <button onClick={() => openAccess(c.name)} className="text-blue-500 hover:text-blue-700 text-xs">Access</button>
+                {!queryOnly && (
+                  <button onClick={() => { setDeleteError(''); setDeleteTarget(c.name) }} className="text-red-400 hover:text-red-600 text-xs">Delete</button>
+                )}
               </td>
             </tr>
           ))}
@@ -146,6 +240,50 @@ export default function CollectionsPage() {
             <div className="flex justify-end gap-2">
               <button onClick={closeCreate} className="text-sm text-gray-500">Cancel</button>
               <button onClick={create} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">Create</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {accessTarget && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
+          <div role="dialog" aria-label={`Access to ${accessTarget}`} className="bg-white rounded-xl p-6 w-96 shadow-xl max-h-[80vh] overflow-y-auto">
+            <h2 className="font-semibold mb-3">Access to {accessTarget}</h2>
+            <label className="flex items-center gap-2 text-sm mb-1">
+              <input type="radio" name="access-mode" checked={accessLoaded && !draft.restricted} disabled={!accessLoaded} onChange={() => { touched.current = true; setDraft(d => ({ ...d, restricted: false })) }} />
+              Open: everyone whose role allows it
+            </label>
+            <label className="flex items-center gap-2 text-sm mb-3">
+              <input type="radio" name="access-mode" checked={accessLoaded && draft.restricted} disabled={!accessLoaded} onChange={() => { touched.current = true; setDraft(d => ({ ...d, restricted: true })) }} />
+              Restricted: only the accounts ticked below (and AI Engineers)
+            </label>
+            {accessLoaded && draft.restricted && (
+              <div className="space-y-3 mb-4">
+                <fieldset>
+                  <legend className="text-xs text-gray-500 mb-1">People</legend>
+                  {people.map(u => (
+                    <label key={u.username} className="flex items-center gap-2 text-sm">
+                      <input type="checkbox" checked={draft.users.includes(u.username)} onChange={() => toggle('users', u.username)} />
+                      {u.username}{u.enabled ? '' : ' (disabled)'}
+                    </label>
+                  ))}
+                </fieldset>
+                <fieldset>
+                  <legend className="text-xs text-gray-500 mb-1">Service principals</legend>
+                  {principals.length === 0 && <p className="text-xs text-gray-400">None</p>}
+                  {principals.map(p => (
+                    <label key={p.name} className="flex items-center gap-2 text-sm">
+                      <input type="checkbox" checked={draft.service_principals.includes(p.name)} onChange={() => toggle('service_principals', p.name)} />
+                      {p.name}{p.enabled ? '' : ' (disabled)'}
+                    </label>
+                  ))}
+                </fieldset>
+              </div>
+            )}
+            {accessError && <p role="alert" className="text-red-600 text-sm mb-4">{accessError}</p>}
+            <div className="flex justify-end gap-2">
+              <button onClick={closeAccess} className="text-sm text-gray-500">Cancel</button>
+              <button onClick={saveAccess} disabled={!accessLoaded} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700 disabled:opacity-40">Save</button>
             </div>
           </div>
         </div>

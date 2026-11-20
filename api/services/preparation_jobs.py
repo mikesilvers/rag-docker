@@ -142,18 +142,26 @@ async def upload(files: list[Any], owner: dict | None) -> tuple[list[dict], list
 
 # ── selection ────────────────────────────────────────────────────────────────
 
-def _resolve(document_ids: list[str] | None, all_of: set[str]) -> list[dict]:
+def _resolve(document_ids: list[str] | None, all_of: set[str], usable=None) -> list[dict]:
     """The records selected: the ids in the order given, or every document whose
-    status is in `all_of`, oldest first."""
+    status is in `all_of`, oldest first. `usable` (a predicate on a record, #606)
+    hides documents the caller may not use: such an id is answered as unknown,
+    and `all` leaves them out."""
+    usable = usable or (lambda record: True)
     if document_ids is None:
-        records = [r for r in store.list_documents() if r.get("status") in all_of]
+        records = [r for r in store.list_documents() if r.get("status") in all_of and usable(r)]
         records.sort(key=lambda r: r.get("created_at") or "")
     else:
         records, missing = [], []
         for document_id in dict.fromkeys(document_ids):
             try:
-                records.append(store.get(document_id))
+                record = store.get(document_id)
             except store.DocumentNotFound:
+                missing.append(document_id)
+                continue
+            if usable(record):
+                records.append(record)
+            else:
                 missing.append(document_id)
         if missing:
             raise store.DocumentNotFound(
@@ -166,14 +174,14 @@ def _resolve(document_ids: list[str] | None, all_of: set[str]) -> list[dict]:
 
 # ── jobs ─────────────────────────────────────────────────────────────────────
 
-async def start(document_ids: list[str] | None, owner: dict | None) -> dict:
+async def start(document_ids: list[str] | None, owner: dict | None, usable=None) -> dict:
     """Queue a preparation job for the selected documents (or every document that
     isn't being prepared, with document_ids None)."""
     await asyncio.to_thread(store.check_not_full)
     job_id = uuid.uuid4().hex[:8]
 
     def admit() -> list[dict]:
-        records = _resolve(document_ids, {"raw", "prepared", "failed"})
+        records = _resolve(document_ids, {"raw", "prepared", "failed"}, usable)
         busy = [r["name"] for r in records
                 if r.get("status") in ("queued", "preparing") or store.is_busy(r["id"])]
         if busy:
@@ -242,6 +250,11 @@ async def _work(queue: asyncio.Queue) -> None:
             _cancel_requested.discard(job_id)
 
 
+def _llm():
+    """The chat and model list preparation uses: the build model's (#671)."""
+    return ollama.build_chat, ollama.list_models
+
+
 async def _run(job_id: str) -> None:
     job = _jobs[job_id]
     job["status"] = "running"
@@ -283,8 +296,9 @@ async def _run(job_id: str) -> None:
 
         try:
             raw = await asyncio.to_thread(store.raw_path, document_id)
+            chat, list_models = _llm()
             result = await preparation.prepare_document(
-                raw, name, record["raw_type"], ollama.chat, ollama.list_models,
+                raw, name, record["raw_type"], chat, list_models,
                 should_stop, write_part, progress)
             await asyncio.to_thread(store.commit, document_id, result.parts, result.fallback)
             job["documents_completed"] = job["documents_completed"] + 1
@@ -344,11 +358,11 @@ class _Part:
         self.size = None
 
 
-async def import_documents(body: Any) -> dict:
+async def import_documents(body: Any, usable=None) -> dict:
     """Start one ingest job with every part of the selected prepared documents."""
 
     def select() -> tuple[list[dict], list[str]]:
-        records = _resolve(body.document_ids, {"prepared"})
+        records = _resolve(body.document_ids, {"prepared"}, usable)
         busy = [r["name"] for r in records
                 if r.get("status") in ("queued", "preparing") or store.is_busy(r["id"])]
         if busy:

@@ -1,18 +1,49 @@
 """Additional service-specific restrictions for the optional disposable collector."""
 import json
 from pathlib import Path
+import re
 
 KEYS = {'profiles', 'mem_limit', 'cpus', 'stop_grace_period', 'read_only', 'logging'}
 SERVICES = {'otel-collector', 'otel-capture'}
 
 
-def check(config, root):
+def repository(image):
+    """The repository of <repository>:<tag>@sha256:<digest>, or None (#532)."""
+    match = re.fullmatch(r'(.+):([\w][\w.-]{0,127})@sha256:[0-9a-f]{64}', image)
+    return match.group(1) if match else None
+
+
+def collector_image(root, pin, problems):
+    """The collector image to expect: the harness's own pin, or a reviewed pin
+    the evaluator supplied with stack.sh --telemetry-pin (#532). A reviewed
+    pin may change only the tag and digest, never the repository."""
+    harness = json.loads((Path(root) / 'telemetry/image.json').read_text())['image']
+    if not pin:
+        return harness
+    try:
+        reviewed = json.loads(Path(pin).read_text())
+    except (OSError, ValueError):
+        reviewed = None
+    if not isinstance(reviewed, dict) or not isinstance(reviewed.get('image'), str):
+        problems.append("otel-collector: the reviewed telemetry pin can't be read")
+        return harness
+    image = reviewed['image']
+    if repository(image) is None:
+        problems.append('otel-collector: the reviewed telemetry pin is not <repository>:<tag>@sha256:<digest>')
+        return harness
+    if repository(image) != repository(harness):
+        problems.append("otel-collector: the reviewed telemetry pin's repository differs from the harness pin")
+        return harness
+    return image
+
+
+def check(config, root, pin=None):
     problems = []
     services = config['services']
-    pin = json.loads((Path(root) / 'telemetry/image.json').read_text())['image']
+    collector = collector_image(root, pin, problems)
     for name in SERVICES & services.keys():
         svc = services[name]
-        expected_image = pin if name == 'otel-collector' else 'rag-verify-api:latest'
+        expected_image = collector if name == 'otel-collector' else 'rag-verify-api:latest'
         if svc.get('image') != expected_image or 'build' in svc:
             problems.append(f'{name}: unexpected telemetry image/build')
         if (svc.get('profiles') != ['telemetry'] or str(svc.get('mem_limit')) != '268435456'

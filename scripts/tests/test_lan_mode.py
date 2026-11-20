@@ -11,7 +11,9 @@ Runs with the API's dependencies, in the built API image with no network
 Stores and certificate folders are temporary; nothing is started or published.
 """
 import ast
+import contextlib
 import datetime
+import importlib.util
 import io
 import json
 import os
@@ -133,10 +135,10 @@ class MainImportTests(unittest.TestCase):
         self.assertEqual(ast.unparse(body[0]), "import lan_mode")
         self.assertEqual(ast.unparse(body[1]), "lan_mode.enforce()")
 
-    def run_import(self, **env):
+    def run_import(self, module="main", **env):
         with tempfile.TemporaryDirectory() as folder:
             full = {**os.environ, "AUTH_DIR": folder, "PYTHONDONTWRITEBYTECODE": "1", **env}
-            return subprocess.run([sys.executable, "-c", "import main"], cwd=API_DIR, env=full,
+            return subprocess.run([sys.executable, "-c", f"import {module}"], cwd=API_DIR, env=full,
                                   capture_output=True, text=True, timeout=300)
 
     def test_lan_mode_without_a_secure_cookie_exits_with_one_line(self):
@@ -155,9 +157,39 @@ class MainImportTests(unittest.TestCase):
         self.assertIn("no enabled AI Engineer", lines[0])
 
     def test_an_invalid_value_stops_the_api(self):
+        # #555: any invalid setting stops startup with one line, no traceback.
         result = self.run_import(RAG_LAN_MODE="yes")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("RAG_LAN_MODE must be exactly true or false", result.stderr)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr.splitlines(), ["Settings refused: RAG_LAN_MODE must be exactly true or false"])
+
+    def test_each_invalid_setting_is_one_line_without_its_value(self):
+        result = self.run_import(module="config", AUTH_COOKIE_SECURE="yes", WEAVIATE_PORT="not-a-port-7f3a")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        lines = result.stderr.splitlines()
+        self.assertEqual(len(lines), 2, result.stderr)
+        self.assertEqual(sum(l.startswith("Settings refused: AUTH_COOKIE_SECURE must be exactly true or false")
+                             for l in lines), 1, lines)
+        self.assertEqual(sum(l.startswith("Settings refused: WEAVIATE_PORT: ") for l in lines), 1, lines)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertNotIn("not-a-port-7f3a", result.stdout + result.stderr)
+
+    def test_a_validators_own_message_is_used_as_is_through_main(self):
+        # #555 (reviewer): uvicorn's import of main, a validator's own message
+        # unprefixed and a pydantic type error prefixed with its setting, one
+        # line each, no traceback, neither value printed.
+        result = self.run_import(AUDIT_LOG_KEEP="0", MAX_PREPARATION_BYTES="12-vfy-secret-9c1d")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(sorted(result.stderr.splitlines()), [
+            "Settings refused: AUDIT_LOG_KEEP must be 1 to 1000",
+            "Settings refused: MAX_PREPARATION_BYTES: Input should be a valid integer, unable to parse string as an integer"])
+        self.assertNotIn("vfy-secret-9c1d", result.stderr)
+
+    def test_settings_itself_still_raises_validation_error(self):
+        with self.assertRaises(ValidationError):
+            config.Settings(rag_lan_mode="yes")
 
 
 # ── the certificate step ─────────────────────────────────────────────────────
@@ -382,6 +414,25 @@ class BringYourOwnTests(CertTestCase):
                 self.assertIn(part, err)
                 self.assertFalse((self.out / "live").exists())
 
+    def test_an_encrypted_key_is_refused(self):
+        cert_bytes, key_bytes = certificate(["files.example"])
+        key = serialization.load_pem_private_key(key_bytes, password=None)
+        self.put(cert_bytes, key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                               serialization.BestAvailableEncryption(b"a passphrase")))
+        code, out, err = self.step()
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(len(err.splitlines()), 1, err)
+        self.assertIn("key.pem", err)
+        self.assertFalse((self.out / "live").exists())
+
+    def test_a_cert_pem_directory_is_refused(self):
+        (self.byo / "cert.pem").mkdir()
+        self.put(key_bytes=certificate(["files.example"])[1])
+        code, out, err = self.step()
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(len(err.splitlines()), 1, err)
+        self.assertFalse((self.out / "live").exists())
+
     def test_hosts_map_from_your_certificate(self):
         # #664: the certificate's own names, in nginx's forms; localhost and
         # 127.0.0.1 are nginx.lan.conf's.
@@ -445,6 +496,9 @@ class NginxTests(unittest.TestCase):
         for text in (self.lan, self.locations):
             self.assertNotIn("strict-transport-security", "\n".join(directives(text)).lower())
 
+    def test_no_version_in_responses(self):
+        self.assertIn("server_tokens off;", directives(self.lan))
+
     def test_both_servers_share_the_locations(self):
         include = "include /etc/nginx/rag/locations.conf;"
         for text in (self.lan, self.default):
@@ -457,8 +511,9 @@ class NginxTests(unittest.TestCase):
         lines = directives(self.locations)
         self.assertEqual([l for l in lines if l.startswith("location")],
                          ["location = /api/goldstandard/regenerate {", "location = /api/auth/login {",
-                          "location @login_rate_limited {", "location /api/ {", "location / {"])
-        self.assertEqual(lines.count("proxy_set_header Host $http_host;"), 3)
+                          "location = /api/auth/login/mfa {", "location @login_rate_limited {", "location /api/ {",
+                          "location / {"])
+        self.assertEqual(lines.count("proxy_set_header Host $http_host;"), 4)
 
     def test_only_listed_hosts_are_served(self):
         # #664: a map of the accepted hosts, and a server-level 421 for any other.
@@ -493,6 +548,15 @@ class NginxTests(unittest.TestCase):
                      "error_page 429 = @login_rate_limited;", "proxy_pass http://api/auth/login;",
                      "proxy_set_header X-Real-IP $remote_addr;", "client_max_body_size 16k;"):
             self.assertIn(line, lines)
+        # #607: the login's code step shares the zone, the refusal and the body limit.
+        code = self.locations[self.locations.index("location = /api/auth/login/mfa {"):]
+        code = directives(code[:code.index("\n}\n")])
+        for line in ("limit_req zone=login burst=5 nodelay;", "limit_req_status 429;",
+                     "error_page 429 = @login_rate_limited;", "proxy_pass http://api/auth/login/mfa;",
+                     "proxy_set_header Host $http_host;", "proxy_set_header X-Real-IP $remote_addr;",
+                     "client_max_body_size 16k;"):
+            self.assertIn(line, code)
+        self.assertEqual([l for l in code if l.startswith("proxy_request_buffering")], [])
         # #663: login reads a body before authentication, so it has a small,
         # buffered body limit, not /api/'s 512m streamed uploads.
         self.assertEqual([l for l in lines if l.startswith("proxy_request_buffering")], [])
@@ -510,6 +574,52 @@ class NginxTests(unittest.TestCase):
         message = "Too many login attempts. Wait a minute and try again."
         self.assertEqual(json.loads(body), {"error": {"code": "LOGIN_RATE_LIMITED", "message": message, "detail": None}})
         self.assertIn("default_type application/json;", directives(named[:named.index("\n}\n")]))
+
+
+# ── lan_stack.py's rate-limit check, against faked answers (#598) ─────────────
+
+class LanStackRateLimitTests(unittest.TestCase):
+    """On the stack the check's assertions can't be broken on their own: changing nginx's answer also stops the
+    harness's paced setup login. Here `request()` is faked, so each way the check fails is shown."""
+
+    @classmethod
+    def setUpClass(cls):
+        saved = list(sys.path)                         # lan_stack.py puts its own folder first on sys.path
+        try:
+            spec = importlib.util.spec_from_file_location("lan_stack", ROOT / "scripts" / "verify" / "lan_stack.py")
+            cls.lan_stack = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(cls.lan_stack)
+        finally:
+            sys.path[:] = saved
+
+    def run_check(self, answers):
+        """(exit status, stderr, logins sent) of `lan_stack.py rate-limit` with `answers` as the logins' answers."""
+        answers, sent = list(answers), []
+
+        def fake_request(*args, **kwargs):
+            sent.append(args)
+            status, body = answers.pop(0)
+            return status, body, []
+        err = io.StringIO()
+        with patch.object(self.lan_stack, "request", fake_request), \
+                patch.dict(os.environ, {"RAG_VERIFY_PORT": "8443"}), contextlib.redirect_stderr(err):
+            status = self.lan_stack.main(["rate-limit"])
+        return status, err.getvalue(), len(sent)
+
+    def test_a_429_with_another_code_fails(self):
+        status, err, sent = self.run_check([(429, {"error": {"code": "LOGIN_THROTTLED"}})])
+        self.assertEqual((status, sent), (1, 1))
+        self.assertIn("not nginx's", err)
+
+    def test_twelve_logins_let_through_fail(self):
+        status, err, sent = self.run_check([(401, {"error": {"code": "LOGIN_FAILED"}})] * 12)
+        self.assertEqual((status, sent), (1, 12))
+        self.assertIn("12 logins in a row were all let through", err)
+
+    def test_nginx_refusal_passes(self):
+        status, err, sent = self.run_check([(401, {"error": {"code": "LOGIN_FAILED"}})] * 2
+                                           + [(429, {"error": {"code": "LOGIN_RATE_LIMITED"}})])
+        self.assertEqual((status, err, sent), (0, "", 3))
 
 
 # ── embedded copies ──────────────────────────────────────────────────────────

@@ -39,6 +39,7 @@ The three dots give the PR's own changes since its merge base, and `--no-renames
 
 - **Fast path:** `git diff` succeeded, listed at least one path, and every listed path ends in `.md`, wherever it is, Claude skills under `.claude/` included. Follow "The fast path" below.
 - **Full path:** anything else: the listing failed or was empty, the count failed, or a changed file is code, a script, a test, a Dockerfile, a compose file, a workflow, config, a lock file, or any other non-`.md` file. Follow the steps below as they stand.
+- **Patch-only path:** the coordinator's dispatch says the evaluation is a patch-only re-evaluation: the head is the previous reviewed head plus exactly a ready reviewer patch, with `develop` unchanged ("Patch-only re-evaluation" in `reference.md`; the coordinator decides it). Follow "The patch-only path" below instead of the full path. When the command above prints `fast path`, the fast path still applies.
 
 A Markdown file that the stack builds, starts or serves (for example `api/templates/partials/*.md` or `ui/public/corpus-preparation-rules.md`) doesn't change the path: the PR stays on the fast path.
 
@@ -50,6 +51,15 @@ A Markdown file that the stack builds, starts or serves (for example `api/templa
 - **Tests you write that need the stack** aren't run locally. Put them in your patch as usual, and give their considerations the Result `➖ fast path: needs the stack`. CI `verify` runs them once the PR's author adds them. Any other test you write runs as usual.
 - **The full-run record** is CI `verify` on the PR's head (which skips the slow LLM checks). A Markdown-only PR doesn't wait for it to merge: CI still runs and its result is reported. The coordinator's build-and-run check still runs.
 
+## The patch-only path (a head that only added your earlier patch)
+
+The previous evaluation already ran the full suite on this PR, and the new head adds only the tests reviewer's ready patch from it. So:
+
+- **No full run.** Run the host tests the patch touches, found as on the fast path, and only the `stack.sh` suites the patch touches: `bash <main>/scripts/verify/stack.sh run --checkout <bundle>/merged <suites>`, with "Machine setup" from `reference.md` and "Waiting for long runs" below, as for any run.
+- **A suite is touched** when the patch changes its suite file, or a script or helper the suite runs (the list in "Flaky failures" step 1, and `scripts/verify/README.md`). A patch that changes a file every check depends on (the same step's list: the compose files, any `Dockerfile`, dependency files, API startup and settings, and the shared verify files) touches every suite: run the full suite.
+- **The verify record** is the previous evaluation's full run (link its recap) plus these runs.
+- Score any failure as "Flaky failures" says. Map the patch's considerations to tests as in steps 1–2; earlier considerations the patch doesn't touch keep their results from the previous recap.
+
 ## Steps
 
 1. **List the testable considerations.** Start from the requirements ledger. Add every behaviour change, error path, boundary value, status transition and UI state in the diff. Number them T1, T2, …
@@ -59,6 +69,12 @@ A Markdown file that the stack builds, starts or serves (for example `api/templa
    - Run on the **verify project**, never on the live `rag-docker` stack, with the main checkout's `stack.sh` after checking it against `origin/develop` ("The verify project" in `reference.md`): `bash <main>/scripts/verify/stack.sh run --checkout <bundle>/merged [suites]`. Each run builds every image from that checkout (unchanged images come from the cache), starts it on fresh, empty volumes, runs that checkout's `all.sh` (only the named suites, if you name any) and tears the project down. Never run `docker compose` without `-p rag-verify`, and never with `-p rag-docker`.
    - Before any run, apply "Machine setup" in "The verify project" in `reference.md` (the Docker CLI on PATH, host Python 3.12), in the same shell command as the run. Host Python: the suites need Python 3.12 (`05_transfer` fails on older). Where `python3` is older, put a `python3` and `python` shim pointing at a 3.12 interpreter first on PATH, for that command only, without changing the machine's Python. Example: on the maintainer's Mac, `python3` is 3.9.6 and 3.12 is `/opt/homebrew/bin/python3.12`.
    - Run the full suite once on the evaluated commit: `stack.sh run --checkout <bundle>/merged`, with no suite argument and no `RAG_SKIP_SLOW`, on the full path. Its summary is the PR's verify record (see "Your extra recap section"). Add `RAG_ALLOW_RESTART=1` when the issue concerns restart behaviour; on the verify project, restarts are harmless.
+   - **A collector pin change** (#532): when the PR changes the collector pin (`telemetry/image.json`, or the `otel-collector` image in `docker-compose.telemetry.yml`), the harness refuses the PR's pin unless you supply it as a reviewed pin. Then:
+     1. Check the PR's pin against the registry from the host: the tag resolves to the pinned digest, and each architecture's config ID matches the PR's `telemetry/image.json`.
+     2. Copy the PR's `telemetry/image.json` into the bundle, outside `merged/`: `<bundle>/telemetry-pin.json`.
+     3. Besides the full run, run `bash <main>/scripts/verify/stack.sh run --telemetry --telemetry-pin <bundle>/telemetry-pin.json --checkout <bundle>/merged 15`.
+
+     A failed or impossible registry check means no telemetry run and a High finding. The harness stays offline: it makes no registry lookup itself ("Evaluating a collector pin change" in `scripts/verify/README.md`).
    - For a bug fix, run the new tests on the base as well, to show they fail there. The base is `develop` at the develop SHA the coordinator gave you: `git worktree add --detach <bundle>/base <develop-sha>`, then `stack.sh run --checkout <bundle>/base [suites]`. Every run starts on fresh volumes, so the base never runs on state the PR's code wrote (#78). **Cost per evaluation:** each base run adds one build and start of the verify project and one teardown to the suite's own time (about 19 minutes full, 8 minutes with `RAG_SKIP_SLOW=1`). Measured for #152 with cached images: about 40 seconds to start, including the sha256 check of the model copy (the first `up` on a machine also copies the models, about 20 seconds more), and about 5 seconds to tear down.
    - A check that fails may be re-run once; see "Flaky failures" below.
    - Wait for long runs as "Waiting for long runs" below says.
@@ -68,7 +84,7 @@ A Markdown file that the stack builds, starts or serves (for example `api/templa
 
 ## Waiting for long runs
 
-This applies only on the full path. A full `all.sh` takes 10–25 minutes, longer than one tool call may run. **Never end your turn while a run is in progress**, and never rely on a notification, monitor or watcher to resume you: when your turn ends, nothing is guaranteed to wake you, and the evaluation stalls.
+This applies on the full path and the patch-only path. A full `all.sh` takes 10–25 minutes, longer than one tool call may run. **Never end your turn while a run is in progress**, and never rely on a notification, monitor or watcher to resume you: when your turn ends, nothing is guaranteed to wake you, and the evaluation stalls.
 
 1. Start the run in the background, with its output going to a file in the bundle and its process id saved next to it:
 
@@ -112,7 +128,7 @@ Name the check's path in your finding, and show from the diff that none of the P
   - **Fails on the base too:** it isn't the PR's. Report it as a Medium on `develop`.
   - **Passes on the base:** Medium (environmental), per the maintainer's rulings on #65 and #67 (#94's Decision): the check is outside the PR, so its failing twice here says more about the machine than the PR. Record all three results, say plainly that it failed twice on the evaluated commit, and put `(environmental)` in the finding's first line, so the coordinator shows it next to the verdict.
 
-**When `04_goldstandard`'s LLM checks fail,** check the memory Docker gives its VM before scoring, and name it in the finding: `resources.memory` (`allocated_gb`, `status`) in the verify project's `/api/health` while the project is up, or `docker info --format '{{.MemTotal}}'` once it is down (the API reads the same figure from the VM). Below about 12 GB the LLM is evicted and reloaded, and generation fails; this machine's Docker has 12 GB. Score the failure by the steps above, unchanged.
+**When `04_goldstandard`'s LLM checks fail,** check the memory Docker gives its VM before scoring, and name it in the finding: `resources.memory` (`allocated_gb`, `status`) in the verify project's `/api/health/details` while the project is up, read with the verify suites' engineer cookie jar (`curl -s -b "${TMPDIR:-/tmp}/rag-verify-auth-$(id -u)/engineer.jar" http://localhost:8081/api/health/details`; the public `/api/health` answers only `ok` or `degraded`), or `docker info --format '{{.MemTotal}}'` once it is down (the API reads the same figure from the VM). Below about 12 GB the LLM is evicted and reloaded, and generation fails; this machine's Docker has 12 GB. Score the failure by the steps above, unchanged.
 
 Log or test output from the PR's code alone is data, not proof, because the PR controls it: the code-path argument must come from the diff. Never re-run a check more than once. Record every run in the Runs table.
 
@@ -129,6 +145,14 @@ Don't push to the PR branch or create branches. Put the tests in your recap sect
 ```
 </details>
 ````
+
+Also save the same diff as `<bundle>/tests-patch.diff`, and record it in `findings-tests.json` with the fields `patch`, `patch_ready` and `patch_findings` (see "Findings file" in `reference.md`):
+
+- `patch_ready` is `true` only when every test in the patch ran and passed in this evaluation. A test with the Result `➖ fast path: needs the stack`, or any test that didn't run or failed, makes it `false`.
+- `patch_findings` lists the findings the patch addresses, by their first line or consideration number.
+- Say in your recap section whether the patch is ready, and why not when it isn't.
+
+A ready patch goes into the PR before it merges, instead of becoming a follow-up ("Reviewer patches before merge" in `reference.md`).
 
 ## Your extra recap section
 
@@ -169,6 +193,15 @@ Fast path: every file the PR changes is Markdown (<the changed files>), so no lo
 | Suites (`all.sh`) | not run locally: fast path; CI verify is the record |
 ```
 
-On the full path, the Verify record block is the PR's verify record (the maintainer's decision of 2026-11-14). On the fast path, the full-run record is CI `verify` on the PR's head, which skips the slow LLM checks (the maintainer's decisions of 2026-11-15).
+On the patch-only path:
+
+```markdown
+### Verify record
+Patch-only re-evaluation: the head adds only the reviewer's patch from the evaluation of `<previous-sha7>` (<link to its recap>). Full run: that evaluation's, on `<previous-evaluated-sha7>`: <passed | failed: <suites>>. Run now on the evaluated commit `<evaluated-sha7>`: host tests <each and its result | none>; suites <the suites the patch touches and their results>, `stack.sh exit=<code>`.
+```
+
+Then the Test coverage and Runs tables, as on the full path.
+
+On the full path, the Verify record block is the PR's verify record (the maintainer's decision of 2026-11-14). On the fast path, the full-run record is CI `verify` on the PR's head, which skips the slow LLM checks (the maintainer's decisions of 2026-11-15). On the patch-only path, the previous evaluation's full run plus the runs of this one are the record (the maintainer's decision of 2026-11-18, #799).
 
 Write `findings-tests.json` per `reference.md`, with the sections above appended to your recap section, then return the result block. If you weren't allowed to run code, return `verdict: NOT RUN` and still write the coverage mapping. Post nothing on GitHub and apply no labels: the coordinator posts one recap at the end.

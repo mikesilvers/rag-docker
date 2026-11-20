@@ -13,7 +13,9 @@ know with `note()` (a collection named in a body, file names, a typed
 username). A refusal by the auth middleware is recorded only when it is a 403
 for an identified principal; 401s and 503s write nothing. Jobs get one record
 when they are stored (`job_started`, called by the job store) and one when they
-end (`job_ended`). The operator command and the API's start write their own.
+end (`job_ended`). The operator commands (`python -m auth`, `python -m loader`,
+#670) and the API's start write their own,
+and so does the deletion of an export package (`package_deleted`, #677).
 
 **What never does.** No password, session token, API key, passphrase, answer
 or document text reaches a record: handlers note named parameters only, and a
@@ -38,6 +40,13 @@ and `details.last_attempt` (the last one's time). The API's background task
 writes closed windows and its shutdown writes open ones; a kill loses the
 open counts. At most LOGIN_WINDOWS_MAX windows are open; past that, failures
 are written one by one. nginx also limits logins per address (locations.conf).
+
+**A second factor is never counted, always written (#607).** POST
+/auth/login/mfa is public like the login; its handler names the challenge's
+user, so each attempt, accepted or failed, is its own record with that user as
+the actor and `details.method` (`totp` or `recovery`). A request with no live
+challenge names nobody and writes nothing. The login throttle and nginx's
+per-address limit bound how many can be written.
 """
 from __future__ import annotations
 
@@ -66,9 +75,14 @@ ACTIONS: dict[tuple[str, str], str] = {
     ("POST", "/auth/login"): "auth.login",
     ("POST", "/auth/logout"): "auth.logout",
     ("POST", "/auth/password"): "auth.password",
+    ("POST", "/auth/login/mfa"): "auth.mfa",
+    ("POST", "/auth/mfa/enroll/confirm"): "auth.mfa.enroll",
+    ("POST", "/auth/mfa/recovery-codes"): "auth.mfa.recovery-codes",
+    ("POST", "/auth/mfa/disable"): "auth.mfa.disable",
     ("POST", "/query"): "query",
     ("POST", "/collections"): "collection.create",
     ("DELETE", "/collections/{name}"): "collection.delete",
+    ("PUT", "/collections/{name}/access"): "collection.access",       # #606
     ("POST", "/ingest/upload"): "ingest",
     ("POST", "/ingest/config"): "ingest.config",
     ("POST", "/retrieval/config"): "retrieval.config",
@@ -79,6 +93,7 @@ ACTIONS: dict[tuple[str, str], str] = {
     ("POST", "/tune/reindex"): "tune.reindex",
     ("POST", "/goldstandard/save"): "goldstandard.save",
     ("GET", "/goldstandard/download/{filename}"): "goldstandard.download",
+    ("GET", "/packages/{filename}"): "package.download",                # #677
     ("POST", "/prepare/upload"): "prepare.upload",
     ("POST", "/prepare/jobs"): "prepare.start",
     ("POST", "/prepare/job/{job_id}/cancel"): "prepare.cancel",
@@ -92,6 +107,8 @@ ACTIONS: dict[tuple[str, str], str] = {
     ("POST", "/auth/users/{username}/role"): "admin.user.set-role",
     ("POST", "/auth/users/{username}/disable"): "admin.user.disable",
     ("POST", "/auth/users/{username}/enable"): "admin.user.enable",
+    ("POST", "/auth/users/{username}/reset-mfa"): "admin.user.reset-mfa",
+    ("POST", "/auth/mfa/policy"): "admin.mfa.policy",
     ("POST", "/auth/service-principals"): "admin.principal.create",
     ("POST", "/auth/service-principals/{name}/role"): "admin.principal.set-role",
     ("POST", "/auth/service-principals/{name}/disable"): "admin.principal.disable",
@@ -101,10 +118,17 @@ ACTIONS: dict[tuple[str, str], str] = {
     ("GET", "/audit"): "audit.view",
     ("GET", "/audit.csv"): "audit.download",
 }
-OPERATOR_ACTIONS = ("bootstrap", "create-user", "reset-password", "set-role", "disable", "enable")
+# A refused use of a restricted collection on a route that has no action of its
+# own (#606); on an audited route the refusal is that route's record.
+ACCESS_REFUSED = "collection.access.refused"
+# An export package deleted after its download or when it expired (#677).
+PACKAGE_DELETE = "package.delete"
+# The operator commands: python -m auth's (#25), and python -m loader's load (#670).
+OPERATOR_ACTIONS = ("bootstrap", "create-user", "reset-password", "set-role", "disable", "enable", "reset-mfa",
+                    "load")
 # Every action name, for the API's filter and the UI's list.
 ALL_ACTIONS = tuple(sorted(set(ACTIONS.values()) | {"operator." + a for a in OPERATOR_ACTIONS}
-                          | {"system.start"}))
+                          | {"system.start", ACCESS_REFUSED, PACKAGE_DELETE}))
 RESULTS = ("success", "refused", "error", "accepted", "succeeded", "failed", "interrupted")
 # A job's final status and the result its end record carries.
 JOB_RESULT = {"completed": "succeeded", "failed": "failed", "partial": "failed", "cancelled": "failed"}
@@ -145,6 +169,49 @@ def note(collection: str | None = None, target: str | None = None, **details) ->
     if target is not None:
         ctx["target"] = target
     ctx["details"].update(details)
+
+
+def access_refused(request, collection: str, code: str = "COLLECTION_NOT_FOUND") -> None:
+    """A caller refused a restricted collection (#606). Inside an audited
+    request its own record names the collection and the reason (the middleware
+    adds the error code sent); otherwise one record of its own, with `code`, the
+    not-found code the route answers with. Never raises."""
+    ctx = _current.get()
+    if ctx is not None:
+        ctx["collection"] = collection
+        ctx["details"]["reason"] = "collection_access"
+        return
+    try:
+        scope = getattr(request, "scope", None) or {}
+        route = getattr(scope.get("route"), "path", None)
+        record(ACCESS_REFUSED, result="refused", status_code=404, collection=collection,
+               **_scope_actor(scope),
+               details={"route": f"{scope.get('method', '')} {route}" if route else scope.get("path"),
+                        "reason": "collection_access", "code": code})
+    except Exception:                                 # noqa: BLE001 - never breaks the answer
+        _log.exception("Could not record a collection access refusal")
+
+
+def _scope_actor(scope) -> dict:
+    """The actor fields of a request's scope: its principal and client address."""
+    principal = (scope.get("state") or {}).get("auth")
+    client = scope.get("client")
+    return {"actor": getattr(principal, "username", None),
+            "actor_kind": ("service" if getattr(principal, "kind", None) == "service" else "user")
+            if principal is not None else "anonymous",
+            "role": getattr(principal, "role", None), "key_id": getattr(principal, "key_id", None),
+            "client_ip": _header(scope, b"x-real-ip") or (client[0] if client else None)}
+
+
+def package_deleted(filename: str, reason: str, scope=None) -> None:
+    """One `package.delete` record (#677): `reason` is `downloaded`, with the
+    downloading request's scope for its actor, or `expired`, by the system.
+    Never raises."""
+    try:
+        actor = _scope_actor(scope) if scope is not None else {"actor": "system", "actor_kind": "system"}
+        record(PACKAGE_DELETE, result="success", details={"file": filename, "reason": reason}, **actor)
+    except Exception:                                 # noqa: BLE001 - never breaks the deletion
+        _log.exception("Could not record the deletion of package %s", filename)
 
 
 def add_details(values: dict) -> None:
@@ -372,7 +439,11 @@ def job_ended(job: dict, interrupted: bool) -> None:
         details.update(package=job.get("filename"), fidelity=job.get("fidelity"))
     elif snapshot.get("action") == "import":
         collection = job.get("collection") or collection
-    record(snapshot.get("action", "unknown"), result="interrupted" if interrupted else JOB_RESULT.get(status, "failed"),
+    result = "interrupted" if interrupted else JOB_RESULT.get(status, "failed")
+    if job.get("access_refused"):
+        # An import of a package from a collection its owner can't use (#606).
+        result, details["reason"] = "refused", "collection_access"
+    record(snapshot.get("action", "unknown"), result=result,
            job_id=job.get("job_id") or getattr(job, "_id", None), collection=collection, target=snapshot.get("target"),
            details=details, **{k: snapshot.get(k) for k in ("actor", "actor_kind", "role", "key_id", "client_ip")})
 
@@ -594,7 +665,7 @@ class AuditMiddleware:
             # nothing (D4). Only a login, which is public, is recorded without
             # a principal: a success names its account, a failure the username
             # as typed.
-            if ctx["action"] != "auth.login" or (ctx["actor"] is None and ctx["target"] is None):
+            if ctx["action"] not in ("auth.login", "auth.mfa") or (ctx["actor"] is None and ctx["target"] is None):
                 return
         status = seen["status"] or 500
         if ctx["job_recorded"] and status == 202:

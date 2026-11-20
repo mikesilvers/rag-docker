@@ -39,7 +39,7 @@ fi
 # question with a known answer first, unless LLM work is being skipped.
 if [ "${RAG_SKIP_SLOW:-0}" != "1" ]; then
   if ! sanity=$(cd "$REPO_ROOT" && docker compose exec -T api python - < scripts/verify/llm_sanity.py 2>&1); then
-    printf '\nThe LLM is not giving usable answers:\n  %s\n' "$sanity"
+    printf '\nThe answer LLM is not giving usable answers:\n  %s\n' "$sanity"
     printf 'Restart it and run again:  docker compose restart ollama\n'
     printf '(with the verify environment that scripts/verify/stack.sh up prints)\n\n'
     exit 2
@@ -51,7 +51,7 @@ printf '\nBuilding fixtures in %s\n' "$FIX"
 rm -rf "$FIX"; python3 ./fixtures.py "$FIX" >/dev/null
 export RAG_FIXTURES="$FIX"
 
-ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings 15_telemetry 17_auth 18_lan 19_audit 20_offline_model 21_prepare 22_ui_ingest)
+ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings 15_telemetry 17_auth 18_lan 19_audit 20_offline_model 21_prepare 22_ui_ingest 23_llm_split 24_query_only)
 if [ "$#" -gt 0 ]; then
   SUITES=()
   for want in "$@"; do

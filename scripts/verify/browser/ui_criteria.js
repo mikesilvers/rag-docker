@@ -33,6 +33,22 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
   r.section('§10.4 login and session');
   {
     const s = await session(browser, BASE, null);
+    // The retry below is forced (#598): this context's first login is answered here with nginx's own refusal
+    // (proxy/locations.conf, @login_rate_limited). It never reaches nginx, so it uses no slot; the second goes through.
+    let stubbed = 0, retried = false;
+    const stubFirstLogin = async request => {
+      try {
+        if (stubbed === 0 && request.method() === 'POST' && new URL(request.url()).pathname === '/api/auth/login') {
+          stubbed = 1;
+          await request.respond({ status: 429, contentType: 'application/json',
+            body: JSON.stringify({ error: { code: 'LOGIN_RATE_LIMITED', message: LOGIN_RATE_LIMITED, detail: null } }) });
+        } else {
+          await request.continue();
+        }
+      } catch { /* seen while interception is switched off below */ }
+    };
+    await s.page.setRequestInterception(true);
+    s.page.on('request', stubFirstLogin);
     await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' });
     r.check('logged out, the UI shows the login page', /Log in to continue/.test(await bodyText(s.page)) && new URL(s.page.url()).pathname === '/login');
     const { username, password } = credentialsFor('engineer');
@@ -46,11 +62,18 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     await submit();
     // nginx allows 10 logins a minute per address, a burst of 5 (#577), and refills a slot every 6 s:
     // a form login it refuses is submitted once more after 6.5 s, as browser/lib.js's login waits.
+    // The first answer is this check's own refusal (above), so this branch runs every time (#598).
     if (await s.page.evaluate(() => document.querySelector('p[role=alert]')?.textContent.trim()) === LOGIN_RATE_LIMITED) {
+      retried = true;
+      console.log("    the login form showed nginx's rate-limit message: submitting it once more after 6.5 s");
       await sleep(6500);
       await submit();
     }
     await s.page.waitForFunction(() => location.pathname === '/qa' && document.querySelectorAll('nav a').length > 0, { timeout: 10000 }).catch(() => {});
+    await s.page.setRequestInterception(false);
+    s.page.off('request', stubFirstLogin);
+    r.check("the form login's retry on nginx's rate-limit message ran (this check answered its first login 429)",
+      stubbed === 1 && retried, `stubbed=${stubbed} retried=${retried}`);
     const badge = await s.page.evaluate(() => document.querySelector('nav button[data-menu=account] span.bg-blue-100')?.textContent.trim());
     r.check('logging in through the form opens /qa as the account\'s role', badge === 'AI Engineer', String(badge));
     const cookies = await s.page.cookies();
@@ -1157,7 +1180,7 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
   }
 
   // ── degraded and unreachable health (#375) ─────────────────────────────────
-  // /health answers 503 with its per-service body when a dependency is down. The
+  // /health/details answers 503 with its per-service body when a dependency is down. The
   // page must show that body, red for the failing service, keep loading the
   // latency metrics, and say so when health can't be read at all. Each load is
   // driven by hand through the captured 30s refresh, with the answers stubbed.
@@ -1176,7 +1199,7 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
       status,
       services: {
         weaviate: service('ok', 11),
-        ollama: { llm: service('ok', 22, 'phi3.5'), embed: service(embed, 33, 'nomic-embed-text') },
+        ollama: { llm: service('ok', 22, 'phi3.5'), build_llm: service('ok', 22, 'phi3.5'), embed: service(embed, 33, 'nomic-embed-text'), same_model: true },
       },
       resources: { memory: { status: 'ok', allocated_gb: 11.67, recommended_minimum_gb: 12.0 } },
     });
@@ -1192,7 +1215,7 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     await s.page.setRequestInterception(true);
     s.page.on('request', request => {
       const path = new URL(request.url()).pathname;
-      if (path === '/api/health') {
+      if (path === '/api/health/details') {
         if (mode === 'refused') return request.abort('connectionrefused');
         if (mode === 'proxy502') return request.respond({ status: 502, contentType: 'text/html', body: proxyPage('502 Bad Gateway') });
         if (mode === 'html503') return request.respond({ status: 503, contentType: 'text/html', body: proxyPage('503 Service Temporarily Unavailable') });
@@ -1603,9 +1626,13 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     }
 
     // Transfer, stubbed: reopening the job a panel is polling, while its poll is
-    // in flight, keeps one poll chain (#629). Each lookup answers after 1 s, so
-    // one chain polls at most 3 times in 7 s (answer, then 2 s wait); a second
-    // chain for the same job would make it at least 4.
+    // in flight, keeps one poll chain (#629). The stub holds every lookup of the
+    // job until the test releases it, so "in flight when the row is clicked" is
+    // true by construction, not by a race with a timer. After the reopen the
+    // test releases the held lookups, the old chain's first and the new chain's,
+    // and counts the lookups that follow: one chain makes exactly one (after its
+    // 2 s wait), and an old chain that the reopen did not stop makes a second.
+    // No wall-clock window is counted, so a slow machine cannot change the result.
     {
       const s = await session(browser, BASE, 'developer');
       try {
@@ -1617,6 +1644,11 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
           collection: null, original_collection: null, chunks_written: 2, fidelity: null, renamed: false, notes: [],
           restored_sessions: [], error: null, error_code: null, error_detail: null };
         const lookups = { '/api/export/job/vfy629e': [], '/api/import/job/vfy629i': [] };
+        // Answers a held lookup. A request the page has already dropped is ignored.
+        const release = lookup => {
+          lookup.answered = true;
+          lookup.request.respond(json(lookup.path.includes('/export/') ? exportJob : importJob)).catch(() => {});
+        };
         await s.page.setRequestInterception(true);
         s.page.on('request', request => {
           const path = new URL(request.url()).pathname;
@@ -1625,35 +1657,41 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
           if (path === '/api/import/jobs') return request.respond(json({ jobs: [
             { ...importJob, owner: mine, created_at: at(30), finished_at: null }] }));
           if (path in lookups) {
-            const lookup = { start: Date.now(), answered: false };
-            lookups[path].push(lookup);
-            setTimeout(() => {
-              lookup.answered = true;
-              request.respond(json(path.includes('/export/') ? exportJob : importJob)).catch(() => {});
-            }, 1000);
+            lookups[path].push({ path, request, answered: false });
             return;
           }
           return request.continue();
         });
-        await s.page.goto(BASE + '/transfer', { waitUntil: 'networkidle2' });
-        // Waits for a new lookup of the job, then clicks the job's row while it
-        // is in flight: still unanswered once the click has happened.
-        const reopen = async (path, text) => {
-          const before = lookups[path].length;
-          for (let i = 0; i < 100 && lookups[path].length === before; i++) await sleep(50);
-          const inflight = lookups[path][lookups[path].length - 1];
-          const clickedAt = Date.now();
-          const clicked = await clickRow(s.page, text);
-          return { path, clickedAt, inFlight: !!inflight && lookups[path].length > before && clicked && !inflight.answered };
+        // Held lookups keep connections open, so the page is not waited on to go idle.
+        await s.page.goto(BASE + '/transfer', { waitUntil: 'domcontentloaded' });
+        // Waits for a condition, polling every 50 ms, for at most limit ms.
+        const until = async (condition, limit = 8000) => {
+          for (let waited = 0; waited < limit && !condition(); waited += 50) await sleep(50);
+          return condition();
         };
-        const exported = await reopen('/api/export/job/vfy629e', 'StubExport629');
-        const imported = await reopen('/api/import/job/vfy629i', 'ragpkg-stub629.tar.gz');
-        await sleep(imported.clickedAt + 7200 - Date.now());
-        for (const [kind, click] of [['export', exported], ['import', imported]]) {
-          const count = lookups[click.path].filter(l => l.start >= click.clickedAt && l.start <= click.clickedAt + 7000).length;
+        const check629 = async (kind, path, text) => {
+          // Each panel opens its running job on load and makes its first lookup, which is held.
+          const arrived = await until(() => lookups[path].length >= 1);
+          const before = lookups[path].length;
+          const first = lookups[path][0];
+          const clicked = arrived && await clickRow(s.page, text);
+          // The reopen starts a new chain with a lookup at once: exactly one more.
+          await until(() => lookups[path].length > before);
+          await sleep(300);
+          const started = lookups[path].length - before;
+          const inFlight = !!clicked && !!first && !first.answered && started === 1;
+          // Release the old chain's lookup, then the new chain's.
+          for (const lookup of lookups[path]) if (!lookup.answered) release(lookup);
+          const released = lookups[path].length;
+          await until(() => lookups[path].length > released);
+          // A second chain would make its lookup at the same moment; allow for it.
+          await sleep(1500);
+          const after = lookups[path].length - released;
           r.check(`Transfer: reopening the polled ${kind} while its poll is in flight keeps one poll chain (#629)`,
-            click.inFlight && count <= 3, `inFlight=${click.inFlight} lookups in 7 s=${count}`);
-        }
+            inFlight && after === 1, `inFlight=${inFlight} new lookups after release=${after}`);
+        };
+        await check629('export', '/api/export/job/vfy629e', 'StubExport629');
+        await check629('import', '/api/import/job/vfy629i', 'ragpkg-stub629.tar.gz');
       } finally { await s.ctx.close(); }
     }
 

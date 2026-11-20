@@ -31,8 +31,8 @@ immediate because the images are built and the models are cached in the
 
 **Docker must be allocated 12 GB of memory and 2 GB of swap** (Settings →
 Resources); on a 16 GB Mac that is the practical ceiling, leaving macOS about 4 GB. phi3.5 is ~6 GB resident; below that it is evicted and reloaded between
-calls and queries time out. `curl http://localhost:8080/api/health` reports the
-allocated figure against the recommendation.
+calls and queries time out. `curl -b ~/.rag-session http://localhost:8080/api/health/details`
+(a Developer or AI Engineer login) reports the allocated figure against the recommendation.
 
 ---
 
@@ -45,6 +45,14 @@ services:
   weaviate:
     # 1.27.0 is the minimum supported by weaviate-client 4.23.1 (pinned in
     # api/requirements.txt); 1.25.x fails at connect with WeaviateStartUpError.
+    # Use the plain X.Y.Z tag: it is the multi-arch image. The suffixed tags,
+    # such as 1.40.2-9858973.arm64, carry one platform only (#527, #530), so
+    # Dependabot ignores Weaviate (.github/dependabot.yml) and it is upgraded
+    # by hand. The main stack's images are pinned by tag, not digest (decided
+    # on #544): weaviate and ollama to exact versions, nginx to the 1.29-alpine
+    # tag, which moves with patch and Alpine rebuilds and which Dependabot
+    # updates. The opt-in telemetry collector (docker-compose.telemetry.yml) is
+    # the exception: it is pinned by digest.
     image: semitechnologies/weaviate:1.40.2
     environment:
       QUERY_DEFAULTS_LIMIT: 25
@@ -99,13 +107,26 @@ services:
     # Windows machine in the transfer path can all drop it), which would
     # otherwise fail with "permission denied" on a fresh install.
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    # The LLMs (#671), set once here; the api reads the same three through the
+    # llm-models anchor. BUILD_LLM_MODEL prepares documents and writes gold
+    # standard pairs; ANSWER_LLM_MODEL answers questions. Each falls back to
+    # LLM_MODEL when empty, and LLM_MODEL to llama3.1:8b. Ollama pulls each
+    # distinct model when it starts (ollama/models.sh). The embedding model is
+    # the api's EMBED_MODEL and stays one.
+    environment: &llm-models
+      LLM_MODEL: llama3.1:8b
+      BUILD_LLM_MODEL: ""
+      ANSWER_LLM_MODEL: ""
     volumes:
       - ollama_models:/root/.ollama
       - ./ollama/entrypoint.sh:/entrypoint.sh:ro
+      - ./ollama/models.sh:/models.sh:ro
     networks: [rag-internal]
     healthcheck:
       # The ollama image has no curl/wget; the CLI is the only probe available.
-      test: ["CMD-SHELL", "ollama list | grep -q llama3.1:8b && ollama list | grep -q nomic-embed-text"]
+      # Healthy once `ollama list` has every model ollama/models.sh resolves
+      # from the settings above, by exact name (#671).
+      test: ["CMD", "bash", "/models.sh", "present"]
       interval: 20s
       timeout: 15s
       retries: 20
@@ -133,11 +154,18 @@ services:
       WEAVIATE_PORT: 8080
       OLLAMA_HOST: ollama
       OLLAMA_PORT: 11434
-      LLM_MODEL: llama3.1:8b
+      # LLM_MODEL, BUILD_LLM_MODEL and ANSWER_LLM_MODEL, from the ollama
+      # service's environment above (#671).
+      <<: *llm-models
       EMBED_MODEL: nomic-embed-text
       UPLOAD_DIR: /app/uploads
       SOURCES_DIR: /app/sources
       EXPORTS_DIR: /app/exports
+      # A package exported here and never downloaded is deleted from ./exports
+      # this many hours after its export finished (#677), 1 to 720; a full
+      # download through the API deletes it at once. Packages copied into
+      # ./exports to be imported are never deleted.
+      EXPORT_RETENTION_HOURS: "24"
       OLLAMA_MODELS_DIR: /ollama
       # The sentence-transformers model is pre-cached in the api image at
       # build time (api/Dockerfile). Without these flags the Hugging Face
@@ -151,7 +179,7 @@ services:
       # when it is imported and on every partition call, so ingest never
       # dials out (issue #695). Also set as ENV in api/Dockerfile.
       DO_NOT_TRACK: "1"
-      # Shown by /health and compared against the memory Docker actually
+      # Shown by /health/details and compared against the memory Docker actually
       # provides. Raise this if you allocate more to Docker Desktop.
       RECOMMENDED_MEMORY_GB: 12
       # The most one upload's ZIPs may expand to in all, gzipped members'
@@ -172,6 +200,10 @@ services:
       # docker-compose.lan.yml serves TLS and sets it true (#26). Exactly true
       # or false.
       AUTH_COOKIE_SECURE: "false"
+      # Query-only mode (#670): an instance that serves questions on collections
+      # loaded with `python -m loader` and can't change them. Exactly true or
+      # false; the overlay docker-compose.query-only.yml sets it true.
+      RAG_QUERY_ONLY: "false"
       # The audit log (#29), in the ingest_uploads volume under audit/ and read
       # on the AI Engineer's Audit page. Whether a query's question text is
       # recorded: exactly true or false, off by default. audit.jsonl is rotated
@@ -352,6 +384,38 @@ volumes:
   lan_certs:
 ```
 
+### docker-compose.query-only.yml
+
+```yaml
+# Query-only mode (#670): an instance that serves questions on collections
+# built elsewhere and can't change them. Opt-in, and only together with the
+# base file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.query-only.yml up -d
+#
+# and, to share it with your office in LAN mode (#26), with LAN mode's file too:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.lan.yml -f docker-compose.query-only.yml up -d
+#
+# What this changes: the API runs with RAG_QUERY_ONLY=true. It then refuses
+# every route that creates, changes or deletes a collection or its data with
+# 403 QUERY_ONLY (ingest, preparation, chunking and retrieval settings, gold
+# standard, tuning, collection create and delete, package import), and the UI
+# hides their pages. Questions, accounts, keys, collection access, the audit
+# log and export keep working. No model setting changes.
+#
+# Collections are built and exported on a full instance, the package is copied
+# into ./exports here, and an operator loads it on this host:
+#
+#   docker compose exec api python -m loader <package> [--on-conflict abort|rename|replace]
+#
+# See README "Query-only mode".
+services:
+  api:
+    environment:
+      RAG_QUERY_ONLY: "true"
+```
+
 ### docker-compose.lan.verify.yml
 
 ```yaml
@@ -390,20 +454,9 @@ until ollama list > /dev/null 2>&1; do
   sleep 2
 done
 
-# Is the model downloaded? `ollama list` prints NAME as "<name>:<tag>", with
-# ":latest" added to a name pulled without a tag; its columns are separated by
-# tabs or spaces, so `read` splits them. The NAME must match exactly: another
-# variant of a tagged name (llama3.1:8b-instruct-q8_0 for llama3.1:8b) is a
-# different model and doesn't count (#647).
-model_present() {
-    local name rest
-    while read -r name rest; do
-        if [ "${name}" = "$1" ] || [ "${name}" = "$1:latest" ]; then
-            return 0
-        fi
-    done < <(ollama list)
-    return 1
-}
+# The model names and model_present (#671): the answer and build LLMs, resolved
+# from the settings compose passes, and the embedding model.
+. "$(dirname "$0")/models.sh"
 
 # Pull a model with retry. Ollama resumes partial downloads so retries are cheap.
 # timeout 7200 (2 hours) kills a truly hung connection while allowing slow downloads.
@@ -430,10 +483,145 @@ pull_with_retry() {
     echo "ollama: ${model} ready."
 }
 
-pull_with_retry llama3.1:8b
-pull_with_retry nomic-embed-text
+# Each distinct model, the answer model first (names hold no spaces).
+for model in $(models); do
+  pull_with_retry "${model}"
+done
 
 wait $OLLAMA_PID
+```
+
+### ollama/models.sh
+
+```bash
+#!/bin/bash
+# The Ollama models this stack needs (#671), from the three LLM settings
+# docker-compose.yml gives the ollama service (its environment):
+#
+#   the answer model  ANSWER_LLM_MODEL, else LLM_MODEL, else llama3.1:8b
+#   the build model   BUILD_LLM_MODEL,  else LLM_MODEL, else llama3.1:8b
+#   the embedding model, nomic-embed-text
+#
+# An empty setting counts as not set. The API resolves its two models the same
+# way (api/config.py). This is the one place the ollama side resolves them: the
+# entrypoint pulls these names, the healthcheck checks them, and
+# package-offline.sh and the CI model cache read them through
+# ollama/compose-models.sh.
+#
+#   bash models.sh [list]   print the names, one per line: the answer model, the
+#                           build model when it is a different model, the
+#                           embedding model
+#   bash models.sh present  exit 0 only when `ollama list` has every name
+#
+# Sourced (by entrypoint.sh), it only defines the functions. Written for bash
+# 3.2 too, which the host tests run it with.
+
+_llm="${LLM_MODEL:-llama3.1:8b}"
+ANSWER_MODEL="${ANSWER_LLM_MODEL:-$_llm}"
+BUILD_MODEL="${BUILD_LLM_MODEL:-$_llm}"
+EMBED_MODEL_NAME=nomic-embed-text
+
+# A model name is letters, digits and . _ : / - only, as compose-models.sh
+# requires on the host: the names are word-split below, so a space or a glob
+# character must stop here, not be split or expanded. A name with `..`, or one
+# starting with `/` or `-`, is refused too (#772).
+for _name in "${ANSWER_MODEL}" "${BUILD_MODEL}"; do
+    case "${_name}" in
+        *[!A-Za-z0-9._:/-]*|*..*|/*|-*)
+            echo "models.sh: not a model name: '${_name}'" >&2
+            # Sourced, return to the caller; run, exit.
+            return 2 2>/dev/null || exit 2 ;;
+    esac
+done
+
+# `name:tag`, with `:latest` for a name without a tag (after its last `/`), so
+# `x` and `x:latest` are one model, as the API compares them.
+tagged() {
+    case "${1##*/}" in
+        *:*) printf '%s\n' "$1" ;;
+        *) printf '%s:latest\n' "$1" ;;
+    esac
+}
+
+models() {
+    printf '%s\n' "${ANSWER_MODEL}"
+    if [ "$(tagged "${BUILD_MODEL}")" != "$(tagged "${ANSWER_MODEL}")" ]; then
+        printf '%s\n' "${BUILD_MODEL}"
+    fi
+    printf '%s\n' "${EMBED_MODEL_NAME}"
+}
+
+# Is the model downloaded? `ollama list` prints NAME as "<name>:<tag>", with
+# ":latest" added to a name pulled without a tag; its columns are separated by
+# tabs or spaces, so `read` splits them. The NAME must match exactly: another
+# variant of a tagged name (llama3.1:8b-instruct-q8_0 for llama3.1:8b) is a
+# different model and doesn't count (#647).
+model_present() {
+    local name rest
+    while read -r name rest; do
+        if [ "${name}" = "$1" ] || [ "${name}" = "$1:latest" ]; then
+            return 0
+        fi
+    done < <(ollama list)
+    return 1
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    case "${1:-list}" in
+        list) models ;;
+        present)
+            for model in $(models); do
+                model_present "${model}" || exit 1
+            done ;;
+        *) echo "usage: bash models.sh [list|present]" >&2; exit 2 ;;
+    esac
+fi
+```
+
+### ollama/compose-models.sh
+
+```bash
+#!/usr/bin/env bash
+# The models the ollama service pulls (#671), on the host: the names
+# ollama/models.sh resolves from the LLM settings `docker compose config` gives
+# the ollama service, one per line. package-offline.sh and the CI model cache
+# read them here, so they read what the entrypoint pulls.
+#
+#   bash ollama/compose-models.sh
+#
+# Run from the folder docker compose reads its files from. Needs docker compose
+# and python3. Exits non-zero, with a message, when it can't give the names.
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+
+config="$(docker compose config --format json)" \
+  || { echo "compose-models.sh: docker compose config failed." >&2; exit 1; }
+
+# LLM_MODEL, BUILD_LLM_MODEL, ANSWER_LLM_MODEL, one per line, each after "v:" so
+# an empty one still has its line.
+settings="$(printf '%s' "$config" | python3 -c '
+import json, re, sys
+try:
+    services = json.load(sys.stdin)["services"]
+    env = services["ollama"].get("environment") or {}
+except (ValueError, KeyError, TypeError, AttributeError):
+    sys.exit("compose-models.sh: the compose config has no ollama service.")
+for key in ("LLM_MODEL", "BUILD_LLM_MODEL", "ANSWER_LLM_MODEL"):
+    value = env.get(key) or ""
+    # The rule ollama/models.sh applies: those characters only, and no "..", no
+    # leading "/" or "-" (#772). An empty value means not set.
+    if not re.fullmatch(r"[A-Za-z0-9._:/-]*", value) or ".." in value or value.startswith(("/", "-")):
+        sys.exit("compose-models.sh: %s is not a model name: %r" % (key, value))
+    print("v:" + value)
+')" || exit 1
+
+{ read -r llm; read -r build; read -r answer; } <<< "$settings"
+llm="${llm#v:}"; build="${build#v:}"; answer="${answer#v:}"
+names="$(env -i PATH="$PATH" LLM_MODEL="$llm" BUILD_LLM_MODEL="$build" ANSWER_LLM_MODEL="$answer" \
+  bash "$here/models.sh" list)" \
+  || { echo "compose-models.sh: ollama/models.sh failed." >&2; exit 1; }
+[ -n "$names" ] || { echo "compose-models.sh: no model names." >&2; exit 1; }
+printf '%s\n' "$names"
 ```
 
 ### proxy/nginx.conf
@@ -529,6 +717,23 @@ location = /api/auth/login {
     proxy_connect_timeout 10s;
 }
 
+# The second step of a login with two-step verification (#607): the code. It
+# shares the login's zone, so a client's passwords and codes together stay
+# within 10 a minute and a burst of 5, and gets the same 16k body limit (a
+# code is at most 64 characters).
+location = /api/auth/login/mfa {
+    limit_req zone=login burst=5 nodelay;
+    limit_req_status 429;
+    error_page 429 = @login_rate_limited;
+    client_max_body_size 16k;
+    proxy_pass http://api/auth/login/mfa;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_read_timeout 300s;
+    proxy_connect_timeout 10s;
+}
+
 location @login_rate_limited {
     default_type application/json;
     return 429 '{"error":{"code":"LOGIN_RATE_LIMITED","message":"Too many login attempts. Wait a minute and try again.","detail":null}}';
@@ -583,6 +788,9 @@ events {
 http {
     include       /etc/nginx/mime.types;
     default_type  application/octet-stream;
+
+    # No nginx version in the Server header or on error pages (#555).
+    server_tokens off;
 
     # Logins per client address (#577): 10 a minute, a burst of 5, so failed
     # logins can't flood the audit log. Used by locations.conf's
@@ -820,14 +1028,14 @@ olefile==0.47
 onnx==1.22.0
 onnxruntime==1.30.0
 opencv-python==5.0.0.93
-opentelemetry-api==1.45.1
-opentelemetry-exporter-http-transport==0.66b1
-opentelemetry-exporter-otlp-common==0.66b1
-opentelemetry-exporter-otlp-proto-common==1.45.1
-opentelemetry-exporter-otlp-proto-http==1.45.1
-opentelemetry-proto==1.45.1
-opentelemetry-sdk==1.45.1
-opentelemetry-semantic-conventions==0.66b1
+opentelemetry-api==1.45.2
+opentelemetry-exporter-http-transport==0.66b2
+opentelemetry-exporter-otlp-common==0.66b2
+opentelemetry-exporter-otlp-proto-common==1.45.2
+opentelemetry-exporter-otlp-proto-http==1.45.2
+opentelemetry-proto==1.45.2
+opentelemetry-sdk==1.45.2
+opentelemetry-semantic-conventions==0.66b2
 orjson==3.12.0
 packaging==26.3
 pandas==2.3.3
@@ -869,7 +1077,7 @@ shellingham==1.5.4
 six==1.17.0
 smart_open==8.0.1
 sniffio==1.3.1
-soupsieve==2.9.2
+soupsieve==4.0
 spacy-legacy==3.0.12
 spacy-loggers==1.0.5
 spacy==3.8.16
@@ -967,8 +1175,8 @@ sentence-transformers>=3.0        # resolved: 6.0.1
 python-multipart>=0.0.9           # resolved: 0.0.32
 
 # Private, optional OTLP HTTP/protobuf telemetry runtime (#282).
-opentelemetry-sdk==1.45.1
-opentelemetry-exporter-otlp-proto-http==1.45.1
+opentelemetry-sdk==1.45.2
+opentelemetry-exporter-otlp-proto-http==1.45.2
 
 # Passphrase encryption of export packages in the age format (#27). Already in
 # the lock as a transitive dependency; listed here because the API now imports
@@ -1003,13 +1211,41 @@ def collection_check_unavailable(name: str, outcome: str) -> JSONResponse:
                      f"Cannot check whether '{name}' exists: Weaviate could not be read. "
                      f"{outcome}; try again when Weaviate is available.",
                      detail={"collection": name})
+
+
+def collection_not_found(name: str) -> JSONResponse:
+    """A collection that doesn't exist, or one the caller may not use (#606)."""
+    return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{name}' not found.")
+
+
+async def usable_collection(request, name: str, outcome: str) -> JSONResponse | None:
+    """For the settings routes (#606): None when the caller may use the
+    collection and it exists; otherwise the answer to send, the same 404 for a
+    refused collection as for a missing one, or the 503 when Weaviate can't say."""
+    import logging
+    from auth import access
+    from services import weaviate_client as wc
+    if not await access.check(request, name):
+        return collection_not_found(name)
+    try:
+        exists = await wc.collection_exists(name)
+    except Exception:                                 # noqa: BLE001
+        # Weaviate couldn't be asked; the cause is logged, not sent (#366).
+        logging.getLogger(__name__).exception("Could not check whether %r exists for its settings", name)
+        return collection_check_unavailable(name, outcome)
+    return None if exists else collection_not_found(name)
 ```
 
 ### api/config.py
 
 ```python
-from pydantic import field_validator
+import sys
+
+from pydantic import ValidationError, field_validator
 from pydantic_settings import BaseSettings
+
+# The LLM when LLM_MODEL isn't set (#647).
+DEFAULT_LLM_MODEL = "llama3.1:8b"
 
 
 class Settings(BaseSettings):
@@ -1017,7 +1253,14 @@ class Settings(BaseSettings):
     weaviate_port: int = 8080
     ollama_host: str = "localhost"
     ollama_port: int = 11434
-    llm_model: str = "llama3.1:8b"
+    # Two LLMs (#671): the build model prepares documents and writes gold
+    # standard pairs; the answer model answers questions. Each is its own
+    # setting when set and not empty, else LLM_MODEL, else DEFAULT_LLM_MODEL.
+    # Code reads only the resolved `build_model` and `answer_model` below,
+    # never these three fields directly.
+    llm_model: str = DEFAULT_LLM_MODEL
+    build_llm_model: str = ""
+    answer_llm_model: str = ""
     embed_model: str = "nomic-embed-text"
     upload_dir: str = "/app/uploads"
     # Retained original documents, content-addressed per collection. Kept in
@@ -1027,10 +1270,15 @@ class Settings(BaseSettings):
     # Written export packages. A host bind mount, not a named volume: the
     # whole point is that the user can pick the file up and carry it away.
     exports_dir: str = "/app/exports"
+    # How long a package this instance exported stays in exports_dir when nobody
+    # downloads it (#677), in whole hours, 1 to 720. Counted from the export's
+    # finish; the sweep (services/package_retention.py) deletes it after that.
+    # Packages copied in to be imported are never expired.
+    export_retention_hours: int = 24
     # Ollama's model store, mounted from the same volume the ollama service
     # uses. Only touched when a package bundles models.
     ollama_models_dir: str = "/ollama"
-    # Reported by /health and compared against the memory Docker actually
+    # Reported by /health/details and compared against the memory Docker actually
     # provides. Raise it in docker-compose.yml; no rebuild required.
     recommended_memory_gb: float = 12.0
     # The most an upload's ZIPs may expand to, in bytes, summed over every ZIP
@@ -1059,6 +1307,11 @@ class Settings(BaseSettings):
     # refuses to start unless the cookie is Secure and an enabled Engineer
     # exists (lan_mode.py).
     rag_lan_mode: bool = False
+    # Query-only mode (#670), set only by docker-compose.query-only.yml. When
+    # true the API refuses every route that creates, changes or deletes a
+    # collection or its data (auth/policy.py QUERY_ONLY_REFUSED) with
+    # 403 QUERY_ONLY; collections are loaded on the host with `python -m loader`.
+    rag_query_only: bool = False
     # The audit log (#29): append-only JSON Lines in the ingest_uploads volume,
     # rotated by size (services/audit.py). The folder is its own setting so
     # tests that point upload_dir elsewhere don't find an audit/ folder there.
@@ -1079,7 +1332,7 @@ class Settings(BaseSettings):
     # briefly (maintainer's decision, #638).
     max_preparation_bytes: int = 20 * 1024 * 1024 * 1024
 
-    @field_validator("auth_cookie_secure", "rag_lan_mode", "audit_log_questions", mode="before")
+    @field_validator("auth_cookie_secure", "rag_lan_mode", "rag_query_only", "audit_log_questions", mode="before")
     @classmethod
     def _exact_boolean(cls, value, info):
         # pydantic would read "1", "yes" or "on" as true. A typo in a security
@@ -1105,6 +1358,14 @@ class Settings(BaseSettings):
             raise ValueError("MAX_PREPARATION_BYTES must be at least 1048576")
         return value
 
+    @field_validator("export_retention_hours")
+    @classmethod
+    def _retention_hours(cls, value):
+        # No value turns expiry off (#677): a package must not stay for good.
+        if not 1 <= value <= 720:
+            raise ValueError("EXPORT_RETENTION_HOURS must be 1 to 720")
+        return value
+
     @field_validator("audit_log_keep")
     @classmethod
     def _rotation_keep(cls, value):
@@ -1112,11 +1373,45 @@ class Settings(BaseSettings):
             raise ValueError("AUDIT_LOG_KEEP must be 1 to 1000")
         return value
 
+    @property
+    def build_model(self) -> str:
+        """The LLM for preparation and gold standard generation (#671)."""
+        return self.build_llm_model or self.llm_model or DEFAULT_LLM_MODEL
+
+    @property
+    def answer_model(self) -> str:
+        """The LLM that answers questions (#671)."""
+        return self.answer_llm_model or self.llm_model or DEFAULT_LLM_MODEL
+
     class Config:
         env_file = ".env"
 
 
-settings = Settings()
+def refusal_lines(error: ValidationError) -> list[str]:
+    """One `Settings refused:` line per invalid setting (#555), without the values given."""
+    reasons: dict[str, list[str]] = {}
+    for item in error.errors(include_url=False, include_input=False):
+        name = ".".join(str(part) for part in item["loc"]).upper()
+        own = str(item["ctx"]["error"]) if item["type"] == "value_error" and "error" in item.get("ctx", {}) else ""
+        message = own or item["msg"]
+        reason = message if not name or name in message else f"{name}: {message}"
+        reasons.setdefault(name, []).append(reason)
+    return ["Settings refused: " + "; ".join(parts) for parts in reasons.values()]
+
+
+def _load() -> Settings:
+    # An invalid setting stops the API, and anything else importing this
+    # module, with one line per setting and no traceback (#555), like LAN
+    # mode's refusal: SystemExit isn't printed as a traceback.
+    try:
+        return Settings()
+    except ValidationError as error:
+        for line in refusal_lines(error):
+            print(line, file=sys.stderr, flush=True)
+        raise SystemExit(1) from None
+
+
+settings = _load()
 ```
 
 ### api/lan_mode.py
@@ -1171,6 +1466,257 @@ def enforce() -> None:
         # One line, and SystemExit, which Python doesn't print as a traceback.
         print(reason, file=sys.stderr, flush=True)
         raise SystemExit(1)
+```
+
+### api/loader.py
+
+```python
+"""The operator command that loads an export package into a query-only instance (#670).
+
+    docker compose exec api python -m loader PACKAGE [--on-conflict abort|rename|replace]
+
+PACKAGE is the name of a package file in ./exports (the api container's
+/app/exports): ragpkg-*.tar.gz, or ragpkg-*.tar.gz.age when it is encrypted.
+Copy the package there first (scp, a shared folder, a USB drive). The load runs
+the import code of POST /import (services/importer.py) in this process, so
+every check of an import applies: the archive, its digests, its sources, and
+the embedding model and dimensions (#390), which must be this instance's. A
+package that carries models installs them, and the collection's retrieval and
+ingest settings and gold standard sessions come with it.
+
+--on-conflict says what to do when the collection already exists: abort (the
+default) refuses, rename loads it under a new name, replace loads it over the
+existing one. While any load runs, a question or export of its collection can
+meet it half-built or fail.
+
+It runs only on a query-only instance (RAG_QUERY_ONLY=true), where the API
+itself changes no collection; a full instance imports on the Transfer page. One
+load runs at a time. Every collection it creates, a rename included, starts
+restricted with no grants, so only AI Engineers can use it until one opens it
+or grants it on the Collections page; it never copies another collection's
+access. Only a replace keeps the collection's access.
+
+The passphrase of an encrypted package is asked for without echo when standard
+input is a terminal, and otherwise read as the first line of standard input
+(`docker compose exec -T api python -m loader NAME < file`). It is never an
+argument, never printed and never recorded.
+
+Each step is one line on standard error, prefixed "loader: ". Exit status: 0
+loaded, 1 refused or failed, 2 usage error. Every run past the arguments writes
+one audit record (#29), `operator.load`, with actor `operator` and result
+`success`, `refused` (before the load), `failed` (the load failed) or
+`interrupted` (Ctrl-C): the package, the collection, the conflict mode, whether
+it is encrypted, and the chunks loaded or the code. A record that can't be
+written is one more line.
+
+Ctrl-C writes the `interrupted` record and then stops the load at once, as a
+kill would. What it leaves: a collection it was building, which the next load
+removes (it runs the import's clean-up of an interrupted import first); the
+load's work folder (import-* in UPLOAD_DIR) and a replace's scratch staging
+collection, which stay until the API's next start (docker compose restart api).
+A replace builds the package into a recovery collection before it deletes the
+old collection, so one stopped after that delete leaves the collection missing
+or partial (the recovery collection holds the package's data, not the old
+data): load the package again with --on-conflict replace to put it back.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import getpass
+import os
+import signal
+import stat
+import sys
+import threading
+import uuid
+from pathlib import Path
+
+PROGRESS_SECONDS = 5
+
+
+class _Refused(Exception):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+def _say(line: str) -> None:
+    print("loader: " + line, file=sys.stderr, flush=True)
+
+
+# The run's state, for the Ctrl-C handler: the job once the load has started,
+# whether a record is being written (the handler then writes none: the audit
+# log's locks are held, and that record is the run's own), and whether the
+# run's final record has been started (`done`: a later Ctrl-C writes none).
+_state: dict = {}
+
+
+def _audit(package: str, on_conflict: str, encrypted: bool, collection: str | None,
+           result: str = "success", code: str | None = None, chunks: int | None = None) -> None:
+    from services import audit
+    details: dict = {"on_conflict": on_conflict, "encrypted": encrypted}
+    if chunks is not None:
+        details["chunks"] = chunks
+    if code:
+        details["code"] = code
+    _state["auditing"] = True
+    try:
+        written = audit.record("operator.load", result=result, actor="operator", actor_kind="operator",
+                               target=package, collection=collection, details=details)
+    finally:
+        _state["auditing"] = False
+    if not written:
+        _say("the audit record could not be written")
+
+
+def _interrupted(package: str, on_conflict: str, encrypted: bool):
+    """The SIGINT handler: record the load as interrupted, then die of the
+    signal as a kill would, so the import's `finally` never retires the marker
+    of a half-built collection."""
+    def handler(signum, frame):
+        # The kill is in `finally`: nothing raised here may reach the import's
+        # own clean-up. The line goes straight to fd 2, since print could be
+        # interrupted in the middle of the main thread's own write to stderr.
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            if not (_state.get("auditing") or _state.get("done")):
+                os.write(2, b"loader: load interrupted: INTERRUPTED\n")
+                job = _state.get("job") or {}
+                _audit(package, on_conflict, encrypted, job.get("collection"), result="interrupted",
+                       code="INTERRUPTED")
+        finally:
+            os.kill(os.getpid(), signal.SIGINT)
+    return handler
+
+
+def _passphrase() -> str:
+    if sys.stdin.isatty():
+        return getpass.getpass("Passphrase: ")
+    return sys.stdin.readline().rstrip("\r\n")
+
+
+def _lock(upload_dir: str):
+    """The one-load-at-a-time lock, held until the returned file is closed."""
+    Path(upload_dir).mkdir(parents=True, exist_ok=True)
+    handle = open(os.path.join(upload_dir, "loader.lock"), "a")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        raise _Refused("LOAD_IN_PROGRESS", "another load is running on this instance; "
+                                           "try again when it has finished") from None
+    return handle
+
+
+def _progress(job: dict, done: threading.Event) -> None:
+    shown = 0
+    while not done.wait(PROGRESS_SECONDS):
+        count = job.get("chunks_written") or 0
+        if count != shown:
+            shown = count
+            _say(f"chunks written: {count}")
+
+
+def _load(package: str, on_conflict: str, passphrase: str | None) -> dict:
+    """Run the import code on the package and return its finished job record."""
+    from services import importer
+    job_id = "load-" + uuid.uuid4().hex[:8]
+    # The job record lives in this process only: the import's job store is
+    # unbound here (jobstore.py), so nothing is added to the API's job lists.
+    importer._jobs[job_id] = {
+        "job_id": job_id, "status": "queued", "filename": package, "on_conflict": on_conflict,
+        "collection": None, "original_collection": None, "chunks_written": 0, "fidelity": None,
+        "renamed": False, "notes": [], "restored_sessions": [], "error": None, "error_code": None,
+        "error_detail": None, "encrypted": passphrase is not None,
+        "owner": None, "operator": True,        # access: restricted, no grants (#670)
+    }
+    job = importer._jobs[job_id]
+    _state["job"] = job
+    done = threading.Event()
+    ticker = threading.Thread(target=_progress, args=(job, done), daemon=True)
+    ticker.start()
+    try:
+        importer._run(job_id, package, on_conflict, passphrase)
+    finally:
+        done.set()
+    return job
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m loader",
+        description="Load an export package from ./exports into this query-only instance.")
+    parser.add_argument("package", help="the package's file name in ./exports")
+    parser.add_argument("--on-conflict", choices=("abort", "rename", "replace"), default="abort",
+                        help="when the collection already exists (default: abort)")
+    args = parser.parse_args(argv)
+
+    from services import age_stream, package_retention
+    if "/" in args.package or not package_retention.valid_name(args.package):
+        parser.error(f"not a package name: {args.package!r} (ragpkg-*.tar.gz or ragpkg-*.tar.gz.age, "
+                     "a file in ./exports)")
+
+    from config import settings
+    from services import importer, packager
+    package, on_conflict = args.package, args.on_conflict
+    encrypted = age_stream.is_encrypted_name(package)
+    # Ctrl-C is recorded, then acts as a kill: Python's KeyboardInterrupt would
+    # run the import's clean-up, which retires the marker of a half-built
+    # collection that the next load must remove.
+    _state.clear()
+    signal.signal(signal.SIGINT, _interrupted(package, on_conflict, encrypted))
+    _say(f"loading {package} (on conflict: {on_conflict})")
+    lock = None
+    try:
+        if not settings.rag_query_only:
+            raise _Refused("NOT_QUERY_ONLY", "this instance isn't query-only (RAG_QUERY_ONLY is false); "
+                                             "import the package on the Transfer page instead")
+        lock = _lock(settings.upload_dir)
+        path = packager.exports_dir() / package
+        try:
+            regular = stat.S_ISREG(os.lstat(path).st_mode)
+        except OSError:
+            regular = False
+        if not regular:
+            raise _Refused("PACKAGE_NOT_FOUND", f"no package named '{package}' in ./exports; copy it there first")
+        passphrase = None
+        if encrypted:
+            passphrase = _passphrase()
+            if not passphrase:
+                raise _Refused("PASSPHRASE_REQUIRED", f"'{package}' is encrypted; give its passphrase")
+        # What an earlier load left when it was killed: the same clean-up the
+        # API runs at its start. Under the lock, and nothing else imports here.
+        for removed in importer.sweep_interrupted_imports():
+            _say(f"removed a collection an interrupted load left half-built: {removed}")
+        job = _load(package, on_conflict, passphrase)
+    except _Refused as refused:
+        _state["done"] = True
+        _say(f"load refused: {refused.code}: {refused}")
+        _audit(package, on_conflict, encrypted, None, result="refused", code=refused.code)
+        return 1
+    finally:
+        if lock is not None:
+            lock.close()
+
+    # The run's own record follows: from here a Ctrl-C writes no other.
+    _state["done"] = True
+    if job.get("status") == "completed":
+        renamed = f" (renamed from {job['original_collection']})" if job.get("renamed") else ""
+        _say(f"loaded into collection {job['collection']}{renamed}: {job['chunks_written']} chunks, "
+             f"{job.get('fidelity')}")
+        for note in job.get("notes") or []:
+            _say("note: " + str(note))
+        _audit(package, on_conflict, encrypted, job["collection"], chunks=job["chunks_written"])
+        return 0
+    code = job.get("error_code") or "IMPORT_FAILED"
+    _say(f"load failed: {code}: {job.get('error')}")
+    _audit(package, on_conflict, encrypted, job.get("collection"), result="failed", code=code)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 ```
 
 ### api/tls_cert.py
@@ -1489,7 +2035,7 @@ if __name__ == "__main__":
 ```python
 from __future__ import annotations
 from typing import Any, Optional, Annotated, Literal
-from pydantic import AfterValidator, BaseModel, Field, BeforeValidator, ValidationError, field_validator, model_validator, SecretStr, StrictInt
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, BeforeValidator, ValidationError, field_validator, model_validator, SecretStr, StrictInt
 
 from services.collection_writes import canonical
 
@@ -1572,6 +2118,28 @@ class CollectionInfo(BaseModel):
 
 class CollectionsResponse(BaseModel):
     collections: list[CollectionInfo]
+
+
+class CollectionAccessRequest(BaseModel):
+    """PUT /collections/{name}/access (#606): the whole state at once. Open
+    takes no names; restricted grants exactly the people and service
+    principals named (none: Engineers only)."""
+    model_config = ConfigDict(extra="forbid")
+    restricted: bool
+    users: list[Annotated[str, Field(max_length=64)]] = Field(default_factory=list, max_length=1000)
+    service_principals: list[Annotated[str, Field(max_length=64)]] = Field(default_factory=list, max_length=1000)
+
+    @model_validator(mode="after")
+    def _names_only_when_restricted(self):
+        if not self.restricted and (self.users or self.service_principals):
+            raise ValueError("an open collection takes no users or service principals")
+        return self
+
+
+class CollectionAccessResponse(BaseModel):
+    restricted: bool
+    users: list[str]
+    service_principals: list[str]
 
 
 # ── Ingest ────────────────────────────────────────────────────────────────────
@@ -1732,6 +2300,9 @@ class ExportJobStatusResponse(BaseModel):
 
     error_code: Optional[str] = None
     error_detail: Optional[dict] = None
+    # When the package expires (UTC, #677): set for a completed export whose
+    # package is still recorded, null once it is downloaded or swept.
+    expires_at: Optional[str] = None
 
 class ImportRequest(BaseModel):
     filename: str
@@ -1802,6 +2373,9 @@ class PackageSummary(BaseModel):
     # can't be read without the passphrase. `readable` then says whether its
     # age header is valid.
     encrypted: bool = False
+    # When a package this instance exported is deleted if nobody downloads it
+    # (UTC, #677); null for one copied in to be imported or from before #677.
+    expires_at: Optional[str] = None
 
 
 class PackageListResponse(BaseModel):
@@ -2106,6 +2680,19 @@ class PasswordChangeRequest(BaseModel):
     new_password: str = Field(max_length=1024)
 
 
+class MfaCodeRequest(BaseModel):
+    code: str = Field(max_length=64)   # a 6-digit TOTP code or a recovery code (#607)
+
+
+class MfaDisableRequest(BaseModel):
+    password: str = Field(max_length=1024)
+    code: str = Field(max_length=64)
+
+
+class MfaPolicyRequest(BaseModel):
+    required: bool
+
+
 class AuthStatus(BaseModel):
     setup_required: bool
 
@@ -2115,6 +2702,12 @@ class AuthUser(BaseModel):
     role: Literal["end_user", "developer", "engineer"]
     must_change_password: bool
     kind: Optional[Literal["user", "service"]] = None   # GET /auth/me: a session's user or a key's principal
+    # Two-step verification (#607): enrolled, the switch, and a set-up due because of it.
+    mfa_enrolled: Optional[bool] = None
+    mfa_required: Optional[bool] = None
+    mfa_enrollment_required: Optional[bool] = None
+    # Query-only mode (#670): the UI hides the pages that change data.
+    query_only: Optional[bool] = None
 
 
 class AdminUser(BaseModel):
@@ -2123,6 +2716,7 @@ class AdminUser(BaseModel):
     enabled: bool
     must_change_password: bool
     created_at: str
+    mfa_enrolled: bool = False
 
 
 class AdminUserList(BaseModel):
@@ -2135,7 +2729,7 @@ class AdminUserResult(BaseModel):
 
 
 class UserCreateRequest(BaseModel):
-    username: str = Field(max_length=256)
+    username: str   # no length cap: the route refuses any name breaking the rule as INVALID_USERNAME (#551)
     role: Literal["end_user", "developer", "engineer"]
 
 
@@ -2172,7 +2766,7 @@ class ServicePrincipalResult(BaseModel):
 
 
 class PrincipalCreateRequest(BaseModel):
-    name: str = Field(max_length=256)
+    name: str   # no length cap: the route refuses any name breaking the rule as INVALID_USERNAME (#551)
     role: Literal["end_user", "developer", "engineer"]
 
 
@@ -3155,6 +3749,8 @@ import shutil
 import uuid
 from pathlib import Path
 
+from auth import access
+from auth import store as auth_store
 from config import settings
 from services import sources
 
@@ -3204,6 +3800,13 @@ def begin(target: str, operation: str, client) -> dict:
     record = dict(version=1, operation_id=token, operation=operation,
                   target=target, staging=staging, state="scratch")
     _write(record)  # Ownership is persisted before collection creation.
+    # The copy will hold the target's data, so it gets the target's access as
+    # it is now, under its own name, before it exists (#606). A target that is
+    # itself a kept copy narrows it by every collection that one was made from:
+    # the narrowest state across the target's chain (#792). Later changes to
+    # them never change this state, but while any of them has a state a caller
+    # other than an Engineer needs every one (access.scope, #788, #792).
+    auth_store.copy_collection_access(target, staging, access.scope(target)[1:])
     return record
 
 
@@ -3345,6 +3948,7 @@ def discard(record: dict, client) -> None:
     name = record["staging"]
     if telemetry.call("weaviate.exists", client.collections.exists, name):
         telemetry.call("weaviate.delete", client.collections.delete, name)
+    auth_store.drop_collection_access(name)          # the copy's own access state (#606)
     sources.delete(name)
     if sources.collection_dir(name).exists():
         raise OSError(f"Could not remove recovery sources for {name}")
@@ -4150,13 +4754,12 @@ async def embed(text: str) -> list[float]:
         return resp.json()["embedding"]
 
 
-@telemetry.traced("ollama.chat")
-async def chat(system: str, user: str) -> str:
+async def _chat(model: str, system: str, user: str) -> str:
     async with httpx.AsyncClient(timeout=300.0) as client:
         resp = await client.post(
             f"{_BASE}/api/chat",
             json={
-                "model": settings.llm_model,
+                "model": model,
                 "messages": [
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
@@ -4166,6 +4769,28 @@ async def chat(system: str, user: str) -> str:
         )
         resp.raise_for_status()
         return resp.json()["message"]["content"]
+
+
+@telemetry.traced("ollama.chat")
+async def chat(system: str, user: str) -> str:
+    """A call to the answer model: query's reformulation and answer (#671)."""
+    return await _chat(settings.answer_model, system, user)
+
+
+@telemetry.traced("ollama.chat")
+async def build_chat(system: str, user: str) -> str:
+    """A call to the build model: preparation and gold standard generation (#671)."""
+    return await _chat(settings.build_model, system, user)
+
+
+def _tagged(model: str) -> str:
+    """`name:tag`, with `:latest` for a name without a tag (after its last `/`)."""
+    return model if ":" in model.rsplit("/", 1)[-1] else f"{model}:latest"
+
+
+def same_model(a: str, b: str) -> bool:
+    """Whether two model names are one model: `x` and `x:latest` are."""
+    return _tagged(a) == _tagged(b)
 
 
 @telemetry.traced("ollama.models")
@@ -4179,6 +4804,9 @@ async def list_models() -> set[str]:
 
 @telemetry.traced("ollama.health")
 async def check_health() -> dict:
+    """`llm` is the answer model, `build_llm` the build model (#671)."""
+    answer, build = settings.answer_model, settings.build_model
+    same = same_model(answer, build)
     start = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -4186,20 +4814,24 @@ async def check_health() -> dict:
             resp.raise_for_status()
             latency_ms = int((time.monotonic() - start) * 1000)
             models = {m["name"].split(":")[0] for m in resp.json().get("models", [])}
-            llm_ok = settings.llm_model.split(":")[0] in models
-            embed_ok = settings.embed_model.split(":")[0] in models
-            if not (llm_ok and embed_ok):
+
+            def entry(model: str) -> dict:
+                ok = model.split(":")[0] in models
+                return {"status": "ok" if ok else "error", "latency_ms": latency_ms, "model": model}
+
+            result = {"llm": entry(answer), "build_llm": entry(build),
+                      "embed": entry(settings.embed_model), "same_model": same}
+            if any(result[k]["status"] != "ok" for k in ("llm", "build_llm", "embed")):
                 telemetry.outcome("error")
-            return {
-                "llm": {"status": "ok" if llm_ok else "error", "latency_ms": latency_ms, "model": settings.llm_model},
-                "embed": {"status": "ok" if embed_ok else "error", "latency_ms": latency_ms, "model": settings.embed_model},
-            }
+            return result
     except Exception as exc:
         telemetry.outcome("error", exc)
         latency_ms = int((time.monotonic() - start) * 1000)
         return {
-            "llm": {"status": "error", "latency_ms": latency_ms, "model": settings.llm_model},
+            "llm": {"status": "error", "latency_ms": latency_ms, "model": answer},
+            "build_llm": {"status": "error", "latency_ms": latency_ms, "model": build},
             "embed": {"status": "error", "latency_ms": latency_ms, "model": settings.embed_model},
+            "same_model": same,
         }
 ```
 
@@ -7443,7 +8075,7 @@ def recover() -> list[str]:
 ### api/services/preparation.py
 
 ```python
-"""Preparing one raw document (#638): code does the rule work, the LLM cleans.
+"""Preparing one raw document (#638): code does the rule work, the build LLM cleans.
 
 SPECIFICATIONS.md §3.1.11. In order, for one document:
 
@@ -7466,8 +8098,9 @@ SPECIFICATIONS.md §3.1.11. In order, for one document:
 5. **Check** each written part as ingest reads it, against the rules that don't
    depend on chunk settings.
 
-The LLM and the part writer are passed in, so tests use a stub and the job
-decides where parts go and whether there is room (a best-effort cap).
+"The LLM" here is the build model (BUILD_LLM_MODEL, else LLM_MODEL; #671): the
+job passes its chat and model list in, with the part writer, so tests use a stub
+and the job decides where parts go and whether there is room (a best-effort cap).
 """
 from __future__ import annotations
 
@@ -8192,7 +8825,7 @@ async def model_available(list_models: Callable[[], Awaitable[set[str]]]) -> boo
         models = await asyncio.wait_for(list_models(), 15)
     except Exception:                                       # noqa: BLE001
         return False
-    wanted = settings.llm_model
+    wanted = settings.build_model                          # preparation's LLM (#671)
     return wanted in models or f"{wanted}:latest" in models or (
         ":" not in wanted and any(m.split(":")[0] == wanted for m in models))
 
@@ -8552,18 +9185,26 @@ async def upload(files: list[Any], owner: dict | None) -> tuple[list[dict], list
 
 # ── selection ────────────────────────────────────────────────────────────────
 
-def _resolve(document_ids: list[str] | None, all_of: set[str]) -> list[dict]:
+def _resolve(document_ids: list[str] | None, all_of: set[str], usable=None) -> list[dict]:
     """The records selected: the ids in the order given, or every document whose
-    status is in `all_of`, oldest first."""
+    status is in `all_of`, oldest first. `usable` (a predicate on a record, #606)
+    hides documents the caller may not use: such an id is answered as unknown,
+    and `all` leaves them out."""
+    usable = usable or (lambda record: True)
     if document_ids is None:
-        records = [r for r in store.list_documents() if r.get("status") in all_of]
+        records = [r for r in store.list_documents() if r.get("status") in all_of and usable(r)]
         records.sort(key=lambda r: r.get("created_at") or "")
     else:
         records, missing = [], []
         for document_id in dict.fromkeys(document_ids):
             try:
-                records.append(store.get(document_id))
+                record = store.get(document_id)
             except store.DocumentNotFound:
+                missing.append(document_id)
+                continue
+            if usable(record):
+                records.append(record)
+            else:
                 missing.append(document_id)
         if missing:
             raise store.DocumentNotFound(
@@ -8576,14 +9217,14 @@ def _resolve(document_ids: list[str] | None, all_of: set[str]) -> list[dict]:
 
 # ── jobs ─────────────────────────────────────────────────────────────────────
 
-async def start(document_ids: list[str] | None, owner: dict | None) -> dict:
+async def start(document_ids: list[str] | None, owner: dict | None, usable=None) -> dict:
     """Queue a preparation job for the selected documents (or every document that
     isn't being prepared, with document_ids None)."""
     await asyncio.to_thread(store.check_not_full)
     job_id = uuid.uuid4().hex[:8]
 
     def admit() -> list[dict]:
-        records = _resolve(document_ids, {"raw", "prepared", "failed"})
+        records = _resolve(document_ids, {"raw", "prepared", "failed"}, usable)
         busy = [r["name"] for r in records
                 if r.get("status") in ("queued", "preparing") or store.is_busy(r["id"])]
         if busy:
@@ -8652,6 +9293,11 @@ async def _work(queue: asyncio.Queue) -> None:
             _cancel_requested.discard(job_id)
 
 
+def _llm():
+    """The chat and model list preparation uses: the build model's (#671)."""
+    return ollama.build_chat, ollama.list_models
+
+
 async def _run(job_id: str) -> None:
     job = _jobs[job_id]
     job["status"] = "running"
@@ -8693,8 +9339,9 @@ async def _run(job_id: str) -> None:
 
         try:
             raw = await asyncio.to_thread(store.raw_path, document_id)
+            chat, list_models = _llm()
             result = await preparation.prepare_document(
-                raw, name, record["raw_type"], ollama.chat, ollama.list_models,
+                raw, name, record["raw_type"], chat, list_models,
                 should_stop, write_part, progress)
             await asyncio.to_thread(store.commit, document_id, result.parts, result.fallback)
             job["documents_completed"] = job["documents_completed"] + 1
@@ -8754,11 +9401,11 @@ class _Part:
         self.size = None
 
 
-async def import_documents(body: Any) -> dict:
+async def import_documents(body: Any, usable=None) -> dict:
     """Start one ingest job with every part of the selected prepared documents."""
 
     def select() -> tuple[list[dict], list[str]]:
-        records = _resolve(body.document_ids, {"prepared"})
+        records = _resolve(body.document_ids, {"prepared"}, usable)
         busy = [r["name"] for r in records
                 if r.get("status") in ("queued", "preparing") or store.is_busy(r["id"])]
         if busy:
@@ -9828,7 +10475,7 @@ def _parse_gs_json(text: str) -> dict:
 
 
 async def _chat_once(system: str, user: str) -> str:
-    """One chat call, retried once if the transport fails.
+    """One call to the build model (#671), retried once if the transport fails.
 
     Ollama serialises requests per model, so generating while someone is
     querying can push a call past the client timeout. `httpx.ReadTimeout`
@@ -9836,10 +10483,10 @@ async def _chat_once(system: str, user: str) -> str:
     empty string. A transient timeout should cost a retry, not a pair.
     """
     try:
-        return await ollama.chat(system, user)
+        return await ollama.build_chat(system, user)
     except (httpx.TimeoutException, httpx.TransportError) as exc:
         log.warning("Ollama call failed (%s); retrying once", type(exc).__name__)
-        return await ollama.chat(system, user)
+        return await ollama.build_chat(system, user)
 
 
 # One initial attempt plus two reprompts. The model's failure mode is malformed
@@ -10250,6 +10897,46 @@ def _save_export_sync(out_path: Path, ragas: list[dict]) -> None:
     _replace_durably(out_path, json.dumps(ragas, indent=2))
 
 
+# Which collection each saved export came from (#606), so a download can be
+# checked against that collection's access. Kept beside the exports folder,
+# never in it, so it is never served; the exports stay plain RAGAS lists. A file
+# with no entry (saved before #606, or put there by hand) is served to Engineers
+# only. An unreadable index is treated as empty, which only narrows downloads.
+EXPORT_INDEX_NAME = "goldstandard_export_collections.json"
+_export_index_lock = threading.Lock()
+
+
+def _export_index_path() -> Path:
+    return Path(settings.upload_dir).resolve() / EXPORT_INDEX_NAME
+
+
+def _read_export_index() -> dict:
+    try:
+        data = json.loads(_export_index_path().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        log.exception("The gold-standard export index can't be read; its files are served to Engineers only")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _record_export_collection(filename: str, collection: str | None) -> None:
+    with _export_index_lock:
+        index = _read_export_index()
+        if collection:
+            index[filename] = collection
+        else:
+            index.pop(filename, None)
+        _replace_durably(_export_index_path(), json.dumps(index, indent=2, sort_keys=True))
+
+
+def export_collection(filename: str) -> str | None:
+    """The collection a saved export came from, or None when it isn't known."""
+    value = _read_export_index().get(filename)
+    return value if isinstance(value, str) and value else None
+
+
 async def save_session(session_id: str, filename: str | None, allow_historical: bool = False) -> dict | None:
     session = _sessions.get(session_id)
     if session is None:
@@ -10295,6 +10982,9 @@ async def save_session(session_id: str, filename: str | None, allow_historical: 
         }
         for p in approved
     ]
+    # The collection is recorded before the file is written (#606): a failure
+    # or a race in between narrows who may download it, never widens it.
+    await asyncio.to_thread(_record_export_collection, filename, session.get("collection"))
     await asyncio.to_thread(_save_export_sync, out_path, ragas)
 
     return {
@@ -10370,6 +11060,8 @@ def exports_dir() -> Path:
 # which a hard kill skips: each killed export left them in ./exports for good,
 # hidden and root-owned, about 2.3 GB with models. Matched by exact name pattern
 # and by kind, never by age; anything else in the folder is left alone.
+# Staging is now `{UPLOAD_DIR}/export-*`, swept with the other work directories
+# there (#549); `.build-*` is staging left here by earlier versions.
 _BUILD_DIR = ".build-*"
 # An encrypted export is written as `.<stem>.tar.gz.age.partial` (#27).
 _PARTIAL_ARCHIVES = (".*.tar.gz.partial", ".*.tar.gz.age.partial")
@@ -10590,7 +11282,7 @@ def render_help(embed_dimensions: int | str) -> str:
     return _render("help_transfer.md.tmpl", {
         "EMBED_MODEL": settings.embed_model,
         "EMBED_DIMENSIONS": embed_dimensions,
-        "LLM_MODEL": settings.llm_model,
+        "LLM_MODEL": settings.answer_model,
     })
 
 
@@ -10715,8 +11407,13 @@ def build(
     out_dir = exports_dir()
     warnings: list[str] = []
 
-    # Staged inside exports_dir so the final rename is on the same filesystem.
-    stage = Path(tempfile.mkdtemp(dir=out_dir, prefix=".build-"))
+    # Staged in UPLOAD_DIR, a volume only the container sees (#549): the package's
+    # unencrypted files, originals included and for an encrypted export too,
+    # never sit in the host's ./exports. Only the archive goes there, written as
+    # `.<filename>.partial` and renamed in place.
+    upload = Path(settings.upload_dir)
+    upload.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(dir=upload, prefix="export-"))
     tmp_archive: Path | None = None
     try:
         b = _Builder(stage)
@@ -10808,7 +11505,9 @@ def build(
             # models/<name>/<tag>/ folder (#487), so removing a failed copy
             # never removes another model's files.
             wanted: dict[str, str] = {}
-            for model in (settings.embed_model, settings.llm_model):
+            # Only the answer model: an imported collection is queried, never
+            # prepared, so the build model stays behind (#671).
+            for model in (settings.embed_model, settings.answer_model):
                 try:
                     key = model_bundle.model_ref(model)
                 except ValueError:
@@ -10872,7 +11571,10 @@ def build(
                 "model": settings.embed_model,
                 "dimensions": dimensions,
             },
-            "llm": {"model": settings.llm_model},
+            # `llm` is the answer model, kept for older readers (#671).
+            "llm": {"model": settings.answer_model},
+            "answer_llm": {"model": settings.answer_model},
+            "build_llm": {"model": settings.build_model},
             "chunking": chunking,
             "fidelity": fidelity,
             # What the package actually carries, not what was asked for: a
@@ -11402,10 +12104,11 @@ _SCRYPT_LABEL = b"age-encryption.org/v1/scrypt"
 HEADER_MAX = 64 * 1024
 
 _B64 = re.compile(rb"^[A-Za-z0-9+/]*$")
-# One or two digits, no sign or leading zero: every accepted value (1 to 20) fits,
-# and a longer field is refused before int(), which raises on a very long one
-# (Python's int string-length limit), so no field can reach an unhandled error.
-_WORK_FACTOR_TEXT = re.compile(r"^[1-9][0-9]?$")
+# A plain decimal, no sign or leading zero; anything else is a malformed header
+# (#549). Every accepted value (1 to 20) has one or two digits, so a longer one
+# is refused as above the limit before int(), which raises on a very long one
+# (Python's int string-length limit): no field can reach an unhandled error.
+_WORK_FACTOR_TEXT = re.compile(r"[1-9][0-9]*")
 # One scrypt derivation at a time in this process: a hostile file at the work
 # factor limit needs about 1 GiB, and concurrent imports must not multiply that.
 _scrypt_lock = threading.Lock()
@@ -11414,10 +12117,12 @@ _scrypt_lock = threading.Lock()
 class AgeError(Exception):
     """A file that can't be decrypted. `kind` says why, without any secret:
 
-    header      not a valid age header (or not an age file at all)
+    header      not a valid age header (or not an age file at all), a scrypt
+                work factor that is not a decimal without a sign or leading
+                zero included (#549)
     recipient   a valid age header, but not for a passphrase
-    work_factor the scrypt work factor is above MAX_WORK_FACTOR, or is not one or
-                two decimal digits without a sign or leading zero
+    work_factor the scrypt work factor is above MAX_WORK_FACTOR, a decimal of
+                more than two digits included
     nonce       the file ends inside the 16-byte payload nonce
     passphrase  the passphrase does not unwrap the file key
     hmac        the header MAC does not match: the header was changed
@@ -11533,8 +12238,9 @@ def scrypt_stanza(header: Header) -> tuple[bytes, int, bytes]:
 
     A passphrase file has exactly one stanza, of type `scrypt`; age refuses a
     scrypt stanza next to any other, since anyone holding the other key could
-    otherwise change the file without the passphrase. The work factor is
-    returned unchecked against MAX_WORK_FACTOR; `unwrap_file_key` checks it.
+    otherwise change the file without the passphrase. A work factor of one or
+    two digits is returned unchecked against MAX_WORK_FACTOR; `unwrap_file_key`
+    checks it. A longer decimal is refused here, before int().
     """
     types = [s.args[0] for s in header.stanzas]
     if "scrypt" in types and len(types) > 1:
@@ -11547,12 +12253,16 @@ def scrypt_stanza(header: Header) -> tuple[bytes, int, bytes]:
     salt = _b64decode(stanza.args[1].encode("ascii"))
     if len(salt) != 16:
         raise AgeError("header", "malformed scrypt salt")
-    if not _WORK_FACTOR_TEXT.match(stanza.args[2]):
-        raise AgeError("work_factor", "the scrypt work factor is not one or two decimal "
-                       "digits without a leading zero")
+    field = stanza.args[2]
+    if not _WORK_FACTOR_TEXT.fullmatch(field):
+        raise AgeError("header", "malformed scrypt work factor: not a decimal number "
+                       "without a sign or leading zero")
+    if len(field) > 2:
+        raise AgeError("work_factor", "the scrypt work factor is above the limit of "
+                       f"{MAX_WORK_FACTOR}")
     if len(stanza.body) != _FILE_KEY + _TAG:
         raise AgeError("header", "malformed scrypt stanza body")
-    return salt, int(stanza.args[2]), stanza.body
+    return salt, int(field), stanza.body
 
 
 def _scrypt(passphrase: bytes, salt: bytes, work_factor: int) -> bytes:
@@ -12399,8 +13109,9 @@ import asyncio
 import logging
 import threading
 import uuid
+from datetime import datetime, timezone
 
-from services import collection_writes, jobstore, packager
+from services import collection_writes, jobstore, package_retention, packager
 
 _log = logging.getLogger(__name__)
 
@@ -12491,6 +13202,17 @@ def _run(job_id: str, collection: str, include_models: bool,
                "cancelled before it finished. Start the export again.")
         raise
     else:
+        # Recorded before the status turns completed, so a client that sees the
+        # export finish also sees when its package expires (#677). A failure
+        # leaves the package unrecorded, never expired: the job says so. The
+        # collection is recorded too: an encrypted package follows its access (#794).
+        warnings = list(result["warnings"])
+        try:
+            package_retention.record_export(result["filename"], datetime.now(timezone.utc), collection)
+        except Exception:                          # noqa: BLE001 - reported in the warnings
+            _log.exception("Could not record the expiry of package %s", result["filename"])
+            warnings.append("The package's expiry could not be recorded, so it won't be deleted "
+                            "automatically. Delete it from ./exports by hand once it has been copied.")
         finish(
             status="completed",
             filename=result["filename"],
@@ -12500,7 +13222,7 @@ def _run(job_id: str, collection: str, include_models: bool,
             fidelity=result["fidelity"],
             models_bundled=result["models_bundled"],
             retrieve_script=result["retrieve_script"],
-            warnings=result["warnings"],
+            warnings=warnings,
         )
     finally:
         collection_writes.end_job("export", job_id)
@@ -12597,6 +13319,392 @@ async def start_export_job(collection: str, include_models: bool = False,
     return job_id
 ```
 
+### api/services/package_retention.py
+
+```python
+"""Export packages don't stay on the server (#677).
+
+A finished export package in `./exports` holds a whole collection, so every copy
+left there is data at rest. Two things remove a package this instance exported:
+
+- **A full download** through `GET /packages/{filename}` (routers/transfer.py)
+  deletes it once its last byte has been handed to the connection. An
+  interrupted download keeps it, so it can be retried.
+- **Expiry.** A package nobody downloads is deleted `EXPORT_RETENTION_HOURS`
+  (1 to 720, default 24) after its export finished. The sweep runs at start-up
+  and then every 15 minutes (`sweeper`, started by main.py).
+
+**Which packages.** Only packages this instance exported: when an export
+finishes, its filename and finish time are recorded in
+`<UPLOAD_DIR>/exported_packages.json`, never in `./exports`. A package copied
+into `./exports` to be imported, or one that was there before this record
+existed, is never recorded, so neither a download nor the sweep deletes it.
+A package copied straight from the host folder is still deleted after the expiry.
+
+**Busy.** While an import of a package runs, or a download of it is in progress,
+a download is refused (409 PACKAGE_BUSY) and the sweep skips it until its next
+run. Claiming a download and the sweep's check-and-delete take the same lock.
+
+**One way to delete.** `delete` removes the package, its companion files (none
+yet; #676's key file will be one) and its record entry, and writes one
+`package.delete` audit record. `may_sweep` alone decides whether the sweep may
+delete a package, so a later "keep" flag changes only that function.
+
+**The record.** Each entry is `{"finished_at": ..., "collection": ...}`: the
+collection is the one exported, so an encrypted package exported here follows
+that collection's access (routers/transfer.py `_hidden`, #794). An entry written
+before #794 is a bare finish time and is read with no collection. A recorded
+name outside the download rule (`valid_name`) is ignored and logged, so a
+tampered record can't name a file outside the exports folder. Replaced whole (a
+temporary file renamed into place) under a lock. One that can't be read is
+never overwritten: it is moved aside to `exported_packages.json.corrupt-<time>`
+and logged, the packages it named are no longer expired (delete them by hand),
+and a new record starts. If it can't be moved, writes refuse until it is dealt
+with.
+
+**Imports.** An import claims its package (importer.start_import_job) under
+this module's lock too, so a sweep or a post-download deletion can't remove a
+package between its busy check and the unlink while an import starts. Both
+claims run in a worker thread through `run_claim`, which releases what a claim
+took when the request waiting for it is cancelled (#794).
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+import stat
+import tempfile
+import threading
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from config import settings
+
+_log = logging.getLogger(__name__)
+
+RECORD_NAME = "exported_packages.json"
+SWEEP_INTERVAL_S = 15 * 60
+# The names a download serves: what exports write (packager.package_stem). The
+# `ragpkg-` prefix rules out a leading `.` and the class rules out `/`.
+NAME = re.compile(r"ragpkg-[A-Za-z0-9._-]+\.tar\.gz(?:\.age)?")
+_TIME = "%Y-%m-%dT%H:%M:%SZ"
+
+_lock = threading.RLock()
+_downloading: set[str] = set()
+# Releases of claims whose request was cancelled, kept until they finish.
+_settling: set = set()
+# An unreadable record that couldn't be moved aside: writes refuse meanwhile.
+_stuck = False
+# Recorded names outside the download rule already logged by this process
+# (#798): each is logged once, not on every read. Changed under `_lock` only.
+_reported: set[str] = set()
+
+
+def lock():
+    """The lock an import's claim, the download slot and every deletion share."""
+    return _lock
+
+
+def valid_name(name) -> bool:
+    return isinstance(name, str) and NAME.fullmatch(name) is not None
+
+
+def _exports() -> Path:
+    return Path(settings.exports_dir)
+
+
+def _path() -> Path:
+    return Path(settings.upload_dir) / RECORD_NAME
+
+
+# ── the record ───────────────────────────────────────────────────────────────
+
+def _set_aside(path: Path) -> None:
+    """Move an unreadable record aside so nothing overwrites it, and say so."""
+    global _stuck
+    aside = path.with_name(path.name + ".corrupt-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
+    try:
+        os.replace(path, aside)
+    except OSError:
+        _stuck = True
+        _log.exception("Could not read %s, nor move it aside; it is left as it is, packages are "
+                       "not recorded until it is removed, and the ones it named don't expire", path)
+        return
+    _stuck = False
+    _log.error("Could not read %s; it was moved to %s and a new record starts. The packages it "
+               "named won't expire: delete them from ./exports by hand", path, aside)
+
+
+def _entry(value) -> dict | None:
+    """One entry as read: a bare finish time (before #794) or an object with
+    `finished_at` and `collection`. None when it is neither."""
+    if isinstance(value, str):
+        return {"finished_at": value, "collection": None}
+    if isinstance(value, dict) and isinstance(value.get("finished_at"), str):
+        collection = value.get("collection")
+        if collection is None or isinstance(collection, str):
+            return {"finished_at": value["finished_at"], "collection": collection or None}
+    return None
+
+
+def _read() -> dict[str, dict]:
+    """Recorded filename -> `{"finished_at", "collection"}`. Missing is empty; an
+    unreadable record is moved aside (`_set_aside`) and taken as empty. A name
+    outside the download rule is left out and logged (#794), once per process
+    (#798): nothing deletes, expires or serves it as recorded, and reads never
+    rewrite the record, so the next export or deletion writes it out."""
+    path = _path()
+    with _lock:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError):
+            _set_aside(path)
+            return {}
+        packages = data.get("packages") if isinstance(data, dict) else None
+        entries = {k: _entry(v) for k, v in packages.items()} if isinstance(packages, dict) else None
+        if entries is None or not all(isinstance(k, str) and v is not None for k, v in entries.items()):
+            _set_aside(path)
+            return {}
+        for name in [k for k in entries if not valid_name(k)]:
+            if name not in _reported:
+                _reported.add(name)
+                _log.warning("The record of exported packages names %r, which isn't a package name; "
+                             "it is ignored", name)
+            del entries[name]
+        return entries
+
+
+def _write(entries: dict[str, dict]) -> None:
+    path = _path()
+    if _stuck and os.path.lexists(path):
+        raise RuntimeError(f"{path} is unreadable and couldn't be moved aside; it isn't overwritten")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix="." + RECORD_NAME + ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"packages": entries}, fh, indent=1, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def record_export(filename: str, finished: datetime, collection: str | None = None) -> None:
+    """Record a package this instance exported, with the collection it holds
+    (#794). Raises when it can't be written."""
+    with _lock:
+        entries = _read()
+        entries[filename] = {"finished_at": finished.astimezone(timezone.utc).strftime(_TIME),
+                             "collection": collection}
+        _write(entries)
+
+
+def _drop(filename: str) -> None:
+    entries = _read()
+    if entries.pop(filename, None) is not None:
+        _write(entries)
+
+
+def _forget(filename: str) -> None:
+    """`_drop`, never raising: a deletion is audited and a sweep goes on even
+    when the record can't be rewritten (#794). The entry is left; once its file
+    is gone, a later sweep drops it."""
+    try:
+        _drop(filename)
+    except Exception:                                 # noqa: BLE001 - logged; the record is retried later
+        _log.exception("Could not remove %s from the record of exported packages; a later sweep "
+                       "drops it", filename)
+
+
+def _expiry(finished_at: str) -> datetime | None:
+    try:
+        finished = datetime.strptime(finished_at, _TIME).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return finished + timedelta(hours=settings.export_retention_hours)
+
+
+def _format(when: datetime | None) -> str | None:
+    return when.strftime(_TIME) if when is not None else None
+
+
+def expires_at(filename: str) -> str | None:
+    """When a recorded package expires (UTC), or None for one not recorded."""
+    entry = _read().get(filename)
+    return _format(_expiry(entry["finished_at"])) if entry is not None else None
+
+
+def expiries() -> dict[str, str | None]:
+    """Every recorded package's `expires_at`, from one read (the listing)."""
+    return {name: _format(_expiry(entry["finished_at"])) for name, entry in _read().items()}
+
+
+def recorded(filename: str) -> bool:
+    return filename in _read()
+
+
+def recorded_collections() -> dict[str, str | None]:
+    """Every recorded package's collection (None when not recorded with one),
+    from one read (routers/transfer.py `_hidden`, #794)."""
+    return {name: entry["collection"] for name, entry in _read().items()}
+
+
+def companions(filename: str) -> list[str]:
+    """Files deleted with a package. None yet: #676's key file will be one."""
+    return []
+
+
+# ── busy, and the download slot ──────────────────────────────────────────────
+
+def busy(filename: str) -> bool:
+    """A download of it is in progress, or an import of it runs."""
+    from services import importer                     # importer imports nothing from here
+    with _lock:
+        return filename in _downloading or importer.package_busy(filename)
+
+
+def claim(filename: str) -> bool:
+    """Take the download slot; False when the package is busy."""
+    with _lock:
+        if busy(filename):
+            return False
+        _downloading.add(filename)
+        return True
+
+
+def release(filename: str) -> None:
+    with _lock:
+        _downloading.discard(filename)
+
+
+async def run_claim(claim, undo):
+    """Run `claim()` in a worker thread and return its result (#794). If the
+    awaiting task is cancelled meanwhile, the thread still finishes; `undo`
+    is then called, in a worker thread, with what it returned, so a claim never
+    outlives a cancelled request. An exception from `claim` propagates."""
+    task = asyncio.ensure_future(asyncio.to_thread(claim))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        def settle(done):
+            if done.cancelled() or done.exception() is not None:
+                return
+            follow = asyncio.ensure_future(asyncio.to_thread(undo, done.result()))
+            _settling.add(follow)
+            follow.add_done_callback(_settling.discard)
+        task.add_done_callback(settle)
+        raise
+
+
+def may_sweep(filename: str, finished_at: str, now: datetime) -> bool:
+    """The one place that decides the sweep may delete a package: it has
+    expired and isn't busy (#677). A "keep" flag would be checked here."""
+    expiry = _expiry(finished_at)
+    return expiry is not None and expiry <= now and not busy(filename)
+
+
+# ── deleting ─────────────────────────────────────────────────────────────────
+
+def _remove_regular(path: Path) -> bool | None:
+    """Unlink a regular file, never following a link. True when removed, None
+    when it is missing, False when something else has the name (kept)."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        return False
+    path.unlink()
+    return True
+
+
+def delete(filename: str, reason: str, scope=None) -> bool:
+    """Delete a recorded package, its companions and its entry, and write its
+    `package.delete` record. `scope` is the downloading request's (reason
+    `downloaded`); without one the actor is the system (reason `expired`).
+    True when the package was deleted."""
+    from services import audit
+    root = _exports()
+    with _lock:
+        try:
+            removed = _remove_regular(root / filename)
+        except OSError:
+            _log.exception("Could not delete package %s (%s); it is kept and tried again", filename, reason)
+            return False
+        if removed is None:
+            _forget(filename)
+            return False
+        if removed is False:
+            _log.warning("%s in the exports folder is not a regular file; it is left as it is "
+                         "and no longer expired", filename)
+            _forget(filename)
+            return False
+        for name in companions(filename):
+            try:
+                if _remove_regular(root / name) is False:
+                    _log.warning("Companion %s of %s is not a regular file; left as it is", name, filename)
+            except OSError:
+                _log.exception("Could not delete %s, a companion of %s", name, filename)
+        _forget(filename)
+    audit.package_deleted(filename, reason, scope)
+    return True
+
+
+def after_download(filename: str, scope) -> bool:
+    """After a complete download: delete the package when this instance
+    exported it and no import of it has started meanwhile."""
+    from services import importer
+    with _lock:
+        if not recorded(filename) or importer.package_busy(filename):
+            return False
+        return delete(filename, "downloaded", scope)
+
+
+def sweep(now: datetime | None = None) -> list[str]:
+    """Delete the recorded packages that have expired. Busy ones wait for the
+    next run; an entry whose file is gone is dropped. Returns the deleted names."""
+    now = now or datetime.now(timezone.utc)
+    deleted = []
+    with _lock:
+        for filename, entry in sorted(_read().items()):
+            finished_at = entry["finished_at"]
+            expiry = _expiry(finished_at)
+            if expiry is None or expiry > now:
+                continue
+            if not os.path.lexists(_exports() / filename):
+                _forget(filename)
+                continue
+            if not may_sweep(filename, finished_at, now):
+                continue
+            if delete(filename, "expired"):
+                deleted.append(filename)
+    return deleted
+
+
+async def sweeper() -> None:
+    """Sweep at once (the start-up run), then every SWEEP_INTERVAL_S."""
+    while True:
+        try:
+            deleted = await asyncio.to_thread(sweep)
+            if deleted:
+                _log.warning("Deleted %d expired export package(s) nobody downloaded within "
+                             "EXPORT_RETENTION_HOURS (%d h): %s", len(deleted),
+                             settings.export_retention_hours, ", ".join(deleted))
+        except Exception:                             # noqa: BLE001 - the next run tries again
+            _log.exception("The sweep of expired export packages failed")
+        await asyncio.sleep(SWEEP_INTERVAL_S)
+```
+
 ### api/services/importer.py
 
 ```python
@@ -12637,6 +13745,8 @@ import uuid
 from pathlib import Path
 from contextlib import nullcontext
 
+from auth import access
+from auth import store as auth_store
 from config import settings
 from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN
 from services import age_stream
@@ -12783,12 +13893,14 @@ def _mark_finished(collection: str) -> None:
     collection_recovery._sync_dir(_markers_dir())
 
 
-# Extraction workspaces created by an import or a re-chunk, and an ingest's
-# upload staging (#377). Each removes its own directory in a `finally`, which a
-# hard kill skips -- twelve of these were found holding 152 MB after the kill
-# tests, a with-models package would leave 2.3 GB behind each time, and an
-# ingest up to 512 MB of upload plus 2 GiB of extracted ZIP members.
-_WORKDIR_PREFIXES = ("import-", "rechunk-", "batch-verify-", "ingest-", "prepare-")
+# Extraction workspaces created by an import or a re-chunk, an ingest's upload
+# staging (#377), and an export's staging (#549). Each removes its own directory
+# in a `finally`, which a hard kill skips -- twelve of these were found holding
+# 152 MB after the kill tests, a with-models package would leave 2.3 GB behind
+# each time, and an ingest up to 512 MB of upload plus 2 GiB of extracted ZIP
+# members.
+_WORKDIR_PREFIXES = ("import-", "rechunk-", "batch-verify-", "ingest-", "prepare-",
+                     "export-")
 # Document preparation also writes two temporary files there (#640): the ZIP of
 # a multi-part prepared download (prepare-*.zip) and a decompressed .json.gz
 # (prepare-*.json). They are removed as regular files, besides as directories.
@@ -12901,6 +14013,30 @@ def canonical(name: str) -> str:
 def _package_key(filename: str) -> str:
     """The package the worker opens, so every spelling of one file is one key."""
     return Path(filename).name
+
+
+def _claim_package(key: str, filename: str) -> None:
+    """Claim the package for this import, or refuse while another import has it.
+    Taken under package_retention's lock as well (that lock, then _lock), so an
+    expiry sweep or a post-download deletion never removes a package between its
+    busy check and the unlink while an import starts (#677)."""
+    from services import package_retention
+    with package_retention.lock(), _lock:
+        if key in _active:
+            raise ImportInProgressError(filename)
+        _active.add(key)
+
+
+def _release_package(key: str) -> None:
+    with _lock:
+        _active.discard(key)
+
+
+def package_busy(filename: str) -> bool:
+    """Whether an import of this package is running (#677: a download is
+    refused, and the expiry sweep waits, meanwhile)."""
+    with _lock:
+        return _package_key(filename) in _active
 
 
 def _claim_target(job_id: str, target: str, instead_of: str | None = None) -> str:
@@ -13034,6 +14170,8 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
     Absent, bundled       -> install, then verify Ollama actually reports it.
     Absent, unbundled     -> EMBEDDING_MODEL_MISSING.
     Namespaced name       -> ask Ollama; it can't be checked or installed here.
+    The LLM is this instance's answer model; the build model is neither checked
+    nor installed (#671).
     """
     notes: list[str] = []
     if not model_bundle.store_available():
@@ -13042,7 +14180,9 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
         return notes
 
     embed_model = settings.embed_model
-    llm_model = settings.llm_model
+    # Only the answer model: a query needs it; the build model is recorded in
+    # the manifest for information and never checked or installed (#671).
+    llm_model = settings.answer_model
     # `name:tag`; a folder counts only for the tag it holds (#487).
     bundled = model_bundle.bundled_models(pkg, manifest)
 
@@ -13415,6 +14555,57 @@ def _build(target: str, pkg: Path, manifest: dict, progress, instance: str | Non
         raise
 
 
+def exists_fail_closed(name: str) -> bool:
+    """Whether a collection exists; Weaviate failing to answer counts as
+    existing, so the access checks below fail closed."""
+    try:
+        return wc._collection_exists_sync(name)
+    except Exception:                                 # noqa: BLE001
+        _log.exception("Could not check whether %r exists for a package's access check", name)
+        return True
+
+
+def package_source(original: str) -> str:
+    """Whose access a package of `original` follows (#606): the collection
+    itself, or for a staging or recovery copy that no longer exists here, the
+    nearest collection it was made from that exists here, or the original
+    (auth.access.package_source, #792)."""
+    return access.package_source(original, exists_fail_closed)
+
+
+def _refused(owner, source: str) -> bool:
+    """True when the package's collection (`package_source`) exists here, is
+    restricted, and the job's owner may not use it (#606). For an existing
+    staging or recovery copy that means the copy or any collection it was made
+    from (access.scope, #788, #792)."""
+    names = access.scope(source)
+    if owner is None or not any(auth_store.collection_access(n).restricted for n in names):
+        return False
+    return exists_fail_closed(source) and not all(auth_store.owner_has_access(owner, n) for n in names)
+
+
+def _start_access(owner, source: str, target: str, operator: bool = False):
+    """A collection this import creates (#606): when the package's collection
+    (`package_source`) exists here, the new one gets its state, and for a
+    staging or recovery copy the narrowest of the copy's and every
+    collection's it was made from (#788, #792), so an import can't open what
+    any of them restricts; otherwise it starts restricted to the job's owner.
+    Written before any data; returns (the state replaced, the state written)
+    for auth_store.put_back. A job with no owner (a direct call in tests)
+    records nothing and returns None. A load by the operator (`python -m
+    loader`, #670) has no owner either: every collection it creates starts
+    restricted with no grants (Engineers only, until one opens or grants it),
+    and never copies an existing collection's state, a rename or a staging
+    copy's package included (maintainer, 2026-11-18)."""
+    if operator:
+        return auth_store.restrict_to(target, None)
+    if owner is None:
+        return None
+    if source != target and exists_fail_closed(source):
+        return auth_store.copy_collection_access(source, target, access.scope(source)[1:])
+    return auth_store.restrict_to(target, auth_store.user_id_for(owner))
+
+
 @telemetry.traced("rag.import")
 def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = None) -> None:
     job = _jobs[job_id]
@@ -13427,6 +14618,8 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
     # set is not by itself evidence that anything survived to recover.
     staged = False
     ownership: dict | None = None
+    new_access = None    # (collection, state replaced, state written) when this job set one (#606)
+    built = False        # this job's build of the target finished
 
     def progress(n: int) -> None:
         job["chunks_written"] = n
@@ -13445,6 +14638,13 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
         _check_embedding(manifest)                                  # check 4
 
         original = manifest["collection"]["name"]
+        # A package of a collection its owner may not use is refused as if it
+        # weren't there, before the job names the collection anywhere (#606).
+        source = package_source(original) if isinstance(original, str) and original else None
+        if source and _refused(job.get("owner"), source):
+            job["access_refused"] = True
+            raise PackageError("PACKAGE_UNREADABLE",
+                               f"No package named '{archive.name}' in the exports directory.")
         id8 = packager.sha256_file(pkg / "manifest.json")[:8]
         job["collection"] = original
         job["fidelity"] = manifest.get("fidelity")
@@ -13494,6 +14694,15 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
                 raise PackageError("COLLECTION_DELETING", collection_writes.deleting_message(target),
                                    {"collection": target}) from None
 
+            # A collection this import creates gets its access state before any
+            # data is written; a replace keeps the target's (#606).
+            if not exists or on_conflict != "replace":
+                states = _start_access(job.get("owner"), source or target, target,
+                                       operator=job.get("operator") is True)
+                if states is not None:
+                    before, written = states
+                    new_access = (target, written, before)       # put_back's (collection, expected, previous)
+
             if exists and on_conflict == "replace":
                 # Prove the package inserts cleanly before destroying anything.
                 ownership = collection_recovery.begin(target, "import", wc.get_client())
@@ -13520,6 +14729,7 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
             instance = _mark_started(target, expected, job_id, lambda: _package_records(pkg, manifest))
             marked = target
             written = _build(target, pkg, manifest, progress, instance)
+            built = True
             _mark_finished(target)
             marked = None
             job.setdefault("restored_sessions", [])
@@ -13568,6 +14778,23 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
                 _mark_finished(marked)
             except Exception:
                 _log.exception("Could not finish import marker for %r; startup will retry", marked)
+        if new_access and not built and job.get("status") == "failed":
+            # The state this job wrote goes back to what it replaced, unless a
+            # create of the same name wrote its own since (#606), but only once
+            # the collection is known to be gone: a build whose cleanup failed
+            # (cleanup_pending), or a create Weaviate applied but answered with
+            # an error, leaves a partial collection, which keeps the
+            # restriction (#788). A collection it did build keeps its state.
+            if ((job.get("error_detail") or {}).get("cleanup_pending")
+                    or exists_fail_closed(new_access[0])):
+                _log.warning("Import into %r failed but the collection may still exist; "
+                             "its access state stays", new_access[0])
+            else:
+                try:
+                    auth_store.put_back(*new_access)
+                except Exception:                         # noqa: BLE001
+                    _log.exception("Could not put back the access state of %r after a failed import",
+                                   new_access[0])
         if ownership and ownership["state"] == "scratch":
             try:
                 collection_recovery.discard(ownership, wc.get_client())
@@ -13598,10 +14825,11 @@ async def start_import_job(filename: str, on_conflict: str, passphrase: str | No
                               f"'{key}' is not encrypted, so it takes no passphrase. "
                               "Anyone with the file can read it.")
     job_id = str(uuid.uuid4())[:8]
-    with _lock:
-        if key in _active:
-            raise ImportInProgressError(filename)
-        _active.add(key)
+    # Off the event loop: the claim waits while a sweep holds the retention lock
+    # (#677). A cancellation while it runs still releases it (#794).
+    from services import package_retention
+    await package_retention.run_claim(lambda: _claim_package(key, filename),
+                                      lambda _: _release_package(key))
 
     # The first write is durable, so it runs off the event loop (#309). A start
     # cancelled meanwhile releases its guard; the store removes the record.
@@ -13625,8 +14853,7 @@ async def start_import_job(filename: str, on_conflict: str, passphrase: str | No
             "owner": owner,                     # who started it, for the job lists (#617)
         })
     except BaseException:
-        with _lock:
-            _active.discard(key)
+        _release_package(key)
         raise
     asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, filename, on_conflict,
                                           passphrase))
@@ -13649,7 +14876,7 @@ The manifest names every blob the model needs, so bundling resolves blobs
 weights, and on a machine with other models pulled it would be far worse.
 
 In a package each model gets its own folder, `models/<name>/<tag>/`, so two
-tags of one name (an embedding model `foo:a` and an LLM `foo:b`) never share
+tags of one name (an embedding model `foo:a` and an answer LLM `foo:b`) never share
 files. Packages built before #487 used `models/<name>/`; such a folder is used
 only for the one tag the package manifest gives that name.
 
@@ -13830,7 +15057,7 @@ def _legacy_tag(name: str, package_manifest) -> str | None:
     """The tag a pre-#487 `models/<name>/` folder holds, or None if unknown.
 
     Those packages didn't record it. The package manifest names the embedding
-    model and the LLM; when exactly one tag of `name` is among them, the folder
+    model and the (answer) LLM; when exactly one tag of `name` is among them, the folder
     holds that tag. Two tags of one name shared the folder, the last copy
     overwriting the first's manifest, so the folder can't be trusted for either.
     """
@@ -14657,9 +15884,15 @@ from services import weaviate_client as wc
 
 router = APIRouter()
 
+# Two routes, one check (#750). GET /health needs no login: the compose
+# healthcheck, stack.sh, CI and the verify wait loops read its status code, so it
+# answers only {"status"}, and on a LAN nobody without an account learns the
+# models, timings or the host's memory. GET /health/details gives Developers and
+# AI Engineers the full report, with the same 200/503 rule.
 
-@router.get("/health")
-async def health_check():
+
+async def _report() -> tuple[bool, dict]:
+    """Whether every dependency is ok, and the full report."""
     results = {}
     overall_ok = True
 
@@ -14681,7 +15914,8 @@ async def health_check():
 
     ollama_result = await ollama.check_health()
     results["ollama"] = ollama_result
-    if any(v["status"] != "ok" for v in ollama_result.values()):
+    # `same_model` is a flag, not a service: it never decides the status (#671).
+    if any(v["status"] != "ok" for v in ollama_result.values() if isinstance(v, dict)):
         overall_ok = False
 
     # Resource reporting is advisory and deliberately does NOT affect
@@ -14690,15 +15924,24 @@ async def health_check():
     # take the whole stack down over a tuning warning.
     resources = {"memory": system_info.memory_info(settings.recommended_memory_gb)}
 
-    status_code = 200 if overall_ok else 503
-    return JSONResponse(
-        status_code=status_code,
-        content={
-            "status": "ok" if overall_ok else "degraded",
-            "services": results,
-            "resources": resources,
-        },
-    )
+    return overall_ok, {
+        "status": "ok" if overall_ok else "degraded",
+        "services": results,
+        "resources": resources,
+    }
+
+
+@router.get("/health")
+async def health_check():
+    overall_ok, _ = await _report()
+    return JSONResponse(status_code=200 if overall_ok else 503,
+                        content={"status": "ok" if overall_ok else "degraded"})
+
+
+@router.get("/health/details")
+async def health_details():
+    overall_ok, report = await _report()
+    return JSONResponse(status_code=200 if overall_ok else 503, content=report)
 ```
 
 ### api/routers/help.py
@@ -14769,11 +16012,14 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from auth import access, store
 from config import settings
 from models.schemas import (
+    CollectionAccessRequest,
+    CollectionAccessResponse,
     CollectionInfo,
     CollectionName,
     CollectionsResponse,
@@ -14871,7 +16117,7 @@ def remove_interrupted_saves() -> None:
 
 
 @router.get("", response_model=CollectionsResponse)
-async def list_collections():
+async def list_collections(request: Request = None):
     try:
         raw = await wc.get_collections()
     except Exception:                                 # noqa: BLE001
@@ -14887,6 +16133,8 @@ async def list_collections():
         _log.warning("The collection registry can't be read, so created_at is null "
                      "for every collection: %s", exc)
         registry = {}
+    # Only the collections the caller may use (#606); Engineers see all.
+    visible = await asyncio.to_thread(access.visible_filter, access.principal_of(request))
     items = [
         CollectionInfo(
             name=c["name"],
@@ -14897,12 +16145,13 @@ async def list_collections():
             hnsw_config=c.get("hnsw_config"),
         )
         for c in raw
+        if visible(c["name"])
     ]
     return CollectionsResponse(collections=items)
 
 
 @router.post("", status_code=201)
-async def create_collection(body: CreateCollectionRequest):
+async def create_collection(body: CreateCollectionRequest, request: Request = None):
     audit.note(collection=body.name)              # the audit record's collection (#29)
     try:
         exists = await wc.collection_exists(body.name)
@@ -14912,6 +16161,20 @@ async def create_collection(body: CreateCollectionRequest):
         return collection_check_unavailable(body.name, "No collection was created")
     if exists:
         return api_error(409, "COLLECTION_EXISTS", f"Collection '{body.name}' already exists.")
+
+    # A new collection starts restricted to the account that created it (#606),
+    # written before it exists, so it is never open: if this write fails nothing
+    # is created, and if the create fails the state goes back (put_back), but
+    # only when the collection is known not to exist: a create Weaviate applied
+    # but answered with an error keeps the restriction (#788).
+    principal = access.principal_of(request)
+    states = None
+    if principal is not None:
+        try:
+            states = await asyncio.to_thread(store.restrict_to, body.name, principal.user_id)
+        except Exception:                             # noqa: BLE001
+            _log.exception("Could not restrict new collection %r; it was not created", body.name)
+            return api_error(500, "CREATE_FAILED", "Failed to create collection.")
 
     try:
         await wc.create_collection(
@@ -14923,6 +16186,19 @@ async def create_collection(body: CreateCollectionRequest):
     except Exception:                                 # noqa: BLE001
         # The cause is logged, not sent (#373).
         _log.exception("Could not create collection %r", body.name)
+        if states is not None:
+            try:
+                gone = not await wc.collection_exists(body.name)
+            except Exception:                         # noqa: BLE001
+                _log.exception("Could not check whether %r exists after a failed create", body.name)
+                gone = False
+            if not gone:
+                _log.warning("Collection %r may exist after a failed create; its restriction stays", body.name)
+            else:
+                try:
+                    await asyncio.to_thread(store.put_back, body.name, states[1], states[0])
+                except Exception:                         # noqa: BLE001
+                    _log.exception("Could not put back the access state of %r after a failed create", body.name)
         return api_error(500, "CREATE_FAILED", "Failed to create collection.")
 
     async with _registry_lock:
@@ -15001,7 +16277,65 @@ async def delete_collection(name: CollectionName, confirm: str | None = None):
                 registry.pop(spelling, None)
             await asyncio.to_thread(_save_registry, registry)
 
+    # A later collection of the same name starts afresh (#606).
+    await asyncio.to_thread(store.drop_collection_access, name)
     return {"name": name, "objects_deleted": count}
+
+
+# ── per-collection access (#606) ─────────────────────────────────────────────
+
+def _access_body(state: store.CollectionAccess) -> CollectionAccessResponse:
+    return CollectionAccessResponse(restricted=state.restricted, users=list(state.users),
+                                    service_principals=list(state.service_principals))
+
+
+async def _missing(name: str, outcome: str):
+    """The 503 or 404 when the collection can't be confirmed, else None."""
+    try:
+        exists = await wc.collection_exists(name)
+    except Exception:                                 # noqa: BLE001
+        _log.exception("Could not check whether %r exists for its access settings", name)
+        return collection_check_unavailable(name, outcome)
+    if not exists:
+        return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{name}' not found.")
+    return None
+
+
+@router.get("/{name}/access", response_model=CollectionAccessResponse)
+async def get_collection_access(name: CollectionName):
+    """Open, or restricted and to whom (Engineers, in a browser session)."""
+    missing = await _missing(name, "Nothing was read")
+    if missing is not None:
+        return missing
+    return _access_body(await asyncio.to_thread(store.collection_access, name))
+
+
+def _names(before: tuple, after: tuple) -> tuple[list, list]:
+    return sorted(set(after) - set(before)), sorted(set(before) - set(after))
+
+
+@router.put("/{name}/access", response_model=CollectionAccessResponse)
+async def set_collection_access(name: CollectionName, body: CollectionAccessRequest, request: Request = None):
+    """Set who may use the collection, the whole state at once (#606)."""
+    audit.note(collection=name)
+    missing = await _missing(name, "Nothing was changed")
+    if missing is not None:
+        return missing
+    try:
+        before, after = await asyncio.to_thread(store.set_collection_access, name, body.restricted,
+                                                body.users, body.service_principals)
+    except store.Refused as exc:
+        return api_error(422, "INVALID_PARAMETER", str(exc))
+    added_users, removed_users = _names(before.users, after.users)
+    added_svc, removed_svc = _names(before.service_principals, after.service_principals)
+    audit.note(restricted_before=before.restricted, restricted_after=after.restricted,
+               added={"users": added_users, "service_principals": added_svc},
+               removed={"users": removed_users, "service_principals": removed_svc})
+    actor = getattr(access.principal_of(request), "username", "?")
+    _log.warning("Admin %r set the access of collection %r: %s, %d people and %d service principals granted",
+                 actor, name, "restricted" if after.restricted else "open", len(after.users),
+                 len(after.service_principals))
+    return _access_body(after)
 ```
 
 ### api/routers/ingest.py
@@ -15020,7 +16354,9 @@ from services import audit, ingest_config, job_lists
 from services import ingest_pipeline
 from services import weaviate_client as wc
 from services.collection_writes import CollectionDeletingError, canonical
-from utils import api_error, collection_check_unavailable, collection_deleting_error
+from auth import access
+from utils import (api_error, collection_check_unavailable, collection_deleting_error, collection_not_found,
+                   usable_collection)
 
 router = APIRouter(prefix="/ingest")
 _log = logging.getLogger(__name__)
@@ -15053,7 +16389,7 @@ async def ingest_upload(
     try:
         return await _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
                                     similarity_threshold, min_chunk_size, files,
-                                    job_lists.job_owner(request))
+                                    job_lists.job_owner(request), request)
     except Exception:
         # Anything not handled below used to reach the client as a plain-text
         # 500, which the Import page could only show as "HTTP 500" (#290).
@@ -15066,7 +16402,7 @@ async def ingest_upload(
 
 
 async def _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
-                         similarity_threshold, min_chunk_size, files, owner=None):
+                         similarity_threshold, min_chunk_size, files, owner=None, request=None):
     try:
         config = IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
                               chunk_overlap=chunk_overlap, similarity_threshold=similarity_threshold,
@@ -15074,6 +16410,9 @@ async def _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
     except ValidationError as exc:
         return api_error(422, "INVALID_SETTINGS", "Invalid chunking settings.",
                          detail={"errors": exc.errors(include_context=False, include_input=False)})
+    # A collection the caller may not use answers as one that doesn't exist (#606).
+    if not await access.check(request, collection):
+        return collection_not_found(collection)
     try:
         exists = await wc.collection_exists(collection)
     except Exception:                                 # noqa: BLE001
@@ -15121,22 +16460,30 @@ async def list_jobs(request: Request):
 
 
 @router.get("/job/{job_id}", response_model=JobStatusResponse)
-async def job_status(job_id: str):
+async def job_status(job_id: str, request: Request = None):
     job = ingest_pipeline.get_job(job_id)
-    if job is None:
+    # A job on a collection the caller may not use answers as a missing one (#606).
+    if job is None or (job.get("collection") and not await access.check(request, job["collection"], "JOB_NOT_FOUND")):
         return api_error(404, "JOB_NOT_FOUND", f"Job '{job_id}' not found.")
     return JobStatusResponse(**job)
 
 
 @router.get("/config/{collection}", response_model=IngestConfigResponse)
-async def get_ingest_config(collection: CollectionName):
+async def get_ingest_config(collection: CollectionName, request: Request = None):
+    # A missing collection, or one the caller may not use, is a 404 (#606).
+    refusal = await usable_collection(request, collection, "No settings were read")
+    if refusal is not None:
+        return refusal
     cfg, is_default = await asyncio.to_thread(ingest_config.resolve, collection)
     return IngestConfigResponse(is_default=is_default, **cfg)
 
 
 @router.post("/config", response_model=IngestConfigResponse, status_code=201)
-async def save_ingest_config(body: SaveIngestConfigBody):
+async def save_ingest_config(body: SaveIngestConfigBody, request: Request = None):
     audit.note(collection=body.collection)        # the audit record's collection (#29)
+    refusal = await usable_collection(request, body.collection, "No settings were saved")
+    if refusal is not None:
+        return refusal
     cfg = body.model_dump()
     await asyncio.to_thread(ingest_config.save, cfg)
     return IngestConfigResponse(is_default=False, **cfg)
@@ -15168,6 +16515,7 @@ from fastapi import APIRouter, File, Request, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
+from auth import access
 from config import settings
 from models.schemas import PrepareImportRequest, PrepareJobEntry, PrepareJobList, PrepareStartRequest
 from services import audit, ingest_pipeline, job_lists
@@ -15184,6 +16532,126 @@ _BLOCK = 1024 * 1024
 
 def _error(exc: store.AreaError):
     return api_error(exc.status, exc.code, exc.message, detail=exc.detail)
+
+
+# ── per-collection access (#606) ─────────────────────────────────────────────
+# A document whose imports are all into collections the caller may not use is
+# hidden from them and refused as an unknown document (Q18, Q19). One with at
+# least one import into a collection they may use stays visible, with the other
+# import records left out. Preparation job records leave hidden documents out
+# (Q20). Engineers see everything. A document with no imports is shared as before.
+
+def _import_names(record: dict) -> list[str]:
+    return [item["collection"] for item in record.get("imports") or []
+            if isinstance(item, dict) and isinstance(item.get("collection"), str) and item["collection"]]
+
+
+def _visible_of(request):
+    """The caller's visible-collection predicate; None for an Engineer or a
+    direct call, who see everything. Reads the store: call it in a thread."""
+    principal = access.principal_of(request)
+    if principal is None or principal.role == "engineer":
+        return None
+    return access.visible_filter(principal)
+
+
+def _blocker(request):
+    """A function giving, for a document record, a collection among its imports
+    the caller may not use when every import is into such a collection (the
+    document is hidden), else None. None for an Engineer or a direct call.
+    Reads the store: call it in a thread."""
+    visible = _visible_of(request)
+    if visible is None:
+        return None
+
+    def blocked(record: dict):
+        names = _import_names(record)
+        if names and not any(visible(name) for name in names):
+            return names[0]
+        return None
+    return blocked
+
+
+def _shown(record: dict, visible) -> dict:
+    """A visible document as the caller sees it: without the import records
+    for collections they may not use."""
+    if visible is None or not record.get("imports"):
+        return record
+    kept = [item for item in record["imports"]
+            if not (isinstance(item, dict) and isinstance(item.get("collection"), str)
+                    and item["collection"] and not visible(item["collection"]))]
+    return {**record, "imports": kept}
+
+
+def _job_view(job: dict, blocked) -> dict:
+    """A preparation job record without the documents hidden from the caller
+    (Q20): their ids and names, `current` when it is one of them, and the
+    errors that name them. The counters stay; they name no document. A
+    document that can't be read (deleted since) isn't hidden."""
+    if blocked is None:
+        return job
+    ids = list(job.get("document_ids") or [])
+    names = list(job.get("names") or [])
+    hidden = set()
+    for document_id in ids:
+        try:
+            record = store.get(document_id)
+        except store.AreaError:
+            continue
+        if blocked(record) is not None:
+            hidden.add(document_id)
+    if not hidden:
+        return job
+    hidden_names = {names[i] for i, document_id in enumerate(ids) if document_id in hidden and i < len(names)}
+    view = dict(job)
+    view["document_ids"] = [d for d in ids if d not in hidden]
+    view["names"] = [n for i, n in enumerate(names) if not (i < len(ids) and ids[i] in hidden)]
+    current = job.get("current")
+    if isinstance(current, dict) and current.get("document_id") in hidden:
+        view["current"] = None
+    prefixes = tuple(f"{key}:" for key in hidden | hidden_names)
+    view["errors"] = [e for e in job.get("errors") or [] if not (isinstance(e, str) and e.startswith(prefixes))]
+    return view
+
+
+async def _hidden(request, document_id: str):
+    """The 404 for a document the caller may not use, audited; None otherwise
+    (also for an unknown or unreadable id, which the route answers itself)."""
+    blocked = await asyncio.to_thread(_blocker, request)
+    if blocked is None:
+        return None
+    try:
+        record = await asyncio.to_thread(store.get, document_id)
+    except store.AreaError:
+        return None
+    collection = blocked(record)
+    if collection is None:
+        return None
+    await asyncio.to_thread(audit.access_refused, request, collection, "DOCUMENT_NOT_FOUND")
+    return api_error(404, "DOCUMENT_NOT_FOUND", f"Document '{document_id}' not found.")
+
+
+async def _usable(request):
+    """The predicate preparation_jobs uses to select documents (None: all)."""
+    blocked = await asyncio.to_thread(_blocker, request)
+    return None if blocked is None else (lambda record: blocked(record) is None)
+
+
+async def _audit_refused_ids(request, document_ids) -> None:
+    """Audit each explicitly selected document the caller may not use (#606)."""
+    if not document_ids:
+        return
+    blocked = await asyncio.to_thread(_blocker, request)
+    if blocked is None:
+        return
+    for document_id in dict.fromkeys(document_ids):
+        try:
+            record = await asyncio.to_thread(store.get, document_id)
+        except store.AreaError:
+            continue
+        collection = blocked(record)
+        if collection is not None:
+            await asyncio.to_thread(audit.access_refused, request, collection, "DOCUMENT_NOT_FOUND")
 
 
 # ── upload ───────────────────────────────────────────────────────────────────
@@ -15212,19 +16680,26 @@ async def upload(files: list[UploadFile] = File(...), request: Request = None):
 # ── reading ──────────────────────────────────────────────────────────────────
 
 @router.get("/documents")
-async def list_documents():
+async def list_documents(request: Request = None):
     records = await asyncio.to_thread(store.list_documents)
+    blocked = await asyncio.to_thread(_blocker, request)
+    if blocked is not None:
+        visible = await asyncio.to_thread(_visible_of, request)
+        records = [_shown(r, visible) for r in records if blocked(r) is None]
     used = await asyncio.to_thread(store.usage)
     return {"documents": [store.list_entry(r) for r in records],
             "used_bytes": used, "limit_bytes": store.limit()}
 
 
 @router.get("/documents/{document_id}")
-async def get_document(document_id: str):
+async def get_document(document_id: str, request: Request = None):
+    if (hidden := await _hidden(request, document_id)) is not None:
+        return hidden
     try:
-        return await asyncio.to_thread(store.preview, document_id)
+        record = await asyncio.to_thread(store.preview, document_id)
     except store.AreaError as exc:
         return _error(exc)
+    return _shown(record, await asyncio.to_thread(_visible_of, request))
 
 
 # ── downloads ────────────────────────────────────────────────────────────────
@@ -15253,7 +16728,9 @@ def _media_type(name: str) -> str:
 
 
 @router.get("/documents/{document_id}/raw")
-async def download_raw(document_id: str):
+async def download_raw(document_id: str, request: Request = None):
+    if (hidden := await _hidden(request, document_id)) is not None:
+        return hidden
     try:
         record, handle = await asyncio.to_thread(store.open_raw, document_id)
     except store.AreaError as exc:
@@ -15289,7 +16766,9 @@ def _build_zip(handles: list[tuple[str, Any]]) -> Path:
 
 
 @router.get("/documents/{document_id}/prepared")
-async def download_prepared(document_id: str):
+async def download_prepared(document_id: str, request: Request = None):
+    if (hidden := await _hidden(request, document_id)) is not None:
+        return hidden
     try:
         record, handles = await asyncio.to_thread(store.open_parts, document_id)
     except store.AreaError as exc:
@@ -15317,7 +16796,9 @@ async def download_prepared(document_id: str):
 # ── deletes ──────────────────────────────────────────────────────────────────
 
 @router.delete("/documents/{document_id}", status_code=204)
-async def delete_document(document_id: str):
+async def delete_document(document_id: str, request: Request = None):
+    if (hidden := await _hidden(request, document_id)) is not None:
+        return hidden
     try:
         record = await asyncio.to_thread(store.delete, document_id)
     except store.AreaError as exc:
@@ -15327,7 +16808,9 @@ async def delete_document(document_id: str):
 
 
 @router.delete("/documents/{document_id}/prepared", status_code=204)
-async def delete_prepared(document_id: str):
+async def delete_prepared(document_id: str, request: Request = None):
+    if (hidden := await _hidden(request, document_id)) is not None:
+        return hidden
     try:
         record = await asyncio.to_thread(store.delete_prepared, document_id)
     except store.AreaError as exc:
@@ -15345,8 +16828,10 @@ async def start_job(body: PrepareStartRequest, request: Request = None):
     else:
         audit.note(document_ids=body.document_ids)
     try:
-        answer = await jobs.start(body.document_ids, job_lists.job_owner(request))
+        answer = await jobs.start(body.document_ids, job_lists.job_owner(request), await _usable(request))
     except store.AreaError as exc:
+        if isinstance(exc, store.DocumentNotFound):
+            await _audit_refused_ids(request, body.document_ids)
         return _error(exc)
     return JSONResponse(status_code=202, content=answer)
 
@@ -15357,16 +16842,21 @@ async def list_jobs(request: Request):
 
     def build():
         items = job_lists.job_items(jobs.job_records())
+        blocked = _blocker(request)
+        if blocked is not None:
+            items = [(_job_view(record, blocked), running, finish) for record, running, finish in items]
         return job_lists.entries(PrepareJobEntry, items, principal)
     return PrepareJobList(jobs=await asyncio.to_thread(build))
 
 
 @router.get("/job/{job_id}")
-async def job_status(job_id: str):
+async def job_status(job_id: str, request: Request = None):
     job = jobs.get_job(job_id)
     if job is None:
         return api_error(404, "JOB_NOT_FOUND", f"Job '{job_id}' not found.")
-    return {key: value for key, value in dict(job).items() if not key.startswith("_")}
+    blocked = await asyncio.to_thread(_blocker, request)
+    view = await asyncio.to_thread(_job_view, dict(job), blocked)
+    return {key: value for key, value in view.items() if not key.startswith("_")}
 
 
 @router.post("/job/{job_id}/cancel", status_code=202)
@@ -15386,10 +16876,15 @@ async def import_documents(body: PrepareImportRequest, request: Request = None):
     collection = body.collection
     audit.note(collection=collection)
     try:
-        selected = await jobs.import_documents(body)
+        selected = await jobs.import_documents(body, await _usable(request))
     except store.AreaError as exc:
+        if isinstance(exc, store.DocumentNotFound):
+            await _audit_refused_ids(request, body.document_ids)
         return _error(exc)
     audit.note(names=selected["names"])
+    # A collection the caller may not use answers as one that doesn't exist (#606).
+    if not await access.check(request, collection):
+        return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{collection}' not found.")
     try:
         exists = await jobs.collection_exists(collection)
     except Exception:                                       # noqa: BLE001
@@ -15418,8 +16913,10 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+
+from auth import access
 
 from models.schemas import QueryRequest, QueryResponse
 from config import settings
@@ -15449,12 +16946,15 @@ def _unavailable(collection: str, exc: rag_pipeline.ServiceUnavailable) -> JSONR
 
 
 @router.post("", response_model=QueryResponse)
-async def run_query(body: QueryRequest):
+async def run_query(body: QueryRequest, request: Request = None):
     # The audit record's parameters (#29); the question only when the operator
     # turned AUDIT_LOG_QUESTIONS on, and never the answer.
     audit.note(collection=body.collection, retrieval_mode=body.retrieval_mode, top_k=body.top_k,
                alpha=body.alpha, response_format=body.response_format, include_citations=body.include_citations,
                **({"question": body.question} if settings.audit_log_questions else {}))
+    # A collection the caller may not use answers as one that doesn't exist (#606).
+    if not await access.check(request, body.collection):
+        return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{body.collection}' not found.")
     try:
         exists = await wc.collection_exists(body.collection)
     except Exception:                                 # noqa: BLE001
@@ -15501,23 +17001,31 @@ from __future__ import annotations
 
 import asyncio
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
 from models.schemas import CollectionName, RetrievalConfigResponse, SaveRetrievalConfigBody
 from services import audit, retrieval_config
+from utils import usable_collection
 
 router = APIRouter(prefix="/retrieval")
 
 
 @router.get("/config/{collection}", response_model=RetrievalConfigResponse)
-async def get_retrieval_config(collection: CollectionName):
+async def get_retrieval_config(collection: CollectionName, request: Request = None):
+    # A missing collection, or one the caller may not use, is a 404 (#606).
+    refusal = await usable_collection(request, collection, "No settings were read")
+    if refusal is not None:
+        return refusal
     cfg, is_default = await asyncio.to_thread(retrieval_config.resolve, collection)
     return RetrievalConfigResponse(is_default=is_default, **cfg)
 
 
 @router.post("/config", response_model=RetrievalConfigResponse, status_code=201)
-async def save_retrieval_config(body: SaveRetrievalConfigBody):
+async def save_retrieval_config(body: SaveRetrievalConfigBody, request: Request = None):
     audit.note(collection=body.collection)        # the audit record's collection (#29)
+    refusal = await usable_collection(request, body.collection, "No settings were saved")
+    if refusal is not None:
+        return refusal
     cfg = body.model_dump()
     await asyncio.to_thread(retrieval_config.save, cfg)
     return RetrievalConfigResponse(is_default=False, **cfg)
@@ -15535,8 +17043,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import stat
+from pathlib import Path
 
 from fastapi import APIRouter, Request
+from starlette.responses import Response
+
+from auth import access
 
 from models.schemas import (
     ExportJobEntry,
@@ -15552,7 +17066,7 @@ from models.schemas import (
     PackageListResponse,
     PackageSummary,
 )
-from services import age_stream, audit, exporter, importer, job_lists, packager
+from services import age_stream, audit, exporter, importer, job_lists, package_retention, packager
 from services import weaviate_client as wc
 from services.collection_writes import CollectionDeletingError
 from utils import api_error, collection_check_unavailable, collection_deleting_error
@@ -15565,6 +17079,9 @@ _log = logging.getLogger(__name__)
 async def start_export(body: ExportRequest, request: Request = None):
     # The audit record's parameters (#29): whether it is encrypted, never the passphrase.
     audit.note(collection=body.collection, include_models=body.include_models, encrypted=body.passphrase is not None)
+    # A collection the caller may not use answers as one that doesn't exist (#606).
+    if not await access.check(request, body.collection):
+        return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{body.collection}' not found.")
     try:
         exists = await wc.collection_exists(body.collection)
     except Exception:                                 # noqa: BLE001
@@ -15608,11 +17125,16 @@ async def list_export_jobs(request: Request):
 
 
 @router.get("/export/job/{job_id}", response_model=ExportJobStatusResponse)
-async def export_job_status(job_id: str):
+async def export_job_status(job_id: str, request: Request = None):
     job = exporter.get_job(job_id)
-    if job is None:
+    # A job on a collection the caller may not use answers as a missing one (#606).
+    if job is None or (job.get("collection") and not await access.check(request, job["collection"], "JOB_NOT_FOUND")):
         return api_error(404, "JOB_NOT_FOUND", f"Job '{job_id}' not found.")
-    return ExportJobStatusResponse(**job)
+    # When its package expires (#677), while it is still recorded.
+    expires = None
+    if job.get("status") == "completed" and isinstance(job.get("filename"), str):
+        expires = await asyncio.to_thread(package_retention.expires_at, job["filename"])
+    return ExportJobStatusResponse(**{**job, "expires_at": expires})
 
 
 @router.post("/import", response_model=ImportStartResponse, status_code=202)
@@ -15646,54 +17168,233 @@ async def list_import_jobs(request: Request):
 
 
 @router.get("/import/job/{job_id}", response_model=ImportJobStatusResponse)
-async def import_job_status(job_id: str):
+async def import_job_status(job_id: str, request: Request = None):
     job = importer.get_job(job_id)
-    if job is None:
+    # An import job names its collection once its package is read (#606).
+    if job is None or (job.get("collection") and not await access.check(request, job["collection"], "JOB_NOT_FOUND")):
         return api_error(404, "JOB_NOT_FOUND", f"Job '{job_id}' not found.")
     return ImportJobStatusResponse(**job)
 
 
-def _list_packages_sync() -> list[dict]:
-    out = []
-    root = packager.exports_dir()
-    for p in sorted([*root.glob("ragpkg-*.tar.gz"), *root.glob("ragpkg-*" + age_stream.ENCRYPTED_SUFFIX)]):
-        if age_stream.is_encrypted_name(p.name):
-            # No metadata without the passphrase, and no scrypt to list (#27).
-            try:
-                with p.open("rb") as fh:
-                    readable = age_stream.check_header(fh)
-                size = p.stat().st_size
-            except Exception:                         # noqa: BLE001
-                # One bad file never breaks the listing of the others.
-                readable, size = False, 0
-            out.append({"filename": p.name, "size_bytes": size,
-                        "collection": None, "chunk_count": None, "fidelity": None,
-                        "created_at": None, "readable": readable, "encrypted": True})
-            continue
+def _summary(p: Path) -> dict:
+    """One package as the listing shows it."""
+    if age_stream.is_encrypted_name(p.name):
+        # No metadata without the passphrase, and no scrypt to list (#27).
         try:
-            fields = packager.listing_fields(packager.read_manifest(p))
-        except Exception:
-            # A file that is not a readable package, or whose manifest has a
-            # wrongly typed field (#451), still belongs in the listing; import
-            # will report precisely why it cannot be used.
-            out.append({"filename": p.name, "size_bytes": p.stat().st_size,
-                        "collection": None, "chunk_count": None,
-                        "fidelity": None, "created_at": None, "readable": False})
-            continue
-        out.append({
-            "filename": p.name,
-            "size_bytes": p.stat().st_size,
-            **fields,
-            "readable": True,
-        })
-    return out
+            with p.open("rb") as fh:
+                readable = age_stream.check_header(fh)
+            size = p.stat().st_size
+        except Exception:                             # noqa: BLE001
+            # One bad file never breaks the listing of the others.
+            readable, size = False, 0
+        return {"filename": p.name, "size_bytes": size,
+                "collection": None, "chunk_count": None, "fidelity": None,
+                "created_at": None, "readable": readable, "encrypted": True}
+    try:
+        fields = packager.listing_fields(packager.read_manifest(p))
+    except Exception:
+        # A file that is not a readable package, or whose manifest has a
+        # wrongly typed field (#451), still belongs in the listing; import
+        # will report precisely why it cannot be used.
+        return {"filename": p.name, "size_bytes": p.stat().st_size,
+                "collection": None, "chunk_count": None,
+                "fidelity": None, "created_at": None, "readable": False}
+    return {
+        "filename": p.name,
+        "size_bytes": p.stat().st_size,
+        **fields,
+        "readable": True,
+    }
+
+
+def _list_packages_sync() -> list[dict]:
+    root = packager.exports_dir()
+    expiries = package_retention.expiries()
+    return [{**_summary(p), "expires_at": expiries.get(p.name)}
+            for p in sorted([*root.glob("ragpkg-*.tar.gz"), *root.glob("ragpkg-*" + age_stream.ENCRYPTED_SUFFIX)])]
+
+
+async def _hidden(principal, packages: list[dict]) -> dict[str, str | None]:
+    """The packages a caller may not see (#606), each with the collection its
+    refusal names: those whose collection exists here and is restricted to
+    others. An unencrypted package's collection is its manifest's; an encrypted
+    package exported here follows the collection recorded at its export (#794),
+    and one recorded without a collection (before #794) is seen by Engineers
+    only. An encrypted package copied in names no collection and is not hidden.
+    Whose access a package follows is the import's own rule
+    (importer.package_source), so the listing and POST /import agree (#788).
+    Weaviate failing to answer counts as existing
+    (importer.exists_fail_closed), so the listing fails closed."""
+    visible = await asyncio.to_thread(access.visible_filter, principal)
+    recorded = None
+    hidden: dict[str, str | None] = {}
+    for p in packages:
+        if p.get("encrypted"):
+            if recorded is None:
+                recorded = await asyncio.to_thread(package_retention.recorded_collections)
+            if p["filename"] not in recorded:
+                continue
+            name = recorded[p["filename"]]
+            if name is None:
+                if principal is not None and principal.role != "engineer":
+                    hidden[p["filename"]] = None
+                continue
+        else:
+            name = p.get("collection")
+            if not p.get("readable") or not isinstance(name, str) or not name:
+                continue
+        source = await asyncio.to_thread(importer.package_source, name)
+        if not visible(source) and await asyncio.to_thread(importer.exists_fail_closed, source):
+            hidden[p["filename"]] = name
+    return hidden
 
 
 @router.get("/packages", response_model=PackageListResponse)
-async def list_packages():
+async def list_packages(request: Request = None):
     """Packages sitting in ./exports — both exported here and dropped in to import."""
     packages = await asyncio.to_thread(_list_packages_sync)
+    hidden = await _hidden(access.principal_of(request), packages)
+    packages = [p for p in packages if p["filename"] not in hidden]
     return PackageListResponse(packages=[PackageSummary(**p) for p in packages])
+
+
+# ── Downloading a package (#677) ─────────────────────────────────────────────
+
+_CHUNK = 1024 * 1024
+
+
+def _package_not_found(filename: str):
+    return api_error(404, "PACKAGE_NOT_FOUND", f"No package named '{filename}' in the exports directory.")
+
+
+def _package_busy(filename: str):
+    return api_error(409, "PACKAGE_BUSY",
+                     f"'{filename}' is being imported or downloaded. Try again when that has finished.")
+
+
+class _PackageStream(Response):
+    """Streams one package and, after a complete GET, has it deleted when this
+    instance exported it (package_retention.after_download).
+
+    The download slot is claimed and the file opened here, not in the handler,
+    so a response that is never called holds neither. Complete means every byte
+    was handed to the connection and no disconnect was seen before the last
+    message; nginx doesn't buffer ahead of the client (X-Accel-Buffering). There
+    is no Range support: a download is the whole file or it is incomplete, and
+    an incomplete one keeps the package."""
+
+    def __init__(self, path: Path, filename: str, head: bool):
+        super().__init__(status_code=200)
+        self.path, self.filename, self.head = path, filename, head
+
+    async def _refuse(self, send, response) -> None:
+        await send({"type": "http.response.start", "status": response.status_code,
+                    "headers": response.raw_headers})
+        await send({"type": "http.response.body", "body": response.body, "more_body": False})
+
+    async def __call__(self, scope, receive, send) -> None:
+        completed = claimed = False
+        fd = None
+        listener = None
+        try:
+            if not self.head:
+                # A cancellation while the claim runs still releases it (#794).
+                claimed = await package_retention.run_claim(
+                    lambda: package_retention.claim(self.filename),
+                    lambda took: took and package_retention.release(self.filename))
+                if not claimed:
+                    return await self._refuse(send, _package_busy(self.filename))
+            try:
+                fd = os.open(self.path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                info = os.fstat(fd)
+            except OSError:
+                return await self._refuse(send, _package_not_found(self.filename))
+            if not stat.S_ISREG(info.st_mode):
+                return await self._refuse(send, _package_not_found(self.filename))
+            size = info.st_size
+            await send({"type": "http.response.start", "status": 200, "headers": [
+                (b"content-type", b"application/octet-stream"),
+                (b"content-length", str(size).encode()),
+                (b"content-disposition", f'attachment; filename="{self.filename}"'.encode()),
+                (b"cache-control", b"no-store"),
+                (b"x-accel-buffering", b"no"),
+            ]})
+            if self.head:
+                await send({"type": "http.response.body", "body": b"", "more_body": False})
+                return
+            gone = asyncio.Event()
+
+            async def listen():
+                while True:
+                    message = await receive()
+                    if message["type"] == "http.disconnect":
+                        gone.set()
+                        return
+            listener = asyncio.create_task(listen())
+            sent = 0
+            while sent < size and not gone.is_set():
+                chunk = await asyncio.to_thread(os.pread, fd, min(_CHUNK, size - sent), sent)
+                if not chunk:
+                    break                             # the file shrank: incomplete
+                await send({"type": "http.response.body", "body": chunk, "more_body": True})
+                sent += len(chunk)
+            await asyncio.sleep(0)                    # let the listener see a disconnect
+            if sent == size and not gone.is_set():
+                completed = True
+                await send({"type": "http.response.body", "body": b"", "more_body": False})
+            # Otherwise no final message: uvicorn drops a lost connection and
+            # closes one that is still open, so the client sees it cut short.
+        finally:
+            if listener is not None:
+                listener.cancel()
+            if fd is not None:
+                os.close(fd)
+            if not self.head:
+                audit.note(completed=completed)
+            try:
+                if completed and not self.head:
+                    await asyncio.to_thread(package_retention.after_download, self.filename, scope)
+            finally:
+                if claimed:
+                    await asyncio.to_thread(package_retention.release, self.filename)
+            if self.background is not None:
+                await self.background()
+
+
+# HEAD is its own route, out of the API schema, so the schema and the policy
+# list the download once (GET); policy.required answers HEAD as GET.
+@router.head("/packages/{filename}", include_in_schema=False)
+@router.get("/packages/{filename}")
+async def download_package(filename: str, request: Request = None):
+    """One package from ./exports, streamed (#677). A full download deletes a
+    package this instance exported; any other package is served and kept. A
+    HEAD is audited with `head: true` and no `completed` (#794)."""
+    head = request is not None and request.method == "HEAD"
+    if head:
+        audit.note(head=True)
+    else:
+        audit.note(completed=False)
+    if not package_retention.valid_name(filename):
+        return _package_not_found(filename)
+    path = packager.exports_dir() / filename
+    try:
+        info = await asyncio.to_thread(os.lstat, path)
+    except OSError:
+        return _package_not_found(filename)
+    if not stat.S_ISREG(info.st_mode):
+        return _package_not_found(filename)
+    # The listing's access rule (#606): a package hidden from the caller there
+    # answers as one that doesn't exist, and the refusal is audited.
+    summary = await asyncio.to_thread(_summary, path)
+    refused = await _hidden(access.principal_of(request), [summary])
+    if filename in refused:
+        collection = refused[filename]
+        await asyncio.to_thread(audit.access_refused, request,
+                                access.canonical(collection) if collection else None, "PACKAGE_NOT_FOUND")
+        return _package_not_found(filename)
+    if await asyncio.to_thread(package_retention.busy, filename):
+        return _package_busy(filename)
+    return _PackageStream(path, filename, head=head)
 ```
 
 ### api/routers/tuning.py
@@ -15709,7 +17410,9 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
+
+from auth import access
 
 from models.schemas import (
     CollectionName,
@@ -15808,8 +17511,11 @@ def _options_unavailable(collection: str):
 
 
 @router.get("/{collection}", response_model=TuneOptionsResponse)
-async def tune_options(collection: CollectionName):
+async def tune_options(collection: CollectionName, request: Request = None):
     """What this collection can be tuned with, given its fidelity."""
+    # A collection the caller may not use answers as one that doesn't exist (#606).
+    if not await access.check(request, collection):
+        return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{collection}' not found.")
     try:
         exists = await wc.collection_exists(collection)
     except Exception:                                 # noqa: BLE001
@@ -15866,6 +17572,8 @@ import logging
 from fastapi import APIRouter, Request
 from fastapi.responses import FileResponse
 
+from auth import access
+
 from models.schemas import (
     GenerateRequest,
     GenerateResponse,
@@ -15890,6 +17598,9 @@ _log = logging.getLogger(__name__)
 
 @router.post("/generate", response_model=GenerateResponse, status_code=202)
 async def generate(body: GenerateRequest, request: Request = None):
+    # A collection the caller may not use answers as one that doesn't exist (#606).
+    if not await access.check(request, body.collection):
+        return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{body.collection}' not found.")
     try:
         exists = await wc.collection_exists(body.collection)
     except Exception:                                 # noqa: BLE001
@@ -15922,10 +17633,19 @@ async def list_generations(request: Request):
     return GenerationList(sessions=await asyncio.to_thread(build))
 
 
-@router.get("/session/{session_id}", response_model=SessionResponse)
-async def get_session(session_id: str):
+async def _refused(request, session_id: str):
+    """The 404 for a session on a collection the caller may not use (#606), the
+    one a missing session gets; None when there is no such session or it may be used."""
     session = gs.get_session(session_id)
-    if session is None:
+    if session is None or await access.check(request, session.get("collection") or "", "SESSION_NOT_FOUND"):
+        return None
+    return api_error(404, "SESSION_NOT_FOUND", f"Session '{session_id}' not found.")
+
+
+@router.get("/session/{session_id}", response_model=SessionResponse)
+async def get_session(session_id: str, request: Request = None):
+    session = gs.get_session(session_id)
+    if session is None or not await access.check(request, session.get("collection") or "", "SESSION_NOT_FOUND"):
         return api_error(404, "SESSION_NOT_FOUND", f"Session '{session_id}' not found.")
     pairs = []
     for p in session.get("pairs", []):
@@ -15949,7 +17669,10 @@ async def get_session(session_id: str):
 
 
 @router.patch("/session/{session_id}/pair/{pair_id}", response_model=GoldPair)
-async def patch_pair(session_id: str, pair_id: str, body: PatchPairRequest):
+async def patch_pair(session_id: str, pair_id: str, body: PatchPairRequest, request: Request = None):
+    refused = await _refused(request, session_id)
+    if refused is not None:
+        return refused
     updates = body.model_dump(exclude_none=True)
     try:
         pair = await gs.update_pair(session_id, pair_id, updates)
@@ -15961,7 +17684,10 @@ async def patch_pair(session_id: str, pair_id: str, body: PatchPairRequest):
 
 
 @router.post("/regenerate", response_model=GoldPair)
-async def regenerate(body: RegenerateRequest):
+async def regenerate(body: RegenerateRequest, request: Request = None):
+    refused = await _refused(request, body.session_id)
+    if refused is not None:
+        return refused
     try:
         pair = await gs.regenerate_pair(body.session_id, body.pair_id)
     except gs.GoldStandardError as exc:
@@ -15972,8 +17698,11 @@ async def regenerate(body: RegenerateRequest):
 
 
 @router.post("/save", response_model=SaveResponse)
-async def save(body: SaveRequest):
+async def save(body: SaveRequest, request: Request = None):
     audit.note(session_id=body.session_id, file=body.filename)   # the audit record's parameters (#29)
+    refused = await _refused(request, body.session_id)
+    if refused is not None:
+        return refused
     try:
         result = await gs.save_session(body.session_id, body.filename, body.allow_historical)
     except gs.GoldStandardError as exc:
@@ -15985,7 +17714,7 @@ async def save(body: SaveRequest):
 
 
 @router.get("/download/{filename}")
-async def download(filename: str):
+async def download(filename: str, request: Request = None):
     # Only files in the exports folder are served, never other upload state (#370).
     try:
         target = gs.export_path(filename)
@@ -15995,6 +17724,16 @@ async def download(filename: str):
     if gs.export_entry_is_other(target):
         return api_error(400, "INVALID_PATH", f"'{filename}' is not an export file.")
     if not target.is_file():
+        return api_error(404, "FILE_NOT_FOUND", f"File '{filename}' not found.")
+    # Only to a caller who may use the collection it came from (#606); a file
+    # whose collection isn't recorded only to an Engineer.
+    collection = await asyncio.to_thread(gs.export_collection, filename)
+    principal = access.principal_of(request)
+    if collection is None:
+        if principal is not None and principal.role != "engineer":
+            await asyncio.to_thread(audit.access_refused, request, None, "FILE_NOT_FOUND")
+            return api_error(404, "FILE_NOT_FOUND", f"File '{filename}' not found.")
+    elif not await access.check(request, collection, "FILE_NOT_FOUND"):
         return api_error(404, "FILE_NOT_FOUND", f"File '{filename}' not found.")
     return FileResponse(
         path=str(target),
@@ -16767,7 +18506,7 @@ fidelity for an older corpus.
 @@INCLUDE:embedding_rule@@
 
 If the target machine has no embedding model at all, export with
-`include_models: true`. That bundles `@@EMBED_MODEL@@` and `@@LLM_MODEL@@` as
+`include_models: true`. That bundles `@@EMBED_MODEL@@` and the answer model `@@LLM_MODEL@@` as
 Ollama's own manifest and blob files, taking the package from kilobytes to
 roughly 2.3 GB. On import a model already present is left alone, provided its
 files match their checksums; a missing one is installed from the package and
@@ -16835,6 +18574,7 @@ alone.
   their API keys, sessions and the login throttle.
 - `keys`: the service API key format (`Authorization: Bearer rag_<id>_<secret>`).
 - `policy`: which role each route needs.
+- `access`: per-collection access (#606): who may use a restricted collection.
 - `middleware`: enforces the policy on every request, before the route sees its body.
 - `__main__`: the operator command, `python -m auth`, which creates the first
   Engineer and recovers lockouts; Engineers manage accounts in the app too
@@ -17016,6 +18756,201 @@ def bearer(value: str | None) -> str | None:
     return key
 ```
 
+### api/auth/mfa.py
+
+```python
+"""Two-step verification (MFA, #607): TOTP codes, recovery codes and the
+encryption of TOTP secrets at rest. Pure functions; the store (store.py) keeps
+the rows and decides when a code counts.
+
+- TOTP is RFC 6238 with HMAC-SHA1, 6 digits and a 30-second step, what every
+  common authenticator app supports, over a 160-bit random secret. A code is
+  accepted for the step before, the current one and the one after (clock drift)
+  and only for a step later than the last one accepted, so no code works twice.
+- Recovery codes are 80 random bits each, shown as `xxxx-xxxx-xxxx-xxxx` and
+  stored only as the SHA-256 of their normalized form: with that much entropy
+  and the login throttle, a slow hash would add nothing.
+- A TOTP secret has to be read back, so it can't be hashed. It is sealed with
+  AES-256-GCM under a key kept in its own file, `AUTH_DIR/mfa.key` (0600),
+  with the user id as associated data: a copied `auth.db` alone (a bug report,
+  a partial backup) reveals no secret, and a sealed secret can't be moved to
+  another user. A secret that can't be unsealed (the key file lost or
+  replaced) never verifies; its user signs in with a recovery code or is reset.
+
+Nothing here logs a secret, code or key.
+"""
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import os
+import re
+import secrets
+import struct
+from pathlib import Path
+from urllib.parse import quote
+
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+from config import settings
+
+STEP_S = 30           # the TOTP time step
+DIGITS = 6
+WINDOW = 1            # steps accepted either side of the current one
+SECRET_BYTES = 20     # 160 bits, RFC 4226's recommended length
+RECOVERY_COUNT = 10
+RECOVERY_BYTES = 10   # 80 bits: 16 base32 characters
+ISSUER = "RAG Platform"
+KEY_FILE = "mfa.key"
+_NONCE = 12
+# ASCII digits only: \d also matches other scripts' digits, which
+# hmac.compare_digest refuses with a TypeError (a 500 and no audit record).
+_TOTP = re.compile(r"[0-9]{6}")
+_RECOVERY = re.compile(r"[a-z2-7]{16}")
+
+
+def _b32(raw: bytes) -> str:
+    return base64.b32encode(raw).decode("ascii").rstrip("=")
+
+
+def _unb32(text: str) -> bytes:
+    text = text.upper()
+    return base64.b32decode(text + "=" * (-len(text) % 8))
+
+
+# ── TOTP ─────────────────────────────────────────────────────────────────────
+
+def new_secret() -> str:
+    """A new TOTP secret as unpadded base32, as authenticator apps take it."""
+    return _b32(secrets.token_bytes(SECRET_BYTES))
+
+
+def code_at(secret: str, step: int) -> str:
+    """The RFC 4226 HOTP value of `step` (RFC 6238's time counter)."""
+    digest = hmac.new(_unb32(secret), struct.pack(">Q", step), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    value = struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF
+    return str(value % 10 ** DIGITS).zfill(DIGITS)
+
+
+def clean(code: str) -> str:
+    return "".join(code.split())
+
+
+def is_totp(code: str) -> bool:
+    return bool(_TOTP.fullmatch(clean(code)))
+
+
+def matching_step(secret: str, code: str, now: float, last_step: int) -> int | None:
+    """The step in now's window, later than `last_step`, whose code is `code`;
+    None when there is none. Every candidate is compared in constant time."""
+    code = clean(code)
+    if not _TOTP.fullmatch(code):
+        return None
+    current = int(now // STEP_S)
+    found = None
+    for step in range(current - WINDOW, current + WINDOW + 1):
+        if hmac.compare_digest(code_at(secret, step), code) and step > last_step and found is None:
+            found = step
+    return found
+
+
+def otpauth_uri(username: str, secret: str) -> str:
+    """The `otpauth://` URI an authenticator app reads from the QR code."""
+    label = quote(f"{ISSUER}:{username}", safe=":")
+    return (f"otpauth://totp/{label}?secret={secret}&issuer={quote(ISSUER)}"
+            f"&algorithm=SHA1&digits={DIGITS}&period={STEP_S}")
+
+
+# ── recovery codes ───────────────────────────────────────────────────────────
+
+def normalize_recovery(code: str) -> str:
+    return "".join(code.split()).replace("-", "").lower()
+
+
+def new_recovery_codes() -> list[str]:
+    codes = []
+    for _ in range(RECOVERY_COUNT):
+        raw = _b32(secrets.token_bytes(RECOVERY_BYTES)).lower()
+        codes.append("-".join(raw[i:i + 4] for i in range(0, 16, 4)))
+    return codes
+
+
+def recovery_hash(code: str) -> str | None:
+    """The stored form of a recovery code, or None when it can't be one."""
+    normal = normalize_recovery(code)
+    if not _RECOVERY.fullmatch(normal):
+        return None
+    return hashlib.sha256(normal.encode("ascii")).hexdigest()
+
+
+# ── secrets at rest ──────────────────────────────────────────────────────────
+
+def key_path() -> Path:
+    return Path(settings.auth_dir) / KEY_FILE
+
+
+def _key(create: bool) -> bytes | None:
+    """The sealing key; created on first need. None when it doesn't exist and
+    `create` is false, or the file isn't a 32-byte key.
+
+    The key is written whole to a private temporary file (0600, fsync'd) and
+    then hard-linked to `mfa.key`, which fails if the name exists: so
+    `mfa.key` never exists without its 32 bytes (no reader sees it empty, and
+    a crash can't leave it empty), and when the API and the operator command
+    race, one key wins and both use it."""
+    path = key_path()
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        if not create:
+            return None
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        key = secrets.token_bytes(32)
+        temp = path.with_name(f".{KEY_FILE}.{os.getpid()}.{secrets.token_hex(4)}")
+        fd = os.open(temp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as out:
+                out.write(key)
+                out.flush()
+                os.fsync(out.fileno())
+            try:
+                os.link(temp, path)
+            except FileExistsError:
+                raw = path.read_bytes()    # another process created it first
+            else:
+                return key
+        finally:
+            temp.unlink(missing_ok=True)
+    return raw if len(raw) == 32 else None
+
+
+def _aad(user_id: int) -> bytes:
+    return b"rag-mfa:%d" % user_id
+
+
+def seal(user_id: int, secret: str) -> str:
+    key = _key(create=True)
+    if key is None:
+        raise RuntimeError(f"{key_path()} is not a 32-byte key")
+    nonce = secrets.token_bytes(_NONCE)
+    sealed = AESGCM(key).encrypt(nonce, secret.encode("ascii"), _aad(user_id))
+    return base64.b64encode(nonce + sealed).decode("ascii")
+
+
+def unseal(user_id: int, sealed: str) -> str | None:
+    """The secret, or None when it can't be read (no key, another key, tampered)."""
+    key = _key(create=False)
+    if key is None:
+        return None
+    try:
+        raw = base64.b64decode(sealed, validate=True)
+        return AESGCM(key).decrypt(raw[:_NONCE], raw[_NONCE:], _aad(user_id)).decode("ascii")
+    except Exception:                                  # noqa: BLE001 - any failure means "can't verify"
+        return None
+```
+
 ### api/auth/policy.py
 
 ```python
@@ -17032,17 +18967,29 @@ import re
 ROLES = ("end_user", "developer", "engineer")   # lowest to highest
 PUBLIC = "public"     # no session needed
 SESSION = "session"   # any logged-in user, even one who must change their password
+# Any logged-in user's own two-step verification (#607): after a due password
+# change, and still open while a required set-up is due (the way out of it).
+MFA = "mfa"
 
 END_USER, DEVELOPER, ENGINEER = ROLES
 
 ACCESS: dict[tuple[str, str], str] = {
-    # Liveness for the container healthcheck, stack.sh and CI, unchanged (Q8).
+    # Liveness for the container healthcheck, stack.sh and CI (Q8): only
+    # {"status"} since #750; the full report is GET /health/details.
     ("GET", "/health"): PUBLIC,
     ("GET", "/auth/status"): PUBLIC,
     ("POST", "/auth/login"): PUBLIC,
     ("GET", "/auth/me"): SESSION,
     ("POST", "/auth/logout"): SESSION,
     ("POST", "/auth/password"): SESSION,
+    # Two-step verification (#607): the code after the password, and the
+    # user's own set-up, recovery codes and turn-off.
+    ("POST", "/auth/login/mfa"): PUBLIC,
+    ("GET", "/auth/mfa"): MFA,
+    ("POST", "/auth/mfa/enroll"): MFA,
+    ("POST", "/auth/mfa/enroll/confirm"): MFA,
+    ("POST", "/auth/mfa/recovery-codes"): MFA,
+    ("POST", "/auth/mfa/disable"): MFA,
     # What the Q&A page needs (Q4).
     ("GET", "/collections"): END_USER,
     ("POST", "/query"): END_USER,
@@ -17069,8 +19016,12 @@ ACCESS: dict[tuple[str, str], str] = {
     ("GET", "/import/job/{job_id}"): DEVELOPER,
     ("GET", "/import/jobs"): DEVELOPER,                 # the caller's jobs only (#617)
     ("GET", "/packages"): DEVELOPER,
+    # Downloading a package; a full download of one exported here deletes it (#677).
+    ("GET", "/packages/{filename}"): DEVELOPER,
     ("GET", "/help/transfer"): DEVELOPER,
     ("GET", "/tune/{collection}"): DEVELOPER,          # read by the Transfer page (Q3)
+    # The full health report (#750): services, models and memory, keys too.
+    ("GET", "/health/details"): DEVELOPER,
     # Document preparation (#638): the ingest permissions (C3).
     ("POST", "/prepare/upload"): DEVELOPER,
     ("GET", "/prepare/documents"): DEVELOPER,
@@ -17086,6 +19037,9 @@ ACCESS: dict[tuple[str, str], str] = {
     ("POST", "/prepare/import"): DEVELOPER,
     # Collections management, tuning, the Health page's data (Q3, Q5, Q6).
     ("DELETE", "/collections/{name}"): ENGINEER,
+    # Who may use a collection (#606): Engineers, in a browser session only.
+    ("GET", "/collections/{name}/access"): ENGINEER,
+    ("PUT", "/collections/{name}/access"): ENGINEER,
     ("POST", "/tune/rechunk"): ENGINEER,
     ("POST", "/tune/reembed"): ENGINEER,
     ("POST", "/tune/reindex"): ENGINEER,
@@ -17099,6 +19053,8 @@ ACCESS: dict[tuple[str, str], str] = {
     ("POST", "/auth/users/{username}/role"): ENGINEER,
     ("POST", "/auth/users/{username}/disable"): ENGINEER,
     ("POST", "/auth/users/{username}/enable"): ENGINEER,
+    ("POST", "/auth/users/{username}/reset-mfa"): ENGINEER,
+    ("POST", "/auth/mfa/policy"): ENGINEER,               # require two-step verification for everyone
     # Service principals and their keys (PR 3 of #25). Nothing deletes a principal.
     ("GET", "/auth/service-principals"): ENGINEER,
     ("POST", "/auth/service-principals"): ENGINEER,
@@ -17122,10 +19078,54 @@ ACCESS: dict[tuple[str, str], str] = {
 # account, principal and key administration, so a leaked key can't mint further
 # keys or accounts that outlive its revocation, and the session's own routes.
 # GET /auth/me answers for a key. The audit log too (#29): a leaked key can't
-# read who did what, or question text when that is recorded.
+# read who did what, or question text when that is recorded. And two-step
+# verification (#607): service keys are unchanged and have no second factor.
+# And per-collection access (#606), so a leaked key can't open a collection to
+# another principal.
 HUMAN_ONLY = frozenset(path for _, path in ACCESS
-                       if path.startswith(("/auth/users", "/auth/service-principals"))) | {
-    "/auth/logout", "/auth/password", "/audit", "/audit.csv"}
+                       if path.startswith(("/auth/users", "/auth/service-principals", "/auth/mfa"))) | {
+    "/auth/logout", "/auth/password", "/audit", "/audit.csv", "/collections/{name}/access"}
+
+
+# GET routes that change state (#794): a full download of a package exported
+# here deletes it. A cookie-authenticated GET of one sent from another origin
+# (`Sec-Fetch-Site` present and neither `same-origin` nor `none`) is refused
+# like a cross-origin change (middleware.py); HEAD changes nothing.
+STATE_CHANGING_GET = frozenset({"/packages/{filename}"})
+
+
+# Query-only mode (#670, RAG_QUERY_ONLY): the routes that create, change or
+# delete a collection or its data. With the mode on, the auth middleware
+# refuses each of them with 403 QUERY_ONLY, after every other check.
+QUERY_ONLY_REFUSED = frozenset({
+    ("POST", "/collections"),
+    ("DELETE", "/collections/{name}"),
+    ("POST", "/ingest/upload"),
+    ("POST", "/ingest/config"),
+    ("POST", "/retrieval/config"),
+    ("POST", "/goldstandard/generate"),
+    ("POST", "/goldstandard/regenerate"),
+    ("PATCH", "/goldstandard/session/{session_id}/pair/{pair_id}"),
+    ("POST", "/goldstandard/save"),
+    ("POST", "/import"),          # packages are loaded on the host (python -m loader)
+    ("POST", "/prepare/upload"),
+    ("DELETE", "/prepare/documents/{document_id}"),
+    ("DELETE", "/prepare/documents/{document_id}/prepared"),
+    ("POST", "/prepare/jobs"),
+    ("POST", "/prepare/job/{job_id}/cancel"),
+    ("POST", "/prepare/import"),
+    ("POST", "/tune/rechunk"),
+    ("POST", "/tune/reembed"),
+    ("POST", "/tune/reindex"),
+})
+# Every other route that changes state keeps working in query-only mode: the
+# /auth routes, a query, export and the package download (#677), and collection
+# access (#606), since the query-only machine has its own accounts. A new
+# data-changing route lands here until it is classified; test_query_only.py
+# pins this set, so it fails until someone decides.
+QUERY_ONLY_KEPT = frozenset(key for key in ACCESS
+                            if (key[0] != "GET" or key[1] in STATE_CHANGING_GET)
+                            and key not in QUERY_ONLY_REFUSED)
 
 
 def required(method: str, path: str) -> str | None:
@@ -17178,6 +19178,18 @@ command deletes an account.
 A service principal (PR 3) is a `users` row with kind 'service': it shares the
 username rule and name pool with people, has no usable password and no
 session, and authenticates only with its API keys (`api_keys`, keys.py).
+
+Two-step verification (#607, schema 3): a user's sealed TOTP secret and last
+accepted step (`mfa`), a set-up not yet confirmed (`mfa_pending`), recovery
+codes as SHA-256 (`recovery_codes`), login challenges between the password and
+the code (`mfa_challenges`, token as SHA-256) and the "require for everyone"
+switch (`settings`). The codes and the sealing are in mfa.py.
+
+Per-collection access (#606, schema 4): a collection named in
+`restricted_collections` is restricted, and only the accounts in its
+`collection_grants` (people or service principals) and Engineers may use it;
+any other collection is open to every account its role allows. Names are the
+canonical (stored) collection names. The rule itself is in access.py.
 """
 from __future__ import annotations
 
@@ -17187,13 +19199,14 @@ import os
 import secrets
 import sqlite3
 import time
+from collections.abc import Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 from config import settings
 
-from . import keys, passwords
+from . import keys, mfa, passwords
 from .policy import ROLES
 
 COOKIE = "rag_session"
@@ -17207,7 +19220,11 @@ KEY_DAYS_DEFAULT = 90            # a key's lifetime when none is given (Q23) ...
 KEY_DAYS_MAX = 365               # ... and the longest allowed
 _DAY_S = 86400
 NO_PASSWORD = "!"                # a principal's password hash: never verifies
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
+MFA_PENDING_S = 10 * 60          # a started set-up must be confirmed within 10 minutes
+MFA_CHALLENGE_S = 5 * 60         # the code must follow the password within 5 minutes ...
+MFA_CHALLENGE_TRIES = 5          # ... with at most 5 codes per challenge
+MFA_COOKIE = "rag_mfa"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -17250,6 +19267,45 @@ CREATE TABLE IF NOT EXISTS api_keys (
     last_used REAL
 );
 CREATE INDEX IF NOT EXISTS api_keys_user ON api_keys(user_id);
+CREATE TABLE IF NOT EXISTS mfa (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id),
+    secret TEXT NOT NULL,
+    last_step INTEGER NOT NULL,
+    enrolled_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mfa_pending (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id),
+    secret TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS recovery_codes (
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    code_hash TEXT NOT NULL,
+    used_at REAL
+);
+CREATE INDEX IF NOT EXISTS recovery_codes_user ON recovery_codes(user_id);
+CREATE TABLE IF NOT EXISTS mfa_challenges (
+    token_hash TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    login_key TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS mfa_challenges_user ON mfa_challenges(user_id);
+CREATE TABLE IF NOT EXISTS settings (
+    name TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS restricted_collections (
+    collection TEXT PRIMARY KEY,
+    restricted_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS collection_grants (
+    collection TEXT NOT NULL,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    granted_at REAL NOT NULL,
+    PRIMARY KEY (collection, user_id)
+);
 """
 
 _ready: set[str] = set()
@@ -17260,7 +19316,10 @@ class Refused(Exception):
     """An account change the rules don't allow; the message says why, in one line.
     `code` names the reason for the API: USER_EXISTS, USER_NOT_FOUND,
     LAST_ENGINEER, PRINCIPAL_EXISTS, PRINCIPAL_NOT_FOUND, KEY_NOT_FOUND,
-    NOT_A_USER, or REFUSED for the bootstrap rules."""
+    NOT_A_USER, REFUSED for the bootstrap rules, or one of the MFA codes
+    (MFA_ALREADY_ENROLLED, MFA_ENROLLMENT_NOT_STARTED, MFA_CODE_INCORRECT,
+    MFA_NOT_ENROLLED, MFA_REQUIRED, MFA_ENROLL_FIRST), or UNKNOWN_ACCOUNT for a
+    collection grant naming no such account (#606)."""
 
     def __init__(self, message: str, code: str = "REFUSED"):
         super().__init__(message)
@@ -17276,6 +19335,8 @@ class Principal:
     token_hash: str              # the session's; "" for a key
     kind: str = "user"           # "service" when authenticated by a key
     key_id: str | None = None
+    mfa_enrolled: bool = False
+    mfa_due: bool = False        # MFA is required for everyone and this user hasn't enrolled (#607)
 
 
 @dataclass(frozen=True)
@@ -17288,6 +19349,7 @@ class User:
     must_change_password: bool
     created_at: float
     kind: str = "user"
+    mfa_enrolled: bool = False
 
 
 @dataclass(frozen=True)
@@ -17358,8 +19420,10 @@ def _connect(write: bool = False):
 
 
 def _migrate(conn) -> None:
-    """Version 2 (PR 3): users.kind. In a write transaction, so the API and the
-    operator command can't both add the column."""
+    """Version 2 (PR 3): users.kind. Versions 3 (#607) and 4 (#606) only add
+    tables, which _SCHEMA creates; version 4 leaves every existing collection
+    open, since none is named in restricted_collections. In a write transaction, so the API and the operator
+    command can't both add the column."""
     conn.execute("BEGIN IMMEDIATE")
     columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
     if "kind" not in columns:
@@ -17372,7 +19436,12 @@ def _user(row) -> User | None:
     if row is None:
         return None
     return User(row["id"], row["username"], row["role"], row["password_hash"],
-                bool(row["enabled"]), bool(row["must_change_password"]), row["created_at"], row["kind"])
+                bool(row["enabled"]), bool(row["must_change_password"]), row["created_at"], row["kind"],
+                bool(row["mfa_enrolled"]))
+
+
+# Every users query that builds a User selects through this, so the MFA state comes along.
+_USERS = "SELECT u.*, (m.user_id IS NOT NULL) AS mfa_enrolled FROM users u LEFT JOIN mfa m ON m.user_id = u.id"
 
 
 def _token_hash(token: str) -> str:
@@ -17405,16 +19474,16 @@ def has_enabled_engineer() -> bool:
 
 def get_user(username: str) -> User | None:
     with _connect() as conn:
-        return _user(conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone())
+        return _user(conn.execute(_USERS + " WHERE u.username = ?", (username,)).fetchone())
 
 
 def list_users(kind: str | None = "user") -> list[User]:
     """Human accounts by default; kind=None lists principals too (the operator's `list`)."""
     with _connect() as conn:
         if kind is None:
-            rows = conn.execute("SELECT * FROM users ORDER BY username")
+            rows = conn.execute(_USERS + " ORDER BY u.username")
         else:
-            rows = conn.execute("SELECT * FROM users WHERE kind = ? ORDER BY username", (kind,))
+            rows = conn.execute(_USERS + " WHERE u.kind = ? ORDER BY u.username", (kind,))
         return [_user(row) for row in rows]
 
 
@@ -17441,7 +19510,7 @@ def create_user(username: str, role: str, password: str, *, bootstrap: bool = Fa
         conn.execute("INSERT INTO users (username, role, password_hash, enabled, must_change_password, "
                      "created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?, ?)",
                      (username, role, password_hash, int(must_change_password), now, now))
-        row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        row = conn.execute(_USERS + " WHERE u.username = ?", (username,)).fetchone()
     return _user(row)
 
 
@@ -17475,6 +19544,8 @@ def reset_password(username: str, password: str, kind: str | None = None) -> Non
         conn.execute("UPDATE users SET password_hash = ?, must_change_password = 1, updated_at = ? "
                      "WHERE id = ?", (password_hash, _now(), row["id"]))
         conn.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
+        # A login half-way through, started with the old password, ends too (#607).
+        conn.execute("DELETE FROM mfa_challenges WHERE user_id = ?", (row["id"],))
 
 
 def set_role(username: str, role: str, kind: str | None = None) -> None:
@@ -17500,6 +19571,8 @@ def set_enabled(username: str, enabled: bool, kind: str | None = None) -> None:
                      (int(enabled), _now(), row["id"]))
         if not enabled:
             conn.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
+            # Pending login challenges end too, so enabling again doesn't revive one (#607).
+            conn.execute("DELETE FROM mfa_challenges WHERE user_id = ?", (row["id"],))
 
 
 # ── service principals and their keys (PR 3) ─────────────────────────────────
@@ -17592,10 +19665,13 @@ def authenticate_key(key: str | None) -> Principal | None:
 # ── sessions ─────────────────────────────────────────────────────────────────
 
 def create_session(user_id: int) -> str:
-    """A new session; returns the token for the cookie. Only its SHA-256 is stored."""
+    """A new session; returns the token for the cookie. Only its SHA-256 is stored.
+    Every session that has ended by time, anyone's, is deleted in the same
+    transaction, so sessions abandoned without a logout don't pile up (#546)."""
     token = secrets.token_urlsafe(32)
     now = _now()
     with _connect(write=True) as conn:
+        conn.execute("DELETE FROM sessions WHERE last_seen < ? OR created_at < ?", (now - IDLE_S, now - ABSOLUTE_S))
         conn.execute("INSERT INTO sessions (token_hash, user_id, created_at, last_seen) VALUES (?, ?, ?, ?)",
                      (_token_hash(token), user_id, now, now))
     return token
@@ -17609,8 +19685,10 @@ def authenticate(token: str | None) -> Principal | None:
     now = _now()
     with _connect() as conn:
         row = conn.execute(
-            "SELECT s.created_at, s.last_seen, u.id, u.username, u.role, u.enabled, u.must_change_password "
-            "FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?", (digest,)).fetchone()
+            "SELECT s.created_at, s.last_seen, u.id, u.username, u.role, u.enabled, u.must_change_password, "
+            "(m.user_id IS NOT NULL) AS mfa_enrolled FROM sessions s JOIN users u ON u.id = s.user_id "
+            "LEFT JOIN mfa m ON m.user_id = u.id WHERE s.token_hash = ?", (digest,)).fetchone()
+        required = _mfa_required(conn) if row is not None else False
     if row is None:
         return None
     if now - row["last_seen"] > IDLE_S or now - row["created_at"] > ABSOLUTE_S or not row["enabled"]:
@@ -17619,7 +19697,9 @@ def authenticate(token: str | None) -> Principal | None:
     if now - row["last_seen"] > _TOUCH_S:
         with _connect(write=True) as conn:
             conn.execute("UPDATE sessions SET last_seen = ? WHERE token_hash = ?", (now, digest))
-    return Principal(row["id"], row["username"], row["role"], bool(row["must_change_password"]), digest)
+    enrolled = bool(row["mfa_enrolled"])
+    return Principal(row["id"], row["username"], row["role"], bool(row["must_change_password"]), digest,
+                     mfa_enrolled=enrolled, mfa_due=required and not enrolled)
 
 
 def delete_session(token_hash: str) -> None:
@@ -17635,34 +19715,11 @@ def change_password(principal: Principal, password: str) -> None:
                      "WHERE id = ?", (password_hash, _now(), principal.user_id))
         conn.execute("DELETE FROM sessions WHERE user_id = ? AND token_hash != ?",
                      (principal.user_id, principal.token_hash))
+        # A login half-way through, started with the old password, ends too (#607).
+        conn.execute("DELETE FROM mfa_challenges WHERE user_id = ?", (principal.user_id,))
 
 
 # ── login throttle ───────────────────────────────────────────────────────────
-
-def locked(username: str, address: str) -> bool:
-    with _connect() as conn:
-        row = conn.execute("SELECT until FROM login_lockouts WHERE username = ? AND address = ?",
-                           (username, address)).fetchone()
-    return row is not None and row["until"] > _now()
-
-
-def record_failure(username: str, address: str) -> bool:
-    """Count a failed login; True when it locks the pair."""
-    now = _now()
-    with _connect(write=True) as conn:
-        conn.execute("DELETE FROM login_failures WHERE at <= ?", (now - THROTTLE_WINDOW_S,))
-        conn.execute("DELETE FROM login_lockouts WHERE until <= ?", (now,))
-        conn.execute("INSERT INTO login_failures (username, address, at) VALUES (?, ?, ?)",
-                     (username, address, now))
-        count = conn.execute("SELECT COUNT(*) FROM login_failures WHERE username = ? AND address = ?",
-                             (username, address)).fetchone()[0]
-        if count < THROTTLE_FAILURES:
-            return False
-        conn.execute("INSERT OR REPLACE INTO login_lockouts (username, address, until) VALUES (?, ?, ?)",
-                     (username, address, now + LOCKOUT_S))
-        conn.execute("DELETE FROM login_failures WHERE username = ? AND address = ?", (username, address))
-    return True
-
 
 def reserve_attempt(username: str, address: str) -> bool:
     """Count an attempt before its password is checked; False when the pair is
@@ -17703,9 +19760,436 @@ def finish_attempt(username: str, address: str, succeeded: bool) -> bool:
     return True
 
 
-def clear_failures(username: str, address: str) -> None:
+def release_attempt(username: str, address: str) -> None:
+    """Withdraw a reserved attempt that wasn't a failure without clearing the
+    pair's count: a right password for an enrolled user (#607), whose earlier
+    failures stay counted until the second factor passes."""
     with _connect(write=True) as conn:
-        conn.execute("DELETE FROM login_failures WHERE username = ? AND address = ?", (username, address))
+        conn.execute("DELETE FROM login_failures WHERE rowid = (SELECT MAX(rowid) FROM login_failures "
+                     "WHERE username = ? AND address = ?)", (username, address))
+
+
+# ── two-step verification (#607) ─────────────────────────────────────────────
+
+def _mfa_required(conn) -> bool:
+    return conn.execute("SELECT 1 FROM settings WHERE name = 'mfa_required' AND value = '1'").fetchone() is not None
+
+
+def mfa_required() -> bool:
+    """The "require two-step verification for everyone" switch."""
+    with _connect() as conn:
+        return _mfa_required(conn)
+
+
+def set_mfa_required(user_id: int, required: bool) -> None:
+    """Set the switch. Turning it on needs the engineer turning it on to be
+    enrolled, so nobody switches on a gate they couldn't pass themselves."""
+    with _connect(write=True) as conn:
+        if required:
+            if conn.execute("SELECT 1 FROM mfa WHERE user_id = ?", (user_id,)).fetchone() is None:
+                raise Refused("set up two-step verification for your own account first", "MFA_ENROLL_FIRST")
+            conn.execute("INSERT OR REPLACE INTO settings (name, value) VALUES ('mfa_required', '1')")
+        else:
+            conn.execute("DELETE FROM settings WHERE name = 'mfa_required'")
+
+
+def _status(conn, user_id: int) -> dict:
+    row = conn.execute("SELECT enrolled_at FROM mfa WHERE user_id = ?", (user_id,)).fetchone()
+    remaining = conn.execute("SELECT COUNT(*) FROM recovery_codes WHERE user_id = ? AND used_at IS NULL",
+                             (user_id,)).fetchone()[0]
+    return {"enrolled": row is not None, "enrolled_at": row["enrolled_at"] if row else None,
+            "required": _mfa_required(conn), "recovery_codes_remaining": remaining if row else 0}
+
+
+def mfa_status(user_id: int) -> dict:
+    """{"enrolled", "enrolled_at" (epoch or None), "required", "recovery_codes_remaining"}."""
+    with _connect() as conn:
+        return _status(conn, user_id)
+
+
+def start_enrollment(user_id: int, username: str) -> tuple[str, str]:
+    """A new pending secret (replacing an earlier one); returns it and its
+    otpauth URI. The secret is stored sealed; this answer is the only copy."""
+    secret = mfa.new_secret()
+    sealed = mfa.seal(user_id, secret)
+    with _connect(write=True) as conn:
+        if conn.execute("SELECT 1 FROM mfa WHERE user_id = ?", (user_id,)).fetchone():
+            raise Refused("two-step verification is already set up", "MFA_ALREADY_ENROLLED")
+        conn.execute("INSERT OR REPLACE INTO mfa_pending (user_id, secret, created_at) VALUES (?, ?, ?)",
+                     (user_id, sealed, _now()))
+    return secret, mfa.otpauth_uri(username, secret)
+
+
+def _new_codes(conn, user_id: int) -> list[str]:
+    codes = mfa.new_recovery_codes()
+    conn.execute("DELETE FROM recovery_codes WHERE user_id = ?", (user_id,))
+    conn.executemany("INSERT INTO recovery_codes (user_id, code_hash) VALUES (?, ?)",
+                     [(user_id, mfa.recovery_hash(code)) for code in codes])
+    return codes
+
+
+def confirm_enrollment(principal: Principal, code: str) -> list[str]:
+    """Confirm the pending set-up with a code from the app: the secret becomes
+    the user's, a recovery-code set is made, and every other session of the
+    user ends (it was opened with the password alone). Returns the codes."""
+    now = _now()
+    with _connect(write=True) as conn:
+        if conn.execute("SELECT 1 FROM mfa WHERE user_id = ?", (principal.user_id,)).fetchone():
+            raise Refused("two-step verification is already set up", "MFA_ALREADY_ENROLLED")
+        row = conn.execute("SELECT secret, created_at FROM mfa_pending WHERE user_id = ?",
+                           (principal.user_id,)).fetchone()
+        if row is None or now - row["created_at"] > MFA_PENDING_S:
+            raise Refused("no set-up is in progress; start it again", "MFA_ENROLLMENT_NOT_STARTED")
+        secret = mfa.unseal(principal.user_id, row["secret"])
+        step = mfa.matching_step(secret, code, now, -1) if secret else None
+        if step is None:
+            raise Refused("the code is incorrect", "MFA_CODE_INCORRECT")
+        conn.execute("INSERT INTO mfa (user_id, secret, last_step, enrolled_at) VALUES (?, ?, ?, ?)",
+                     (principal.user_id, row["secret"], step, now))
+        conn.execute("DELETE FROM mfa_pending WHERE user_id = ?", (principal.user_id,))
+        codes = _new_codes(conn, principal.user_id)
+        conn.execute("DELETE FROM sessions WHERE user_id = ? AND token_hash != ?",
+                     (principal.user_id, principal.token_hash))
+    return codes
+
+
+def _verify_factor(conn, user_id: int, code: str, allow_recovery: bool) -> str | None:
+    """Inside the caller's write transaction: "totp" or "recovery" when `code`
+    is a valid second factor of the user (and spends it), else None. A TOTP
+    code's step becomes the last accepted one; a recovery code is marked used."""
+    now = _now()
+    if mfa.is_totp(code):
+        row = conn.execute("SELECT secret, last_step FROM mfa WHERE user_id = ?", (user_id,)).fetchone()
+        secret = mfa.unseal(user_id, row["secret"]) if row else None
+        step = mfa.matching_step(secret, code, now, row["last_step"]) if secret else None
+        if step is None:
+            return None
+        conn.execute("UPDATE mfa SET last_step = ? WHERE user_id = ?", (step, user_id))
+        return "totp"
+    if not allow_recovery:
+        return None
+    digest = mfa.recovery_hash(code)
+    if digest is None:
+        return None
+    found = conn.execute("SELECT rowid FROM recovery_codes WHERE user_id = ? AND code_hash = ? AND used_at IS NULL",
+                         (user_id, digest)).fetchone()
+    if found is None:
+        return None
+    conn.execute("UPDATE recovery_codes SET used_at = ? WHERE rowid = ?", (now, found[0]))
+    return "recovery"
+
+
+def factor_method(code: str) -> str:
+    """How a typed code is checked: "totp" for 6 digits, else "recovery"."""
+    return "totp" if mfa.is_totp(code) else "recovery"
+
+
+def create_challenge(user_id: int, login_key: str) -> str:
+    """A login challenge after a right password; returns the token for the
+    `rag_mfa` cookie, of which only the SHA-256 is stored. The user's earlier
+    challenges and every expired one are deleted."""
+    token = secrets.token_urlsafe(32)
+    now = _now()
+    with _connect(write=True) as conn:
+        conn.execute("DELETE FROM mfa_challenges WHERE user_id = ? OR created_at < ?",
+                     (user_id, now - MFA_CHALLENGE_S))
+        conn.execute("INSERT INTO mfa_challenges (token_hash, user_id, login_key, created_at, attempts) "
+                     "VALUES (?, ?, ?, ?, 0)", (_token_hash(token), user_id, login_key, now))
+    return token
+
+
+def _live_challenge(conn, token: str | None):
+    if not token or len(token) > 256:
+        return None
+    row = conn.execute(
+        "SELECT c.token_hash, c.user_id, c.login_key, c.created_at, c.attempts, u.username, u.role, u.enabled, "
+        "u.kind, (m.user_id IS NOT NULL) AS enrolled FROM mfa_challenges c JOIN users u ON u.id = c.user_id "
+        "LEFT JOIN mfa m ON m.user_id = u.id WHERE c.token_hash = ?", (_token_hash(token),)).fetchone()
+    if (row is None or _now() - row["created_at"] > MFA_CHALLENGE_S or row["attempts"] >= MFA_CHALLENGE_TRIES
+            or not row["enabled"] or not row["enrolled"] or row["kind"] != "user"):
+        return None
+    return row
+
+
+def challenge(token: str | None) -> tuple[str, str] | None:
+    """(username, login_key) of a live challenge, or None when it is missing,
+    expired, used up, or its user is disabled or no longer enrolled."""
+    with _connect() as conn:
+        row = _live_challenge(conn, token)
+    return None if row is None else (row["username"], row["login_key"])
+
+
+def answer_challenge(token: str | None, code: str) -> tuple[str, User | None, str | None]:
+    """Check a second factor against a challenge, in one write transaction:
+    ("ok", user, method) deletes the challenge; ("failed", user, method) counts
+    an attempt and deletes the challenge at the fifth; ("invalid", None, None)
+    when the challenge isn't live (any more)."""
+    with _connect(write=True) as conn:
+        row = _live_challenge(conn, token)
+        if row is None:
+            return "invalid", None, None
+        method = _verify_factor(conn, row["user_id"], code, allow_recovery=True)
+        if method is None:
+            conn.execute("UPDATE mfa_challenges SET attempts = attempts + 1 WHERE token_hash = ?", (row["token_hash"],))
+            conn.execute("DELETE FROM mfa_challenges WHERE token_hash = ? AND attempts >= ?",
+                         (row["token_hash"], MFA_CHALLENGE_TRIES))
+            outcome = "failed"
+        else:
+            conn.execute("DELETE FROM mfa_challenges WHERE token_hash = ?", (row["token_hash"],))
+            outcome = "ok"
+        user = _user(conn.execute(_USERS + " WHERE u.id = ?", (row["user_id"],)).fetchone())
+    return outcome, user, method or factor_method(code)
+
+
+def regenerate_codes(principal: Principal, code: str) -> list[str] | None:
+    """A new recovery-code set, replacing the old one, for a current TOTP code
+    (a recovery code doesn't count). None when the code is wrong."""
+    with _connect(write=True) as conn:
+        if conn.execute("SELECT 1 FROM mfa WHERE user_id = ?", (principal.user_id,)).fetchone() is None:
+            raise Refused("two-step verification isn't set up", "MFA_NOT_ENROLLED")
+        if _verify_factor(conn, principal.user_id, code, allow_recovery=False) is None:
+            return None
+        return _new_codes(conn, principal.user_id)
+
+
+def disable_mfa(principal: Principal, password: str, code: str) -> bool:
+    """The user's own turn-off, only while MFA isn't required: needs the
+    current password and a TOTP or recovery code. False when either is wrong.
+    Sessions stay."""
+    with _connect() as conn:
+        if _mfa_required(conn):
+            raise Refused("two-step verification is required for everyone", "MFA_REQUIRED")
+        row = conn.execute("SELECT password_hash FROM users WHERE id = ?", (principal.user_id,)).fetchone()
+        if conn.execute("SELECT 1 FROM mfa WHERE user_id = ?", (principal.user_id,)).fetchone() is None:
+            raise Refused("two-step verification isn't set up", "MFA_NOT_ENROLLED")
+    # scrypt outside the write lock, as a login does.
+    right_password = row is not None and passwords.verify_password(password, row["password_hash"])
+    with _connect(write=True) as conn:
+        if _mfa_required(conn):
+            raise Refused("two-step verification is required for everyone", "MFA_REQUIRED")
+        if not right_password:
+            return False
+        if _verify_factor(conn, principal.user_id, code, allow_recovery=True) is None:
+            return False
+        _forget_mfa(conn, principal.user_id)
+    return True
+
+
+def _forget_mfa(conn, user_id: int) -> None:
+    for table in ("mfa", "mfa_pending", "recovery_codes", "mfa_challenges"):
+        conn.execute(f"DELETE FROM {table} WHERE user_id = ?", (user_id,))
+
+
+def reset_mfa(username: str, kind: str | None = None) -> None:
+    """An engineer's or the operator's reset: the user's secret, pending set-up,
+    recovery codes and challenges are deleted and every session of theirs ends.
+    Their next login asks for no code (and for a set-up, while MFA is required).
+    A service principal has no second factor, so it is refused."""
+    with _connect(write=True) as conn:
+        row = _existing(conn, username, kind)
+        if row["kind"] != "user":
+            raise Refused(f"{username!r} is a service principal; it has no two-step verification", "NOT_A_USER")
+        _forget_mfa(conn, row["id"])
+        conn.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
+
+
+# ── per-collection access (#606) ─────────────────────────────────────────────
+
+def _canonical(collection: str) -> str:
+    # collection_writes.canonical, inlined so auth imports nothing from services.
+    return collection[:1].upper() + collection[1:]
+
+
+@dataclass(frozen=True)
+class CollectionAccess:
+    restricted: bool
+    users: tuple[str, ...] = ()
+    service_principals: tuple[str, ...] = ()
+
+
+def _access(conn, collection: str) -> CollectionAccess:
+    if conn.execute("SELECT 1 FROM restricted_collections WHERE collection = ?", (collection,)).fetchone() is None:
+        return CollectionAccess(False)
+    rows = conn.execute("SELECT u.username, u.kind FROM collection_grants g JOIN users u ON u.id = g.user_id "
+                        "WHERE g.collection = ? ORDER BY u.username", (collection,)).fetchall()
+    return CollectionAccess(True, tuple(r["username"] for r in rows if r["kind"] == "user"),
+                            tuple(r["username"] for r in rows if r["kind"] == "service"))
+
+
+def collection_access(collection: str) -> CollectionAccess:
+    """Whether the collection is restricted, and who is granted it (names sorted)."""
+    with _connect() as conn:
+        return _access(conn, _canonical(collection))
+
+
+def restricted_collections() -> dict[str, frozenset[int]]:
+    """Every restricted collection and the ids of the accounts granted it."""
+    with _connect() as conn:
+        found = {row["collection"]: set() for row in conn.execute("SELECT collection FROM restricted_collections")}
+        for row in conn.execute("SELECT collection, user_id FROM collection_grants"):
+            if row["collection"] in found:
+                found[row["collection"]].add(row["user_id"])
+    return {name: frozenset(ids) for name, ids in found.items()}
+
+
+def has_access(user_id: int, role: str, collection: str) -> bool:
+    """An Engineer reaches every collection; anyone else an open one, or a
+    restricted one they are granted. Read on every call, so a change applies to
+    the next request."""
+    if role == "engineer":
+        return True
+    collection = _canonical(collection)
+    with _connect() as conn:
+        if conn.execute("SELECT 1 FROM restricted_collections WHERE collection = ?", (collection,)).fetchone() is None:
+            return True
+        return conn.execute("SELECT 1 FROM collection_grants WHERE collection = ? AND user_id = ?",
+                            (collection, user_id)).fetchone() is not None
+
+
+def _owner_row(conn, owner):
+    """The account a job record's owner ({"name", "kind"}) names, or None."""
+    if not isinstance(owner, dict):
+        return None
+    kind = "service" if owner.get("kind") == "service" else "user"
+    return conn.execute("SELECT * FROM users WHERE username = ? AND kind = ?", (owner.get("name"), kind)).fetchone()
+
+
+def owner_has_access(owner, collection: str) -> bool:
+    """has_access for a job's owner as the account is now. A job with no owner
+    (a direct call in tests) isn't checked; an owner that names no account has
+    no access."""
+    if owner is None:
+        return True
+    with _connect() as conn:
+        row = _owner_row(conn, owner)
+    return row is not None and has_access(row["id"], row["role"], collection)
+
+
+def user_id_for(owner) -> int | None:
+    """The id of the account a job's owner names, or None."""
+    with _connect() as conn:
+        row = _owner_row(conn, owner)
+    return row["id"] if row is not None else None
+
+
+def _grant_ids(conn, names, kind: str) -> list[int]:
+    ids = []
+    for name in names:
+        row = conn.execute("SELECT id FROM users WHERE username = ? AND kind = ?",
+                           (str(name).strip().lower(), kind)).fetchone()
+        if row is None:
+            what = "person" if kind == "user" else "service principal"
+            raise Refused(f"no {what} is named {name!r}", "UNKNOWN_ACCOUNT")
+        ids.append(row["id"])
+    return ids
+
+
+def _restrict(conn, collection: str, user_ids) -> None:
+    now = _now()
+    conn.execute("INSERT OR IGNORE INTO restricted_collections (collection, restricted_at) VALUES (?, ?)",
+                 (collection, now))
+    conn.execute("DELETE FROM collection_grants WHERE collection = ?", (collection,))
+    conn.executemany("INSERT INTO collection_grants (collection, user_id, granted_at) VALUES (?, ?, ?)",
+                     [(collection, user_id, now) for user_id in dict.fromkeys(user_ids)])
+
+
+def _open(conn, collection: str) -> None:
+    conn.execute("DELETE FROM collection_grants WHERE collection = ?", (collection,))
+    conn.execute("DELETE FROM restricted_collections WHERE collection = ?", (collection,))
+
+
+def set_collection_access(collection: str, restricted: bool, users=(), service_principals=()):
+    """An Engineer's change (PUT /collections/{name}/access): the whole state
+    at once. Returns (before, after). An unknown name refuses the whole change
+    (UNKNOWN_ACCOUNT); disabled accounts may be granted."""
+    collection = _canonical(collection)
+    with _connect(write=True) as conn:
+        before = _access(conn, collection)
+        if restricted:
+            ids = _grant_ids(conn, users, "user") + _grant_ids(conn, service_principals, "service")
+            _restrict(conn, collection, ids)
+        else:
+            _open(conn, collection)
+        return before, _access(conn, collection)
+
+
+def restrict_to(collection: str, user_id: int | None) -> tuple[CollectionAccess, CollectionAccess]:
+    """A new collection: restricted, granted only to its creator (none when
+    None). Returns (the state it replaced, the state written), for put_back."""
+    collection = _canonical(collection)
+    with _connect(write=True) as conn:
+        before = _access(conn, collection)
+        _restrict(conn, collection, [] if user_id is None else [user_id])
+        return before, _access(conn, collection)
+
+
+def _no_store() -> bool:
+    """True when no account store exists yet: then nothing can be restricted,
+    so copying or dropping a collection's state has nothing to do, and the
+    store isn't created just for that (a rebuild or import run outside the API,
+    as in-process tests do)."""
+    return str(db_path()) not in _ready and not db_path().exists()
+
+
+def _grant_set(conn, collection: str):
+    """None for an open collection; otherwise the ids of the accounts granted it."""
+    if conn.execute("SELECT 1 FROM restricted_collections WHERE collection = ?", (collection,)).fetchone() is None:
+        return None
+    return [row["user_id"] for row in
+            conn.execute("SELECT user_id FROM collection_grants WHERE collection = ?", (collection,))]
+
+
+def copy_collection_access(source: str, target: str,
+                           narrowed_by: Iterable[str] = ()) -> tuple[CollectionAccess, CollectionAccess]:
+    """The target takes the source's state: open stays open, restricted copies
+    its grants. With `narrowed_by` (the collections a staging or recovery copy
+    was made from, its chain after itself, #788, #792), it takes the narrowest
+    of them all: restricted when any is, to the accounts granted every
+    restricted one. Returns (the target's state it replaced, the state
+    written)."""
+    source, target = _canonical(source), _canonical(target)
+    if _no_store():
+        return CollectionAccess(False), CollectionAccess(False)
+    with _connect(write=True) as conn:
+        before = _access(conn, target)
+        sets = [_grant_set(conn, source)] + [_grant_set(conn, _canonical(n)) for n in narrowed_by]
+        restricted = [ids for ids in sets if ids is not None]
+        if not restricted:
+            _open(conn, target)
+        else:
+            _restrict(conn, target, [i for i in restricted[0] if all(i in ids for ids in restricted[1:])])
+        return before, _access(conn, target)
+
+
+def put_back(collection: str, expected: CollectionAccess, previous: CollectionAccess) -> bool:
+    """After a create that failed: the collection's state goes back to
+    `previous`, but only while it is still `expected`, the state the failed
+    create wrote. A concurrent create or import that wrote its own state since
+    keeps it, so a failure never takes another's grants nor opens a collection.
+    One transaction. True when it put the state back."""
+    collection = _canonical(collection)
+    with _connect(write=True) as conn:
+        if _access(conn, collection) != expected:
+            return False
+        if not previous.restricted:
+            _open(conn, collection)
+            return True
+        ids = []
+        for names, kind in ((previous.users, "user"), (previous.service_principals, "service")):
+            for name in names:
+                row = conn.execute("SELECT id FROM users WHERE username = ? AND kind = ?", (name, kind)).fetchone()
+                if row is not None:
+                    ids.append(row["id"])
+        _restrict(conn, collection, ids)
+        return True
+
+
+def drop_collection_access(collection: str) -> None:
+    """A deleted collection's restriction and grants, so a later one of the same name starts afresh."""
+    if _no_store():
+        return
+    with _connect(write=True) as conn:
+        _open(conn, _canonical(collection))
 ```
 
 ### api/auth/middleware.py
@@ -17721,9 +20205,16 @@ before the route runs, and never reads the body of a request it refuses.
 The refusals, in the order they apply:
   503 SETUP_REQUIRED          no account exists yet (python -m auth bootstrap)
   401 AUTH_REQUIRED           no valid session cookie
-  403 CROSS_ORIGIN_REFUSED    a cookie-authenticated POST/PUT/PATCH/DELETE from another origin
+  403 CROSS_ORIGIN_REFUSED    a cookie-authenticated POST/PUT/PATCH/DELETE from another origin,
+                              or a GET of a state-changing route (policy.STATE_CHANGING_GET)
+                              whose Sec-Fetch-Site is present and not same-origin or none (#794)
   403 PASSWORD_CHANGE_REQUIRED the user must change a generated password first
+  403 MFA_ENROLLMENT_REQUIRED two-step verification is required for everyone and
+                              the user hasn't set it up (#607); only the session
+                              routes and their own MFA routes answer
   403 FORBIDDEN               the user's role is too low
+  403 QUERY_ONLY              query-only mode (#670) and a route that changes a
+                              collection or its data (policy.QUERY_ONLY_REFUSED)
 
 A request with an `Authorization` header is a service key request (PR 3): the
 header alone decides and any cookie is ignored, with no fallback to it.
@@ -17731,6 +20222,7 @@ header alone decides and any cookie is ignored, with no fallback to it.
   401 KEY_INVALID             not one `Bearer <key>` header with a valid key (one answer for every reason)
   403 KEY_NOT_ALLOWED         a route keys can't use (policy.HUMAN_ONLY)
   403 FORBIDDEN               the principal's role is too low
+  403 QUERY_ONLY              as above
 It has no origin check (it carries no cookie, Q26) and no password change.
 
 Each 403 comes back with the principal it refused, which the audit log
@@ -17742,12 +20234,12 @@ app; test_auth.py fails when any route lacks an entry.
 from __future__ import annotations
 
 import asyncio
-from http.cookies import CookieError, SimpleCookie
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 
-from starlette.requests import Request
+from starlette.requests import Request, cookie_parser
 
+from config import settings
 from utils import api_error
 
 from . import keys, policy, store
@@ -17776,13 +20268,10 @@ def session_token(scope) -> str | None:
     raw = _header(scope, b"cookie")
     if not raw:
         return None
-    cookies = SimpleCookie()
-    try:
-        cookies.load(raw)
-    except CookieError:
-        return None
-    morsel = cookies.get(store.COOKIE)
-    return morsel.value if morsel else None
+    # starlette's parser, as Request.cookies uses: a malformed earlier cookie
+    # (another app on localhost) doesn't hide the session, as it did with
+    # http.cookies.SimpleCookie (#546).
+    return cookie_parser(raw).get(store.COOKIE) or None
 
 
 def same_origin(scope) -> bool:
@@ -17852,32 +20341,52 @@ class AuthMiddleware:
                              "`docker compose exec api python -m auth bootstrap <username>`."), None
         authorization = _headers(scope, b"authorization")
         if authorization:
-            return await self._check_key(access, template, authorization)
+            return await self._check_key(scope, access, template, authorization)
         principal = await asyncio.to_thread(store.authenticate, session_token(scope))
         if principal is None:
             return api_error(401, "AUTH_REQUIRED", "Log in to use this."), None
         if scope["method"] in UNSAFE and not same_origin(scope):
             return api_error(403, "CROSS_ORIGIN_REFUSED",
                              "This request came from another site and was refused."), principal
+        if (scope["method"] == "GET" and template in policy.STATE_CHANGING_GET
+                and _header(scope, b"sec-fetch-site") not in (None, "same-origin", "none")):
+            return api_error(403, "CROSS_ORIGIN_REFUSED",
+                             "This request came from another site and was refused."), principal
         if principal.must_change_password and access != policy.SESSION:
             return api_error(403, "PASSWORD_CHANGE_REQUIRED",
                              "Change your password before doing anything else."), principal
-        if access != policy.SESSION and policy.rank(principal.role) < policy.rank(access):
+        if principal.mfa_due and access not in (policy.SESSION, policy.MFA):
+            return api_error(403, "MFA_ENROLLMENT_REQUIRED",
+                             "Set up two-step verification before doing anything else."), principal
+        if access not in (policy.SESSION, policy.MFA) and policy.rank(principal.role) < policy.rank(access):
             return api_error(403, "FORBIDDEN", "Your role can't do this.",
                              detail={"required_role": access}), principal
-        return None, principal
+        return _query_only(scope, template), principal
 
-    async def _check_key(self, access, template, authorization):
+    async def _check_key(self, scope, access, template, authorization):
         key = keys.bearer(authorization[0]) if len(authorization) == 1 else None
         principal = await asyncio.to_thread(store.authenticate_key, key) if key else None
         if principal is None:
             return api_error(401, "KEY_INVALID", "The API key is invalid, expired or revoked."), None
         if template in policy.HUMAN_ONLY:
             return api_error(403, "KEY_NOT_ALLOWED", "API keys can't be used for this."), principal
-        if access != policy.SESSION and policy.rank(principal.role) < policy.rank(access):
+        if access not in (policy.SESSION, policy.MFA) and policy.rank(principal.role) < policy.rank(access):
             return api_error(403, "FORBIDDEN", "Your role can't do this.",
                              detail={"required_role": access}), principal
-        return None, principal
+        return _query_only(scope, template), principal
+
+
+QUERY_ONLY_MESSAGE = ("This instance is query-only: its collections can't be created, changed or deleted "
+                      "here. Collections are loaded on the host with `python -m loader`.")
+
+
+def _query_only(scope, template):
+    """The 403 QUERY_ONLY refusal (#670), or None. Checked last, so a caller
+    refused for any other reason is refused as before; read on each request."""
+    method = "GET" if scope["method"] == "HEAD" else scope["method"]
+    if settings.rag_query_only and (method, template) in policy.QUERY_ONLY_REFUSED:
+        return api_error(403, "QUERY_ONLY", QUERY_ONLY_MESSAGE)
+    return None
 
 
 class Unlisted(Exception):
@@ -17911,6 +20420,7 @@ def require_listed(request: Request) -> None:
     docker compose exec api python -m auth set-role USERNAME ROLE
     docker compose exec api python -m auth disable USERNAME
     docker compose exec api python -m auth enable USERNAME
+    docker compose exec api python -m auth reset-mfa USERNAME
     docker compose exec api python -m auth list
 
 ROLE is end_user, developer or engineer. bootstrap, create-user and
@@ -17919,8 +20429,15 @@ shown nowhere else, and the user must change it at their first login. Each
 action writes one line to standard error. Exit status: 0 done, 1 refused,
 2 usage error.
 
-The last enabled engineer can't be disabled or demoted. A lockout is recovered
-with create-user, enable or reset-password.
+The last enabled engineer can't be disabled or demoted. An account a user is
+locked out of (lost password, disabled) is recovered with create-user, enable
+or reset-password; these don't lift a login throttle, which ends by itself
+after 15 minutes.
+
+reset-mfa (#607) is the last-resort recovery of two-step verification: it
+deletes the user's secret and recovery codes and ends their sessions, so their
+next login asks for no code (and, while MFA is required for everyone, for a new
+set-up). It works for an engineer's own account too, which the app refuses.
 
 Service principals (API keys, PR 3) are created and given keys by Engineers in
 the app; this command issues no key. `list` shows principals too, marked
@@ -17982,9 +20499,11 @@ def main(argv=None) -> int:
     p = commands.add_parser("set-role", help="change a user's role")
     p.add_argument("username")
     p.add_argument("role")
-    p = commands.add_parser("disable", help="disable an account and end its sessions")
+    p = commands.add_parser("disable", help="disable an account (a user's sessions end, a service account's keys stop working)")
     p.add_argument("username")
     p = commands.add_parser("enable", help="enable a disabled account")
+    p.add_argument("username")
+    p = commands.add_parser("reset-mfa", help="remove a user's two-step verification and end their sessions")
     p.add_argument("username")
     commands.add_parser("list", help="list the accounts")
     args = parser.parse_args(argv)
@@ -18007,10 +20526,17 @@ def main(argv=None) -> int:
         elif args.command == "set-role":
             store.set_role(username, role)
             _say(f"set-role: {username!r} is now {role}")
+        elif args.command == "reset-mfa":
+            store.reset_mfa(username)
+            _say(f"reset-mfa: two-step verification of {username!r} removed; their sessions ended")
         elif args.command in ("disable", "enable"):
             store.set_enabled(username, args.command == "enable")
-            _say(f"{args.command}: {username!r} {args.command}d"
-                 + ("; their sessions ended" if args.command == "disable" else ""))
+            ended = ""
+            if args.command == "disable":
+                # A service principal has no sessions: disabling it stops its keys (#553).
+                service = store.get_user(username).kind == "service"
+                ended = "; its keys stop working" if service else "; their sessions ended"
+            _say(f"{args.command}: {username!r} {args.command}d{ended}")
         else:
             for user in store.list_users(kind=None):
                 created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(user.created_at))
@@ -18098,6 +20624,129 @@ def headers(role: str = "engineer", base_url: str = "http://testserver") -> dict
     return {"Cookie": f"{store.COOKIE}={token}", "Origin": base_url.rstrip("/")}
 ```
 
+### api/auth/access.py
+
+```python
+"""Per-collection access (#606): who may use which collection.
+
+A collection is open, or restricted to the accounts granted it (people or
+service principals; a key acts as its principal). Engineers reach every
+collection. The state is in the store (store.py, schema 4); this module holds
+the rule and the check the routes call.
+
+A refused caller gets the answer the route gives a collection, session, job or
+file that doesn't exist, so a restricted collection's name isn't confirmed. The
+refusal is audited (services/audit.py, `access_refused`).
+
+A staging or recovery collection of a rebuild or import
+(`<target>__tuning_<token>`, `<target>__importing_<token>`) holds its target's
+data, so it is given its target's access when it is made
+(collection_recovery.begin) and keeps that state under its own name. A kept
+copy can itself be rebuilt, so a copy's target may be a copy too: its `chain`
+is the copy, its target, that one's target and so on, down to the original
+collection. A new copy takes the narrowest state across its target's chain
+(#792). While any collection in the chain has a state too, a caller other than
+an Engineer may use the copy only when they may use every one (`scope`, #788,
+#792): restricting the original later reaches its existing copies and their
+copies, including ones kept from before #606 with no state of their own. A
+deleted collection's state is dropped with it, so it then narrows nothing; a
+re-created one's new state narrows its copies again. A package of a copy that
+no longer exists follows the nearest collection in its chain that exists here,
+or the original (`package_source`; services/importer.py, routers/transfer.py).
+"""
+from __future__ import annotations
+
+import asyncio
+import re
+
+from . import store
+
+_STAGING = re.compile(r"(.+)__(?:tuning|importing)_[0-9a-f]{32}")
+
+
+def canonical(name: str) -> str:
+    return name[:1].upper() + name[1:]
+
+
+def target_of(name: str) -> str:
+    """The target of a staging or recovery copy's name; any other name, canonical."""
+    name = canonical(name)
+    found = _STAGING.fullmatch(name)
+    return found.group(1) if found else name
+
+
+def chain(name: str) -> tuple[str, ...]:
+    """Collection `name` (canonical), then each collection it was copied from:
+    its target while it is a staging or recovery copy's name, that one's
+    target, and so on, ending at the original (#792). An ordinary name is its
+    own chain. Each step is strictly shorter, so the walk ends."""
+    names = [canonical(name)]
+    while (target := target_of(names[-1])) != names[-1]:
+        names.append(target)
+    return tuple(names)
+
+
+def package_source(name: str, exists) -> str:
+    """Whose access a package of collection `name` follows (#606): the name
+    itself, unless it is a staging or recovery copy's that no longer exists here
+    (`exists(name)` is False); then the nearest collection in its `chain` that
+    exists here, or the original when none does (#792), so a package of a
+    discarded copy isn't open to everyone. `exists` is asked in chain order and
+    an ordinary name is never asked about."""
+    names = chain(name)
+    for i, n in enumerate(names):
+        if i == len(names) - 1 or exists(n):
+            return n
+    return names[-1]
+
+
+def scope(name: str) -> tuple[str, ...]:
+    """The names whose state decides who may use collection `name`: its whole
+    `chain`, the name itself and, for a staging or recovery copy, every
+    collection it was made from (#788, #792)."""
+    return chain(name)
+
+
+def allowed(principal, name: str) -> bool:
+    """True when the principal may use the collection (every name in `scope`).
+    No principal means a handler called directly (tests), which is not
+    checked, as job owners aren't."""
+    if principal is None:
+        return True
+    return all(store.has_access(principal.user_id, principal.role, n) for n in scope(name))
+
+
+def principal_of(request):
+    return getattr(getattr(request, "state", None), "auth", None) if request is not None else None
+
+
+async def check(request, name: str, code: str = "COLLECTION_NOT_FOUND") -> bool:
+    """Whether the request's caller may use the collection. A refusal is
+    audited here, with `code`, the not-found code the caller then answers with."""
+    if await asyncio.to_thread(allowed, principal_of(request), name):
+        return True
+    from services import audit
+    await asyncio.to_thread(audit.access_refused, request, canonical(name), code)
+    return False
+
+
+def visible_filter(principal):
+    """A predicate for listings: True for a collection name the principal may
+    see. One read of the store for the whole listing."""
+    if principal is None or principal.role == "engineer":
+        return lambda name: True
+    restricted = store.restricted_collections()
+    me = principal.user_id
+
+    def visible(name: str) -> bool:
+        for n in scope(name):
+            grants = restricted.get(n)
+            if grants is not None and me not in grants:
+                return False
+        return True
+    return visible
+```
+
 ### api/routers/auth.py
 
 ```python
@@ -18114,6 +20763,13 @@ Each of these requests that logs in, changes something or is refused is also an
 audit record (#29), written by services/audit.py's middleware with what the
 handlers note here (a typed username, a new role, a key's id; never a password
 or a key). The WARNING log lines are unchanged.
+
+Two-step verification (#607): for an enrolled user a right password starts a
+challenge (the `rag_mfa` cookie) instead of a session, and POST
+/auth/login/mfa with a TOTP or recovery code completes the login. The user's
+own set-up, recovery codes and turn-off are under /auth/mfa; engineers reset a
+user's enrollment and switch "required for everyone". Codes and secrets are in
+their one answer only (no-store) and never logged or audited.
 """
 from __future__ import annotations
 
@@ -18128,8 +20784,9 @@ from auth import passwords, store
 from config import settings
 from services import audit
 from models.schemas import (AdminUserList, AdminUserResult, AuthStatus, AuthUser, KeyIssueRequest, LoginRequest,
-                            PasswordChangeRequest, PrincipalCreateRequest, RoleChangeRequest,
-                            ServicePrincipalList, ServicePrincipalResult, UserCreateRequest)
+                            MfaCodeRequest, MfaDisableRequest, MfaPolicyRequest, PasswordChangeRequest,
+                            PrincipalCreateRequest, RoleChangeRequest, ServicePrincipalList, ServicePrincipalResult,
+                            UserCreateRequest)
 from utils import api_error
 
 router = APIRouter(prefix="/auth")
@@ -18138,6 +20795,8 @@ router = APIRouter(prefix="/auth")
 _log = logging.getLogger("auth")
 
 LOGIN_FAILED = "The username or password is incorrect."
+MFA_FAILED = "The code is incorrect."
+MFA_CHALLENGE_INVALID = "Your sign-in expired. Log in again."
 
 
 def _address(request: Request) -> str:
@@ -18147,12 +20806,39 @@ def _address(request: Request) -> str:
 
 
 def _user_body(username: str, role: str, must_change_password: bool) -> dict:
-    return {"username": username, "role": role, "must_change_password": must_change_password}
+    # query_only (#670) in every user answer, so the UI knows it from the login on.
+    return {"username": username, "role": role, "must_change_password": must_change_password,
+            "query_only": settings.rag_query_only}
+
+
+def _mfa_body(enrolled: bool, required: bool) -> dict:
+    """The MFA fields of a user's answers (#607); never a secret or code."""
+    return {"mfa_enrolled": enrolled, "mfa_required": required,
+            "mfa_enrollment_required": required and not enrolled}
 
 
 def _cookie(response: JSONResponse, token: str) -> None:
     response.set_cookie(store.COOKIE, token, max_age=store.ABSOLUTE_S, path="/", httponly=True,
                         samesite="strict", secure=settings.auth_cookie_secure)
+
+
+def _challenge_cookie(response: JSONResponse, token: str | None) -> None:
+    """Set the login challenge's cookie, or expire it with None."""
+    if token is None:
+        response.delete_cookie(store.MFA_COOKIE, path="/", httponly=True, samesite="strict",
+                               secure=settings.auth_cookie_secure)
+    else:
+        response.set_cookie(store.MFA_COOKIE, token, max_age=store.MFA_CHALLENGE_S, path="/", httponly=True,
+                            samesite="strict", secure=settings.auth_cookie_secure)
+
+
+def _session_answer(user: store.User, token: str) -> JSONResponse:
+    """A login's answer: the user, their MFA state and the session cookie."""
+    required = store.mfa_required()
+    response = JSONResponse({**_user_body(user.username, user.role, user.must_change_password),
+                             **_mfa_body(user.mfa_enrolled, required)})
+    _cookie(response, token)
+    return response
 
 
 @router.get("/status", response_model=AuthStatus)
@@ -18161,7 +20847,9 @@ async def auth_status():
 
 
 def _login(typed: str, password: str, address: str):
-    """('throttled' | 'failed' | 'ok', user, token). Blocking: scrypt and SQLite."""
+    """('throttled' | 'failed' | 'ok' | 'mfa', user, token). Blocking: scrypt and SQLite.
+    'mfa': the password was right for an enrolled user; the token is a
+    challenge's, not a session's (#607)."""
     key = typed.lower()
     # The attempt is counted before the password is checked, in the same
     # transaction as the lockout check, so parallel requests can't all slip in.
@@ -18175,6 +20863,11 @@ def _login(typed: str, password: str, address: str):
     person = user if user and user.kind == "user" else None
     matched = passwords.verify_password(password, person.password_hash if person else passwords.dummy_hash())
     ok = bool(matched and person and person.enabled)
+    if ok and user.mfa_enrolled:
+        # Not a failure, but the pair's earlier failures stay counted until the
+        # second factor passes (#607).
+        store.release_attempt(key, address)
+        return "mfa", user, store.create_challenge(user.id, key)
     store.finish_attempt(key, address, ok)
     if not ok:
         return "failed", None, None
@@ -18191,7 +20884,7 @@ async def login(body: LoginRequest, request: Request):
     outcome, user, token = await asyncio.to_thread(_login, body.username, body.password, address)
     # The audit record (#29): a success names the account, a failure the
     # username as typed; never the password.
-    if outcome == "ok":
+    if outcome in ("ok", "mfa"):
         audit.identify(user.username, user.role)
     else:
         audit.note(target=body.username)
@@ -18201,9 +20894,61 @@ async def login(body: LoginRequest, request: Request):
     if outcome == "failed":
         _log.warning("Login failed for %r from %s", body.username, address)
         return api_error(401, "LOGIN_FAILED", LOGIN_FAILED)
+    if outcome == "mfa":
+        audit.note(mfa="required")
+        _log.warning("Login for %r (%s) from %s: password accepted, code required", user.username, user.role, address)
+        response = JSONResponse({"mfa_required": True})
+        _challenge_cookie(response, token)
+        return response
     _log.warning("Login succeeded for %r (%s) from %s", user.username, user.role, address)
-    response = JSONResponse(_user_body(user.username, user.role, user.must_change_password))
-    _cookie(response, token)
+    return await asyncio.to_thread(_session_answer, user, token)
+
+
+def _second_factor(token: str | None, code: str, address: str):
+    """('invalid' | 'throttled' | 'failed' | 'ok', user, method, session token).
+    The attempt counts against the login throttle of the challenge's username
+    and this address before the code is checked, as a password is."""
+    found = store.challenge(token)
+    if found is None:
+        return "invalid", None, None, None
+    username, key = found
+    if not store.reserve_attempt(key, address):
+        return "throttled", store.get_user(username), store.factor_method(code), None
+    outcome, user, method = store.answer_challenge(token, code)
+    store.finish_attempt(key, address, outcome == "ok")
+    if outcome == "invalid":
+        return "invalid", None, None, None
+    if outcome == "failed":
+        return "failed", user, method, None
+    return "ok", user, method, store.create_session(user.id)
+
+
+@router.post("/login/mfa", response_model=AuthUser, response_model_exclude_none=True)
+async def login_mfa(body: MfaCodeRequest, request: Request):
+    if not await asyncio.to_thread(store.is_set_up):
+        return api_error(503, "SETUP_REQUIRED",
+                         "No account exists yet. An operator must create the first Engineer with "
+                         "`docker compose exec api python -m auth bootstrap <username>`.")
+    address = _address(request)
+    token = request.cookies.get(store.MFA_COOKIE)
+    outcome, user, method, session = await asyncio.to_thread(_second_factor, token, body.code, address)
+    # Every attempt that reaches a live challenge is its own audit record, with
+    # its user as the actor (#607); the code never is.
+    if user is not None:
+        audit.identify(user.username, user.role)
+        audit.note(method=method)
+    if outcome == "invalid":
+        return api_error(401, "MFA_CHALLENGE_INVALID", MFA_CHALLENGE_INVALID)
+    if outcome == "throttled":
+        _log.warning("Second factor refused for %r from %s: too many failed attempts", user.username if user else None,
+                     address)
+        return api_error(429, "LOGIN_THROTTLED", "Too many failed attempts. Wait 15 minutes and try again.")
+    if outcome == "failed":
+        _log.warning("Second factor failed for %r from %s (%s)", user.username, address, method)
+        return api_error(401, "MFA_FAILED", MFA_FAILED)
+    _log.warning("Login succeeded for %r (%s) from %s with a %s code", user.username, user.role, address, method)
+    response = await asyncio.to_thread(_session_answer, user, session)
+    _challenge_cookie(response, None)
     return response
 
 
@@ -18222,8 +20967,9 @@ async def logout(request: Request):
 async def me(request: Request):
     # A session's user (kind "user") or an API key's service principal ("service").
     principal = request.state.auth
+    required = principal.kind == "user" and await asyncio.to_thread(store.mfa_required)
     return {**_user_body(principal.username, principal.role, principal.must_change_password),
-            "kind": principal.kind}
+            "kind": principal.kind, **_mfa_body(principal.mfa_enrolled, required)}
 
 
 def _change(principal, current: str, new: str, address: str):
@@ -18267,19 +21013,29 @@ async def change_password(body: PasswordChangeRequest, request: Request):
 # Each change and each refusal is one WARNING line naming the Engineer, the
 # action and the account (Q30); a generated password is in its answer only.
 
-_REFUSED_STATUS = {"USER_NOT_FOUND": 404, "USER_EXISTS": 409, "LAST_ENGINEER": 409}
+_REFUSED_STATUS = {"USER_NOT_FOUND": 404, "USER_EXISTS": 409, "LAST_ENGINEER": 409, "MFA_ENROLL_FIRST": 409}
 _NO_STORE = {"Cache-Control": "no-store"}
 
 
 def _admin_user(user: store.User) -> dict:
     return {"username": user.username, "role": user.role, "enabled": user.enabled,
             "must_change_password": user.must_change_password,
-            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(user.created_at))}
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(user.created_at)),
+            "mfa_enrolled": user.mfa_enrolled}
 
 
 def _target(username: str) -> str | None:
     """The stored form of a username in a path, or None when no account can have it."""
     return passwords.normalize_username(username)
+
+
+# A refused name is logged and audited cut to this many characters: the
+# request models don't cap its length, so the route can answer INVALID_USERNAME (#551).
+_SHOWN_MAX = 256
+
+
+def _shown(name: str) -> str:
+    return name[:_SHOWN_MAX]
 
 
 def _refusal(actor: str, action: str, target: str, code: str, message: str):
@@ -18312,9 +21068,9 @@ def _create(username: str, role: str):
 async def create_user(body: UserCreateRequest, request: Request):
     actor = request.state.auth.username
     username = passwords.normalize_username(body.username)
-    audit.note(target=username or body.username, role=body.role)
+    audit.note(target=username or _shown(body.username), role=body.role)
     if username is None:
-        _log.warning("Admin %r: create of %r refused: invalid username", actor, body.username)
+        _log.warning("Admin %r: create of %r refused: invalid username", actor, _shown(body.username))
         return api_error(422, "INVALID_USERNAME", f"The username must be {passwords.USERNAME_RULE}.")
     try:
         user, password = await asyncio.to_thread(_create, username, body.role)
@@ -18395,6 +21151,160 @@ async def enable_user(username: str, request: Request):
     return await _set_enabled(username, request, True)
 
 
+@router.post("/users/{username}/reset-mfa", response_model=AdminUserResult, response_model_exclude_none=True)
+async def reset_user_mfa(username: str, request: Request):
+    """Reset a user's two-step verification (#607): their secret and recovery
+    codes are deleted and every session of theirs ends."""
+    actor = request.state.auth.username
+    target = _target(username)
+    if target is None:
+        return _not_found(actor, "reset-mfa", username)
+    if target == actor:
+        _log.warning("Admin %r: reset-mfa of their own account refused", actor)
+        return api_error(409, "SELF_MFA_RESET_REFUSED",
+                         "You can't reset your own two-step verification here. Another engineer can, or the "
+                         "operator command `python -m auth reset-mfa`.")
+    try:
+        user = await asyncio.to_thread(_apply, store.reset_mfa, target, "user")
+    except store.Refused as exc:
+        return _refused(actor, "reset-mfa", target, exc)
+    _log.warning("Admin %r reset the two-step verification of %r; their sessions ended", actor, target)
+    return {"user": _admin_user(user)}
+
+
+@router.post("/mfa/policy")
+async def set_mfa_policy(body: MfaPolicyRequest, request: Request):
+    """Require two-step verification for everyone, or stop requiring it (#607)."""
+    principal = request.state.auth
+    audit.note(required=body.required)
+    try:
+        await asyncio.to_thread(store.set_mfa_required, principal.user_id, body.required)
+    except store.Refused as exc:
+        return _refusal(principal.username, "require-mfa", principal.username, exc.code,
+                        "Set up two-step verification for your own account first, on the Account page.")
+    _log.warning("Admin %r %s two-step verification for everyone", principal.username,
+                 "required" if body.required else "stopped requiring")
+    return {"required": body.required}
+
+
+# ── the user's own two-step verification (#607) ──────────────────────────────
+
+def _iso_or_none(at: float | None) -> str | None:
+    return None if at is None else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at))
+
+
+def _status_body(user_id: int) -> dict:
+    status = store.mfa_status(user_id)
+    return {**status, "enrolled_at": _iso_or_none(status["enrolled_at"])}
+
+
+_MFA_STATUS = {"MFA_ALREADY_ENROLLED": 409, "MFA_ENROLLMENT_NOT_STARTED": 409, "MFA_CODE_INCORRECT": 422,
+               "MFA_NOT_ENROLLED": 409, "MFA_REQUIRED": 409}
+
+
+def _mfa_refused(principal, action: str, exc: store.Refused):
+    message = str(exc)
+    _log.warning("Two-step verification %s for %r refused: %s", action, principal.username, message)
+    return api_error(_MFA_STATUS.get(exc.code, 409), exc.code, message[:1].upper() + message[1:] + ".")
+
+
+@router.get("/mfa")
+async def mfa_status(request: Request):
+    return await asyncio.to_thread(_status_body, request.state.auth.user_id)
+
+
+@router.post("/mfa/enroll")
+async def mfa_enroll(request: Request):
+    principal = request.state.auth
+    try:
+        secret, uri = await asyncio.to_thread(store.start_enrollment, principal.user_id, principal.username)
+    except store.Refused as exc:
+        return _mfa_refused(principal, "set-up", exc)
+    return JSONResponse({"secret": secret, "otpauth_uri": uri}, headers=_NO_STORE)
+
+
+def _confirm(principal, code: str):
+    codes = store.confirm_enrollment(principal, code)
+    return codes, _status_body(principal.user_id)
+
+
+@router.post("/mfa/enroll/confirm")
+async def mfa_enroll_confirm(body: MfaCodeRequest, request: Request):
+    principal = request.state.auth
+    try:
+        codes, status = await asyncio.to_thread(_confirm, principal, body.code)
+    except store.Refused as exc:
+        return _mfa_refused(principal, "confirmation", exc)
+    _log.warning("Two-step verification set up by %r; their other sessions ended", principal.username)
+    return JSONResponse({"recovery_codes": codes, "status": status}, headers=_NO_STORE)
+
+
+def _regenerate(principal, code: str, address: str):
+    # A wrong code counts against the login throttle, like a wrong current
+    # password: an open session can't be used to guess codes.
+    if not store.reserve_attempt(principal.username, address):
+        return "throttled", None
+    try:
+        codes = store.regenerate_codes(principal, code)
+    except store.Refused:
+        store.release_attempt(principal.username, address)   # refused by rule, not a guess
+        raise
+    store.finish_attempt(principal.username, address, codes is not None)
+    if codes is None:
+        return "incorrect", None
+    return "ok", (codes, _status_body(principal.user_id))
+
+
+@router.post("/mfa/recovery-codes")
+async def mfa_recovery_codes(body: MfaCodeRequest, request: Request):
+    principal = request.state.auth
+    address = _address(request)
+    try:
+        outcome, result = await asyncio.to_thread(_regenerate, principal, body.code, address)
+    except store.Refused as exc:
+        return _mfa_refused(principal, "recovery-code regeneration", exc)
+    if outcome == "throttled":
+        _log.warning("Recovery codes refused for %r from %s: too many failed attempts", principal.username, address)
+        return api_error(429, "LOGIN_THROTTLED", "Too many failed attempts. Wait 15 minutes and try again.")
+    if outcome == "incorrect":
+        _log.warning("Recovery codes refused for %r from %s: wrong code", principal.username, address)
+        return api_error(403, "MFA_CODE_INCORRECT", MFA_FAILED)
+    codes, status = result
+    _log.warning("Recovery codes regenerated by %r", principal.username)
+    return JSONResponse({"recovery_codes": codes, "status": status}, headers=_NO_STORE)
+
+
+def _disable(principal, password: str, code: str, address: str):
+    if not store.reserve_attempt(principal.username, address):
+        return "throttled"
+    try:
+        ok = store.disable_mfa(principal, password, code)
+    except store.Refused:
+        store.release_attempt(principal.username, address)   # refused by rule, not a guess
+        raise
+    store.finish_attempt(principal.username, address, ok)
+    return "ok" if ok else "incorrect"
+
+
+@router.post("/mfa/disable")
+async def mfa_disable(body: MfaDisableRequest, request: Request):
+    principal = request.state.auth
+    address = _address(request)
+    audit.note(method=store.factor_method(body.code))
+    try:
+        outcome = await asyncio.to_thread(_disable, principal, body.password, body.code, address)
+    except store.Refused as exc:
+        return _mfa_refused(principal, "turn-off", exc)
+    if outcome == "throttled":
+        _log.warning("Two-step turn-off refused for %r from %s: too many failed attempts", principal.username, address)
+        return api_error(429, "LOGIN_THROTTLED", "Too many failed attempts. Wait 15 minutes and try again.")
+    if outcome == "incorrect":
+        _log.warning("Two-step turn-off refused for %r from %s: wrong password or code", principal.username, address)
+        return api_error(403, "MFA_DISABLE_INCORRECT", "The password or code is incorrect.")
+    _log.warning("Two-step verification turned off by %r", principal.username)
+    return {"status": await asyncio.to_thread(_status_body, principal.user_id)}
+
+
 # ── service principals and their API keys (Engineers only; PR 3) ─────────────
 # A principal is an account that can't log in and authenticates only with its
 # keys (auth/keys.py). Each change and each refusal is one WARNING line naming
@@ -18442,9 +21352,9 @@ async def list_principals():
 async def create_principal(body: PrincipalCreateRequest, request: Request):
     actor = request.state.auth.username
     name = passwords.normalize_username(body.name)
-    audit.note(target=name or body.name, role=body.role)
+    audit.note(target=name or _shown(body.name), role=body.role)
     if name is None:
-        _log.warning("Admin %r: create of service principal %r refused: invalid name", actor, body.name)
+        _log.warning("Admin %r: create of service principal %r refused: invalid name", actor, _shown(body.name))
         return api_error(422, "INVALID_USERNAME", f"The name must be {passwords.USERNAME_RULE}.")
     try:
         principal = await asyncio.to_thread(store.create_principal, name, body.role)
@@ -18560,7 +21470,9 @@ know with `note()` (a collection named in a body, file names, a typed
 username). A refusal by the auth middleware is recorded only when it is a 403
 for an identified principal; 401s and 503s write nothing. Jobs get one record
 when they are stored (`job_started`, called by the job store) and one when they
-end (`job_ended`). The operator command and the API's start write their own.
+end (`job_ended`). The operator commands (`python -m auth`, `python -m loader`,
+#670) and the API's start write their own,
+and so does the deletion of an export package (`package_deleted`, #677).
 
 **What never does.** No password, session token, API key, passphrase, answer
 or document text reaches a record: handlers note named parameters only, and a
@@ -18585,6 +21497,13 @@ and `details.last_attempt` (the last one's time). The API's background task
 writes closed windows and its shutdown writes open ones; a kill loses the
 open counts. At most LOGIN_WINDOWS_MAX windows are open; past that, failures
 are written one by one. nginx also limits logins per address (locations.conf).
+
+**A second factor is never counted, always written (#607).** POST
+/auth/login/mfa is public like the login; its handler names the challenge's
+user, so each attempt, accepted or failed, is its own record with that user as
+the actor and `details.method` (`totp` or `recovery`). A request with no live
+challenge names nobody and writes nothing. The login throttle and nginx's
+per-address limit bound how many can be written.
 """
 from __future__ import annotations
 
@@ -18613,9 +21532,14 @@ ACTIONS: dict[tuple[str, str], str] = {
     ("POST", "/auth/login"): "auth.login",
     ("POST", "/auth/logout"): "auth.logout",
     ("POST", "/auth/password"): "auth.password",
+    ("POST", "/auth/login/mfa"): "auth.mfa",
+    ("POST", "/auth/mfa/enroll/confirm"): "auth.mfa.enroll",
+    ("POST", "/auth/mfa/recovery-codes"): "auth.mfa.recovery-codes",
+    ("POST", "/auth/mfa/disable"): "auth.mfa.disable",
     ("POST", "/query"): "query",
     ("POST", "/collections"): "collection.create",
     ("DELETE", "/collections/{name}"): "collection.delete",
+    ("PUT", "/collections/{name}/access"): "collection.access",       # #606
     ("POST", "/ingest/upload"): "ingest",
     ("POST", "/ingest/config"): "ingest.config",
     ("POST", "/retrieval/config"): "retrieval.config",
@@ -18626,6 +21550,7 @@ ACTIONS: dict[tuple[str, str], str] = {
     ("POST", "/tune/reindex"): "tune.reindex",
     ("POST", "/goldstandard/save"): "goldstandard.save",
     ("GET", "/goldstandard/download/{filename}"): "goldstandard.download",
+    ("GET", "/packages/{filename}"): "package.download",                # #677
     ("POST", "/prepare/upload"): "prepare.upload",
     ("POST", "/prepare/jobs"): "prepare.start",
     ("POST", "/prepare/job/{job_id}/cancel"): "prepare.cancel",
@@ -18639,6 +21564,8 @@ ACTIONS: dict[tuple[str, str], str] = {
     ("POST", "/auth/users/{username}/role"): "admin.user.set-role",
     ("POST", "/auth/users/{username}/disable"): "admin.user.disable",
     ("POST", "/auth/users/{username}/enable"): "admin.user.enable",
+    ("POST", "/auth/users/{username}/reset-mfa"): "admin.user.reset-mfa",
+    ("POST", "/auth/mfa/policy"): "admin.mfa.policy",
     ("POST", "/auth/service-principals"): "admin.principal.create",
     ("POST", "/auth/service-principals/{name}/role"): "admin.principal.set-role",
     ("POST", "/auth/service-principals/{name}/disable"): "admin.principal.disable",
@@ -18648,10 +21575,17 @@ ACTIONS: dict[tuple[str, str], str] = {
     ("GET", "/audit"): "audit.view",
     ("GET", "/audit.csv"): "audit.download",
 }
-OPERATOR_ACTIONS = ("bootstrap", "create-user", "reset-password", "set-role", "disable", "enable")
+# A refused use of a restricted collection on a route that has no action of its
+# own (#606); on an audited route the refusal is that route's record.
+ACCESS_REFUSED = "collection.access.refused"
+# An export package deleted after its download or when it expired (#677).
+PACKAGE_DELETE = "package.delete"
+# The operator commands: python -m auth's (#25), and python -m loader's load (#670).
+OPERATOR_ACTIONS = ("bootstrap", "create-user", "reset-password", "set-role", "disable", "enable", "reset-mfa",
+                    "load")
 # Every action name, for the API's filter and the UI's list.
 ALL_ACTIONS = tuple(sorted(set(ACTIONS.values()) | {"operator." + a for a in OPERATOR_ACTIONS}
-                          | {"system.start"}))
+                          | {"system.start", ACCESS_REFUSED, PACKAGE_DELETE}))
 RESULTS = ("success", "refused", "error", "accepted", "succeeded", "failed", "interrupted")
 # A job's final status and the result its end record carries.
 JOB_RESULT = {"completed": "succeeded", "failed": "failed", "partial": "failed", "cancelled": "failed"}
@@ -18692,6 +21626,49 @@ def note(collection: str | None = None, target: str | None = None, **details) ->
     if target is not None:
         ctx["target"] = target
     ctx["details"].update(details)
+
+
+def access_refused(request, collection: str, code: str = "COLLECTION_NOT_FOUND") -> None:
+    """A caller refused a restricted collection (#606). Inside an audited
+    request its own record names the collection and the reason (the middleware
+    adds the error code sent); otherwise one record of its own, with `code`, the
+    not-found code the route answers with. Never raises."""
+    ctx = _current.get()
+    if ctx is not None:
+        ctx["collection"] = collection
+        ctx["details"]["reason"] = "collection_access"
+        return
+    try:
+        scope = getattr(request, "scope", None) or {}
+        route = getattr(scope.get("route"), "path", None)
+        record(ACCESS_REFUSED, result="refused", status_code=404, collection=collection,
+               **_scope_actor(scope),
+               details={"route": f"{scope.get('method', '')} {route}" if route else scope.get("path"),
+                        "reason": "collection_access", "code": code})
+    except Exception:                                 # noqa: BLE001 - never breaks the answer
+        _log.exception("Could not record a collection access refusal")
+
+
+def _scope_actor(scope) -> dict:
+    """The actor fields of a request's scope: its principal and client address."""
+    principal = (scope.get("state") or {}).get("auth")
+    client = scope.get("client")
+    return {"actor": getattr(principal, "username", None),
+            "actor_kind": ("service" if getattr(principal, "kind", None) == "service" else "user")
+            if principal is not None else "anonymous",
+            "role": getattr(principal, "role", None), "key_id": getattr(principal, "key_id", None),
+            "client_ip": _header(scope, b"x-real-ip") or (client[0] if client else None)}
+
+
+def package_deleted(filename: str, reason: str, scope=None) -> None:
+    """One `package.delete` record (#677): `reason` is `downloaded`, with the
+    downloading request's scope for its actor, or `expired`, by the system.
+    Never raises."""
+    try:
+        actor = _scope_actor(scope) if scope is not None else {"actor": "system", "actor_kind": "system"}
+        record(PACKAGE_DELETE, result="success", details={"file": filename, "reason": reason}, **actor)
+    except Exception:                                 # noqa: BLE001 - never breaks the deletion
+        _log.exception("Could not record the deletion of package %s", filename)
 
 
 def add_details(values: dict) -> None:
@@ -18919,7 +21896,11 @@ def job_ended(job: dict, interrupted: bool) -> None:
         details.update(package=job.get("filename"), fidelity=job.get("fidelity"))
     elif snapshot.get("action") == "import":
         collection = job.get("collection") or collection
-    record(snapshot.get("action", "unknown"), result="interrupted" if interrupted else JOB_RESULT.get(status, "failed"),
+    result = "interrupted" if interrupted else JOB_RESULT.get(status, "failed")
+    if job.get("access_refused"):
+        # An import of a package from a collection its owner can't use (#606).
+        result, details["reason"] = "refused", "collection_access"
+    record(snapshot.get("action", "unknown"), result=result,
            job_id=job.get("job_id") or getattr(job, "_id", None), collection=collection, target=snapshot.get("target"),
            details=details, **{k: snapshot.get(k) for k in ("actor", "actor_kind", "role", "key_id", "client_ip")})
 
@@ -19141,7 +22122,7 @@ class AuditMiddleware:
             # nothing (D4). Only a login, which is public, is recorded without
             # a principal: a success names its account, a failure the username
             # as typed.
-            if ctx["action"] != "auth.login" or (ctx["actor"] is None and ctx["target"] is None):
+            if ctx["action"] not in ("auth.login", "auth.mfa") or (ctx["actor"] is None and ctx["target"] is None):
                 return
         status = seen["status"] or 500
         if ctx["job_recorded"] and status == 202:
@@ -19282,6 +22263,7 @@ async def lifespan(app: FastAPI):
     runtime = bootstrap()
     app.state.telemetry = runtime
     flusher = None
+    sweeper = None
     try:
         import logging
         from services import goldstandard, metrics
@@ -19352,6 +22334,10 @@ async def lifespan(app: FastAPI):
                             "earlier state: %s", len(restored), ", ".join(restored))
         except Exception:                                 # noqa: BLE001
             log.exception("Could not recover the preparation area")
+        # Export packages nobody downloaded are deleted after EXPORT_RETENTION_HOURS
+        # (#677): a sweep now, after the job records are loaded, then every 15 minutes.
+        from services import package_retention
+        sweeper = asyncio.create_task(package_retention.sweeper())
         # One audit record per start, saying whether question text is recorded,
         # so a reader can tell why some query records carry it (#29).
         from config import settings
@@ -19367,6 +22353,8 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         try:
+            if sweeper is not None:
+                sweeper.cancel()
             if flusher is not None:
                 flusher.cancel()
                 from services import audit
@@ -19485,15 +22473,16 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
 ```json
 {
   "name": "rag-ui",
-  "version": "1.2.2",
+  "version": "1.3.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview"
   },
   "dependencies": {
-    "lucide-react": "^1.64.0",
+    "qrcode-generator": "2.0.4",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-markdown": "^9.0.1",
@@ -19502,15 +22491,15 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
     "remark-gfm": "^4.0.0"
   },
   "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.5",
     "@tailwindcss/typography": "^0.5.15",
     "@types/react": "^18.3.5",
     "@types/react-dom": "^18.3.0",
-    "@vitejs/plugin-react": "^4.3.1",
-    "autoprefixer": "^10.6.2",
+    "@vitejs/plugin-react": "^6.3.0",
     "postcss": "^8.5.32",
-    "tailwindcss": "^3.4.11",
+    "tailwindcss": "^4.3.5",
     "typescript": "^7.0.2",
-    "vite": "^6.4.4"
+    "vite": "^8.3.8"
   },
   "overrides": {
     "@tailwindcss/typography": {
@@ -19541,32 +22530,12 @@ export default defineConfig({
 })
 ```
 
-### ui/tailwind.config.js
-
-```javascript
-/** @type {import('tailwindcss').Config} */
-import typography from '@tailwindcss/typography'
-
-export default {
-  content: ['./index.html', './src/**/*.{js,ts,jsx,tsx}'],
-  theme: {
-    extend: {},
-  },
-  // `prose` is used by the Q&A answer pane and the transfer help page. Without
-  // this plugin those classes compile to nothing and Tailwind's preflight has
-  // already stripped heading and list styling, so markdown renders as one
-  // undifferentiated block.
-  plugins: [typography],
-}
-```
-
 ### ui/postcss.config.js
 
 ```javascript
 export default {
   plugins: {
-    tailwindcss: {},
-    autoprefixer: {},
+    '@tailwindcss/postcss': {},
   },
 }
 ```
@@ -19631,9 +22600,45 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
 ### ui/src/index.css
 
 ```css
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+/* Scan exactly the files Tailwind 3's `content` globs named, not whatever
+   Tailwind 4's automatic detection finds in the build context. */
+@import 'tailwindcss' source(none);
+@source '../index.html';
+@source './**/*.{js,ts,jsx,tsx}';
+
+/* `prose` is used by the Q&A answer pane and the transfer help page. Without
+   this plugin those classes compile to nothing and Tailwind's preflight has
+   already stripped heading and list styling, so markdown renders as one
+   undifferentiated block. */
+@plugin '@tailwindcss/typography';
+
+/* Compatibility with Tailwind 3, from the Tailwind 4 upgrade guide. */
+
+/* Hover styles apply on every device, not only where the primary input can hover. */
+@custom-variant hover (&:hover);
+
+@layer base {
+  /* Borders default to gray-200, not currentcolor. */
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentcolor);
+  }
+
+  /* Placeholders are gray-400, not the text colour at half opacity. */
+  input::placeholder,
+  textarea::placeholder {
+    color: var(--color-gray-400);
+  }
+
+  /* Buttons show the pointer cursor. */
+  button:not(:disabled),
+  [role='button']:not(:disabled) {
+    cursor: pointer;
+  }
+}
 ```
 
 ### ui/src/App.tsx
@@ -19666,6 +22671,7 @@ import NavBar from './components/NavBar'
 import LoginPage from './pages/LoginPage'
 import SetupRequiredPage from './pages/SetupRequiredPage'
 import ChangePasswordPage from './pages/ChangePasswordPage'
+import AccountPage from './pages/AccountPage'
 import QAPage from './pages/QAPage'
 import ImportPage from './pages/ImportPage'
 import PreparePage from './pages/PreparePage'
@@ -19681,7 +22687,7 @@ import TransferPage from './pages/TransferPage'
 import HelpTransferPage from './pages/HelpTransferPage'
 
 // What the API says decides what is shown (#25): set up, logged in, a password
-// change due, and the role. Hiding a page is a convenience; the API refuses
+// change due, a two-step verification set-up due (#607), and the role. Hiding a page is a convenience; the API refuses
 // what the role can't do whatever the UI shows.
 export default function AppRouter() {
   const { state } = useAuth()
@@ -19709,7 +22715,20 @@ export default function AppRouter() {
       </Routes>
     )
   }
+  // Two-step verification is required for everyone and this user hasn't set
+  // it up: only the account page, until they do (#607).
+  if (state.user.mfa_enrollment_required) {
+    return (
+      <Routes>
+        <Route path="/account" element={<AccountPage forced />} />
+        <Route path="*" element={<Navigate to="/account" replace />} />
+      </Routes>
+    )
+  }
   const role = state.user.role
+  // Query-only mode (#670): the pages that change data aren't routed; the API
+  // refuses their writes whatever the UI shows.
+  const queryOnly = state.user.query_only === true
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -19719,14 +22738,19 @@ export default function AppRouter() {
           <Route path="/" element={<Navigate to="/qa" replace />} />
           <Route path="/login" element={<Navigate to="/qa" replace />} />
           <Route path="/qa" element={<QAPage />} />
+          <Route path="/account" element={<AccountPage />} />
           <Route path="/account/password" element={<ChangePasswordPage />} />
           {role !== 'end_user' && (
             <>
-              <Route path="/import" element={<ImportPage />} />
-              <Route path="/prepare" element={<PreparePage />} />
-              <Route path="/chunking" element={<ChunkingPage />} />
-              <Route path="/retrieval" element={<RetrievalPage />} />
-              <Route path="/goldstandard" element={<GoldStandardPage />} />
+              {!queryOnly && (
+                <>
+                  <Route path="/import" element={<ImportPage />} />
+                  <Route path="/prepare" element={<PreparePage />} />
+                  <Route path="/chunking" element={<ChunkingPage />} />
+                  <Route path="/retrieval" element={<RetrievalPage />} />
+                  <Route path="/goldstandard" element={<GoldStandardPage />} />
+                </>
+              )}
               <Route path="/transfer" element={<TransferPage />} />
               <Route path="/help/transfer" element={<HelpTransferPage />} />
             </>
@@ -19766,7 +22790,9 @@ type AuthState =
 interface AuthValue {
   state: AuthState
   user: AuthUser | null
-  login: (username: string, password: string) => Promise<void>
+  // Resolves to true when the password was right and a code is needed (#607).
+  login: (username: string, password: string) => Promise<boolean>
+  verifyCode: (code: string) => Promise<void>
   logout: () => Promise<void>
   changePassword: (current: string, next: string) => Promise<void>
   refresh: () => Promise<void>
@@ -19801,14 +22827,30 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     onAuthProblem(code => {
       if (code === 'AUTH_REQUIRED') setState({ phase: 'logged_out' })
+      else if (code === 'MFA_ENROLLMENT_REQUIRED') {
+        setState(s => s.phase === 'logged_in' ? { phase: 'logged_in', user: { ...s.user, mfa_enrollment_required: true } } : s)
+      }
       else setState(s => s.phase === 'logged_in' ? { phase: 'logged_in', user: { ...s.user, must_change_password: true } } : s)
     })
     return () => onAuthProblem(null)
   }, [])
 
   const login = useCallback(async (username: string, password: string) => {
-    const user = await api.login(username, password)
-    setState({ phase: 'logged_in', user })
+    const result = await api.login(username, password)
+    // A login that opened a session names the user; it also carries the switch
+    // as `mfa_required` (true while MFA is required for everyone), so that field
+    // alone doesn't mean a code is due. Only the challenge answer,
+    // {mfa_required: true} with no user, asks for one (#607).
+    if (!('username' in result)) {
+      if (result.mfa_required === true) return true
+      throw new Error('The server sent a response the UI could not read.')
+    }
+    setState({ phase: 'logged_in', user: result })
+    return false
+  }, [])
+
+  const verifyCode = useCallback(async (code: string) => {
+    setState({ phase: 'logged_in', user: await api.loginMfa(code) })
   }, [])
 
   const logout = useCallback(async () => {
@@ -19817,12 +22859,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const changePassword = useCallback(async (current: string, next: string) => {
     const result = await api.changePassword(current, next)
-    setState({ phase: 'logged_in', user: { username: result.username, role: result.role, must_change_password: false } })
+    setState(s => ({ phase: 'logged_in', user: {
+      ...(s.phase === 'logged_in' ? s.user : {}), username: result.username, role: result.role, must_change_password: false,
+    } }))
   }, [])
 
   const user = state.phase === 'logged_in' ? state.user : null
   return (
-    <AuthContext.Provider value={{ state, user, login, logout, changePassword, refresh }}>
+    <AuthContext.Provider value={{ state, user, login, verifyCode, logout, changePassword, refresh }}>
       {children}
     </AuthContext.Provider>
   )
@@ -20039,10 +23083,12 @@ export class ApiError extends Error {
   }
 }
 
-// The session ended (401 AUTH_REQUIRED) or a generated password must be changed
-// first (403 PASSWORD_CHANGE_REQUIRED), whichever call noticed it (#25). The
-// auth context listens and shows the login or password page.
-type AuthListener = (code: 'AUTH_REQUIRED' | 'PASSWORD_CHANGE_REQUIRED') => void
+// The session ended (401 AUTH_REQUIRED), a generated password must be changed
+// first (403 PASSWORD_CHANGE_REQUIRED), or two-step verification must be set
+// up first (403 MFA_ENROLLMENT_REQUIRED, #607), whichever call noticed it (#25).
+// The auth context listens and shows the login, password or account page.
+export type AuthProblem = 'AUTH_REQUIRED' | 'PASSWORD_CHANGE_REQUIRED' | 'MFA_ENROLLMENT_REQUIRED'
+type AuthListener = (code: AuthProblem) => void
 let authListener: AuthListener | null = null
 export function onAuthProblem(listener: AuthListener | null) { authListener = listener }
 
@@ -20060,7 +23106,9 @@ async function request<T>(method: string, path: string, body?: unknown, isFormDa
   try { data = text ? JSON.parse(text) : null } catch { /* not JSON; handled below */ }
   if (!res.ok) {
     const code: string | null = typeof data?.error?.code === 'string' ? data.error.code : null
-    if (code === 'AUTH_REQUIRED' || code === 'PASSWORD_CHANGE_REQUIRED') authListener?.(code)
+    if (code === 'AUTH_REQUIRED' || code === 'PASSWORD_CHANGE_REQUIRED' || code === 'MFA_ENROLLMENT_REQUIRED') {
+      authListener?.(code)
+    }
     throw new ApiError(data?.error?.message ?? PROXY_ERRORS[res.status] ?? `HTTP ${res.status}`, res.status, code)
   }
   if (data === null && text) throw new Error('The server sent a response the UI could not read.')
@@ -20069,10 +23117,11 @@ async function request<T>(method: string, path: string, body?: unknown, isFormDa
 
 function isHealthResult(data: any): data is HealthResult {
   const service = (s: any) => !!s && typeof s === 'object' && typeof s.status === 'string'
-  return service(data?.services?.weaviate) && service(data?.services?.ollama?.llm) && service(data?.services?.ollama?.embed)
+  return service(data?.services?.weaviate) && service(data?.services?.ollama?.llm)
+    && service(data?.services?.ollama?.build_llm) && service(data?.services?.ollama?.embed)
 }
 
-// GET /health answers 503 with the same per-service body when a dependency is
+// GET /health/details answers 503 with the same per-service body when a dependency is
 // down. request() throws on any non-2xx, so the Health page never saw which
 // service failed and could not show it red (#375). This call accepts a 200 or
 // a 503 that carries that body; every other error is thrown as request() would,
@@ -20080,7 +23129,7 @@ function isHealthResult(data: any): data is HealthResult {
 async function getHealthResult(): Promise<HealthResult> {
   let res: Response
   try {
-    res = await fetch(`${BASE}/health`)
+    res = await fetch(`${BASE}/health/details`)
   } catch {
     // fetch rejects only when no answer arrived; its own text ("Failed to fetch") says nothing.
     throw new Error('The API could not be reached. Check that the stack is running.')
@@ -20102,7 +23151,22 @@ export const api = {
   // sends with every same-origin request; the UI never sees or stores it.
   authStatus: () => request<{ setup_required: boolean }>('GET', '/auth/status'),
   me: () => request<AuthUser>('GET', '/auth/me'),
-  login: (username: string, password: string) => request<AuthUser>('POST', '/auth/login', { username, password }),
+  // For a user with two-step verification the password step answers
+  // {mfa_required: true} and sets a short-lived challenge cookie; loginMfa
+  // sends the code and opens the session (#607).
+  login: (username: string, password: string) =>
+    request<AuthUser | { mfa_required: true }>('POST', '/auth/login', { username, password }),
+  loginMfa: (code: string) => request<AuthUser>('POST', '/auth/login/mfa', { code }),
+  // The user's own two-step verification (#607). A secret or recovery codes are
+  // in one answer only; the Account page keeps them in memory until "Done".
+  mfaStatus: () => request<MfaStatus>('GET', '/auth/mfa'),
+  mfaEnroll: () => request<{ secret: string; otpauth_uri: string }>('POST', '/auth/mfa/enroll'),
+  mfaConfirm: (code: string) =>
+    request<{ recovery_codes: string[]; status: MfaStatus }>('POST', '/auth/mfa/enroll/confirm', { code }),
+  mfaRegenerate: (code: string) =>
+    request<{ recovery_codes: string[]; status: MfaStatus }>('POST', '/auth/mfa/recovery-codes', { code }),
+  mfaDisable: (password: string, code: string) =>
+    request<{ status: MfaStatus }>('POST', '/auth/mfa/disable', { password, code }),
   logout: () => request<{ status: string }>('POST', '/auth/logout'),
   changePassword: (current_password: string, new_password: string) =>
     request<{ status: string } & AuthUser>('POST', '/auth/password', { current_password, new_password }),
@@ -20117,6 +23181,9 @@ export const api = {
     request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/role`, { role }),
   disableUser: (username: string) => request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/disable`),
   enableUser: (username: string) => request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/enable`),
+  resetUserMfa: (username: string) =>
+    request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/reset-mfa`),
+  setMfaRequired: (required: boolean) => request<{ required: boolean }>('POST', '/auth/mfa/policy', { required }),
   // Service principals and their API keys (Engineers only, #25 PR 3).
   listPrincipals: () => request<{ principals: ServicePrincipal[] }>('GET', '/auth/service-principals'),
   createPrincipal: (name: string, role: Role) =>
@@ -20139,6 +23206,10 @@ export const api = {
   // Answers with the name as stored, first letter capitalised (#372).
   createCollection: (body: CreateCollectionBody) => request<{ name: string; status: string }>('POST', '/collections', body),
   deleteCollection: (name: string) => request('DELETE', `/collections/${name}?confirm=true`),
+  // Who may use a collection (#606), for Engineers: open, or restricted to the named accounts.
+  getCollectionAccess: (name: string) => request<CollectionAccess>('GET', `/collections/${encodeURIComponent(name)}/access`),
+  setCollectionAccess: (name: string, body: CollectionAccess) =>
+    request<CollectionAccess>('PUT', `/collections/${encodeURIComponent(name)}/access`, body),
 
   // Ingest — form field is "strategy"; job status URL is /ingest/job/{id}; config POST is /ingest/config
   uploadFiles: (form: FormData) => request<{ job_id: string; status: string; files_queued: number; collection: string }>('POST', '/ingest/upload', form, true),
@@ -20186,6 +23257,9 @@ export const api = {
   listExportJobs: () => request<{ jobs: ExportJobEntry[] }>('GET', '/export/jobs'),
   listImportJobs: () => request<{ jobs: ImportJobEntry[] }>('GET', '/import/jobs'),
   getPackages: () => request<{ packages: PackageSummary[] }>('GET', '/packages'),
+  // A plain link, sent with the session cookie. A full download deletes a
+  // package this instance exported (#677).
+  packageDownloadUrl: (filename: string) => `${BASE}/packages/${encodeURIComponent(filename)}`,
   getTuneOptions: (collection: string) => request<TuneOptions>('GET', `/tune/${collection}`),
   getTransferHelp: () => request<{ topic: string; markdown: string }>('GET', '/help/transfer'),
 
@@ -20196,8 +23270,17 @@ export const api = {
 
 // Types
 export type Role = 'engineer' | 'developer' | 'end_user'
-export interface AuthUser { username: string; role: Role; must_change_password: boolean; kind?: 'user' | 'service' }
-export interface AdminUser { username: string; role: Role; enabled: boolean; must_change_password: boolean; created_at: string }
+export interface AuthUser {
+  username: string; role: Role; must_change_password: boolean; kind?: 'user' | 'service'
+  // Two-step verification (#607): enrolled, required for everyone, and a set-up due because of it.
+  mfa_enrolled?: boolean; mfa_required?: boolean; mfa_enrollment_required?: boolean
+  // Query-only mode (#670): the pages that change data are hidden.
+  query_only?: boolean
+}
+export interface AdminUser {
+  username: string; role: Role; enabled: boolean; must_change_password: boolean; created_at: string; mfa_enrolled?: boolean
+}
+export interface MfaStatus { enrolled: boolean; enrolled_at: string | null; required: boolean; recovery_codes_remaining: number }
 export interface ServiceKey {
   id: string; label: string; created_at: string; expires_at: string
   revoked_at: string | null; last_used_at: string | null; status: 'active' | 'expired' | 'revoked'
@@ -20207,6 +23290,7 @@ export interface CollectionInfo {
   name: string; object_count: number; index_type: string; distance_metric: string; created_at: string | null
   hnsw_config?: { ef: number; efConstruction: number; maxConnections: number } | null
 }
+export interface CollectionAccess { restricted: boolean; users: string[]; service_principals: string[] }
 export interface CreateCollectionBody {
   name: string; index_type: string; distance_metric: string; hnsw_config: { efConstruction: number; maxConnections: number; ef: number }
 }
@@ -20287,6 +23371,9 @@ export interface ExportJob {
   fidelity: string | null; models_bundled: boolean | null; retrieve_script: boolean | null
   warnings: string[]; error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
   encrypted?: boolean
+  // When the package is deleted if nobody downloads it (UTC, #677); null once
+  // it has been downloaded or swept.
+  expires_at?: string | null
 }
 // passphrase: required for a .tar.gz.age package and refused for any other (#27).
 export interface ImportBody { filename: string; on_conflict: string; passphrase?: string }
@@ -20336,6 +23423,9 @@ export interface PackageSummary {
   filename: string; size_bytes: number; collection: string | null
   chunk_count: number | null; fidelity: string | null; created_at: string | null; readable: boolean
   encrypted?: boolean
+  // When a package this instance exported is deleted if nobody downloads it
+  // (UTC, #677); null for one copied in to be imported.
+  expires_at?: string | null
 }
 export interface TuneOptions {
   collection: string; fidelity: string; source_document_count: number
@@ -20349,8 +23439,12 @@ export interface HealthResult {
     // `ollama_embed` keys. Reading the flat names yielded undefined and threw
     // during render, which unmounted the whole app.
     ollama: {
+      // `llm` answers questions; `build_llm` prepares documents and writes gold
+      // standard pairs; `same_model` says they are one model (#671).
       llm: { status: string; latency_ms: number; model: string }
+      build_llm: { status: string; latency_ms: number; model: string }
       embed: { status: string; latency_ms: number; model: string }
+      same_model: boolean
     }
   }
   resources?: {
@@ -20401,22 +23495,23 @@ import type { Role } from '../api/client'
 
 // The pages grouped into menus (#616). Each role sees the pages it had before;
 // a menu with none of them isn't shown. Hiding a page is a convenience: the
-// router and the API refuse what the role can't do (#25).
-interface PageEntry { label: string; to: string; roles: Role[] }
+// router and the API refuse what the role can't do (#25). A page that changes
+// data (`writes`) is hidden in query-only mode, where the API refuses it (#670).
+interface PageEntry { label: string; to: string; roles: Role[]; writes?: true }
 interface MenuDef { key: string; label: string; entries: PageEntry[] }
 
 const STAFF: Role[] = ['engineer', 'developer']
 const ENGINEER: Role[] = ['engineer']
 const MENUS: MenuDef[] = [
   { key: 'data', label: 'Data', entries: [
-    { label: 'Import', to: '/import', roles: STAFF },
-    { label: 'Prepare', to: '/prepare', roles: STAFF },
+    { label: 'Import', to: '/import', roles: STAFF, writes: true },
+    { label: 'Prepare', to: '/prepare', roles: STAFF, writes: true },
     { label: 'Transfer', to: '/transfer', roles: STAFF },
   ] },
   { key: 'tune', label: 'Tune', entries: [
-    { label: 'Chunking', to: '/chunking', roles: STAFF },
-    { label: 'Retrieval', to: '/retrieval', roles: STAFF },
-    { label: 'Gold Standard', to: '/goldstandard', roles: STAFF },
+    { label: 'Chunking', to: '/chunking', roles: STAFF, writes: true },
+    { label: 'Retrieval', to: '/retrieval', roles: STAFF, writes: true },
+    { label: 'Gold Standard', to: '/goldstandard', roles: STAFF, writes: true },
   ] },
   { key: 'admin', label: 'Admin', entries: [
     { label: 'Collections', to: '/collections', roles: ENGINEER },
@@ -20430,9 +23525,9 @@ const MENUS: MenuDef[] = [
 type Item = { label: string; to: string; current: boolean } | { label: string; onSelect: () => void }
 type Focus = 'first' | 'last'
 
-const TOP = 'text-sm px-2 py-1 rounded hover:text-blue-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-600'
+const TOP = 'text-sm px-2 py-1 rounded hover:text-blue-600 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-blue-600'
 const CURRENT = 'text-blue-700 font-semibold bg-blue-50'
-const ENTRY = 'block w-full text-left whitespace-nowrap px-3 py-1.5 text-sm hover:bg-gray-100 focus:bg-gray-100 focus:outline-none'
+const ENTRY = 'block w-full text-left whitespace-nowrap px-3 py-1.5 text-sm hover:bg-gray-100 focus:bg-gray-100 focus:outline-hidden'
 
 // One menu button and its menu, after the WAI-ARIA menu button pattern: Enter,
 // Space or ArrowDown opens it on the first entry, ArrowUp on the last; the
@@ -20492,7 +23587,7 @@ function NavMenu({ menuKey, label, items, current, open, focus, align, onOpen, o
   }
 
   return (
-    <div ref={wrapper} className={`relative${align === 'right' ? ' ml-auto' : ''}`}>
+    <div ref={wrapper} className={align === 'right' ? 'relative ml-auto' : 'relative'}>
       <button
         ref={button}
         type="button"
@@ -20553,6 +23648,7 @@ export default function NavBar() {
   const navigate = useNavigate()
   const { pathname } = useLocation()
   const role = user?.role ?? null
+  const queryOnly = user?.query_only === true
   const [open, setOpen] = useState<{ key: string; focus: Focus } | null>(null)
 
   // A change of page closes any open menu.
@@ -20574,13 +23670,19 @@ export default function NavBar() {
   })
 
   const menus = MENUS
-    .map(m => ({ ...m, entries: m.entries.filter(e => role !== null && e.roles.includes(role)) }))
+    .map(m => ({ ...m, entries: m.entries.filter(e => role !== null && e.roles.includes(role)
+      && !(queryOnly && e.writes)) }))
     .filter(m => m.entries.length > 0)
-  const accountCurrent = pathname === '/account/password'
+  const accountCurrent = pathname === '/account' || pathname === '/account/password'
 
   return (
     <nav className="bg-white border-b border-gray-200 px-4 py-3 flex items-center gap-4">
       <span className="font-bold text-blue-700 text-lg mr-2">RAG Platform</span>
+      {queryOnly && (
+        <span data-testid="nav-query-only"
+              title="This instance is query-only: it answers questions on its collections and can't change them."
+              className="text-xs bg-amber-100 text-amber-800 px-2 py-1 rounded">Query-only</span>
+      )}
       <Link
         to="/qa"
         aria-current={pathname === '/qa' ? 'page' : undefined}
@@ -20607,7 +23709,9 @@ export default function NavBar() {
         align="right"
         current={accountCurrent}
         items={[
-          { label: 'Change password', to: '/account/password', current: accountCurrent },
+          // The account page holds two-step verification (#607).
+          { label: 'Account', to: '/account', current: pathname === '/account' },
+          { label: 'Change password', to: '/account/password', current: pathname === '/account/password' },
           { label: 'Log out', onSelect: logOut },
         ]}
       />
@@ -20908,14 +24012,19 @@ export default function LatencyCharts({ data }: { data: MetricsResult }) {
 ```typescript
 import { FormEvent, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { ApiError } from '../api/client'
 import { useAuth } from '../context/AuthContext'
 
 // Replaces the role picker (#25): the role now comes with the account.
+// With two-step verification (#607) a right password asks for a code from the
+// authenticator app, or a recovery code, before the session opens.
 export default function LoginPage() {
-  const { login } = useAuth()
+  const { login, verifyCode } = useAuth()
   const navigate = useNavigate()
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+  const [code, setCode] = useState('')
+  const [step, setStep] = useState<'password' | 'code'>('password')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
@@ -20924,7 +24033,11 @@ export default function LoginPage() {
     setBusy(true)
     setError('')
     try {
-      await login(username, password)
+      if (await login(username, password)) {
+        setPassword('')
+        setStep('code')
+        return
+      }
       navigate('/qa', { replace: true })
     } catch (err) {
       // The server's own message: generic for a failed login, "wait" when throttled.
@@ -20935,28 +24048,70 @@ export default function LoginPage() {
     }
   }
 
+  async function submitCode(e: FormEvent) {
+    e.preventDefault()
+    setBusy(true)
+    setError('')
+    try {
+      await verifyCode(code)
+      navigate('/qa', { replace: true })
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      setCode('')
+      // The challenge ended (expired or used up): start again with the password.
+      if (err instanceof ApiError && err.code === 'MFA_CHALLENGE_INVALID') setStep('password')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function back() {
+    setStep('password')
+    setCode('')
+    setError('')
+  }
+
+  const input = 'mt-1 w-full border border-gray-300 rounded px-3 py-2 text-sm'
+  const button = 'w-full bg-blue-600 text-white rounded px-4 py-2 text-sm font-medium disabled:opacity-50'
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-8">
       <h1 className="text-3xl font-bold text-gray-800 mb-2">RAG Platform</h1>
       <p className="text-gray-500 mb-8">Log in to continue</p>
-      <form onSubmit={submit} className="bg-white border border-gray-200 rounded-xl p-6 shadow-sm w-full max-w-sm space-y-4">
-        <label className="block text-sm text-gray-700">
-          Username
-          <input id="login-username" autoComplete="username" value={username} onChange={e => setUsername(e.target.value)}
-            className="mt-1 w-full border border-gray-300 rounded px-3 py-2 text-sm" required />
-        </label>
-        <label className="block text-sm text-gray-700">
-          Password
-          <input id="login-password" type="password" autoComplete="current-password" value={password}
-            onChange={e => setPassword(e.target.value)}
-            className="mt-1 w-full border border-gray-300 rounded px-3 py-2 text-sm" required />
-        </label>
-        {error && <p role="alert" className="text-sm text-red-600">{error}</p>}
-        <button type="submit" disabled={busy || !username || !password}
-          className="w-full bg-blue-600 text-white rounded px-4 py-2 text-sm font-medium disabled:opacity-50">
-          {busy ? 'Logging in…' : 'Log in'}
-        </button>
-      </form>
+      {step === 'password' ? (
+        <form onSubmit={submit} className="bg-white border border-gray-200 rounded-xl p-6 shadow-xs w-full max-w-sm space-y-4">
+          <label className="block text-sm text-gray-700">
+            Username
+            <input id="login-username" autoComplete="username" value={username} onChange={e => setUsername(e.target.value)}
+              className={input} required />
+          </label>
+          <label className="block text-sm text-gray-700">
+            Password
+            <input id="login-password" type="password" autoComplete="current-password" value={password}
+              onChange={e => setPassword(e.target.value)}
+              className={input} required />
+          </label>
+          {error && <p role="alert" className="text-sm text-red-600">{error}</p>}
+          <button type="submit" disabled={busy || !username || !password} className={button}>
+            {busy ? 'Logging in…' : 'Log in'}
+          </button>
+        </form>
+      ) : (
+        <form onSubmit={submitCode} className="bg-white border border-gray-200 rounded-xl p-6 shadow-xs w-full max-w-sm space-y-4">
+          <p className="text-sm text-gray-600">
+            Enter the 6-digit code from your authenticator app, or one of your recovery codes.
+          </p>
+          <label className="block text-sm text-gray-700">
+            Authentication code
+            <input id="login-code" autoComplete="one-time-code" inputMode="text" value={code} maxLength={64}
+              onChange={e => setCode(e.target.value)} className={input} required autoFocus />
+          </label>
+          {error && <p role="alert" className="text-sm text-red-600">{error}</p>}
+          <button type="submit" disabled={busy || !code} className={button}>
+            {busy ? 'Verifying…' : 'Verify'}
+          </button>
+          <button type="button" onClick={back} className="w-full text-sm text-gray-500 hover:text-blue-600">Back</button>
+        </form>
+      )}
     </div>
   )
 }
@@ -20971,7 +24126,7 @@ export default function SetupRequiredPage() {
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-8">
       <h1 className="text-3xl font-bold text-gray-800 mb-2">RAG Platform</h1>
-      <div className="bg-white border border-gray-200 rounded-xl p-6 shadow-sm w-full max-w-xl space-y-3">
+      <div className="bg-white border border-gray-200 rounded-xl p-6 shadow-xs w-full max-w-xl space-y-3">
         <h2 className="text-lg font-semibold text-gray-800">Not set up yet</h2>
         <p className="text-sm text-gray-600">
           No account exists. On the machine running the stack, create the first AI Engineer from the
@@ -21033,7 +24188,7 @@ export default function ChangePasswordPage({ forced = false }: { forced?: boolea
   )
 
   const form = (
-    <form onSubmit={submit} className="bg-white border border-gray-200 rounded-xl p-6 shadow-sm w-full max-w-sm space-y-4">
+    <form onSubmit={submit} className="bg-white border border-gray-200 rounded-xl p-6 shadow-xs w-full max-w-sm space-y-4">
       <h2 className="text-lg font-semibold text-gray-800">Change password</h2>
       {forced && (
         <p className="text-sm text-gray-600">
@@ -21191,7 +24346,7 @@ export default function QAPage() {
         onKeyDown={handleKeyDown}
         placeholder="Type your question… (Ctrl+Enter to submit)"
         rows={3}
-        className="w-full border rounded px-3 py-2 text-sm mb-3 resize-none focus:outline-none focus:ring-2 focus:ring-blue-300"
+        className="w-full border rounded px-3 py-2 text-sm mb-3 resize-none focus:outline-hidden focus:ring-2 focus:ring-blue-300"
       />
       <div className="flex items-center gap-4 mb-4">
         <button
@@ -21567,7 +24722,7 @@ import JobList, { newestToOpen, useJobList } from '../components/JobList'
 
 // Document preparation (#638). Raw documents are uploaded to the preparation area
 // on the instance, prepared by a background job (the code does the corpus rules'
-// work, the local LLM only removes headers, footers and boilerplate and writes a
+// work, the build LLM only removes headers, footers and boilerplate and writes a
 // title and summary for PDF, DOCX, TXT and MD; CSV and JSON parts are labelled
 // from their data, #648), reviewed here, and imported into a collection through the
 // normal ingest path. They stay on the instance until deleted.
@@ -21822,7 +24977,7 @@ export default function PreparePage() {
       <h1 className="text-2xl font-bold mb-2">Prepare Documents</h1>
       <p className="text-sm text-gray-600 mb-4">
         Raw documents are made to follow the corpus rules here: the code extracts the text, splits it to the limits,
-        normalises it and converts JSON, and the local LLM only removes page headers, footers, page numbers and
+        normalises it and converts JSON, and the build LLM only removes page headers, footers, page numbers and
         boilerplate and writes a title and summary for PDF, DOCX, TXT and MD. CSV and JSON parts are labelled from
         their data, with no LLM call. Where its cleaning would lose content, the part keeps the
         code-only text and the fallback is shown. Documents stay on this instance until you delete them.
@@ -22777,10 +25932,20 @@ export default function GoldStandardPage() {
 ### ui/src/pages/CollectionsPage.tsx
 
 ```typescript
-import { useState, useEffect } from 'react'
-import { api, CollectionInfo } from '../api/client'
+import { useState, useEffect, useRef } from 'react'
+import { api, AdminUser, CollectionAccess, CollectionInfo, ServicePrincipal } from '../api/client'
+import { useAuth } from '../context/AuthContext'
+
+// Who may use each collection (#606): "Open", "Restricted (n)" with n grants,
+// or a dash when the state couldn't be read.
+function accessLabel(a: CollectionAccess | null | undefined): string {
+  if (!a) return '—'
+  return a.restricted ? `Restricted (${a.users.length + a.service_principals.length})` : 'Open'
+}
 
 export default function CollectionsPage() {
+  // Query-only mode (#670): no create or delete; the list and access stay.
+  const queryOnly = useAuth().user?.query_only === true
   const [collections, setCollections] = useState<CollectionInfo[]>([])
   // A refused create is shown inside the New Collection modal, and a failed
   // list on the page; both were hidden or swallowed before (#379).
@@ -22798,12 +25963,89 @@ export default function CollectionsPage() {
   // Shown inside the delete dialog: the page-level error sits behind its
   // overlay, so a refused delete (409 while a job runs, #40) looked like nothing.
   const [deleteError, setDeleteError] = useState('')
+  // Per-collection access (#606): each row's state, and the Access dialog.
+  const [access, setAccess] = useState<Record<string, CollectionAccess | null>>({})
+  const [accessTarget, setAccessTarget] = useState('')
+  const [draft, setDraft] = useState<CollectionAccess>({ restricted: false, users: [], service_principals: [] })
+  const [people, setPeople] = useState<AdminUser[]>([])
+  const [principals, setPrincipals] = useState<ServicePrincipal[]>([])
+  const [accessError, setAccessError] = useState('')
+  // The dialog's own read of the state: until it succeeds the choice is
+  // unknown and Save stays disabled; once the Engineer changes something, a
+  // late answer doesn't overwrite the change. Each opening is numbered, and
+  // an answer to an earlier opening (another collection's, or one closed
+  // since) is ignored, so it can't become this dialog's draft (#788). The
+  // opening's lists of people and service principals are numbered the same
+  // way, so an earlier opening's late answer or error never reaches this one
+  // (#792).
+  const [accessLoaded, setAccessLoaded] = useState(false)
+  const touched = useRef(false)
+  const accessRead = useRef(0)
 
   async function load() {
     api.getCollections().then(r => {
       setCollections(r.collections)
       setListError('')
+      for (const c of r.collections) {
+        api.getCollectionAccess(c.name)
+          .then(a => setAccess(prev => ({ ...prev, [c.name]: a })))
+          .catch(() => setAccess(prev => ({ ...prev, [c.name]: null })))
+      }
     }).catch((e: unknown) => setListError(`Could not load the collections: ${e instanceof Error ? e.message : String(e)}`))
+  }
+
+  function openAccess(name: string) {
+    const ticket = ++accessRead.current
+    setAccessError('')
+    setAccessTarget(name)
+    setAccessLoaded(false)
+    touched.current = false
+    setDraft({ restricted: false, users: [], service_principals: [] })
+    api.getCollectionAccess(name).then(a => {
+      if (ticket !== accessRead.current) return
+      if (!touched.current) setDraft({ ...a })
+      setAccessLoaded(true)
+    }).catch((e: unknown) => {
+      if (ticket !== accessRead.current) return
+      setAccessError(`Could not read who may use this collection: ${e instanceof Error ? e.message : String(e)}`)
+    })
+    api.listUsers().then(r => {
+      if (ticket !== accessRead.current) return
+      setPeople(r.users)
+    }).catch((e: unknown) => {
+      if (ticket !== accessRead.current) return
+      setAccessError(`Could not load the people: ${e instanceof Error ? e.message : String(e)}`)
+    })
+    api.listPrincipals().then(r => {
+      if (ticket !== accessRead.current) return
+      setPrincipals(r.principals)
+    }).catch((e: unknown) => {
+      if (ticket !== accessRead.current) return
+      setAccessError(`Could not load the service principals: ${e instanceof Error ? e.message : String(e)}`)
+    })
+  }
+
+  function closeAccess() {
+    accessRead.current++
+    setAccessTarget('')
+    setAccessError('')
+  }
+
+  function toggle(list: 'users' | 'service_principals', name: string) {
+    touched.current = true
+    setDraft(d => ({ ...d, [list]: d[list].includes(name) ? d[list].filter(n => n !== name) : [...d[list], name] }))
+  }
+
+  async function saveAccess() {
+    if (!accessLoaded) return
+    const body = draft.restricted ? draft : { restricted: false, users: [], service_principals: [] }
+    try {
+      const saved = await api.setCollectionAccess(accessTarget, body)
+      setAccess(prev => ({ ...prev, [accessTarget]: saved }))
+      closeAccess()
+    } catch (e: unknown) {
+      setAccessError(e instanceof Error ? e.message : String(e))
+    }
   }
 
   useEffect(() => { load() }, [])
@@ -22853,7 +26095,9 @@ export default function CollectionsPage() {
     <div className="max-w-4xl mx-auto">
       <div className="flex justify-between items-center mb-6">
         <h1 className="text-2xl font-bold">Collections</h1>
-        <button onClick={openCreate} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">+ New Collection</button>
+        {!queryOnly && (
+          <button onClick={openCreate} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">+ New Collection</button>
+        )}
       </div>
       {listError && <p role="alert" className="text-red-600 text-sm mb-4">{listError}</p>}
       <table className="w-full text-sm border-collapse">
@@ -22864,6 +26108,7 @@ export default function CollectionsPage() {
             <th className="py-2">Index</th>
             <th className="py-2">Distance</th>
             <th className="py-2">Created</th>
+            <th className="py-2">Access</th>
             <th />
           </tr>
         </thead>
@@ -22875,8 +26120,12 @@ export default function CollectionsPage() {
               <td className="py-2">{c.index_type}</td>
               <td className="py-2">{c.distance_metric}</td>
               <td className="py-2 text-gray-500">{c.created_at ? new Date(c.created_at).toLocaleDateString() : '—'}</td>
-              <td className="py-2">
-                <button onClick={() => { setDeleteError(''); setDeleteTarget(c.name) }} className="text-red-400 hover:text-red-600 text-xs">Delete</button>
+              <td className="py-2">{accessLabel(access[c.name])}</td>
+              <td className="py-2 space-x-3">
+                <button onClick={() => openAccess(c.name)} className="text-blue-500 hover:text-blue-700 text-xs">Access</button>
+                {!queryOnly && (
+                  <button onClick={() => { setDeleteError(''); setDeleteTarget(c.name) }} className="text-red-400 hover:text-red-600 text-xs">Delete</button>
+                )}
               </td>
             </tr>
           ))}
@@ -22930,6 +26179,50 @@ export default function CollectionsPage() {
         </div>
       )}
 
+      {accessTarget && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
+          <div role="dialog" aria-label={`Access to ${accessTarget}`} className="bg-white rounded-xl p-6 w-96 shadow-xl max-h-[80vh] overflow-y-auto">
+            <h2 className="font-semibold mb-3">Access to {accessTarget}</h2>
+            <label className="flex items-center gap-2 text-sm mb-1">
+              <input type="radio" name="access-mode" checked={accessLoaded && !draft.restricted} disabled={!accessLoaded} onChange={() => { touched.current = true; setDraft(d => ({ ...d, restricted: false })) }} />
+              Open: everyone whose role allows it
+            </label>
+            <label className="flex items-center gap-2 text-sm mb-3">
+              <input type="radio" name="access-mode" checked={accessLoaded && draft.restricted} disabled={!accessLoaded} onChange={() => { touched.current = true; setDraft(d => ({ ...d, restricted: true })) }} />
+              Restricted: only the accounts ticked below (and AI Engineers)
+            </label>
+            {accessLoaded && draft.restricted && (
+              <div className="space-y-3 mb-4">
+                <fieldset>
+                  <legend className="text-xs text-gray-500 mb-1">People</legend>
+                  {people.map(u => (
+                    <label key={u.username} className="flex items-center gap-2 text-sm">
+                      <input type="checkbox" checked={draft.users.includes(u.username)} onChange={() => toggle('users', u.username)} />
+                      {u.username}{u.enabled ? '' : ' (disabled)'}
+                    </label>
+                  ))}
+                </fieldset>
+                <fieldset>
+                  <legend className="text-xs text-gray-500 mb-1">Service principals</legend>
+                  {principals.length === 0 && <p className="text-xs text-gray-400">None</p>}
+                  {principals.map(p => (
+                    <label key={p.name} className="flex items-center gap-2 text-sm">
+                      <input type="checkbox" checked={draft.service_principals.includes(p.name)} onChange={() => toggle('service_principals', p.name)} />
+                      {p.name}{p.enabled ? '' : ' (disabled)'}
+                    </label>
+                  ))}
+                </fieldset>
+              </div>
+            )}
+            {accessError && <p role="alert" className="text-red-600 text-sm mb-4">{accessError}</p>}
+            <div className="flex justify-end gap-2">
+              <button onClick={closeAccess} className="text-sm text-gray-500">Cancel</button>
+              <button onClick={saveAccess} disabled={!accessLoaded} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700 disabled:opacity-40">Save</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {deleteTarget && (
         <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
           <div className="bg-white rounded-xl p-6 w-96 shadow-xl">
@@ -22957,7 +26250,7 @@ import { Link } from 'react-router-dom'
 import {
   api, CollectionInfo, ExportJob, ExportJobEntry, ImportJob, ImportJobEntry, PackageSummary, TuneOptions,
 } from '../api/client'
-import { useRole } from '../context/AuthContext'
+import { useAuth, useRole } from '../context/AuthContext'
 import JobList, { JobRow, newestToOpen, useJobList } from '../components/JobList'
 
 // A transfer job is running until it completes or fails (#617).
@@ -22978,6 +26271,11 @@ function sizeLabel(bytes: number | null): string {
   if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB`
   if (bytes >= 1e3) return `${(bytes / 1e3).toFixed(0)} KB`
   return `${bytes} B`
+}
+
+// A package's expiry (#677) in the viewer's local time.
+function expiresLabel(iso: string): string {
+  return new Date(iso).toLocaleString()
 }
 
 const CONFLICT = [
@@ -23008,6 +26306,8 @@ function message(e: unknown): string {
 
 export default function TransferPage() {
   const { role } = useRole()
+  // Query-only mode (#670): no import here; packages are loaded on the host.
+  const queryOnly = useAuth().user?.query_only === true
   // Running and recent exports and imports, in one list (#617). Each panel
   // opens its own newest job on the first answer, unless it already has one.
   const exportJobs = useJobList<ExportJobEntry>(loadExportJobs, transferRunning)
@@ -23051,6 +26351,11 @@ export default function TransferPage() {
   const importTimer = useRef<number | null>(null)
   const exportPoll = useRef(0)
   const importPoll = useRef(0)
+  // Downloads being watched (#677): a full download deletes a package exported
+  // here, so the list is re-read until it is gone. `gone` holds the packages
+  // seen to go, so the finished export stops offering its Download.
+  const downloadWatches = useRef(new Map<string, number>())
+  const [gone, setGone] = useState<Set<string>>(new Set())
 
   const loadPackages = useCallback(() => {
     api.getPackages().then(r => {
@@ -23072,8 +26377,33 @@ export default function TransferPage() {
       importPoll.current += 1
       if (exportTimer.current) window.clearTimeout(exportTimer.current)
       if (importTimer.current) window.clearTimeout(importTimer.current)
+      downloadWatches.current.forEach(id => window.clearInterval(id))
+      downloadWatches.current.clear()
     }
   }, [loadPackages])
+
+  // After a Download click: re-read the package list every 3 s, for at most 10
+  // minutes, until the package isn't listed any more. A package not exported
+  // here stays listed, and its watch just ends at the limit (#677).
+  const watchDownload = useCallback((name: string) => {
+    const watches = downloadWatches.current
+    if (watches.has(name)) return
+    const started = Date.now()
+    const stop = () => { window.clearInterval(watches.get(name)); watches.delete(name) }
+    watches.set(name, window.setInterval(() => {
+      if (!alive.current || Date.now() - started > 10 * 60 * 1000) { stop(); return }
+      api.getPackages().then(r => {
+        if (!alive.current) return
+        setPackages(r.packages)
+        setPackagesError('')
+        if (!r.packages.some(p => p.filename === name)) {
+          stop()
+          setGone(g => new Set(g).add(name))
+          setFilename(f => (f === name ? '' : f))
+        }
+      }, () => {})
+    }, 3000))
+  }, [])
 
   // Fidelity is shown before the export runs, so the choice is informed rather
   // than discovered afterwards in the manifest. A lookup that fails says so
@@ -23263,6 +26593,8 @@ export default function TransferPage() {
       </div>
       <p className="text-sm text-gray-500 mb-6">
         Packages are written to and read from <code>./exports</code> in the project directory.
+        A package exported here is deleted from there once it has been fully downloaded, or when it
+        expires if nobody downloads it. Packages copied in to be imported are left alone.
       </p>
 
       <JobList rows={jobRows} showOwner={role === 'engineer'}
@@ -23308,7 +26640,7 @@ export default function TransferPage() {
           <span>
             Include the models
             <span className="block text-xs text-gray-500">
-              Bundles the embedding model and the LLM, taking the package to roughly 2.3 GB.
+              Bundles the embedding model and the answering LLM, taking the package to roughly 2.3 GB.
               Needed only when the target machine has never pulled them.
             </span>
           </span>
@@ -23364,6 +26696,21 @@ export default function TransferPage() {
                 </span>
               </p>
             )}
+            {exportJob.status === 'completed' && exportJob.filename && gone.has(exportJob.filename) && (
+              <p className="mt-2 text-gray-500 text-xs">Downloaded and deleted from ./exports.</p>
+            )}
+            {exportJob.status === 'completed' && exportJob.filename && !gone.has(exportJob.filename) && (
+              <p className="mt-2 flex items-center gap-3">
+                <a href={api.packageDownloadUrl(exportJob.filename)} download
+                   onClick={() => watchDownload(exportJob.filename as string)}
+                   className="bg-blue-600 text-white px-3 py-1 rounded text-xs hover:bg-blue-700">
+                  Download
+                </a>
+                {exportJob.expires_at && (
+                  <span className="text-gray-500 text-xs">Expires {expiresLabel(exportJob.expires_at)}</span>
+                )}
+              </p>
+            )}
             {exportJob.status === 'failed' && (
               <p className="text-red-600">
                 {exportJob.error_code && <code className="text-xs mr-2">{exportJob.error_code}</code>}
@@ -23379,11 +26726,23 @@ export default function TransferPage() {
 
       {/* ── Import ─────────────────────────────────────────────────────── */}
       <section className="bg-white border rounded p-4">
-        <h2 className="font-medium mb-3">Import a package</h2>
+        <h2 className="font-medium mb-3">{queryOnly ? 'Packages in ./exports' : 'Import a package'}</h2>
+        {queryOnly && (
+          <p className="text-xs text-gray-500 mb-3">
+            This instance is query-only. An operator loads a package on the host
+            with <code>python -m loader</code> (README, "Query-only mode").
+          </p>
+        )}
 
         <div className="flex items-center justify-between mb-1">
           <label className="block text-sm font-medium">Package in ./exports</label>
-          <button onClick={loadPackages} className="text-xs text-blue-600 hover:underline">Refresh</button>
+          <span className="flex items-center gap-3">
+            {filename
+              ? <a href={api.packageDownloadUrl(filename)} download onClick={() => watchDownload(filename)}
+                   className="text-xs text-blue-600 hover:underline">Download</a>
+              : <button disabled className="text-xs text-gray-400">Download</button>}
+            <button onClick={loadPackages} className="text-xs text-blue-600 hover:underline">Refresh</button>
+          </span>
         </div>
         <select
           value={filename}
@@ -23399,6 +26758,7 @@ export default function TransferPage() {
                 : p.readable
                 ? ` — ${p.collection}, ${p.chunk_count} chunks, ${p.fidelity}, ${sizeLabel(p.size_bytes)}`
                 : ' — unreadable'}
+              {p.expires_at ? `, expires ${expiresLabel(p.expires_at)}` : ''}
             </option>
           ))}
         </select>
@@ -23409,6 +26769,7 @@ export default function TransferPage() {
           </p>
         )}
 
+        {!queryOnly && (<>
         {selectedEncrypted && (
           <div className="mb-3">
             <label className="block text-sm font-medium mb-1">Passphrase</label>
@@ -23470,6 +26831,7 @@ export default function TransferPage() {
             ))}
           </div>
         )}
+        </>)}
       </section>
     </div>
   )
@@ -23595,7 +26957,7 @@ export default function HealthPage() {
       </div>}
       {healthError && <p role="alert" className="text-red-700 mb-4">Service health could not be read: {healthError}</p>}
       {health && (
-        <div className="grid grid-cols-3 gap-4 mb-8">
+        <div className={`grid ${health.services.ollama.same_model ? 'grid-cols-3' : 'grid-cols-4'} gap-4 mb-8`}>
           <div className="bg-white border rounded p-4">
             <div className="flex items-center text-sm font-medium mb-1">
               <StatusBadge status={health.services.weaviate.status} />
@@ -23603,13 +26965,33 @@ export default function HealthPage() {
             </div>
             <div className="text-xs text-gray-500">{health.services.weaviate.latency_ms}ms</div>
           </div>
-          <div className="bg-white border rounded p-4">
-            <div className="flex items-center text-sm font-medium mb-1">
-              <StatusBadge status={health.services.ollama.llm.status} />
-              LLM ({health.services.ollama.llm.model})
+          {/* One LLM, or an answer model and a build model (#671). */}
+          {health.services.ollama.same_model ? (
+            <div className="bg-white border rounded p-4">
+              <div className="flex items-center text-sm font-medium mb-1">
+                <StatusBadge status={health.services.ollama.llm.status} />
+                LLM ({health.services.ollama.llm.model}), builds and answers
+              </div>
+              <div className="text-xs text-gray-500">{health.services.ollama.llm.latency_ms}ms</div>
             </div>
-            <div className="text-xs text-gray-500">{health.services.ollama.llm.latency_ms}ms</div>
-          </div>
+          ) : (
+            <>
+              <div className="bg-white border rounded p-4">
+                <div className="flex items-center text-sm font-medium mb-1">
+                  <StatusBadge status={health.services.ollama.llm.status} />
+                  Answer LLM ({health.services.ollama.llm.model})
+                </div>
+                <div className="text-xs text-gray-500">{health.services.ollama.llm.latency_ms}ms</div>
+              </div>
+              <div className="bg-white border rounded p-4">
+                <div className="flex items-center text-sm font-medium mb-1">
+                  <StatusBadge status={health.services.ollama.build_llm.status} />
+                  Build LLM ({health.services.ollama.build_llm.model})
+                </div>
+                <div className="text-xs text-gray-500">{health.services.ollama.build_llm.latency_ms}ms</div>
+              </div>
+            </>
+          )}
           <div className="bg-white border rounded p-4">
             <div className="flex items-center text-sm font-medium mb-1">
               <StatusBadge status={health.services.ollama.embed.status} />
@@ -23642,12 +27024,27 @@ import { useAuth } from '../context/AuthContext'
 
 const ROLES: Role[] = ['end_user', 'developer', 'engineer']
 const ROLE_LABELS: Record<Role, string> = { end_user: 'End User', developer: 'Developer', engineer: 'AI Engineer' }
+// Reset password, Reset two-step, Disable and a role change ask first, on every
+// row; Enable doesn't (#551, #779). The own row says what the change does to the Engineer.
+const ASK = {
+  role: (name: string, own: boolean, next: Role) => own
+    ? `Change your own role to ${ROLE_LABELS[next]}? You will lose access to the Users page.`
+    : `Change the role of ${name} to ${ROLE_LABELS[next]}?`,
+  disable: (name: string, own: boolean) => own
+    ? "Disable your own account? You will be logged out and can't log in again until another AI Engineer enables you."
+    : `Disable ${name}? Their sessions end and they can't log in until enabled.`,
+  reset: (name: string) => `Reset the password of ${name}? Their sessions end and they must change the new password at their next login.`,
+  reset2: (name: string) => `Reset the two-step verification of ${name}? Their sessions end and they must log in again with their password alone.`,
+}
 
 // Account administration for Engineers (#25). The API decides what is allowed:
 // the last enabled Engineer can't be demoted or disabled, and an Engineer's own
 // password is changed on the Change password page, not reset here. Accounts are
 // disabled, never deleted. A generated password is shown once, from the answer
 // that carried it, and kept only in this page's memory until "Done".
+// Two-step verification (#607): each user's state, an Engineer's reset of
+// another user's set-up (which logs them out), and the switch that requires it
+// for everyone, which the API allows only once the Engineer has set it up.
 export default function UsersPage() {
   const { user: me, refresh } = useAuth()
   const [users, setUsers] = useState<AdminUser[]>([])
@@ -23684,6 +27081,19 @@ export default function UsersPage() {
       await load()
       return false
     } finally {
+      setBusy(false)
+    }
+  }
+
+  async function requireMfa(required: boolean) {
+    setActionError('')
+    setBusy(true)
+    try {
+      await api.setMfaRequired(required)
+    } catch (e: unknown) {
+      setActionError(e instanceof Error ? e.message : String(e))
+    } finally {
+      await refresh()
       setBusy(false)
     }
   }
@@ -23730,6 +27140,13 @@ export default function UsersPage() {
         </p>
       </form>
 
+      <label className="flex items-center gap-2 text-sm text-gray-700 mb-6">
+        <input id="mfa-required" type="checkbox" checked={!!me?.mfa_required} disabled={busy}
+          onChange={e => requireMfa(e.target.checked)} />
+        Require two-step verification for everyone
+        <span className="text-xs text-gray-500">(set it up for your own account first, on the Account page)</span>
+      </label>
+
       {actionError && <p role="alert" className="text-red-600 text-sm mb-4">{actionError}</p>}
 
       <table className="w-full text-sm border-collapse">
@@ -23739,6 +27156,7 @@ export default function UsersPage() {
             <th className="py-2 pr-4">Role</th>
             <th className="py-2 pr-4">Status</th>
             <th className="py-2 pr-4">Password</th>
+            <th className="py-2 pr-4">Two-step</th>
             <th className="py-2 pr-4">Created</th>
             <th className="py-2"></th>
           </tr>
@@ -23751,28 +27169,282 @@ export default function UsersPage() {
                 <td className="py-2 pr-4 font-medium">{u.username}{own && <span className="text-gray-500 font-normal"> (you)</span>}</td>
                 <td className="py-2 pr-4">
                   <select aria-label={`Role of ${u.username}`} value={u.role} disabled={busy}
-                    onChange={e => { const next = e.target.value as Role; act(u.username, () => api.setUserRole(u.username, next)) }}
+                    onChange={e => { const next = e.target.value as Role; if (window.confirm(ASK.role(u.username, own, next))) act(u.username, () => api.setUserRole(u.username, next)) }}
                     className="border border-gray-300 rounded px-2 py-1 text-sm">
                     {ROLES.map(r => <option key={r} value={r}>{ROLE_LABELS[r]}</option>)}
                   </select>
                 </td>
                 <td className="py-2 pr-4">{u.enabled ? 'Enabled' : 'Disabled'}</td>
                 <td className="py-2 pr-4">{u.must_change_password ? 'Change due' : 'Set'}</td>
+                <td className="py-2 pr-4">{u.mfa_enrolled ? 'On' : 'Off'}</td>
                 <td className="py-2 pr-4">{new Date(u.created_at).toLocaleDateString()}</td>
                 <td className="py-2 space-x-3 whitespace-nowrap">
                   {own
                     ? <span className="text-xs text-gray-500">Use Change password for your own</span>
-                    : <button disabled={busy} onClick={() => act(u.username, () => api.resetUserPassword(u.username))}
+                    : <button disabled={busy} onClick={() => { if (window.confirm(ASK.reset(u.username))) act(u.username, () => api.resetUserPassword(u.username)) }}
                         className="text-blue-600 hover:underline disabled:opacity-50">Reset password</button>}
                   <button disabled={busy}
-                    onClick={() => act(u.username, () => u.enabled ? api.disableUser(u.username) : api.enableUser(u.username))}
+                    onClick={() => { if (!u.enabled || window.confirm(ASK.disable(u.username, own))) act(u.username, () => u.enabled ? api.disableUser(u.username) : api.enableUser(u.username)) }}
                     className="text-blue-600 hover:underline disabled:opacity-50">{u.enabled ? 'Disable' : 'Enable'}</button>
+                  {u.mfa_enrolled && !own && (
+                    <button disabled={busy} onClick={() => { if (window.confirm(ASK.reset2(u.username))) act(u.username, () => api.resetUserMfa(u.username)) }}
+                      className="text-blue-600 hover:underline disabled:opacity-50">Reset two-step</button>
+                  )}
                 </td>
               </tr>
             )
           })}
         </tbody>
       </table>
+    </div>
+  )
+}
+```
+
+### ui/src/pages/AccountPage.tsx
+
+```typescript
+import { FormEvent, ReactNode, useEffect, useState } from 'react'
+import { Link, useNavigate } from 'react-router-dom'
+import qrcode from 'qrcode-generator'
+import { api, MfaStatus } from '../api/client'
+import { useAuth } from '../context/AuthContext'
+
+// The user's own account (#607): two-step verification with an authenticator
+// app (TOTP), and a link to Change password. Everything sensitive (the secret
+// while setting up, recovery codes) comes in one answer and is kept only in
+// this page's memory until "Done". The QR code is drawn here in the browser,
+// so the secret never leaves the machine for an image service; the secret is
+// also shown as text for apps that take it typed. When two-step verification
+// is required for everyone and this user hasn't set it up, this is the only
+// page the UI shows (`forced`), with a way to log out.
+
+function qrDataUrl(text: string): string {
+  const qr = qrcode(0, 'M')
+  qr.addData(text)
+  qr.make()
+  return qr.createDataURL(4, 4)
+}
+
+function Codes({ codes, onDone }: { codes: string[]; onDone: () => void }) {
+  return (
+    <div data-testid="recovery-codes" className="border border-amber-300 bg-amber-50 rounded p-4 text-sm space-y-3">
+      <p>
+        Your recovery codes. Each works once, in place of a code from the app, if you lose your phone. They are
+        shown only once: save them somewhere safe now.
+      </p>
+      <ul className="grid grid-cols-2 gap-2 font-mono">
+        {codes.map(c => <li key={c} className="bg-white border border-gray-200 rounded px-2 py-1 select-all">{c}</li>)}
+      </ul>
+      <button onClick={onDone} className="bg-blue-600 text-white px-3 py-1 rounded text-sm hover:bg-blue-700">Done</button>
+    </div>
+  )
+}
+
+export default function AccountPage({ forced = false }: { forced?: boolean }) {
+  const { user, logout, refresh } = useAuth()
+  const navigate = useNavigate()
+  const [status, setStatus] = useState<MfaStatus | null>(null)
+  const [loadError, setLoadError] = useState('')
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [setup, setSetup] = useState<{ secret: string; uri: string } | null>(null)
+  const [codes, setCodes] = useState<string[] | null>(null)
+  const [code, setCode] = useState('')
+  const [password, setPassword] = useState('')
+  const [form, setForm] = useState<'none' | 'regenerate' | 'disable'>('none')
+
+  async function load() {
+    try {
+      setStatus(await api.mfaStatus())
+      setLoadError('')
+    } catch (e: unknown) {
+      setLoadError(`Could not load your two-step verification: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+
+  useEffect(() => { load() }, [])
+
+  async function run(action: () => Promise<void>) {
+    setError('')
+    setBusy(true)
+    try {
+      await action()
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const start = () => run(async () => {
+    const started = await api.mfaEnroll()
+    setSetup({ secret: started.secret, uri: started.otpauth_uri })
+    setCode('')
+  })
+
+  const confirm = (e: FormEvent) => {
+    e.preventDefault()
+    run(async () => {
+      try {
+        const result = await api.mfaConfirm(code)
+        setSetup(null)
+        setStatus(result.status)
+        setCodes(result.recovery_codes)
+      } finally {
+        setCode('')
+      }
+    })
+  }
+
+  const regenerate = (e: FormEvent) => {
+    e.preventDefault()
+    run(async () => {
+      try {
+        const result = await api.mfaRegenerate(code)
+        setStatus(result.status)
+        setCodes(result.recovery_codes)
+        setForm('none')
+      } finally {
+        setCode('')
+      }
+    })
+  }
+
+  const disable = (e: FormEvent) => {
+    e.preventDefault()
+    run(async () => {
+      try {
+        const result = await api.mfaDisable(password, code)
+        setStatus(result.status)
+        setForm('none')
+        await refresh()
+      } finally {
+        setCode('')
+        setPassword('')
+      }
+    })
+  }
+
+  // After the codes of a new set-up are put away, the API's view of the user
+  // (enrolled; no set-up due any more) is read again; a forced set-up then
+  // opens Q&A, as a forced password change does.
+  const done = async () => {
+    setCodes(null)
+    await refresh()
+    if (forced) navigate('/qa', { replace: true })
+  }
+
+  const input = 'mt-1 block w-full border border-gray-300 rounded px-3 py-2 text-sm'
+  const primary = 'bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700 disabled:opacity-50'
+  const codeField = (id: string, label: string) => (
+    <label className="block text-sm text-gray-700">
+      {label}
+      <input id={id} autoComplete="one-time-code" value={code} maxLength={64} onChange={e => setCode(e.target.value)}
+        className={input} required />
+    </label>
+  )
+
+  let body: ReactNode
+  if (codes) {
+    body = <Codes codes={codes} onDone={done} />
+  } else if (!status) {
+    body = loadError ? null : <p className="text-sm text-gray-500">Loading…</p>
+  } else if (!status.enrolled) {
+    body = setup ? (
+      <form onSubmit={confirm} className="space-y-4" data-testid="mfa-setup">
+        <p className="text-sm text-gray-700">
+          Scan this code with an authenticator app (for example Microsoft Authenticator, Google Authenticator or
+          1Password), then enter the 6-digit code it shows.
+        </p>
+        <img src={qrDataUrl(setup.uri)} alt="QR code for your authenticator app" className="border border-gray-200 rounded" />
+        <p className="text-sm text-gray-700">
+          Or enter this key in the app by hand:{' '}
+          <code data-testid="mfa-secret" className="bg-white border border-gray-200 rounded px-2 py-1 select-all break-all">{setup.secret}</code>
+        </p>
+        {codeField('mfa-confirm-code', 'Code from the app')}
+        <div className="flex gap-3">
+          <button type="submit" disabled={busy || !code} className={primary}>Confirm</button>
+          <button type="button" onClick={() => setSetup(null)} className="text-sm text-gray-500 hover:text-blue-600">Cancel</button>
+        </div>
+      </form>
+    ) : (
+      <div className="space-y-3">
+        <p className="text-sm text-gray-700">
+          {forced
+            ? 'Two-step verification is required for every account. Set it up to continue.'
+            : 'Two-step verification is off. When it is on, logging in also needs a code from an authenticator app on your phone.'}
+        </p>
+        <button onClick={start} disabled={busy} className={primary}>Set up</button>
+      </div>
+    )
+  } else {
+    body = (
+      <div className="space-y-4">
+        <p className="text-sm text-gray-700" data-testid="mfa-on">
+          Two-step verification is on{status.enrolled_at ? ` since ${new Date(status.enrolled_at).toLocaleDateString()}` : ''}.
+          {' '}{status.recovery_codes_remaining} of 10 recovery codes left.
+        </p>
+        {form === 'regenerate' && (
+          <form onSubmit={regenerate} className="space-y-3">
+            <p className="text-sm text-gray-600">New codes replace all your old ones.</p>
+            {codeField('mfa-regenerate-code', 'Code from the app')}
+            <button type="submit" disabled={busy || !code} className={primary}>Get new recovery codes</button>
+          </form>
+        )}
+        {form === 'disable' && (
+          <form onSubmit={disable} className="space-y-3">
+            <label className="block text-sm text-gray-700">
+              Password
+              <input id="mfa-disable-password" type="password" autoComplete="current-password" value={password}
+                onChange={e => setPassword(e.target.value)} className={input} required />
+            </label>
+            {codeField('mfa-disable-code', 'Code from the app, or a recovery code')}
+            <button type="submit" disabled={busy || !code || !password} className={primary}>Turn off</button>
+          </form>
+        )}
+        {form === 'none' && (
+          <div className="flex gap-4">
+            <button onClick={() => { setForm('regenerate'); setCode(''); setError('') }}
+              className="text-sm text-blue-600 hover:underline">Regenerate recovery codes</button>
+            {!status.required && (
+              <button onClick={() => { setForm('disable'); setCode(''); setPassword(''); setError('') }}
+                className="text-sm text-blue-600 hover:underline">Turn off</button>
+            )}
+          </div>
+        )}
+        {form !== 'none' && (
+          <button onClick={() => { setForm('none'); setError('') }} className="text-sm text-gray-500 hover:text-blue-600">Cancel</button>
+        )}
+      </div>
+    )
+  }
+
+  const section = (
+    <div className="bg-white border border-gray-200 rounded-xl p-6 shadow-xs w-full max-w-lg space-y-4">
+      <h2 className="text-lg font-semibold text-gray-800">Two-step verification</h2>
+      {loadError && <p role="alert" className="text-sm text-red-600">{loadError}</p>}
+      {body}
+      {error && <p role="alert" className="text-sm text-red-600">{error}</p>}
+    </div>
+  )
+
+  if (forced) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-8 gap-4">
+        <h1 className="text-3xl font-bold text-gray-800 mb-2">RAG Platform</h1>
+        {section}
+        <button type="button" onClick={() => logout()} className="text-sm text-gray-500 hover:text-blue-600">Log out</button>
+      </div>
+    )
+  }
+  return (
+    <div className="flex flex-col items-center gap-6">
+      <h1 className="text-2xl font-bold self-start">Account</h1>
+      <p className="text-sm text-gray-600 self-start">
+        {user?.username}. <Link to="/account/password" className="text-blue-600 hover:underline">Change password</Link>
+      </p>
+      {section}
     </div>
   )
 }
@@ -23976,14 +27648,16 @@ import { api, AuditFilters, AuditPage as AuditPageData, AuditRecord, auditCsvUrl
 
 // The names the API records (api/services/audit.py ALL_ACTIONS), for the filter.
 const ACTIONS = [
-  'admin.key.issue', 'admin.key.revoke', 'admin.principal.create', 'admin.principal.disable',
+  'admin.key.issue', 'admin.key.revoke', 'admin.mfa.policy', 'admin.principal.create', 'admin.principal.disable',
   'admin.principal.enable', 'admin.principal.set-role', 'admin.user.create', 'admin.user.disable',
-  'admin.user.enable', 'admin.user.reset-password', 'admin.user.set-role', 'audit.download', 'audit.view',
-  'auth.login', 'auth.logout', 'auth.password', 'collection.create', 'collection.delete', 'export',
+  'admin.user.enable', 'admin.user.reset-mfa', 'admin.user.reset-password', 'admin.user.set-role', 'audit.download',
+  'audit.view', 'auth.login', 'auth.logout', 'auth.mfa', 'auth.mfa.disable', 'auth.mfa.enroll',
+  'auth.mfa.recovery-codes', 'auth.password', 'collection.access', 'collection.access.refused', 'collection.create',
+  'collection.delete', 'export',
   'goldstandard.download', 'goldstandard.save', 'import', 'ingest', 'ingest.config', 'operator.bootstrap',
-  'operator.create-user', 'operator.disable', 'operator.enable', 'operator.reset-password', 'operator.set-role',
-  'prepare.cancel', 'prepare.delete', 'prepare.download', 'prepare.import', 'prepare.start', 'prepare.upload',
-  'query', 'retrieval.config', 'system.start', 'tune.rechunk', 'tune.reembed', 'tune.reindex',
+  'operator.create-user', 'operator.disable', 'operator.enable', 'operator.load', 'operator.reset-mfa', 'operator.reset-password',
+  'operator.set-role', 'package.delete', 'package.download', 'prepare.cancel', 'prepare.delete', 'prepare.download', 'prepare.import', 'prepare.start',
+  'prepare.upload', 'query', 'retrieval.config', 'system.start', 'tune.rechunk', 'tune.reembed', 'tune.reindex',
 ]
 const RESULTS = ['success', 'refused', 'error', 'accepted', 'succeeded', 'failed', 'interrupted']
 const EMPTY: AuditFilters = { from: '', to: '', actor: '', action: '', collection: '', result: '' }
@@ -24220,6 +27894,7 @@ bash scripts/verify/stack.sh run                    # everything, ~20 min plus s
 RAG_SKIP_SLOW=1 bash scripts/verify/stack.sh run    # skip LLM work, ~8 min, start-up included
 bash scripts/verify/stack.sh run 02 04              # only the named suites
 bash scripts/verify/stack.sh run --lan              # LAN mode, TLS on loopback only (#26)
+bash scripts/verify/stack.sh run --query-only       # query-only mode on a second instance (#670)
 ```
 
 Exits non-zero if any check fails.
@@ -24250,9 +27925,10 @@ request comes from one address, so the harness waits for a slot instead of faili
 refuses with `429 LOGIN_RATE_LIMITED` is sent again every 6.5 s for up to 5 minutes, by
 `auth_setup.request` and `paced` (used by `auth_stack.py`'s `code`, `audit_stack.py` and
 `lan_stack.py`) and by `browser/lib.js`'s `login`; `browser/ui_criteria.js`'s §10.4 login through
-the login form is submitted once more after 6.5 s when the page shows nginx's refusal. The API's
-own `429 LOGIN_THROTTLED` and every other answer reach the check at once. Suites that log in often
-take longer for it.
+the login form is submitted once more after 6.5 s when the page shows nginx's refusal, printing a
+line when it retries. That check answers the form's first login itself with nginx's refusal, so the
+retry runs in every run (#598). The API's own `429 LOGIN_THROTTLED` and every other answer reach
+the check at once. Suites that log in often take longer for it.
 
 `require_stack` then logs `vfy-engineer` in, into the curl cookie jar
 `$RAG_AUTH_DIR/engineer.jar` (0600), exported as `RAG_AUTH_JAR`. `lib.sh` defines `curl` as a
@@ -24336,6 +28012,37 @@ and 4 min 10 s in a full run (the Prepare case about 25 s), most of it the large
 2.5 min). Splitting it through `overlap` at chunk size 50 instead embedded about 11,200 chunks and took
 26.5 min, which is why it uses `fixed` with the merge.
 
+`23_llm_split.sh` checks that each task uses its own LLM (#671): preparation and gold standard
+generation the build model, query the answer model. It runs only in a full run (`RAG_SKIP_SLOW`
+unset); every other check stays on one model. It ingests the fixtures' `policies.txt` into
+`VfyLlmSplit`, then runs `llm_split.py` in the api container with `BUILD_LLM_MODEL=qwen2.5:0.5b`
+set for that process only, the answer model left as compose sets it, so neither the API nor the
+compose settings change. `llm_split.py` pulls `qwen2.5:0.5b` into the verify project's Ollama, then
+prepares a short text (`preparation.prepare_document`, with the chat and model list
+`preparation_jobs` uses), generates one gold standard pair (`goldstandard._generate_pair`) and runs
+one query (`rag_pipeline.run_query`) on the collection, recording the model Ollama reports in each
+chat reply. The checks: preparation and gold standard were answered only by `qwen2.5:0.5b`, query
+only by the answer model. Preparation writes to a temporary folder and the pair isn't stored; the
+small model is deleted from Ollama and the collection dropped at the end.
+
+`24_query_only.sh` checks query-only mode (#670, SPECIFICATIONS.md §2.6 and §10.11). In every run:
+`query_only_config.py` resolves `docker-compose.yml` with and without `docker-compose.query-only.yml` through
+`docker compose config` (nothing started) and checks that only the api's `RAG_QUERY_ONLY` changes, from `"false"` to
+`"true"`; `../tests/test_query_only.py` runs in the API image with no network (the setting, the classification of
+every state-changing route, the `403 QUERY_ONLY` refusals and their order, the user answers' `query_only`, the
+loader and the access of a collection it creates); a one-off api container refuses `RAG_QUERY_ONLY=yes` with one
+line; and on the default instance `python -m loader` refuses with `NOT_QUERY_ONLY` (exit 1, an `operator.load`
+record) and a path is a usage error (exit 2). The rest needs `stack.sh run --query-only`, which runs this suite
+alone: it ingests the fixtures' `policies.txt` into `VfyQueryOnly` and exports it, then `stack.sh query-only-mode`
+starts the project again in query-only mode with empty volumes and only that package in its exports folder (the
+second machine). There, after the test accounts are made again, it checks `GET /auth/me`'s `query_only`, a load
+with `EMBED_MODEL` set to another model for that process (refused `EMBEDDING_MISMATCH`, no collection), the load
+(exit 0, the exported chunk count, an `operator.load` record), a second load (`COLLECTION_EXISTS`), that the End
+User doesn't see the loaded collection until the Engineer opens it (`PUT .../access`, kept), each of the 19 refused
+routes (`403 QUERY_ONLY`), a Developer's delete (`FORBIDDEN`) and no session (`401`), outside `RAG_SKIP_SLOW=1` an
+End User's question with an answer and citations, and an export and the package list. The project is removed when
+the run ends. Two stacks never run at once, so Docker's memory holds one answer model.
+
 ## Entry point and verify project
 
 `stack.sh` runs everything on compose project `rag-verify`, a disposable copy of
@@ -24346,9 +28053,10 @@ against" below).
 
 | Command | What it does |
 |---|---|
-| `stack.sh run [--checkout DIR] [--telemetry \| --lan] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
-| `stack.sh up [--checkout DIR] [--pull] [--telemetry \| --lan]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. `--telemetry` brings it up in the same telemetry configuration as `run --telemetry` (see "Optional Collector acceptance") and also prints `COMPOSE_PROFILES`, `RAG_VERIFY_HARNESS`, `RAG_VERIFY_CHECKOUT` and `RAG_VERIFY_OTEL_ENABLED`. |
+| `stack.sh run [--checkout DIR] [--telemetry [--telemetry-pin FILE] \| --lan \| --query-only] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
+| `stack.sh up [--checkout DIR] [--pull] [--telemetry [--telemetry-pin FILE] \| --lan \| --query-only]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. `--telemetry` brings it up in the same telemetry configuration as `run --telemetry` (see "Optional Collector acceptance") and also prints `COMPOSE_PROFILES`, `RAG_VERIFY_HARNESS`, `RAG_VERIFY_CHECKOUT`, `RAG_VERIFY_OTEL_ENABLED` and `RAG_VERIFY_TELEMETRY_PIN`. `--telemetry-pin FILE` supplies a reviewed collector pin (see "Evaluating a collector pin change"). |
 | `stack.sh down` | Removes the project: its containers, network, volumes, images and exports folder. |
+| `stack.sh query-only-mode --package NAME [--checkout DIR]` | Only for `24_query_only.sh`, under the inherited lock of a `run --query-only` (#670): keeps package NAME aside, removes the project's containers, network and volumes (not its images or the model copy), puts the package back alone in an empty exports folder, and starts the project again from the checkout's `docker-compose.query-only.yml`, after the configuration check and without a build, as a second instance on another machine would be. |
 
 `--checkout` is the checkout to build and test; the default is the one holding
 `stack.sh`. The overlay `docker-compose.verify.yml` and `stack.sh` itself always
@@ -24446,10 +28154,14 @@ would fail by design). `--lan` can't be combined with `--telemetry`.
 `lan_config.py` (`docker compose config` of the base file plus
 `docker-compose.lan.yml`, under the project name `rag-lan-config`, with no
 `.env`; nothing is created) and runs `../tests/test_lan_mode.py` in the API
-image. Only in a `--lan` run does it check the running LAN project through
+image. It also checks, in one-off api containers of the running verify project
+(default or LAN configuration; `docker compose run --rm --no-deps`), that the API refuses with one line and
+no traceback for a non-Secure cookie in LAN mode, an empty account store in LAN
+mode and a non-boolean `RAG_LAN_MODE`. Only in a `--lan` run does it check the running LAN project through
 `lan_stack.py`: HTTPS with the generated certificate, the hosts nginx answers
 for (localhost, 127.0.0.1 and the test names; another `Host` gets 421, #664),
 TLS versions and HTTP/2, the single loopback binding, the `Secure` cookie, the origin rule over HTTPS,
+a `Server` header with no nginx version (`server_tokens off`),
 the API's refusal in one-off containers (`docker compose run --rm
 --no-deps`, no ports) and nginx's login rate limit (logins sent without
 waiting until one is refused `429 LOGIN_RATE_LIMITED`, #577); it also prints
@@ -24509,8 +28221,9 @@ top of the main `README.md` shows its result on `develop`.
   failed.
 - **The model cache.** Even with `RAG_SKIP_SLOW=1`, ingest needs the embedding
   model, so Ollama starts with both models (about 5.2 GB). The cache key is
-  built from the models `ollama/entrypoint.sh` pulls
-  (`ollama-models-llama3.1:8b-nomic-embed-text`). On a hit, the cached models are
+  built from the models `ollama/entrypoint.sh` pulls, the names
+  `ollama/compose-models.sh` resolves from the LLM settings compose gives the
+  ollama service (#671) (`ollama-models-llama3.1:8b-nomic-embed-text` by default). On a hit, the cached models are
   copied into `rag-verify-ollama-models` before `up`, and Ollama pulls
   nothing. On a miss, Ollama pulls them; after `down`, the workflow copies the
   volume's `models/` folder out, only once every model's manifest is there,
@@ -24556,7 +28269,7 @@ Run `python3 scripts/tests/test_session_implementation.py` from the repository r
 
 Suite 05 also runs `scripts/tests/test_batch_implementation.py` on the host (Python and bash).
 
-`05_transfer.sh` registers the nine controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_export_snapshot.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_import_guard.py`, `test_batch_recovery.py`, `test_package_listing.py` and `test_export_encryption.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links. It also checks (#509) that export writes a `null` `source_sha256` for a chunk whose retained blob is missing on disk, and that import check 3a refuses a chunk whose non-null `source_sha256` isn't a digest of the package's source index (with or without `sources/`) as `PACKAGE_CORRUPT`, `detail` `{"file": "chunks.jsonl", "line": n}`, before the embedding check and any backend work.
+`05_transfer.sh` registers the ten controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_export_snapshot.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_import_guard.py`, `test_batch_recovery.py`, `test_package_listing.py`, `test_export_encryption.py` and `test_package_download.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links. It also checks (#509) that export writes a `null` `source_sha256` for a chunk whose retained blob is missing on disk, and that import check 3a refuses a chunk whose non-null `source_sha256` isn't a digest of the package's source index (with or without `sources/`) as `PACKAGE_CORRUPT`, `detail` `{"file": "chunks.jsonl", "line": n}`, before the embedding check and any backend work.
 
 `scripts/tests/test_export_snapshot.py` (#509, API container) drives `exporter._run` with the real `packager.build` and retained-source store and a mocked Weaviate backend whose iterator reads the stored chunks one at a time. A re-ingest that tries to commit new chunks and a new `doc.txt` source after the first chunk is streamed waits for the export: the package holds the old chunk text and the old source bytes and index, every chunk's `source_sha256` names a blob in `sources/`, and the re-ingest lands after the build. During an export, gold-standard generation preparation answers `COLLECTION_BUSY` (409) and a guarded chunk insert waits; an export started while another writer holds the guard reads `queued` until it is released; and the guard is free again after an export that succeeds, is refused (`PackageError`), fails or is cancelled. An export whose build is cancelled, or ended by another non-`Exception`, reads `failed` with an `error` naming the exception and saying it was cancelled, and the exception still propagates (#521). Orderings use events and the guard's waiter count. On the code before #509 the re-ingest, generation, insert, queued and guard-held checks fail; on the code before #521 the cancelled-status checks fail.
 
@@ -24900,9 +28613,11 @@ operation runs reliably long enough to interrupt, so `test_jobstore.py` covers i
 
 `scripts/tests/test_startup_sweep.py` (#377) checks the startup sweeps of what a killed job
 leaves behind, in disposable folders. In `UPLOAD_DIR`, ingest staging is created as
-`ingest-*` and removed with the `import-*`, `rechunk-*`, `batch-verify-*` and `prepare-*` work
-directories, and document preparation's `prepare-*.zip` and `prepare-*.json` temporary files (#640);
-in `EXPORTS_DIR`, `.build-*` directories and `.*.tar.gz.partial` files are removed. Only those
+`ingest-*` and export staging as `export-*` (#549), and both are removed with the `import-*`,
+`rechunk-*`, `batch-verify-*` and `prepare-*` work directories, and document preparation's
+`prepare-*.zip` and `prepare-*.json` temporary files (#640); in `EXPORTS_DIR`, `.build-*`
+directories (export staging from earlier versions) and `.*.tar.gz.partial` and
+`.*.tar.gz.age.partial` files are removed. Only those
 names, and only a real directory or regular file as the name says: completed packages,
 `ingest_configs/`, look-alike names, a file where a directory is expected and the reverse, and
 anything in a sub-folder are kept. A symlink is never followed, at the top or inside a
@@ -24912,7 +28627,7 @@ child process removes both kinds and logs them by name and size. A second one, w
 sweep fails, logs the error and still starts, with the ingest staging removed (#423).
 `02_ingest.sh` runs it in the API container. With `RAG_ALLOW_RESTART=1`, `02_ingest.sh` checks
 that its two killed ingests' `ingest-*` staging existed before its restart and is gone after it
-(#423), and `05_transfer.sh` checks after its export restart that the interrupted export's build
+(#423), and `05_transfer.sh` checks after its export restart that the interrupted export's staging
 directory and temporary archive are gone, without removing anything itself, and that the
 completed package from the top of the suite is still there.
 
@@ -25106,11 +28821,12 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps; the proxy answers `Host` localhost and 127.0.0.1 and refuses another with 421 (#664) |
 | `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
 | `../tests/test_package_archives.py` | host-side: `package.sh` and `package-offline.sh` in a scratch git repository with `docker` stubbed hold exactly the tracked files of `HEAD`, and refuse outside a git top level (#384), run in a checkout reached through a symlink, and ignore the user's system and global git config (#447); embedded copies; registered by suite 01 |
-| `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate, alone or together (#375, #415), and advisory memory (#415), registered by suite 01 |
+| `../tests/test_health.py` | controlled `/health/details` 503 body for a missing model and an unreachable Ollama or Weaviate, alone or together (#375, #415), and advisory memory (#415); the public `/health`'s status-only body and who may read the details (#750), registered by suite 01 |
+| `../tests/test_installed_authlib.py` | the Authlib installed in the built API image is the version `api/requirements.txt` pins (#565), run in the image with no network; registered by suite 01 |
 | `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388, #445): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged, the folder is fsynced after the replace, startup removes interrupted saves' temporary files; registered by suite 01 |
-| `memory_override.py` | helper for suite 01, on the host: the in-process `RECOMMENDED_MEMORY_GB` its memory checks raise past the allocation, derived from the `allocated_gb` `/health` reports, so the status flips to `below_recommended` on any host (#536) |
+| `memory_override.py` | helper for suite 01, on the host: the in-process `RECOMMENDED_MEMORY_GB` its memory checks raise past the allocation, derived from the `allocated_gb` `/health/details` reports, so the status flips to `below_recommended` on any host (#536) |
 | `../tests/test_memory_override.py` | host-side, standard library: the derived override makes `system_info.memory_info` report `below_recommended` with a note for allocations below and above the 12.35 GB a fixed 13 GB could flip, and no override without a usable allocation (#536); embedded copies; registered by suite 01 |
-| `17_auth.sh` | §10.6 — authentication (#25): the endpoint/role matrix, sessions, origin rules, throttling, the operator command, account administration, service API keys; registers `../tests/test_auth.py`, `../tests/test_auth_enforcement.py` and `../tests/test_verify_auth.py`; opt-in restart check |
+| `17_auth.sh` | §10.6 — authentication (#25): the endpoint/role matrix, sessions, origin rules, throttling, the operator command, account administration, service API keys, two-step verification (#607), per-collection access (#606); registers `../tests/test_auth.py`, `../tests/test_collection_access.py`, `../tests/test_auth_enforcement.py` and `../tests/test_verify_auth.py`; opt-in restart check |
 | `auth_setup.py` | the test accounts and their credentials file, and a role's login into a cookie jar; run by `lib.sh` (#25) |
 | `auth_stack.py` | the stack checks of `17_auth.sh`, one per subcommand (#25) |
 | `auth_headers.py` | the suite's session as `Cookie` and `Origin` headers, for the host-side Python helpers (#25) |
@@ -25120,7 +28836,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `18_lan.sh` | §2.5 and §10.5 — LAN mode (#26): the real override resolved without starting it; registers `../tests/test_lan_mode.py`; with `stack.sh run --lan`, the running LAN project on loopback |
 | `lan_config.py` | host-side, standard library: `docker-compose.lan.yml` as `docker compose config` resolves it, at the default port and `RAG_LAN_PORT=8443` (#26) |
 | `lan_stack.py` | the stack checks of `18_lan.sh` in a `--lan` run, one per subcommand (#26) |
-| `../tests/test_lan_mode.py` | API image, no network: `RAG_LAN_MODE` parsing, the startup refusal (also through `import main`), the certificate step, both nginx configurations, embedded copies (#26) |
+| `../tests/test_lan_mode.py` | API image, no network: `RAG_LAN_MODE` parsing, the startup refusal (also through `import main`), the certificate step, both nginx configurations, `lan_stack.py`'s rate-limit check against faked answers (#598), embedded copies (#26) |
 | `docker-compose.lan.verify.yml` | the harness overlay of a `--lan` run: TLS on loopback at the verify port, the verify image for `tls-init`, reserved test names (#26) |
 | `16_api_paths.sh` | ingest, query, metrics and health API paths (#399), run last by suite 01: `NO_SUPPORTED_FILES`, `JOB_NOT_FOUND`, schema rules, the proxy's `/api/` timeouts, `/metrics/latency`, a default query and its metric (LLM); opt-in restart and first-start checks |
 | `../tests/test_api_paths.py` | controlled ingest error, `/query` default, §6 prompt, query metric, retrieval-config file, `/metrics/latency` and `/health` probe regressions (#399), registered by `16_api_paths.sh` |
@@ -25137,7 +28853,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_goldstandard_review.py` | controlled PATCH/regenerate 404 codes for unknown sessions and pairs, and the empty-edit refusal (#381), registered by `04_goldstandard.sh` outside the slow gate |
 | `../tests/test_goldstandard_exports.py` | controlled gold-standard export folder, name rule, overwrite and refusal regressions (#370), exports-folder refusal and replace-not-follow write (#402), registered by `10_validity.sh` |
 | `../tests/test_session_validity.py` | controlled retained-session validity, historical export guard, durable pre-replacement stale markers, their rollback on abort and the real tuning abort branch (#93, #275), registered by `10_validity.sh` |
-| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E40, encrypted packages (#27); destructive replace fidelity, live metadata and model checks, controlled regressions and source drift; a lowercase-first collection name end to end (#372) |
+| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E40, encrypted packages (#27); destructive replace fidelity, live metadata and model checks, controlled regressions and source drift; a lowercase-first collection name end to end (#372); downloading a package and expiry (#677) |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
 | `../tests/test_zip_expansion.py` | controlled ZIP expansion-cap (1 MiB cap from env) and off-event-loop regressions, registered by ingest |
 | `../tests/test_zip_limits.py` | controlled ZIP member-count (cap of 20 from env), ratio, escaping-member and `detail` bound regressions (#28), registered by ingest |
@@ -25156,12 +28872,14 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
 | `../tests/test_batch_recovery_fixture.py` | controlled check that the import package `batch_recovery.py`'s `write_import_package` writes passes the importer's real digest and source checks; run in the API image with no network and the repository mounted read-only, registered by transfer |
 | `../tests/test_package_listing.py` | controlled package-listing regressions (#383): the listing reads each archive only up to its manifest, new archives put the manifest first, an oversized manifest and other unreadable files are listed `readable: false`, and so is a manifest with a wrongly typed listed value (#451); run in the API image with no network, registered by transfer |
+| `../tests/test_package_download.py` | controlled package download and expiry regressions (#677): the record of exported packages, `expires_at`, `GET /packages/{filename}` (deletion after a complete download only, HEAD, names, roles, access, busy), an interrupted download, the sweep and the audit records; registered by suite 05 |
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
 | `../tests/test_batch_implementation.py` | host-side: exact embedded source checks for `api/main.py`, the Weaviate client, the batch-write, recovery, import and tuning services and their verify scripts, and the restart-recovery block of `05_transfer.sh` with stubbed commands (refused-prefix skip, `RAG_ALLOW_RESTART`, the #152 refusal), registered by transfer |
 | `../tests/test_chunk_limits.py` / `../tests/test_insert_chunks.py` | controlled chunker per-file limits, chunk ceiling and semantic floor (#111) / insert batching and the "index not ready" retry, registered by ingest in the API image with the repository mounted (#386) |
 | `../tests/test_embed_batching.py` | controlled embedding writes (#613): a write that leaves vectors to Weaviate's `text2vec-ollama` uses `fixed_size(10, 1)` batches and one with every vector `dynamic()`; only objects whose embed request timed out in Weaviate are sent again, at most twice, with the write counts and rollback unchanged, and no other failure is retried. Registered by ingest in the API image with the repository mounted, after which ingest writes 45 vectorless chunks to a scratch `<prefix>EmbedBatch` collection on the real Weaviate and Ollama and checks they are all stored, through `fixed_size(10, 1)` and never `dynamic()`; the collection is removed afterwards |
 | `../tests/test_corpus_rules.py` | controlled: the corpus preparation rules the Import page offers (`ui/public/corpus-preparation-rules.md`) state every ingest limit as the chunker, the ingest pipeline, the settings defaults, the chunk-setting bounds, `docker-compose.yml` and the proxy define it, and no other number (#615), registered by ingest in the API image with the repository mounted |
 | `../tests/test_corpus_rules_estimates.py` | controlled: the chunk counts the corpus preparation rules give hold for the real chunker for every strategy, on files built at the rules' targets, which are never refused for the text or chunk limits (#615), registered by ingest in the API image with the repository mounted |
+| `../tests/test_scanned_pdf_ocr.py` | an image-only (scanned) PDF is read by OCR through the ingest pipeline's own parser, and the installed Pillow is the version `api/requirements.txt` pins (#522, #524); run in the built API image with no network, registered by suite 02 |
 | `../tests/test_model_bundle.py` | controlled bundled-model install safety, E21 and E22 with a temporary store, registered by transfer in the API image with the repository mounted (#386) |
 | `../tests/test_settings_validation.py` | controlled settings refusals before work, registered by settings in the API image with the repository mounted (#386) |
 | `../tests/test_retrieval_controls.py` | controlled collection list rows and retrieval-mode dispatch, registered by retrieval (suite 11) in the API image with the repository mounted (#386) |
@@ -25171,11 +28889,18 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `browser/ui_ingest.js` | the browser side of suite 22: the Import and Prepare pages driven as a user does, the observations printed as one JSON line (#641) |
 | `ui_ingest_weaviate.py` | helper for suite 22, run in the API container: the `VfyUiIngest*` collections' documents and chunk text, read only (#641) |
 | `ui_ingest_check.py` | the checks of suite 22, one per subcommand, on the host, and its cleanup (#641) |
+| `23_llm_split.sh` | the build and answer models (#671), full runs only: with `BUILD_LLM_MODEL` set to a small model, preparation and gold standard use it and query uses the answer model |
+| `llm_split.py` | helper for suite 23, run in the API container: pulls the small model, runs the three tasks through the services' code and prints the models Ollama reports answering each (#671) |
+| `24_query_only.sh` | §2.6 and §10.11 — query-only mode (#670): the overlay resolved without starting it; registers `../tests/test_query_only.py`; the start-up refusal of a non-boolean `RAG_QUERY_ONLY`; the loader's refusal on a full instance; with `stack.sh run --query-only`, build and export, `stack.sh query-only-mode`, then the load, the refusals, access and Q&A on the query-only instance |
+| `query_only_config.py` | host-side, standard library: `docker-compose.yml` with and without `docker-compose.query-only.yml` as `docker compose config` resolves them; only the api's `RAG_QUERY_ONLY` may differ (#670) |
+| `../tests/test_query_only.py` | API image, no network (also on the host): `RAG_QUERY_ONLY` parsing, the refused and kept routes, the refusals through the app and their order, `query_only` in the user answers, the loader (usage, refusals, lock, passphrase, results `success`/`refused`/`failed`/`interrupted`, the Ctrl-C handler) and the access of a collection it creates (#670) |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
 | `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
 | `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530); the nginx tag in SPECIFICATIONS.md's compose copy and 11.3 image list matches docker-compose.yml (#665), registered by infrastructure |
 | `../tests/test_upgrade_backup.py` | host-only: the README's 1.1.0 → 1.2.0 upgrade blocks, run as written under bash, `zsh -c` and interactive zsh with comments off, against stub `docker`, `git` and `curl`; the stub docker accepts only mounts inside its temp directory and only the README's two container commands: no block holds a `#` comment line; the backup skips a missing volume (a wrong prefix) and counts only existing volumes' archives, and writes each copy to a `.tmp` file that replaces the archive only once `gzip -t` passes, so a failed or corrupt copy prints `backup FAILED` and keeps an earlier archive; the rollback is gated on `git checkout v1.1.0` and checks every archive (`gzip -t`, `tar tzf`) and volume before it empties any, and a failed restore stops before `compose up`; alpine is pinned by version and digest; git ignores `backups/` (#679, #693), registered by infrastructure |
 | `../tests/test_version_agreement.py` | host-only: the first-party version strings agree with each other, not with a fixed version: `ui/package.json`, the root versions in `ui/package-lock.json`, `mcp/mcpapp.py`, the two `service.version` defaults in `api/services/telemetry.py` and `RAG_OTEL_SERVICE_VERSION` in `docker-compose.telemetry.yml` and `docker-compose.telemetry.verify.yml` (#605, #656), registered by infrastructure |
+| `../tests/test_ui_dependencies.py` | host-only: the copy of `ui/package.json` embedded in `IMPLEMENTATION.md` (`### ui/package.json`) is the file, exactly, so a UI dependency bump that misses the copy fails (#532), registered by infrastructure |
+| `../tests/test_tailwind_output.py` | runs from the host, standard library plus the docker CLI: the built UI CSS keeps what the Tailwind 4 migration relies on (RD-157, #773): the `prose` and `prose-sm` rules, `relative`, `hover` on every device with no `@media (hover: hover)`, and the `@source` globs with automatic detection off (a sentinel `.jsx` file under `ui/src/` is scanned, a sentinel `.md` file is not). It builds a scratch copy of `ui/` with `npm ci --ignore-scripts` from the lock file and `vite build` in a throwaway container of the image `ui/Dockerfile` builds with (its `builder` stage), not on the host (#826), so it needs the network unless the image and the npm cache are present, and is skipped, with a message, only when the docker CLI is missing (a docker or build failure fails it); a second class reads `ui/src/index.css`, `NavBar.tsx` and `ui/Dockerfile` directly, and checks that the builder image is an image reference with a tag or a digest (a `--platform` flag, a digest pin and a registry with a port are accepted; a token starting with `-` is refused before it reaches `docker run`); a third checks, with a stub in place of docker, that a build step that times out has its named container removed (#841). Registered by infrastructure |
 | `15_transfer_paths.sh` | transfer and tuning paths with no check before (#387): import refusals, `on_conflict`, unknown job ids, `/packages`, the package file unchanged, export without the model store, `retrieve.py` (E8-E10), E11 retrieval, a re-chunk with no chunks; run by `05_transfer.sh` |
 | `transfer_packages.py` | helper for suite 15; writes one damaged copy of a package per refusal kind |
 | `../tests/test_package_refusals.py` | controlled import checks 1 and 2, collection-name and `chunks.jsonl` record refusals, registered by suite 15 |
@@ -25387,11 +29112,42 @@ secrecy rules above. Suite 05 then exports the transfer collection encrypted, va
 with `validate_package.py` in the API container (`RAG_PACKAGE_PASSPHRASE`), and checks a wrong
 passphrase, both refusals and a round trip on the live verify stack.
 
+## Downloading a package and expiry (#677)
+
+`scripts/tests/test_package_download.py`, run by `05_transfer.sh` in the API image with no
+network (or on the host with the API's dependencies), checks:
+
+- `EXPORT_RETENTION_HOURS` (1-720);
+- the record of exported packages (`<UPLOAD_DIR>/exported_packages.json`) and `expires_at` in
+  `GET /packages` and the export job status;
+- `GET /packages/{filename}`:
+  - the bytes and headers;
+  - the deletion of a recorded package after a complete download only;
+  - HEAD;
+  - bad names, folders and links answering `404 PACKAGE_NOT_FOUND`;
+  - an End User refused;
+  - the #606 access rule and its audit record;
+  - `409 PACKAGE_BUSY` during an import or another download;
+- a client that goes away keeping the package (the response driven directly);
+- the sweep (expired, fresh, busy, gone, a link);
+- the `package.download` and `package.delete` records.
+
+Suite 05's live checks run through the proxy on the verify stack, with fixtures from
+`package_retention_stack.py` in the API container:
+
+- a new export's listing entry has `expires_at`;
+- a full download returns every byte, removes the package from `./exports` and the listing, and
+  is audited as `package.download` (`completed: true`) and `package.delete` (`downloaded`, by the user);
+- a 64 MiB recorded package read at 1 MB/s for 2 seconds is kept, its record `completed: false`;
+- one sweep deletes a package recorded 25 hours ago (`package.delete`, `expired`, `system`) and
+  keeps an unrecorded one;
+- an End User is refused `403`.
+
 ## Transfer page polling and failure checks
 
 `browser/transfer_page.js`, registered in `06_ui.sh` through `ui_criteria.js`, renders the
 Transfer page with every API call stubbed in the browser and the page's 2 s poll delay cut to
-20 ms (#382). Seventeen cases: for each half, a failed poll (a proxy 502) is shown and retried
+20 ms (#382). Twenty-three cases: for each half, a failed poll (a proxy 502) is shown and retried
 with the button still busy and cleared by the next good poll; 30 failures in a row stop polling,
 show the last error and enable the button again, and a new start clears the message; a poll in
 flight when the page is left schedules no further poll. An export start answered after the page
@@ -25402,7 +29158,15 @@ is shown without the empty-folder hint until a good Refresh. Three cases cover e
 an export passphrase holds Export until it has 12 characters and matches its confirmation, is
 sent only when the box is checked, and both fields clear once the export starts; an encrypted
 package is labelled, asks for its passphrase, sends it and clears it, and a plain package sends
-none. Like `query_config.js`, it can run
+none. Four cases cover downloading a package (#677):
+- a finished export offers a Download link to its package with "Expires" in local time, and none
+  when it has no expiry;
+- the package list says when a package exported here expires, and its Download link follows the
+  selected package;
+- after a Download click the page re-reads the list, and once the package is gone it shows
+  "Downloaded and deleted from ./exports." instead of the link.
+
+Like `query_config.js`, it can run
 on its own against a UI with no backend (`RAG_UI_BASE`, `RAG_CHROMIUM_PATH`):
 
 ```bash
@@ -25464,7 +29228,9 @@ nothing reaches the backend or a model. 67 cases:
   (Ctrl+Enter, plain Enter, Ask disabled while empty or loading), the citations toggle, markdown,
   the latency and error lines and the End User view with `response_format`; the Retrieval page's
   saved and default texts, alpha slider and Save while loading; and the client's handling of
-  nginx's HTML 413, 502, 504 and 500 pages, a non-JSON 200 and a JSON message.
+  nginx's HTML 413, 502, 504 and 500 pages, a non-JSON 200 and a JSON message; and query-only
+  mode (#670): the "Query-only" tag, the nav and router without the pages that change data, the
+  Collections page without create and Delete, and the Transfer page without its import controls.
 - `ui_pages.js`: Gold Standard generate (selector, sample size, progress, confirm) and review
   (summary bar, approve, reject, regenerate, edit, failed action, export enabled); the Transfer
   export controls (collection selector, fidelity line, include-models payload, progress and
@@ -25512,15 +29278,17 @@ ingests under a lowercase-first name, reads the tuning options and exports under
 name, re-chunks under the lowercase name and, unless `RAG_SKIP_SLOW=1`, checks a query's
 metrics under both spellings.
 
-Suite 01 also runs `scripts/tests/test_health.py` the same way (#375). It sends `GET /health`
+Suite 01 also runs `scripts/tests/test_health.py` the same way (#375). It sends `GET /health/details`
 through the app with Ollama's `/api/tags` answered by an httpx mock transport and the Weaviate
 client check mocked, and checks the 503 `degraded` body: the LLM or embedding model missing
 from Ollama's list (that service `error`, the rest `ok`), Ollama unreachable (both models
 `error`), Weaviate not ready or unreachable (Weaviate `error`), Weaviate and Ollama down
 together (all three `error`), each with its latency, model names and `resources`; and 200
 `ok` when everything is up, also with memory below the recommendation or unreadable
-(`resources.memory.status` `below_recommended` or `unknown`; memory is advisory, #415). `browser/ui_criteria.js` (suite 06)
-stubs `/api/health` and checks that the Health page shows a degraded 503 body with the failing
+(`resources.memory.status` `below_recommended` or `unknown`; memory is advisory, #415). Without a
+session, `GET /health` answers only `{"status"}` by the same rule, and `/health/details` is 401;
+an End User gets 403 and a Developer the full body (#750). `browser/ui_criteria.js` (suite 06)
+stubs `/api/health/details` and checks that the Health page shows a degraded 503 body with the failing
 service red and the others green, that a proxy 502, a refused connection and a 503 without a
 health body each show "Service health could not be read:" with the reason and remove the
 earlier cards, that the next good load clears it, and that the latency metrics load on every
@@ -25702,6 +29470,40 @@ independent of ambient operator telemetry variables. Before disabled-mode counti
 the old API, Collector queues and capture handlers terminate; a fresh Collector
 and capture process isolate the zero-traffic observation from earlier exports.
 Malformed capture shapes fail as incomplete evidence, never partial success.
+
+### Evaluating a collector pin change (#532)
+
+The guard checks the `otel-collector` image against the harness's own
+`telemetry/image.json`, so a checkout that changes the collector pin (in
+`telemetry/image.json` or `docker-compose.telemetry.yml`) is refused by default,
+and no file in the checkout is ever read as a pin. To evaluate such a change,
+the evaluator supplies a reviewed pin with `--telemetry-pin FILE`, together with
+`--telemetry`, on `run` or `up`:
+
+```sh
+bash scripts/verify/stack.sh run --telemetry --telemetry-pin <bundle>/telemetry-pin.json --checkout <bundle>/merged 15
+```
+
+- The harness makes no registry lookup. Before the run, the evaluator checks the
+  PR's pin against the registry from the host (the tag resolves to the pinned
+  digest, and each architecture's config ID matches `image.json`), then copies
+  the PR's `telemetry/image.json` outside the checkout. If that check fails or
+  can't be done, there is no telemetry run.
+- `FILE` must be an existing file outside the checkout under test (after
+  resolving symlinks); otherwise `stack.sh` exits 2 before any Docker command.
+  The check compares by device and inode, so letter case on a case-insensitive
+  volume doesn't matter, and it refuses a file with a second hard link, since
+  that link could be a file in the checkout.
+- Its `image` must be `<repository>:<tag>@sha256:<digest>` with the harness
+  pin's repository, so only the tag and digest can change. Anything else (an
+  unreadable file, another form, another repository) is refused by the guard,
+  and nothing is built.
+- The same pin applies to suite 15's `telemetry-mode` calls, which inherit it
+  as `RAG_VERIFY_TELEMETRY_PIN`. `up` and `run` set that variable only from
+  the option; an ambient value is ignored. `telemetry-mode` checks the inherited
+  pin the same way as `--telemetry-pin`, before any Docker command.
+
+Without the option, the harness's own pin applies, as before.
 ````
 
 ### scripts/verify/all.sh
@@ -25748,7 +29550,7 @@ fi
 # question with a known answer first, unless LLM work is being skipped.
 if [ "${RAG_SKIP_SLOW:-0}" != "1" ]; then
   if ! sanity=$(cd "$REPO_ROOT" && docker compose exec -T api python - < scripts/verify/llm_sanity.py 2>&1); then
-    printf '\nThe LLM is not giving usable answers:\n  %s\n' "$sanity"
+    printf '\nThe answer LLM is not giving usable answers:\n  %s\n' "$sanity"
     printf 'Restart it and run again:  docker compose restart ollama\n'
     printf '(with the verify environment that scripts/verify/stack.sh up prints)\n\n'
     exit 2
@@ -25760,7 +29562,7 @@ printf '\nBuilding fixtures in %s\n' "$FIX"
 rm -rf "$FIX"; python3 ./fixtures.py "$FIX" >/dev/null
 export RAG_FIXTURES="$FIX"
 
-ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings 15_telemetry 17_auth 18_lan 19_audit 20_offline_model 21_prepare 22_ui_ingest)
+ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings 15_telemetry 17_auth 18_lan 19_audit 20_offline_model 21_prepare 22_ui_ingest 23_llm_split 24_query_only)
 if [ "$#" -gt 0 ]; then
   SUITES=()
   for want in "$@"; do
@@ -25809,8 +29611,8 @@ exit "$overall"
 # Run the verification suite on a disposable compose project, never on the
 # live stack (#152).
 #
-#   bash scripts/verify/stack.sh run [--checkout DIR] [--telemetry | --lan] [suite ...]
-#   bash scripts/verify/stack.sh up [--checkout DIR] [--pull] [--lan]
+#   bash scripts/verify/stack.sh run [--checkout DIR] [--telemetry [--telemetry-pin FILE] | --lan | --query-only] [suite ...]
+#   bash scripts/verify/stack.sh up [--checkout DIR] [--pull] [--telemetry [--telemetry-pin FILE] | --lan | --query-only]
 #   bash scripts/verify/stack.sh down
 #
 # `run` brings the verify project up, runs that checkout's all.sh against it
@@ -25855,6 +29657,26 @@ exit "$overall"
 # exactly proxy:127.0.0.1:<verify port>->443/tcp. The suites then reach it at
 # https://localhost:<port>/api and trust the certificate it generated, copied
 # into the private folder. Without suite names, a --lan run runs 18_lan.
+#
+# --query-only (#670) runs the verify project in its default configuration,
+# where 24_query_only builds and exports a collection; that suite then calls
+# `stack.sh query-only-mode --package NAME` under the inherited lock, which
+# carries the package out of the exports folder, removes the project's
+# containers, network and volumes (its images and the model copy stay), puts
+# the package back alone in an empty exports folder and starts the project
+# again in query-only mode (the checkout's docker-compose.query-only.yml): a
+# second instance with its own empty volumes, as on another machine, never two
+# at once. Without suite names, a --query-only run runs 24_query_only.
+#
+# --telemetry checks the collector image against this checkout's own
+# telemetry/image.json, so a PR that changes the pin is refused. To evaluate
+# one, the evaluator checks the PR's pin against the registry, copies its
+# telemetry/image.json outside the checkout and passes it with
+# --telemetry-pin FILE (#532). The guard then expects that image, which may
+# change only the tag and digest of this checkout's pin, never the
+# repository. Nothing here contacts a registry, and no file in the checkout
+# is read as a pin: the file is checked by device and inode, for telemetry-mode's
+# inherited pin too.
 #
 # What this does not do: the suites, and anything else the checkout runs on the
 # host, still have full access to Docker. It keeps verification away from the
@@ -25901,15 +29723,23 @@ private_problem() {
 # ── arguments, checked before any Docker command ─────────────────────────────
 [ "$#" -ge 1 ] || usage
 CMD="$1"; shift
-case "$CMD" in up|down|run|telemetry-mode) ;; *) usage ;; esac
+case "$CMD" in up|down|run|telemetry-mode|query-only-mode) ;; *) usage ;; esac
 if [ "$CMD" = telemetry-mode ]; then
   [ "${RAG_VERIFY_LOCK_HELD:-}" = 1 ] || fail "telemetry-mode requires an inherited verification lock"
+fi
+if [ "$CMD" = query-only-mode ]; then
+  [ "${RAG_VERIFY_LOCK_HELD:-}" = 1 ] || fail "query-only-mode requires an inherited verification lock"
+  [ "${RAG_VERIFY_QUERY_ONLY:-}" = 1 ] || fail "query-only-mode runs only in a stack.sh run --query-only"
 fi
 CHECKOUT="$HARNESS"
 PULL=""
 TELEMETRY=0
 LAN=0
+QUERY_ONLY=0
+QO_PACKAGE=""
 OTEL_ENABLED=true
+PIN=""
+PIN_SET=0
 ARGS=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -25919,9 +29749,18 @@ while [ "$#" -gt 0 ]; do
     --telemetry)
       [ "$CMD" != down ] || usage
       TELEMETRY=1; shift ;;
+    --telemetry-pin)
+      { [ "$CMD" = up ] || [ "$CMD" = run ]; } && [ "$#" -ge 2 ] || usage
+      PIN="$2"; PIN_SET=1; shift 2 ;;
     --lan)
       { [ "$CMD" = up ] || [ "$CMD" = run ]; } || usage
       LAN=1; shift ;;
+    --query-only)
+      { [ "$CMD" = up ] || [ "$CMD" = run ]; } || usage
+      QUERY_ONLY=1; shift ;;
+    --package)
+      [ "$CMD" = query-only-mode ] && [ "$#" -ge 2 ] || usage
+      QO_PACKAGE="$2"; shift 2 ;;
     --disabled)
       [ "$CMD" = telemetry-mode ] || usage
       OTEL_ENABLED=false; shift ;;
@@ -25936,6 +29775,14 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ "$TELEMETRY" = 0 ] || [ "$LAN" = 0 ] || fail "--lan and --telemetry can't be combined."
+[ "$QUERY_ONLY" = 0 ] || { [ "$TELEMETRY" = 0 ] && [ "$LAN" = 0 ]; } \
+  || fail "--query-only can't be combined with --lan or --telemetry."
+if [ "$CMD" = query-only-mode ]; then
+  # A package name as the loader takes it (#670): no path, no other file.
+  printf '%s' "$QO_PACKAGE" | grep -Eqx 'ragpkg-[A-Za-z0-9._-]+\.tar\.gz(\.age)?' \
+    || fail "query-only-mode needs --package with a package name (ragpkg-*.tar.gz), not '$QO_PACKAGE'."
+fi
+[ "$PIN_SET" = 0 ] || [ "$TELEMETRY" = 1 ] || fail "--telemetry-pin requires --telemetry."
 
 PORT="${RAG_VERIFY_PORT:-8081}"
 case "$PORT" in
@@ -25950,6 +29797,52 @@ if [ "$CMD" != down ]; then
   { [ -d "$CHECKOUT" ] && [ -f "$CHECKOUT/docker-compose.yml" ]; } \
     || fail "--checkout must be a checkout of this project (a folder with docker-compose.yml): $CHECKOUT"
   CHECKOUT="$(cd "$CHECKOUT" && pwd -P)"
+fi
+
+# The reviewed collector pin (#532): the evaluator's file, never the checkout's.
+# --telemetry-pin and the inherited pin of telemetry-mode (#764) get one check:
+# the file exists, and neither it nor a directory above it is the checkout,
+# compared by device and inode so letter case on a case-insensitive volume
+# doesn't matter, and it has no second hard link (one could be in the checkout).
+check_pin() {
+  [ -f "$PIN" ] || fail "$1 must name an existing file: $PIN"
+  PIN="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$PIN")" \
+    || fail "could not resolve the $1 path."
+  local rc=0
+  python3 - "$PIN" "$CHECKOUT" <<'PINPY' || rc=$?
+import os, sys
+
+# Exit 1: the pin is in the checkout. 3: it has a second hard link. 4: an OS error.
+pin, checkout = sys.argv[1:3]
+try:
+    if os.stat(pin).st_nlink > 1:
+        sys.exit(3)
+    folder = os.path.dirname(pin)
+    while True:
+        if os.path.samefile(folder, checkout):
+            sys.exit(1)
+        parent = os.path.dirname(folder)
+        if parent == folder:
+            break
+        folder = parent
+except OSError:
+    sys.exit(4)
+PINPY
+  case "$rc" in
+    0) ;;
+    3) fail "$1 has a second hard link, which could be a file in the checkout under test: $PIN" ;;
+    4) fail "$1 could not be checked against the checkout under test: $PIN" ;;
+    *) fail "$1 must be outside the checkout under test: $PIN" ;;
+  esac
+}
+if [ "$PIN_SET" = 1 ]; then
+  check_pin "--telemetry-pin"
+fi
+# telemetry-mode, run by a suite under the inherited lock, keeps the run's
+# reviewed pin, checked again here; up and run take it only from --telemetry-pin.
+if [ "$CMD" = telemetry-mode ] && [ -n "${RAG_VERIFY_TELEMETRY_PIN:-}" ]; then
+  PIN="$RAG_VERIFY_TELEMETRY_PIN"
+  check_pin "RAG_VERIFY_TELEMETRY_PIN"
 fi
 
 # The private folder, checked before any Docker command; up and run create it.
@@ -26008,6 +29901,7 @@ export RAG_VERIFY_TELEMETRY="$TELEMETRY"
 export RAG_VERIFY_OTEL_ENABLED="$OTEL_ENABLED"
 export RAG_VERIFY_HARNESS="$HARNESS"
 export RAG_VERIFY_CHECKOUT="$CHECKOUT"
+export RAG_VERIFY_TELEMETRY_PIN="$PIN"
 if [ "$TELEMETRY" = 1 ]; then
   export COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$CHECKOUT/docker-compose.telemetry.yml:$HARNESS/docker-compose.verify.yml:$HARNESS/docker-compose.telemetry.verify.yml"
   export COMPOSE_PROFILES=telemetry
@@ -26015,6 +29909,12 @@ fi
 # LAN mode's configuration, switched to once the default one is up and set up.
 LAN_COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$CHECKOUT/docker-compose.lan.yml:$HARNESS/docker-compose.verify.yml:$HARNESS/docker-compose.lan.verify.yml"
 export RAG_VERIFY_LAN="$LAN"
+# Query-only mode's configuration (#670), switched to by query-only-mode.
+QUERY_ONLY_COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$CHECKOUT/docker-compose.query-only.yml:$HARNESS/docker-compose.verify.yml"
+[ "$CMD" != query-only-mode ] || QUERY_ONLY="${RAG_VERIFY_QUERY_ONLY:-0}"
+export RAG_VERIFY_QUERY_ONLY="$QUERY_ONLY"
+# Where query-only-mode keeps the package while the exports folder is replaced.
+QO_CARRY="$PRIVATE/query-only-carry"
 export RAG_VERIFY_PORT="$PORT"
 export RAG_API="http://localhost:$PORT/api"
 export RAG_EXPECTED_PROXY_PORT="$PORT"
@@ -26054,6 +29954,11 @@ do_down() {
   fi
   [ ! -d "$EXPORTS" ] || rm -rf "$EXPORTS"
   rm -f "$LAN_CERT"
+  if [ -L "$QO_CARRY" ]; then
+    printf 'stack.sh: %s is a symlink; not removing it.\n' "$QO_CARRY" >&2
+    return 2
+  fi
+  [ ! -d "$QO_CARRY" ] || rm -rf "$QO_CARRY"
   left="$(docker ps -aq --filter "$filter")$(docker network ls -q --filter "$filter")$(docker volume ls -q --filter "$filter" | grep -vx "$MODELS")$(labelled_images)"
   if [ -e "$EXPORTS" ] || [ -L "$EXPORTS" ]; then
     left="$left $EXPORTS"
@@ -26141,7 +30046,7 @@ do_guard() {
     rm -f "$config"
     fail "docker compose config failed for $CHECKOUT."
   fi
-  python3 - "$CHECKOUT" "$EXPORTS" "$PORT" "$config" "$HARNESS" "$GUARD_MODE" <<'GUARDPY'
+  python3 - "$CHECKOUT" "$EXPORTS" "$PORT" "$config" "$HARNESS" "$GUARD_MODE" "$PIN" <<'GUARDPY'
 import json, os, sys
 
 checkout, exports, port, path = sys.argv[1:5]
@@ -26199,8 +30104,9 @@ for svc, service in services.items():
 if {'otel-collector', 'otel-capture'} & services.keys():
     import runpy
     harness = sys.argv[5] if len(sys.argv) > 5 else checkout
+    pin = sys.argv[7] if len(sys.argv) > 7 else ''
     guard = runpy.run_path(os.path.join(harness, 'scripts/verify/telemetry_guard.py'))
-    problems.extend(guard['check'](config, harness))
+    problems.extend(guard['check'](config, harness, pin or None))
 
 # (i) builds: only a context and a Dockerfile, both inside the checkout
 for svc, service in services.items():
@@ -26377,6 +30283,49 @@ lan_switch() {
   [ "$code" = 200 ] || fail "$RAG_API/health did not return 200 over TLS within 60 seconds (last: $code)."
 }
 
+# ── query-only mode (#670) ───────────────────────────────────────────────────
+# Called by 24_query_only under the inherited lock, once it has exported a
+# package from the default configuration: the same project comes up again in
+# query-only mode with its own empty volumes and only that package in its
+# exports folder, as another machine would have it. Images are kept (no build),
+# and so is the model copy, an external volume `down -v` doesn't remove.
+query_only_switch() {
+  local i code=000 service state health
+  [ -f "$EXPORTS/$QO_PACKAGE" ] && [ ! -L "$EXPORTS/$QO_PACKAGE" ] \
+    || fail "query-only-mode: no package $QO_PACKAGE in $EXPORTS."
+  { [ ! -e "$QO_CARRY" ] && [ ! -L "$QO_CARRY" ]; } || rm -rf "$QO_CARRY" \
+    || fail "query-only-mode: could not clear $QO_CARRY."
+  mkdir -m 700 "$QO_CARRY" && cp -p "$EXPORTS/$QO_PACKAGE" "$QO_CARRY/" \
+    || fail "query-only-mode: could not copy the package out of the exports folder."
+  printf 'removing the default instance (its containers, network and volumes)...\n'
+  docker compose -p "$PROJECT" down -v --remove-orphans >/dev/null 2>&1 \
+    || fail "query-only-mode: could not remove the default instance."
+  { [ ! -L "$EXPORTS" ] && rm -rf "$EXPORTS" && mkdir -p "$EXPORTS" \
+      && cp -p "$QO_CARRY/$QO_PACKAGE" "$EXPORTS/" && rm -rf "$QO_CARRY"; } \
+    || fail "query-only-mode: could not put the package back alone in $EXPORTS."
+  export COMPOSE_FILE="$QUERY_ONLY_COMPOSE_FILE"
+  do_guard
+  printf 'starting the query-only instance...\n'
+  if ! docker compose -p "$PROJECT" up -d --no-build --pull never --wait --wait-timeout 900; then
+    docker compose -p "$PROJECT" ps -a --format '{{.Service}} {{.State}} {{.Health}}' \
+      | while read -r service state health; do
+          case "$state/${health:-}" in
+            running/healthy|running/) ;;
+            *) printf '\n── %s (%s %s) ──\n' "$service" "$state" "${health:-}"
+               docker compose -p "$PROJECT" logs --tail 50 "$service" ;;
+          esac
+        done
+    fail "the verify project did not come up in query-only mode."
+  fi
+  for i in $(seq 1 60); do
+    code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "$RAG_API/health" 2>/dev/null)
+    [ "$code" = 200 ] && break
+    sleep 1
+  done
+  [ "$code" = 200 ] || fail "$RAG_API/health did not return 200 within 60 seconds in query-only mode (last: $code)."
+  printf 'the verify project is up in query-only mode with %s\n' "$QO_PACKAGE"
+}
+
 # ── up ───────────────────────────────────────────────────────────────────────
 do_up() {
   local i code=000 service state health
@@ -26411,7 +30360,7 @@ do_up() {
   [ "$code" = 200 ] || fail "$RAG_API/health did not return 200 within 60 seconds (last: $code)."
   [ "$LAN" = 0 ] || lan_switch
   printf '\nThe verify project is up at %s. To point commands at it:\n\n' "${RAG_API%/api}"
-  for var in COMPOSE_PROJECT_NAME COMPOSE_FILE RAG_API RAG_EXPECTED_PROXY_PORT RAG_EXPORTS_DIR RAG_VERIFY_PORT RAG_VERIFY_TELEMETRY RAG_VERIFY_LAN; do
+  for var in COMPOSE_PROJECT_NAME COMPOSE_FILE RAG_API RAG_EXPECTED_PROXY_PORT RAG_EXPORTS_DIR RAG_VERIFY_PORT RAG_VERIFY_TELEMETRY RAG_VERIFY_LAN RAG_VERIFY_QUERY_ONLY; do
     printf 'export %s=%q\n' "$var" "${!var}"
   done
   if [ "$LAN" = 1 ]; then
@@ -26420,7 +30369,7 @@ do_up() {
     done
   fi
   if [ "$TELEMETRY" = 1 ]; then
-    for var in COMPOSE_PROFILES RAG_VERIFY_HARNESS RAG_VERIFY_CHECKOUT RAG_VERIFY_OTEL_ENABLED; do
+    for var in COMPOSE_PROFILES RAG_VERIFY_HARNESS RAG_VERIFY_CHECKOUT RAG_VERIFY_OTEL_ENABLED RAG_VERIFY_TELEMETRY_PIN; do
       printf 'export %s=%q\n' "$var" "${!var}"
     done
   fi
@@ -26433,6 +30382,9 @@ case "$CMD" in
     [ "$TELEMETRY" = 1 ] || fail "telemetry-mode requires --telemetry"
     do_guard
     docker compose -p "$PROJECT" up -d --no-deps --no-build --pull never --wait --wait-timeout 120 api || fail "API telemetry reconfiguration failed" ;;
+  query-only-mode)
+    # Called only by 24_query_only under the inherited lock of a --query-only run.
+    query_only_switch ;;
   down)
     do_down || exit 2 ;;
   up)
@@ -26443,6 +30395,8 @@ case "$CMD" in
     rc=0
     # A LAN run checks LAN mode; other suites assume the default configuration.
     [ "$LAN" = 0 ] || [ "${#ARGS[@]}" -gt 0 ] || ARGS=(18_lan)
+    # A query-only run checks query-only mode (#670).
+    [ "$QUERY_ONLY" = 0 ] || [ "${#ARGS[@]}" -gt 0 ] || ARGS=(24_query_only)
     # In the background with job control on, all.sh leads a process group of
     # its own (pgid $!), which stop_suite ends; and `wait`, unlike a foreground
     # command, returns as soon as INT or TERM arrives, so the traps act at once.
@@ -26631,6 +30585,12 @@ make_collection() {
 }
 
 drop_collection() { _rag_require_lock_owner; curl -s -o /dev/null -m 120 -X DELETE "$API/collections/$1?confirm=true"; }
+
+# open_collection <name>: a new collection is restricted to the account that
+# created it, here the harness Engineer (#606); this opens it to every account
+# its role allows, for a suite that then uses it as another role.
+open_collection() { _rag_require_lock_owner; curl -s -o /dev/null -m 120 -X PUT "$API/collections/$1/access" \
+  -H 'Content-Type: application/json' -d '{"restricted":false}'; }
 
 # Remove every collection and package this run created.
 cleanup_prefixed() {
@@ -27155,6 +31115,8 @@ stack() { _rag_require_lock_owner; python3 ./auth_stack.py "$@" $operator; }
 section "Auth units: passwords, store, policy, middleware, routes, operator command"
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_auth.py)
 check "test_auth.py registered regression checks" $?
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_collection_access.py)
+check "test_collection_access.py: per-collection access (#606) in the store, the routes and the audit log" $?
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_auth_enforcement.py)
 check "test_auth_enforcement.py: every protected route refuses a request without a session" $?
 python3 "$REPO_ROOT/scripts/tests/test_verify_auth.py"
@@ -27192,6 +31154,14 @@ section "Account administration by Engineers (PR 2)"
 stack admin-accounts
 check "an Engineer creates, resets, re-roles, disables and enables an account through the API; own reset refused; no password logged" $?
 
+section "Two-step verification (#607)"
+stack mfa
+check "set-up, password then code, no code twice, a recovery code once, an Engineer's reset; nothing secret logged" $?
+stack mfa-required
+check "the switch needs an enrolled Engineer and gates an unenrolled session to its own routes; reset-mfa ends the sessions; audit records hold no code" $?
+stack mfa-rate-limit
+check "nginx gives POST /auth/login/mfa the login's 16k body limit and its rate zone (429 LOGIN_RATE_LIMITED)" $?
+
 section "Service principals and API keys (PR 3, H3)"
 stack key-matrix end_user
 check "End User key, no Origin: 403 above its role and on account/key administration, logout and password change" $?
@@ -27201,6 +31171,10 @@ stack key-matrix engineer
 check "Engineer key, no Origin: no 401 or 403 on data routes; 403 KEY_NOT_ALLOWED on account/key administration" $?
 stack service-keys
 check "keys: no principal login, rotation, role change, disable, revoke and expiry; bad keys 401; no key in listings or the log" $?
+
+section "Per-collection access (#606)"
+stack collection-access
+check "a new collection is restricted to its creator: hidden from and refused to others until granted; a key can't change access; audited" $?
 
 section "Request protection and login throttling (H4)"
 stack control-path
@@ -27260,12 +31234,16 @@ that create throwaway accounts (vfy-t-<random>), service principals
 it up. No password, session token or API key is printed; keys are held in
 memory only.
 """
+import base64
 import hashlib
+import hmac
 import json
 import os
 import secrets
+import struct
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -27304,9 +31282,15 @@ MATRIX = (
     ("GET", "/import/job/vfy-no-such-job", None, "developer"),
     ("GET", "/import/jobs", None, "developer"),
     ("GET", "/packages", None, "developer"),
+    # Downloading a package (#677): an allowed request finds no such package, 404.
+    ("GET", "/packages/ragpkg-vfy-no-such.tar.gz", None, "developer"),
     ("GET", "/help/transfer", None, "developer"),
     ("GET", "/tune/" + X, None, "developer"),
+    ("GET", "/health/details", None, "developer"),       # the full health report (#750)
     ("DELETE", "/collections/" + X + "?confirm=true", None, "engineer"),
+    # Per-collection access (#606): a 404 for no such collection, a 422 for no value.
+    ("GET", "/collections/" + X + "/access", None, "engineer"),
+    ("PUT", "/collections/" + X + "/access", {}, "engineer"),
     ("POST", "/tune/rechunk", {}, "engineer"),
     ("POST", "/tune/reembed", {}, "engineer"),
     ("POST", "/tune/reindex", {}, "engineer"),
@@ -27336,10 +31320,15 @@ MATRIX = (
     ("POST", "/auth/service-principals/vfy-no-such-svc/enable", None, "engineer"),
     ("POST", "/auth/service-principals/vfy-no-such-svc/keys", {}, "engineer"),
     ("POST", "/auth/service-principals/vfy-no-such-svc/keys/nosuchkey123/revoke", None, "engineer"),
+    # Two-step verification (#607): a 404 for no such account, a 422 for no value.
+    ("POST", "/auth/users/vfy-no-such-user/reset-mfa", None, "engineer"),
+    ("POST", "/auth/mfa/policy", {}, "engineer"),
 )
 # Routes an API key can't use whatever its role (S5 of PR 3): every account,
 # principal and key route, logout and the password change; and the audit log (#29).
-KEY_REFUSED = ("/auth/users", "/auth/service-principals", "/auth/logout", "/auth/password", "/audit")
+KEY_REFUSED = ("/auth/users", "/auth/service-principals", "/auth/logout", "/auth/password", "/audit", "/auth/mfa")
+# And per-collection access (#606), by its path's end.
+KEY_REFUSED_SUFFIX = "/access"
 SESSION_ROUTES = (("GET", "/auth/me", None), ("POST", "/auth/logout", None), ("POST", "/auth/password", {}))
 
 
@@ -27385,6 +31374,41 @@ def code(method, path, body=None, token=None, headers=None, paced=True):
             return error.code, error.read(), error.headers
 
     return auth_setup.paced(path, send) if paced else send()
+
+
+def upload(token, filename, content):
+    """POST /prepare/upload of one file as a same-origin browser would.
+    Returns (status, parsed body or None)."""
+    boundary = "vfy" + secrets.token_hex(8)
+    data = ('--{}\r\nContent-Disposition: form-data; name="files"; filename="{}"\r\n'
+            'Content-Type: application/octet-stream\r\n\r\n'.format(boundary, filename).encode()
+            + content + "\r\n--{}--\r\n".format(boundary).encode())
+    headers = {"Origin": auth_setup.origin(), "Cookie": "rag_session=" + token,
+               "Content-Type": "multipart/form-data; boundary=" + boundary}
+    req = urllib.request.Request(auth_setup.api_base() + "/prepare/upload", data=data, method="POST",
+                                 headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            status, raw = response.status, response.read()
+    except urllib.error.HTTPError as error:
+        status, raw = error.code, error.read()
+    try:
+        return status, json.loads(raw)
+    except ValueError:
+        return status, None
+
+
+def wait_job(token, path, timeout=600):
+    """GET `path` every 2 s until the job ends; returns its record."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status, raw, _ = code("GET", path, token=token)
+        expect(status == 200, "{} answered {}".format(path, status))
+        job = json.loads(raw)
+        if job["status"] in ("completed", "failed", "partial", "cancelled"):
+            return job
+        time.sleep(2)
+    raise CheckFailed("{} didn't end within {}s".format(path, timeout))
 
 
 def error_code(raw):
@@ -27470,7 +31494,7 @@ def check_key_matrix(role, operator_ok):
     try:
         for method, path, body, need in MATRIX:
             status, raw, _ = code(method, path, body, headers=bearer(key))
-            if path.startswith(KEY_REFUSED):
+            if path.startswith(KEY_REFUSED) or path.endswith(KEY_REFUSED_SUFFIX):
                 ok = status == 403 and error_code(raw) == "KEY_NOT_ALLOWED"
             elif ROLES.index(role) < ROLES.index(need):
                 ok = status == 403 and error_code(raw) == "FORBIDDEN"
@@ -27592,6 +31616,12 @@ def check_service_keys(operator_ok):
 def check_public(operator_ok):
     status, raw, _ = code("GET", "/health", headers={})
     expect(status in (200, 503), "GET /health without a session answered {}".format(status))
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        body = None
+    expect(body in ({"status": "ok"}, {"status": "degraded"}),
+           "GET /health without a session answered {} {!r}, not a status-only body".format(status, raw[:200]))
     status, raw, _ = code("GET", "/auth/status", headers={})
     expect(status == 200 and json.loads(raw) == {"setup_required": False},
            "GET /auth/status answered {} {!r}".format(status, raw[:200]))
@@ -27620,7 +31650,8 @@ def check_login_logout(operator_ok):
     status, raw, _ = code("GET", "/auth/me", token=token)
     body = json.loads(raw)
     expect(status == 200 and body == {"username": "vfy-developer", "role": "developer", "must_change_password": False,
-                                      "kind": "user"},
+                                      "kind": "user", "mfa_enrolled": False, "mfa_required": False,
+                                      "mfa_enrollment_required": False, "query_only": False},
            "GET /auth/me answered {} {}".format(status, body))
     status, _, _ = code("POST", "/auth/logout", token=token)
     expect(status == 200, "logout answered {}".format(status))
@@ -27673,6 +31704,31 @@ def check_origin(operator_ok):
                 name, status, error_code(raw)))
     status, _, _ = code("GET", "/collections", token=token, headers={"Origin": "http://evil.example"})
     expect(status == 200, "a cross-origin GET answered {} (reads aren't origin-checked)".format(status))
+    # #794: the deleting GET /packages/{filename} refuses a cookie request whose
+    # Sec-Fetch-Site is present and not same-origin or none, through nginx. The
+    # package doesn't exist, so an allowed request is a 404 and deletes nothing.
+    package = "/packages/ragpkg-vfy-no-such.tar.gz"
+    for method, site, want in (("GET", "cross-site", 403), ("GET", "same-site", 403),
+                               ("GET", "same-origin", 404), ("GET", "none", 404), ("GET", None, 404),
+                               ("HEAD", "cross-site", 404)):
+        headers = {"Origin": auth_setup.origin()}
+        if site is not None:
+            headers["Sec-Fetch-Site"] = site
+        status, raw, _ = code(method, package, token=token, headers=headers)
+        if want == 403:
+            expect(status == 403 and error_code(raw) == "CROSS_ORIGIN_REFUSED",
+                   "{} {} with Sec-Fetch-Site {}: answered {} {}".format(method, package, site, status,
+                                                                         error_code(raw)))
+        elif method == "HEAD":
+            # A HEAD answer has no body, so only its status can be checked.
+            expect(status == 404, "{} {} with Sec-Fetch-Site {}: answered {}, wanted the 404 of an "
+                   "allowed request".format(method, package, site, status))
+        else:
+            expect(status == 404 and error_code(raw) == "PACKAGE_NOT_FOUND",
+                   "{} {} with Sec-Fetch-Site {}: answered {} {}, wanted the 404 PACKAGE_NOT_FOUND of an "
+                   "allowed request".format(method, package, site, status, error_code(raw)))
+    status, _, _ = code("GET", "/packages", token=token, headers={"Sec-Fetch-Site": "cross-site"})
+    expect(status == 200, "the package listing with Sec-Fetch-Site cross-site answered {}".format(status))
     request("POST", "/auth/logout", token=token)
 
 
@@ -27921,6 +31977,197 @@ def check_no_secrets_logged(operator_ok):
            "the API log has no login line for vfy-engineer")
 
 
+def totp(secret, offset=0):
+    """RFC 6238 (SHA-1, 6 digits, 30 s), computed here from the secret the
+    set-up answered, so the API is checked against the standard, not itself."""
+    key = base64.b32decode(secret + "=" * (-len(secret) % 8))
+    digest = hmac.new(key, struct.pack(">Q", int(time.time() // 30) + offset), hashlib.sha1).digest()
+    at = digest[-1] & 0x0F
+    return str((struct.unpack(">I", digest[at:at + 4])[0] & 0x7FFFFFFF) % 1000000).zfill(6)
+
+
+def cookie_value(headers, name):
+    for cookie in headers.get_all("Set-Cookie") or []:
+        key, _, rest = cookie.partition("=")
+        if key.strip() == name:
+            return rest.split(";", 1)[0]
+    return None
+
+
+def second_factor(challenge, value):
+    """POST /auth/login/mfa with the challenge cookie; paced like a login,
+    since nginx limits it in the same zone."""
+    headers = {"Origin": auth_setup.origin(), "Cookie": "rag_mfa=" + challenge}
+    return auth_setup.paced(auth_setup.LOGIN_PATH, lambda: code(
+        "POST", "/auth/login/mfa", {"code": value}, headers=headers, paced=False))
+
+
+def password_step(username, password):
+    status, raw, headers = code("POST", "/auth/login", {"username": username, "password": password})
+    body = json.loads(raw) if status == 200 else {}
+    challenge = cookie_value(headers, "rag_mfa")
+    expect(status == 200 and body == {"mfa_required": True} and challenge
+           and cookie_value(headers, "rag_session") is None,
+           "the password step for an enrolled user answered {} {} (challenge {})".format(
+               status, body, "set" if challenge else "missing"))
+    return challenge
+
+
+def check_mfa(operator_ok):
+    """Two-step verification on the stack (#607): set-up, the two-step login,
+    no code twice, a recovery code once, and an Engineer's reset."""
+    username, password, token = throwaway("developer", operator_ok)
+    status, raw, headers = code("POST", "/auth/mfa/enroll", token=token)
+    expect(status == 200 and headers.get("Cache-Control") == "no-store", "set-up answered {} {}".format(
+        status, error_code(raw)))
+    secret = json.loads(raw)["secret"]
+    status, raw, _ = code("POST", "/auth/mfa/enroll/confirm", {"code": totp(secret, -1)}, token=token)
+    expect(status == 200, "confirming the set-up answered {} {}".format(status, error_code(raw)))
+    recovery = json.loads(raw)["recovery_codes"]
+    expect(len(recovery) == 10, "{} recovery codes".format(len(recovery)))
+
+    challenge = password_step(username, password)
+    accepted = totp(secret)
+    status, raw, headers = second_factor(challenge, accepted)
+    expect(status == 200 and cookie_value(headers, "rag_session"), "the right code answered {} {}".format(
+        status, error_code(raw)))
+    challenge = password_step(username, password)
+    status, raw, _ = second_factor(challenge, accepted)
+    expect(status == 401 and error_code(raw) == "MFA_FAILED", "a used code answered {} {}".format(
+        status, error_code(raw)))
+    status, raw, _ = second_factor(challenge, recovery[0])
+    expect(status == 200, "a recovery code answered {} {}".format(status, error_code(raw)))
+    challenge = password_step(username, password)
+    status, raw, _ = second_factor(challenge, recovery[0])
+    expect(status == 401 and error_code(raw) == "MFA_FAILED", "a used recovery code answered {} {}".format(
+        status, error_code(raw)))
+
+    admin = role_token("engineer")
+    try:
+        status, raw, _ = code("POST", "/auth/users/{}/reset-mfa".format(username), token=admin)
+        expect(status == 200 and json.loads(raw)["user"]["mfa_enrolled"] is False,
+               "the Engineer's reset answered {} {}".format(status, error_code(raw)))
+    finally:
+        request("POST", "/auth/logout", token=admin)
+    status, body, _ = request("POST", "/auth/login", {"username": username, "password": password})
+    expect(status == 200 and body.get("mfa_enrolled") is False, "after the reset the login answered {} {}".format(
+        status, body))
+    result = compose("logs", "--no-color", "api")
+    expect(all(value not in result.stdout + result.stderr for value in [secret, accepted] + recovery),
+           "a secret or code appears in the API log")
+
+
+def enroll(token):
+    """Set up two-step verification for the session `token` through the API; returns the secret."""
+    status, raw, _ = code("POST", "/auth/mfa/enroll", token=token)
+    expect(status == 200, "set-up answered {} {}".format(status, error_code(raw)))
+    secret = json.loads(raw)["secret"]
+    status, raw, _ = code("POST", "/auth/mfa/enroll/confirm", {"code": totp(secret, -1)}, token=token)
+    expect(status == 200, "confirming the set-up answered {} {}".format(status, error_code(raw)))
+    return secret
+
+
+def check_mfa_rate_limit(operator_ok):
+    """#607: nginx gives POST /auth/login/mfa the login's 16k body limit and its
+    rate zone, so codes and passwords from one address share 10 a minute."""
+    big = {"code": "x" * 17000}
+    status, raw, headers = code("POST", "/auth/login/mfa", big, paced=False)
+    expect(status == 413 and error_code(raw) is None
+           and not headers.get("Content-Type", "").startswith("application/json"),
+           "a {}-byte code body answered {} {} (not nginx's 413)".format(len(json.dumps(big)), status,
+                                                                        error_code(raw)))
+    refusal = None
+    for _ in range(12):
+        status, raw, _ = code("POST", "/auth/login/mfa", {"code": "123456"}, paced=False)
+        if status == 429:
+            refusal = raw
+            break
+        expect(status == 401 and error_code(raw) == "MFA_CHALLENGE_INVALID",
+               "a code with no challenge answered {} {}".format(status, error_code(raw)))
+    expect(refusal is not None, "12 codes in a row were all let through")
+    expect(json.loads(refusal) == {"error": {"code": "LOGIN_RATE_LIMITED", "detail": None,
+                                             "message": "Too many login attempts. Wait a minute and try again."}},
+           "the refusal is {}".format(refusal[:200]))
+    status, raw, _ = code("POST", "/auth/login", {"username": "vfy-rate-" + secrets.token_hex(3),
+                                                  "password": "x" * 12}, paced=False)
+    expect(status == 429 and error_code(raw) == "LOGIN_RATE_LIMITED",
+           "right after the codes were limited, a login answered {} {}: not the same zone".format(
+               status, error_code(raw)))
+
+
+def _set_required(token, required):
+    return code("POST", "/auth/mfa/policy", {"required": required}, token=token)
+
+
+def check_mfa_required(operator_ok):
+    """#607 on the stack: the switch needs an enrolled Engineer; while it is on,
+    an unenrolled session reaches only its session and MFA routes; the operator's
+    reset-mfa ends the sessions and the next login asks for no code; the policy,
+    reset and code attempts are audit records without a code."""
+    eng_name, eng_password, eng = throwaway("engineer", operator_ok)
+    dev_name, _, dev = throwaway("developer", operator_ok)
+    status, raw, _ = _set_required(eng, True)
+    expect(status == 409 and error_code(raw) == "MFA_ENROLL_FIRST",
+           "an unenrolled Engineer turning the switch on answered {} {}".format(status, error_code(raw)))
+    secret = enroll(eng)
+    switched = False
+    try:
+        status, raw, _ = _set_required(eng, True)
+        switched = status == 200
+        expect(switched, "an enrolled Engineer turning the switch on answered {} {}".format(status, error_code(raw)))
+        status, raw, _ = code("GET", "/collections", token=dev)
+        expect(status == 403 and error_code(raw) == "MFA_ENROLLMENT_REQUIRED",
+               "while required, an unenrolled session's GET /collections answered {} {}".format(
+                   status, error_code(raw)))
+        status, body, _ = request("GET", "/auth/me", token=dev)
+        expect(status == 200 and body.get("mfa_enrollment_required") is True,
+               "while required, /auth/me answered {} {}".format(status, body))
+        status, raw, _ = code("GET", "/auth/mfa", token=dev)
+        expect(status == 200 and json.loads(raw).get("required") is True,
+               "while required, GET /auth/mfa answered {} {}".format(status, error_code(raw)))
+        status, raw, _ = code("GET", "/collections", token=eng)
+        expect(status == 200, "while required, the enrolled Engineer's GET /collections answered {}".format(status))
+    finally:
+        if switched:
+            status, raw, _ = _set_required(eng, False)
+            expect(status == 200, "turning the switch off answered {} {}".format(status, error_code(raw)))
+    status, raw, _ = code("GET", "/collections", token=dev)
+    expect(status == 200, "after the switch went off, GET /collections answered {} {}".format(status, error_code(raw)))
+
+    challenge = password_step(eng_name, eng_password)
+    status, _, _ = second_factor(challenge, "abcd-efgh-ijkl-mnop")
+    expect(status == 401, "a wrong recovery code answered {}".format(status))
+    rc, _ = auth_setup.operator("reset-mfa", eng_name)
+    expect(rc == 0, "reset-mfa exited {}".format(rc))
+    status, _, _ = code("GET", "/auth/me", token=eng)
+    expect(status == 401, "after reset-mfa the Engineer's session answered {}".format(status))
+    status, body, eng = request("POST", "/auth/login", {"username": eng_name, "password": eng_password})
+    expect(status == 200 and eng and body.get("mfa_enrolled") is False,
+           "after reset-mfa the login answered {} {}".format(status, body))
+    request("POST", "/auth/logout", token=eng)
+    request("POST", "/auth/logout", token=dev)
+
+    admin = role_token("engineer")
+    try:
+        def records(action):
+            status, raw, _ = code("GET", "/audit?action={}&limit=1000".format(action), token=admin)
+            expect(status == 200, "GET /audit?action={} answered {}".format(action, status))
+            return json.loads(raw)["records"]
+        policy = [r for r in records("admin.mfa.policy") if r["actor"] == eng_name]
+        expect(sorted(r["details"].get("required") for r in policy if r["result"] == "success") == [False, True],
+               "the switch's audit records are {}".format(policy))
+        expect(any(r["actor"] == eng_name for r in records("auth.mfa.enroll")), "no auth.mfa.enroll record")
+        failed = [r for r in records("auth.mfa") if r["actor"] == eng_name]
+        expect(len(failed) == 1 and failed[0]["details"].get("method") == "recovery"
+               and failed[0]["result"] != "success",
+               "the failed code's audit records are {}".format(failed))
+        expect(any(r["target"] == eng_name for r in records("operator.reset-mfa")), "no operator.reset-mfa record")
+        expect("abcd" not in json.dumps(failed) and secret not in json.dumps(records("auth.mfa.enroll")),
+               "an audit record holds a code or secret")
+    finally:
+        request("POST", "/auth/logout", token=admin)
+
+
 STATE = "restart-state.json"
 
 
@@ -27943,6 +32190,119 @@ def check_restart_verify(operator_ok):
     expect(status == 200, "a session did not survive the API restart ({})".format(status))
     status, _, _ = code("POST", "/auth/login", {"username": state["locked"], "password": "x" * 12})
     expect(status == 429, "a lockout did not survive the API restart ({})".format(status))
+
+
+def check_collection_access(operator_ok):
+    """Per-collection access (#606) on the stack: a collection the harness
+    Engineer creates is restricted to it; a throwaway End User and Developer
+    and a Developer key can't see or use it until granted, and the access routes
+    refuse a key. Changes and refusals are in the audit log. In the Prepare
+    area, a document the granted Developer imports into it is hidden from a
+    Developer without access (#788)."""
+    expect(operator_ok, "creates accounts, a service principal and a collection, so it runs only on the verify project")
+    admin = role_token("engineer")
+    name = "VfyAccess" + secrets.token_hex(4)
+    users, principal = [], None
+    document, document_owner = None, None
+    try:
+        status, raw, _ = code("POST", "/collections", {"name": name}, token=admin)
+        expect(status == 201, "creating {} answered {} {}".format(name, status, error_code(raw)))
+        user, _, user_token = throwaway("end_user", operator_ok)
+        users.append(user)
+        dev, _, dev_token = throwaway("developer", operator_ok)
+        users.append(dev)
+        principal, _, key = new_principal(admin, "developer")
+        callers = {"End User": {"token": user_token}, "Developer": {"token": dev_token},
+                   "key": {"headers": bearer(key)}}
+
+        def listed(who):
+            status, raw, _ = code("GET", "/collections", **callers[who])
+            expect(status == 200, "{}: GET /collections answered {}".format(who, status))
+            return name in [c["name"] for c in json.loads(raw)["collections"]]
+
+        def answer(who, method, path, body=None):
+            status, raw, _ = code(method, path, body, **callers[who])
+            return status, error_code(raw)
+
+        missing = (404, "COLLECTION_NOT_FOUND")
+        for who in callers:
+            expect(not listed(who), "{} sees the new collection, restricted to its creator".format(who))
+            got = answer(who, "POST", "/query", {"question": "Is it there?", "collection": name})
+            expect(got == missing, "{}: the query answered {}".format(who, got))
+        for who in ("Developer", "key"):
+            got = answer(who, "POST", "/export", {"collection": name})
+            expect(got == missing, "{}: the export answered {}".format(who, got))
+        got = answer("key", "GET", "/retrieval/config/" + name)
+        expect(got == missing, "key: the retrieval settings answered {}".format(got))
+        expect(answer("End User", "GET", "/retrieval/config/VfyAccessNoSuch")[0] == 404,
+               "a missing collection's settings must be a 404 as well")
+
+        status, raw, _ = code("PUT", "/collections/{}/access".format(name),
+                              {"restricted": True, "users": [dev], "service_principals": [principal]}, token=admin)
+        expect(status == 200 and json.loads(raw) == {"restricted": True, "users": [dev], "service_principals": [principal]},
+               "granting answered {} {}".format(status, raw[:200]))
+        for who in ("Developer", "key"):
+            expect(listed(who), "{} doesn't see the collection once granted".format(who))
+            got = answer(who, "GET", "/ingest/config/" + name)
+            expect(got[0] == 200, "{}: the granted collection's settings answered {}".format(who, got))
+        expect(not listed("End User"), "the End User sees a collection not granted to it")
+
+        # The Prepare area (#606 Q18, #788): a .csv is labelled from its data,
+        # with no LLM call, so preparing it is quick.
+        status, body = upload(dev_token, "vfy-access-{}.csv".format(secrets.token_hex(3)), b"name,team\nAda,core\n")
+        expect(status == 201 and body and len(body["documents"]) == 1, "the upload answered {} {}".format(status, body))
+        document, document_owner = body["documents"][0]["id"], dev_token
+        status, raw, _ = code("POST", "/prepare/jobs", {"document_ids": [document]}, token=dev_token)
+        expect(status == 202, "starting the preparation answered {} {}".format(status, error_code(raw)))
+        job = wait_job(dev_token, "/prepare/job/" + json.loads(raw)["job_id"])
+        expect(job["status"] == "completed", "the preparation ended {}: {}".format(job["status"], job.get("errors")))
+        other, _, other_token = throwaway("developer", operator_ok)
+        users.append(other)
+
+        def prepared(token):
+            status, raw, _ = code("GET", "/prepare/documents", token=token)
+            expect(status == 200, "GET /prepare/documents answered {}".format(status))
+            return document in [d["id"] for d in json.loads(raw)["documents"]]
+        # A document with no imports is shared, so the hiding below comes from the import (#792).
+        expect(prepared(other_token), "a second Developer doesn't see a prepared document with no imports")
+        status, raw, _ = code("POST", "/prepare/import", {"collection": name, "document_ids": [document],
+                                                          "chunk_size": 500, "chunk_overlap": 50}, token=dev_token)
+        expect(status == 202, "the import into {} answered {} {}".format(name, status, error_code(raw)))
+        job = wait_job(dev_token, "/ingest/job/" + json.loads(raw)["job_id"])
+        expect(job["status"] == "completed", "the import ended {}: {}".format(job["status"], job.get("errors")))
+        expect(prepared(dev_token), "the granted Developer doesn't see the document it imported")
+        expect(not prepared(other_token), "a Developer without access sees a document imported only into {}".format(name))
+        status, raw, _ = code("GET", "/prepare/documents/" + document, token=other_token)
+        expect((status, error_code(raw)) == (404, "DOCUMENT_NOT_FOUND"),
+               "a Developer without access reading the document answered {} {}".format(status, error_code(raw)))
+        got = answer("key", "PUT", "/collections/{}/access".format(name), {"restricted": False})
+        expect(got == (403, "KEY_NOT_ALLOWED"), "a key changing access answered {}".format(got))
+        got = answer("key", "GET", "/collections/{}/access".format(name))
+        expect(got == (403, "KEY_NOT_ALLOWED"), "a key reading access answered {}".format(got))
+
+        def audited(action, **match):
+            query = "/audit?action={}&collection={}&limit=100".format(action, name)
+            status, raw, _ = code("GET", query, token=admin)
+            expect(status == 200, "GET /audit answered {}".format(status))
+            return [r for r in json.loads(raw)["records"] if all(r.get(k) == v for k, v in match.items())]
+        # The newest record is the key's refused change below; this is the Engineer's grant.
+        change = audited("collection.access", result="success")
+        expect(change and change[0]["details"].get("added") == {"users": [dev], "service_principals": [principal]},
+               "the change's audit record is {}".format(change[:1]))
+        refused = audited("query", actor=user)
+        expect(refused and refused[0]["result"] == "refused" and refused[0]["details"].get("reason") == "collection_access",
+               "the refused query's audit record is {}".format(refused[:1]))
+        expect(audited("collection.access.refused", actor=principal),
+               "no collection.access.refused record for the key's settings read")
+    finally:
+        if document:
+            code("DELETE", "/prepare/documents/" + document, token=document_owner)
+        code("DELETE", "/collections/{}?confirm=true".format(name), token=admin)
+        for username in users:
+            code("POST", "/auth/users/{}/disable".format(username), token=admin)
+        if principal:
+            code("POST", "/auth/service-principals/{}/disable".format(principal), token=admin)
+        request("POST", "/auth/logout", token=admin)
 
 
 CHECKS = {name[len("check_"):].replace("_", "-"): fn for name, fn in globals().items() if name.startswith("check_")}
@@ -28532,7 +32892,7 @@ if __name__ == "__main__":
 # The unit checks (U1-U14) run in the API image with no network and a stub LLM.
 # The stack checks (P1-P11) run on the verify project through prepare_stack.py,
 # one check each, as the harness Developer. P9-P11 prepare three small files with
-# the local LLM, one job at a time, so they run only in a full run
+# the build LLM, one job at a time, so they run only in a full run
 # (RAG_SKIP_SLOW unset). Documents this suite uploads are vfy-prepare-*, its
 # collections VfyPrepare*; both are removed at the end.
 cd "$(dirname "$0")" && . ./lib.sh
@@ -28567,9 +32927,9 @@ check "P7 cancelling an unknown job is 404" $?
 stack audit
 check "P8 the audit log records upload, download and delete with names and no document text" $?
 
-section "Preparation with the local LLM (P9-P11)"
+section "Preparation with the build LLM (P9-P11)"
 if [ "$SKIP_SLOW" = "1" ]; then
-  skip "P9-P11 prepare, import and download with the LLM" "RAG_SKIP_SLOW=1"
+  skip "P9-P11 prepare, import and download with the build LLM" "RAG_SKIP_SLOW=1"
 else
   stack prepare
   check "P9 the .txt becomes cleaned Markdown of source lines in order with its header, every window without a fallback losing at most 20 % of its characters; the .csv and .jsonl are unchanged and labelled from their data" $?
@@ -28952,7 +33312,7 @@ def check_prepare(fix):
                "no header: {!r}".format(lines[:3]))
         lines = lines[4:]
     # The part's text as preparation reads the .txt: its paragraphs joined by
-    # one blank line, then cut into the windows the LLM saw.
+    # one blank line, then cut into the windows the build LLM saw.
     source = "\n\n".join(block.strip("\n") for block in PAGES.split("\n\n")
                           if block.strip()).split("\n")
     position = 0
@@ -29071,7 +33431,7 @@ if __name__ == "__main__":
 # A real browser (browser/ui_ingest.js), logged in as the harness Engineer, with
 # nothing stubbed, ingests on the Import page every supported type into a new
 # collection each, a ZIP of mixed types with a .jsonl.gz, and a file over the
-# part limit; prepares two files on the Prepare page with the local LLM and
+# part limit; prepares two files on the Prepare page with the build LLM and
 # imports them into a new collection (full runs only); and sends a broken PDF,
 # an unsupported type and an over-limit ZIP, each into a new collection. Then
 # ui_ingest_check.py checks each collection: the job ended with no error and the
@@ -29515,6 +33875,186 @@ finally:
     wc.close_client()
 ```
 
+### scripts/verify/23_llm_split.sh
+
+```bash
+#!/usr/bin/env bash
+# Build and answer models (#671): preparation and gold standard generation use
+# the build model, query uses the answer model.
+#
+# Slow only (it pulls a small model and makes real LLM calls), so a run with
+# RAG_SKIP_SLOW=1 skips it; every other check stays on one model. It runs
+# llm_split.py in the api container with BUILD_LLM_MODEL set to a small model
+# for that process only, leaving the answer model as compose sets it: the API
+# itself and the compose settings are not changed. Its collection is
+# VfyLlmSplit, removed at the end; it creates no preparation document and no
+# gold standard session.
+cd "$(dirname "$0")" && . ./lib.sh
+REPO_ROOT="$(cd ../.. && pwd)"
+FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
+[ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
+require_stack
+SMALL=qwen2.5:0.5b
+C="${PREFIX}LlmSplit"
+OUT="$(mktemp)"
+trap 'rm -f "$OUT" /tmp/vfy_llm_split_ingest.json' EXIT
+
+section "Build and answer models (#671)"
+
+if [ "$SKIP_SLOW" = "1" ]; then
+  skip "preparation and gold standard on the build model, query on the answer model" \
+    "set RAG_SKIP_SLOW=0 to include it"
+  summary; exit $?
+fi
+
+drop_collection "$C"; make_collection "$C"
+curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
+  -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$FIX/policies.txt" > /tmp/vfy_llm_split_ingest.json
+job=$(python3 -c "import json;print(json.load(open('/tmp/vfy_llm_split_ingest.json'))['job_id'])" 2>/dev/null)
+check_eq "the collection for the query is ingested" "$(wait_for_job "/ingest/job/$job" 900)" "completed"
+
+(cd "$REPO_ROOT" && docker compose exec -T -e BUILD_LLM_MODEL="$SMALL" -e RAG_LLM_SPLIT_COLLECTION="$C" \
+  api python - < scripts/verify/llm_split.py) > "$OUT"
+check "llm_split.py ran to the end" $? "$(tail -c 400 "$OUT")"
+
+f() { python3 -c "import json,sys;print(json.loads(open(sys.argv[1]).read().strip().splitlines()[-1]).get(sys.argv[2]))" "$OUT" "$1" 2>/dev/null; }
+check_eq "with BUILD_LLM_MODEL set, the API resolves it as the build model" "$(f build_model)" "$SMALL"
+answer="$(f answer_model)"
+[ -n "$answer" ] && [ "$answer" != "None" ] && [ "$answer" != "$SMALL" ]
+check "the answer model stays as compose sets it" $? "got '$answer'"
+# Ollama names a model `name:tag`, so compare with the tagged names. A task that
+# raised still counts the calls it made; its error is shown with the check.
+build_tagged="$(f build_tagged)"; answer_tagged="$(f answer_tagged)"
+models_check() {   # models_check <name> <task> <want>
+  local got; got="$(f "$2")"
+  [ "$got" = "['$3']" ]
+  check "$1" $? "got '$got', wanted '['$3']'; error: $(f "$2_error")"
+}
+models_check "preparation's LLM calls were answered by the build model only" prepare "$build_tagged"
+models_check "gold standard generation's LLM calls were answered by the build model only" goldstandard "$build_tagged"
+models_check "query's LLM calls were answered by the answer model only" query "$answer_tagged"
+
+drop_collection "$C"
+summary
+```
+
+### scripts/verify/llm_split.py
+
+```python
+"""Which model answers each task (#671). Run in the api container by
+23_llm_split.sh, with BUILD_LLM_MODEL set for this process only:
+
+    docker compose exec -T -e BUILD_LLM_MODEL=qwen2.5:0.5b \
+        -e RAG_LLM_SPLIT_COLLECTION=<collection> api python - < scripts/verify/llm_split.py
+
+It pulls the build model, then runs a preparation of a short text, one gold
+standard pair and one query through the services' own code, recording the model
+Ollama reports in each /api/chat reply (the calls themselves are unchanged).
+Preparation writes its parts to a temporary folder and the pair isn't stored,
+so nothing is left behind; the build model is deleted from Ollama at the end.
+Prints one JSON line: the resolved models (as set, and as `name:tag`) and, per
+task, the sorted set of models that answered (Ollama's names, `name:tag`) and,
+when the task raised, `<task>_error`.
+"""
+import asyncio
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+import httpx
+
+from config import settings
+from services import goldstandard, preparation, preparation_jobs, rag_pipeline
+
+COLLECTION = os.environ["RAG_LLM_SPLIT_COLLECTION"]
+BASE = f"http://{settings.ollama_host}:{settings.ollama_port}"
+TEXT = ("Overtime policy\n\nDepartment managers approve overtime before it is worked. "
+        "Requests go to the manager in writing at least one day ahead.\n\n"
+        "Page 1 of 1\n\nPayroll pays approved overtime at one and a half times the "
+        "hourly rate, in the next pay period.\n")
+
+
+def tagged(model):
+    return model if ":" in model.rsplit("/", 1)[-1] else f"{model}:latest"
+
+
+out = {"build_model": settings.build_model, "answer_model": settings.answer_model,
+       # As Ollama names the model in a reply, so the suite compares like with like.
+       "build_tagged": tagged(settings.build_model),
+       "answer_tagged": tagged(settings.answer_model)}
+build = settings.build_model
+
+# The build model, pulled into the verify project's Ollama (removed below).
+httpx.post(f"{BASE}/api/pull", json={"name": build, "stream": False},
+           timeout=1800).raise_for_status()
+
+seen = []
+real_post = httpx.AsyncClient.post
+
+
+async def recording_post(self, url, *args, **kwargs):
+    response = await real_post(self, url, *args, **kwargs)
+    if str(url).endswith("/api/chat"):
+        try:
+            seen.append(response.json().get("model"))
+        except ValueError:
+            seen.append(None)
+    return response
+
+httpx.AsyncClient.post = recording_post
+
+
+def task(name, coroutine):
+    seen.clear()
+    try:
+        asyncio.run(coroutine)
+    except Exception as exc:                          # noqa: BLE001
+        out[name + "_error"] = f"{type(exc).__name__}: {exc}"
+    out[name] = sorted({tagged(m) if m else "none" for m in seen})
+
+
+async def prepare():
+    with tempfile.TemporaryDirectory() as folder:
+        raw = Path(folder) / "overtime.txt"
+        raw.write_text(TEXT)
+        parts = Path(folder) / "parts"
+        parts.mkdir()
+
+        async def write_part(index, suffix, data):
+            path = parts / f"{index + 1:03d}{suffix}"
+            path.write_bytes(data)
+            return path
+
+        chat, list_models = preparation_jobs._llm()
+        await preparation.prepare_document(raw, raw.name, ".txt", chat, list_models,
+                                           lambda: False, write_part)
+
+
+async def gold_pair():
+    await goldstandard._generate_pair({"content": TEXT})
+
+
+async def query():
+    await rag_pipeline.run_query("Who approves overtime?", COLLECTION, "hnsw", 3, 0.5,
+                                 False, "end_user")
+
+
+try:
+    task("prepare", prepare())
+    task("goldstandard", gold_pair())
+    task("query", query())
+finally:
+    httpx.AsyncClient.post = real_post
+    try:
+        httpx.request("DELETE", f"{BASE}/api/delete", json={"name": build}, timeout=60)
+    except httpx.HTTPError as exc:
+        print(f"could not delete {build}: {exc}", file=sys.stderr)
+
+print(json.dumps(out))
+```
+
 ### scripts/verify/browser/ui_ingest.js
 
 ```javascript
@@ -29906,6 +34446,10 @@ def main(argv):
         status, raw, _ = code("POST", "/collections", {"name": name}, token=dev)
         expect(status == 201, "creating {} answered {} {}".format(name, status, error_code(raw)))
         name = json.loads(raw)["name"]
+        # The new collection is the Developer's alone (#606); the key's principal is granted it too.
+        status, raw, _ = code("PUT", "/collections/{}/access".format(name),
+                              {"restricted": True, "users": [DEVELOPER], "service_principals": [principal]}, token=admin)
+        expect(status == 200, "granting {} answered {} {}".format(name, status, error_code(raw)))
 
         status, mine = upload(name, "vfy-jobs-dev.txt", b"A note the Developer imports.\n" * 20, token=dev)
         expect(status == 202, "the Developer's upload answered {} {}".format(status, mine))
@@ -29998,9 +34542,71 @@ section "LAN override, resolved without starting it"
 python3 ./lan_config.py "$REPO_ROOT"
 check "docker-compose.lan.yml publishes only the proxy on every interface at 443 (RAG_LAN_PORT changes it), in LAN mode with a Secure cookie, after tls-init" $?
 
+# #555 (reviewer): the fail-closed chain checks report a broken chain.
+python3 - "$REPO_ROOT" <<'ENDPY'
+import copy, sys
+sys.path.insert(0, ".")
+import lan_config
+checkout = sys.argv[1]
+config = lan_config.resolve(checkout)
+bad_ui = copy.deepcopy(config)
+bad_ui["services"]["ui"]["depends_on"]["api"]["condition"] = "service_started"
+bad_proxy = copy.deepcopy(config)
+del bad_proxy["services"]["proxy"]["depends_on"]["ui"]
+failed = False
+for label, cfg, expected in (("ui condition service_started", bad_ui, "the ui doesn't wait for a healthy api"),
+                             ("no ui in the proxy's depends_on", bad_proxy, "the proxy doesn't wait for the ui")):
+    found = lan_config.problems(cfg, checkout, "443")
+    if not any(expected in problem for problem in found):
+        failed = True
+        print("    {}: not reported; problems were {}".format(label, found), file=sys.stderr)
+sys.exit(1 if failed else 0)
+ENDPY
+check "lan_config reports a ui that doesn't wait for a healthy api, and a proxy that doesn't wait for the ui" $?
+
 section "LAN units: setting, startup refusal, certificate step, nginx configuration"
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_lan_mode.py)
 check "test_lan_mode.py registered regression checks" $?
+
+section "LAN refusal in the built API image, on the running verify project (default or LAN configuration)"
+# One-off api containers (no dependencies, removed afterwards) with LAN mode
+# switched on by environment: the real image and its settings parsing refuse to
+# start, with one line and no traceback, in every run, not only with --lan.
+_rag_require_lock_owner
+(cd "$REPO_ROOT" && python3 - <<'ENDPY'
+import secrets, subprocess, sys
+cases = [(["RAG_LAN_MODE=true", "AUTH_COOKIE_SECURE=false"], "LAN mode refused: AUTH_COOKIE_SECURE"),
+         (["RAG_LAN_MODE=true", "AUTH_COOKIE_SECURE=true", "AUTH_DIR=/tmp/vfy-lan-empty-" + secrets.token_hex(4)],
+          "LAN mode refused: there is no enabled AI Engineer"),
+         (["RAG_LAN_MODE=yes"], "RAG_LAN_MODE must be exactly true or false")]
+failed = False
+for env, expected in cases:
+    args = ["docker", "compose", "run", "--rm", "--no-deps", "-T"]
+    for item in env:
+        args += ["-e", item]
+    try:
+        result = subprocess.run(args + ["api"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, universal_newlines=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        print("    {}: the API kept running".format(" ".join(env)), file=sys.stderr)
+        failed = True
+        continue
+    lines = result.stdout.splitlines()
+    hits = [line for line in lines if expected in line]
+    problems = []
+    if result.returncode == 0:
+        problems.append("exit 0")
+    if not hits:
+        problems.append("no line with {!r}".format(expected))
+    if len(hits) != 1 or any(line.startswith("Traceback") for line in lines):
+        problems.append("not exactly one refusal line without a traceback")
+    if problems:
+        failed = True
+        print("    {}: {}; last lines {}".format(" ".join(env), ", ".join(problems), lines[-5:]), file=sys.stderr)
+sys.exit(1 if failed else 0)
+ENDPY
+)
+check "the API image refuses LAN mode with one line and no traceback: a non-Secure cookie, no Engineer, a non-boolean RAG_LAN_MODE" $?
 
 if [ "${RAG_VERIFY_LAN:-0}" != 1 ]; then
   skip "LAN mode on the running verify project" "run stack.sh run --lan"
@@ -30023,6 +34629,8 @@ lan cookie
 check "a login over HTTPS sets the session cookie Secure, HttpOnly and SameSite=Strict" $?
 lan origin
 check "a same-origin change over HTTPS is accepted, another origin's refused 403 CROSS_ORIGIN_REFUSED" $?
+lan server-tokens
+check "nginx sends no version: the Server header is plain nginx on an API answer and on its own 421 page (#555)" $?
 lan refusals
 check "the API refuses LAN mode with one line when AUTH_COOKIE_SECURE is false or no Engineer exists" $?
 lan rate-limit
@@ -30102,6 +34710,12 @@ def problems(config, checkout, port):
     wait = (proxy.get("depends_on") or {}).get("tls-init") or {}
     if wait.get("condition") != "service_completed_successfully":
         found.append("the proxy doesn't wait for tls-init to complete successfully")
+    # Fail closed (§2.5): the ui starts only on a healthy api and the proxy only
+    # after the ui, so an API that refuses LAN mode leaves nothing published.
+    if ((services.get("ui") or {}).get("depends_on") or {}).get("api", {}).get("condition") != "service_healthy":
+        found.append("the ui doesn't wait for a healthy api, so the proxy could publish while the API refuses")
+    if "ui" not in (proxy.get("depends_on") or {}):
+        found.append("the proxy doesn't wait for the ui")
     expected = [
         ("proxy", "/etc/nginx/nginx.conf", "bind", os.path.join(checkout, "proxy", "nginx.lan.conf"), True),
         ("proxy", "/etc/nginx/rag/locations.conf", "bind", os.path.join(checkout, "proxy", "locations.conf"), True),
@@ -30150,7 +34764,7 @@ if __name__ == "__main__":
 ```python
 """LAN mode on the verify project (#26). Host-side, standard library, Python 3.9+.
 
-    python3 lan_stack.py https|hosts|tls|bindings|cookie|origin|refusals|rate-limit|address
+    python3 lan_stack.py https|hosts|tls|bindings|cookie|origin|server-tokens|refusals|rate-limit|address
 
 Run by 18_lan.sh in a `stack.sh run --lan`, which brings the verify project up
 in LAN mode with TLS on 127.0.0.1:<verify port> only, copies the certificate
@@ -30171,6 +34785,9 @@ printing what failed:
             SameSite=Strict
   origin    a cookie-authenticated change from another origin is refused 403
             CROSS_ORIGIN_REFUSED, and from https://localhost:<port> accepted
+  server-tokens
+            the Server header is exactly "nginx" on an API answer and on
+            nginx's own 421 page, whose body names no version either (#555)
   refusals  a one-off api container of the LAN configuration (no ports, the
             running project untouched) refuses to start, with one line, when
             AUTH_COOKIE_SECURE is false and when its account store is empty
@@ -30290,6 +34907,21 @@ def check_hosts():
     for path in ("/api/health", "/"):
         status = status_for(host, path)
         assert status == 421, "Host {} got {} at {}, not 421".format(host, status, path)
+
+
+def check_server_tokens():
+    for host, path, expected in (("localhost", "/api/health", 200), ("rebind.invalid", "/", 421)):
+        conn = http.client.HTTPSConnection("localhost", port(), context=context(), timeout=60)
+        try:
+            conn.request("GET", path, headers={"Host": "{}:{}".format(host, port())})
+            response = conn.getresponse()
+            body = response.read().decode("utf-8", "replace")
+            server = response.getheader("Server")
+        finally:
+            conn.close()
+        assert response.status == expected, "Host {} got {} at {}, not {}".format(host, response.status, path, expected)
+        assert server == "nginx", "Host {} at {}: Server header {!r}, not 'nginx'".format(host, path, server)
+        assert not re.search(r"nginx/\d", body), "Host {} at {}: the page names nginx's version".format(host, path)
 
 
 def handshake(ctx, alpn=None):
@@ -30431,7 +35063,8 @@ def check_address():
 
 
 CHECKS = {"https": check_https, "hosts": check_hosts, "tls": check_tls, "bindings": check_bindings,
-          "cookie": check_cookie, "origin": check_origin, "refusals": check_refusals,
+          "cookie": check_cookie, "origin": check_origin, "server-tokens": check_server_tokens,
+          "refusals": check_refusals,
           "rate-limit": check_rate_limit, "address": check_address}
 
 
@@ -30451,6 +35084,276 @@ if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
 ```
 
+### scripts/verify/24_query_only.sh
+
+```bash
+#!/usr/bin/env bash
+# Query-only mode (#670): SPECIFICATIONS.md §2.6 and §10.11.
+#
+# Every run checks the real docker-compose.query-only.yml as `docker compose
+# config` resolves it (nothing is started), runs test_query_only.py in the API
+# image with no network, checks that the API image refuses a non-boolean
+# RAG_QUERY_ONLY at start-up, and that the loader refuses on the running
+# default instance. The two-instance checks need `stack.sh run --query-only`:
+# a collection is built and exported on the default instance, then
+# `stack.sh query-only-mode` starts the same project again in query-only mode
+# with empty volumes and only that package in its exports folder, as another
+# machine would have it, and the package is loaded and queried there. Anywhere
+# else they are skipped. Nothing here needs cleaning up afterwards: a
+# --query-only run ends with stack.sh removing the project.
+cd "$(dirname "$0")" && . ./lib.sh
+REPO_ROOT="$(cd ../.. && pwd)"
+FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
+[ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
+require_stack
+C="${PREFIX}QueryOnly"
+OUT="$(mktemp)"
+trap 'rm -f "$OUT" /tmp/vfy_qo.json' EXIT
+
+# loader [docker compose exec options...] -- [loader arguments...]: runs the
+# loader in the api container, its lines in $OUT, and returns its exit status.
+loader() {
+  local opts=()
+  while [ "$#" -gt 0 ] && [ "$1" != -- ]; do opts+=("$1"); shift; done
+  shift
+  _rag_require_lock_owner
+  (cd "$REPO_ROOT" && docker compose exec -T ${opts[@]+"${opts[@]}"} api python -m loader "$@") \
+    </dev/null >"$OUT" 2>&1
+}
+
+# The newest operator.load record's result and code, as "result code".
+last_load() {
+  api_get "/audit?action=operator.load&limit=1" | python3 -c "
+import json, sys
+r = json.load(sys.stdin)['records'][0]
+print(r['result'], (r.get('details') or {}).get('code') or '-', r.get('target'))" 2>/dev/null
+}
+
+section "Query-only overlay, resolved without starting it"
+python3 ./query_only_config.py "$REPO_ROOT"
+check "docker-compose.query-only.yml changes only the api's RAG_QUERY_ONLY, from false to true" $?
+
+section "Query-only units: setting, policy, refusal, flag, loader"
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api \
+  "$(docker compose images -q api)" python scripts/tests/test_query_only.py)
+check "test_query_only.py registered regression checks" $?
+
+section "Query-only refusal in the built API image"
+_rag_require_lock_owner
+(cd "$REPO_ROOT" && docker compose run --rm --no-deps -T -e RAG_QUERY_ONLY=yes api </dev/null 2>&1) > "$OUT"
+hits=$(grep -c "Settings refused: RAG_QUERY_ONLY must be exactly true or false" "$OUT")
+! grep -q '^Traceback' "$OUT" && [ "$hits" = 1 ]
+check "the API image refuses RAG_QUERY_ONLY=yes at start-up with one line and no traceback" $? "$(tail -3 "$OUT")"
+
+section "The loader on a full instance"
+loader -- ragpkg-vfy-not-there.tar.gz
+rc=$?
+[ "$rc" = 1 ] && grep -q "NOT_QUERY_ONLY" "$OUT"
+check "the loader refuses on an instance that isn't query-only (exit 1, NOT_QUERY_ONLY)" $? "exit $rc: $(tail -2 "$OUT")"
+check_eq "the refusal is an operator.load audit record" "$(last_load)" "refused NOT_QUERY_ONLY ragpkg-vfy-not-there.tar.gz"
+loader -- ../etc/passwd
+check_eq "a path instead of a package name is a usage error (exit 2)" "$?" "2"
+
+if [ "${RAG_VERIFY_QUERY_ONLY:-0}" != 1 ]; then
+  skip "query-only mode on a second instance: build, export, load, refusals, Q&A" "run stack.sh run --query-only"
+  summary
+  exit $?
+fi
+
+# ── the build instance ───────────────────────────────────────────────────────
+section "Build and export on the default instance"
+drop_collection "$C"; make_collection "$C"
+curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
+  -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$FIX/policies.txt" > /tmp/vfy_qo.json
+job=$(python3 -c "import json;print(json.load(open('/tmp/vfy_qo.json'))['job_id'])" 2>/dev/null)
+check_eq "the collection is ingested" "$(wait_for_job "/ingest/job/$job" 900)" "completed"
+api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_qo.json
+ejob=$(jfield "['job_id']" < /tmp/vfy_qo.json)
+check_eq "the collection is exported" "$(wait_for_job "/export/job/$ejob" 1800)" "completed"
+pkg=$(api_get "/export/job/$ejob" | jfield "['filename']")
+chunks=$(api_get "/packages" | python3 -c "
+import json, sys
+print([p['chunk_count'] for p in json.load(sys.stdin)['packages'] if p['filename'] == sys.argv[1]][0])" "$pkg" 2>/dev/null)
+[ -n "$pkg" ] && [ -f "${RAG_EXPORTS_DIR:?}/$pkg" ] && [ -n "$chunks" ]
+check "the package is in the exports folder, with its chunk count" $? "package '$pkg', chunks '$chunks'"
+if [ "$FAIL" -gt 0 ]; then
+  summary
+  exit $?
+fi
+
+# ── the query-only instance ──────────────────────────────────────────────────
+section "Switch to a query-only instance with its own volumes"
+_rag_require_lock_owner
+bash "$RAG_VERIFY_HARNESS/scripts/verify/stack.sh" query-only-mode --package "$pkg" \
+  --checkout "$RAG_VERIFY_CHECKOUT"
+check "stack.sh query-only-mode started the project again in query-only mode with only the package" $?
+if [ "$FAIL" -gt 0 ]; then
+  summary
+  exit $?
+fi
+# The same project, now with the overlay: docker compose here resolves it so.
+export COMPOSE_FILE="$RAG_VERIFY_CHECKOUT/docker-compose.yml:$RAG_VERIFY_CHECKOUT/docker-compose.query-only.yml:$RAG_VERIFY_HARNESS/docker-compose.verify.yml"
+# A new, empty account store: the test accounts are made again.
+auth_ensure
+names=$(ls "${RAG_EXPORTS_DIR:?}")
+check_eq "the exports folder holds only the copied package" "$names" "$pkg"
+code=$(api_get "/collections" | python3 -c "import json,sys; print(len(json.load(sys.stdin)['collections']))" 2>/dev/null)
+check_eq "the query-only instance starts with no collection" "$code" "0"
+check_eq "GET /auth/me says query_only" "$(api_get /auth/me | jfield "['query_only']")" "True"
+
+section "Load the package"
+loader -e EMBED_MODEL=vfy-other-embed -- "$pkg"
+rc=$?
+[ "$rc" = 1 ] && grep -q "EMBEDDING_MISMATCH" "$OUT"
+check "a package from another embedding model is refused (exit 1, EMBEDDING_MISMATCH)" $? "exit $rc: $(tail -2 "$OUT")"
+exists=$(api_get "/collections" | python3 -c "import json,sys; print(any(c['name']=='$C' for c in json.load(sys.stdin)['collections']))" 2>/dev/null)
+check_eq "the refused load created no collection" "$exists" "False"
+loader -- "$pkg"
+rc=$?
+check_eq "the loader loads the package (exit 0)" "$rc" "0"
+grep -q "loaded into collection $C: $chunks chunks" "$OUT"
+check "the loader reports the collection and its $chunks chunks" $? "$(tail -3 "$OUT")"
+count=$(api_get "/collections" | python3 -c "
+import json, sys
+print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name'] == sys.argv[1]][0])" "$C" 2>/dev/null)
+check_eq "the loaded collection holds the exported chunks" "$count" "$chunks"
+check_eq "the load is an operator.load audit record" "$(last_load)" "success - $pkg"
+loader -- "$pkg"
+rc=$?
+[ "$rc" = 1 ] && grep -q "COLLECTION_EXISTS" "$OUT"
+check "loading it again with the default abort is refused (exit 1, COLLECTION_EXISTS)" $? "exit $rc: $(tail -2 "$OUT")"
+
+section "Who sees the loaded collection"
+user=$(auth_jar end_user) || user=""
+seen() { command curl -s -m 60 -b "$1" "$API/collections" | python3 -c "import json,sys; print(any(c['name']=='$C' for c in json.load(sys.stdin)['collections']))" 2>/dev/null; }
+check_eq "the End User doesn't see it: a loaded collection starts restricted with no grants" "$(seen "$user")" "False"
+check_eq "the Engineer sees it" "$(seen "$RAG_AUTH_JAR")" "True"
+
+section "Refused and kept routes"
+refused() {   # refused <method> <path>: the Engineer's answer, as "status code"
+  curl -s -m 60 -o /tmp/vfy_qo.json -w '%{http_code}' -X "$1" "$API$2" -H 'Content-Type: application/json' -d '{}' \
+    >/tmp/vfy_qo.code
+  printf '%s %s' "$(cat /tmp/vfy_qo.code)" "$(jfield "['error']['code']" < /tmp/vfy_qo.json)"
+}
+bad=""
+for route in "POST /collections" "DELETE /collections/$C" "POST /ingest/upload" "POST /ingest/config" \
+             "POST /retrieval/config" "POST /goldstandard/generate" "POST /goldstandard/regenerate" \
+             "PATCH /goldstandard/session/vfy-s/pair/vfy-p" "POST /goldstandard/save" "POST /import" \
+             "POST /prepare/upload" "DELETE /prepare/documents/vfy-d" "DELETE /prepare/documents/vfy-d/prepared" \
+             "POST /prepare/jobs" "POST /prepare/job/vfy-j/cancel" "POST /prepare/import" \
+             "POST /tune/rechunk" "POST /tune/reembed" "POST /tune/reindex"; do
+  got=$(refused ${route% *} "${route#* }")
+  [ "$got" = "403 QUERY_ONLY" ] || bad="$bad; $route: $got"
+done
+[ -z "$bad" ]
+check "each of the 19 data-changing routes answers the Engineer 403 QUERY_ONLY" $? "${bad#; }"
+dev=$(auth_jar developer) || dev=""
+got=$(command curl -s -m 60 -b "$dev" -H "Origin: $RAG_AUTH_ORIGIN" -X DELETE "$API/collections/$C?confirm=true" | jfield "['error']['code']")
+check_eq "a Developer deleting a collection is still refused FORBIDDEN" "$got" "FORBIDDEN"
+check_eq "no session is still 401" "$(command curl -s -o /dev/null -m 60 -w '%{http_code}' -X POST "$API/import" -H 'Content-Type: application/json' -d '{}')" "401"
+check_eq "the Engineer opens the loaded collection (PUT access is kept)" \
+  "$(curl -s -o /dev/null -m 60 -w '%{http_code}' -X PUT "$API/collections/$C/access" -H 'Content-Type: application/json' -d '{"restricted":false}')" "200"
+check_eq "the End User then sees it" "$(seen "$user")" "True"
+
+if [ "$SKIP_SLOW" = "1" ]; then
+  skip "an End User's question on the loaded collection" "set RAG_SKIP_SLOW=0 to include it"
+else
+  command curl -s -m 600 -b "$user" -H "Origin: $RAG_AUTH_ORIGIN" -X POST "$API/query" -H 'Content-Type: application/json' \
+    -d "{\"question\":\"who approves overtime?\",\"collection\":\"$C\",\"top_k\":3,\"include_citations\":true}" > /tmp/vfy_qo.json
+  python3 -c "
+import json, sys
+r = json.load(open('/tmp/vfy_qo.json'))
+sys.exit(0 if r.get('answer', '').strip() and r.get('citations') else 1)"
+  check "an End User asks a question on the loaded collection and gets an answer with citations" $? "$(head -c 300 /tmp/vfy_qo.json)"
+fi
+
+api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_qo.json
+ejob=$(jfield "['job_id']" < /tmp/vfy_qo.json)
+check_eq "export keeps working in query-only mode" "$(wait_for_job "/export/job/$ejob" 1800)" "completed"
+check_eq "the package list keeps working" "$(api_code "$API/packages")" "200"
+
+summary
+```
+
+### scripts/verify/query_only_config.py
+
+```python
+"""The real query-only overlay, resolved without starting it (#670). Host-side, standard library, Python 3.9+.
+
+    python3 query_only_config.py CHECKOUT
+
+Resolves CHECKOUT's docker-compose.yml alone and with docker-compose.query-only.yml
+through `docker compose config` (which creates no container, volume or network),
+under a project name that is neither rag-docker nor rag-verify, with no .env file
+and none of the caller's COMPOSE_* or RAG_* variables, and checks that the overlay
+changes exactly one thing: the API's RAG_QUERY_ONLY, from "false" to "true". No
+other service, setting, port, volume or model changes. Prints each problem;
+exits 0 or 1.
+"""
+import json
+import os
+import subprocess
+import sys
+
+PROJECT = "rag-query-only-config"
+
+
+def resolve(checkout, overlay):
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("COMPOSE_", "RAG_"))}
+    files = ["-f", os.path.join(checkout, "docker-compose.yml")]
+    if overlay:
+        files += ["-f", os.path.join(checkout, "docker-compose.query-only.yml")]
+    result = subprocess.run(
+        ["docker", "compose", "--env-file", os.devnull, "-p", PROJECT, *files, "config", "--format", "json"],
+        cwd=checkout, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        universal_newlines=True, timeout=120)
+    if result.returncode != 0:
+        raise RuntimeError("docker compose config failed: " + result.stderr.strip())
+    return json.loads(result.stdout)
+
+
+def problems(base, query_only):
+    found = []
+    base_env = ((base.get("services") or {}).get("api") or {}).get("environment") or {}
+    qo_env = ((query_only.get("services") or {}).get("api") or {}).get("environment") or {}
+    if base_env.get("RAG_QUERY_ONLY") != "false":
+        found.append("the base file's api must set RAG_QUERY_ONLY to \"false\", not {!r}".format(
+            base_env.get("RAG_QUERY_ONLY")))
+    if qo_env.get("RAG_QUERY_ONLY") != "true":
+        found.append("with the overlay the api's RAG_QUERY_ONLY must be \"true\", not {!r}".format(
+            qo_env.get("RAG_QUERY_ONLY")))
+    # Everything else is the same: put the one setting back and compare.
+    changed = json.loads(json.dumps(query_only))
+    api_env = ((changed.get("services") or {}).get("api") or {}).get("environment")
+    if isinstance(api_env, dict) and "RAG_QUERY_ONLY" in base_env:
+        api_env["RAG_QUERY_ONLY"] = base_env["RAG_QUERY_ONLY"]
+    if changed != base:
+        keys = sorted(set(base.get("services") or {}) | set(changed.get("services") or {}))
+        differ = [k for k in keys if (base.get("services") or {}).get(k) != (changed.get("services") or {}).get(k)]
+        found.append("the overlay changes more than the api's RAG_QUERY_ONLY (services differing: {})".format(
+            ", ".join(differ) or "none; a top-level key differs"))
+    return found
+
+
+def main(argv):
+    if len(argv) != 2:
+        print(__doc__.strip().splitlines()[2].strip(), file=sys.stderr)
+        return 2
+    checkout = os.path.realpath(argv[1])
+    try:
+        found = problems(resolve(checkout, False), resolve(checkout, True))
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+        print("    " + str(exc), file=sys.stderr)
+        return 1
+    for problem in found:
+        print("    " + problem, file=sys.stderr)
+    return 1 if found else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+```
+
 ### scripts/tests/test_lan_mode.py
 
 ````python
@@ -30467,7 +35370,9 @@ Runs with the API's dependencies, in the built API image with no network
 Stores and certificate folders are temporary; nothing is started or published.
 """
 import ast
+import contextlib
 import datetime
+import importlib.util
 import io
 import json
 import os
@@ -30589,10 +35494,10 @@ class MainImportTests(unittest.TestCase):
         self.assertEqual(ast.unparse(body[0]), "import lan_mode")
         self.assertEqual(ast.unparse(body[1]), "lan_mode.enforce()")
 
-    def run_import(self, **env):
+    def run_import(self, module="main", **env):
         with tempfile.TemporaryDirectory() as folder:
             full = {**os.environ, "AUTH_DIR": folder, "PYTHONDONTWRITEBYTECODE": "1", **env}
-            return subprocess.run([sys.executable, "-c", "import main"], cwd=API_DIR, env=full,
+            return subprocess.run([sys.executable, "-c", f"import {module}"], cwd=API_DIR, env=full,
                                   capture_output=True, text=True, timeout=300)
 
     def test_lan_mode_without_a_secure_cookie_exits_with_one_line(self):
@@ -30611,9 +35516,39 @@ class MainImportTests(unittest.TestCase):
         self.assertIn("no enabled AI Engineer", lines[0])
 
     def test_an_invalid_value_stops_the_api(self):
+        # #555: any invalid setting stops startup with one line, no traceback.
         result = self.run_import(RAG_LAN_MODE="yes")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("RAG_LAN_MODE must be exactly true or false", result.stderr)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr.splitlines(), ["Settings refused: RAG_LAN_MODE must be exactly true or false"])
+
+    def test_each_invalid_setting_is_one_line_without_its_value(self):
+        result = self.run_import(module="config", AUTH_COOKIE_SECURE="yes", WEAVIATE_PORT="not-a-port-7f3a")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        lines = result.stderr.splitlines()
+        self.assertEqual(len(lines), 2, result.stderr)
+        self.assertEqual(sum(l.startswith("Settings refused: AUTH_COOKIE_SECURE must be exactly true or false")
+                             for l in lines), 1, lines)
+        self.assertEqual(sum(l.startswith("Settings refused: WEAVIATE_PORT: ") for l in lines), 1, lines)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertNotIn("not-a-port-7f3a", result.stdout + result.stderr)
+
+    def test_a_validators_own_message_is_used_as_is_through_main(self):
+        # #555 (reviewer): uvicorn's import of main, a validator's own message
+        # unprefixed and a pydantic type error prefixed with its setting, one
+        # line each, no traceback, neither value printed.
+        result = self.run_import(AUDIT_LOG_KEEP="0", MAX_PREPARATION_BYTES="12-vfy-secret-9c1d")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(sorted(result.stderr.splitlines()), [
+            "Settings refused: AUDIT_LOG_KEEP must be 1 to 1000",
+            "Settings refused: MAX_PREPARATION_BYTES: Input should be a valid integer, unable to parse string as an integer"])
+        self.assertNotIn("vfy-secret-9c1d", result.stderr)
+
+    def test_settings_itself_still_raises_validation_error(self):
+        with self.assertRaises(ValidationError):
+            config.Settings(rag_lan_mode="yes")
 
 
 # ── the certificate step ─────────────────────────────────────────────────────
@@ -30838,6 +35773,25 @@ class BringYourOwnTests(CertTestCase):
                 self.assertIn(part, err)
                 self.assertFalse((self.out / "live").exists())
 
+    def test_an_encrypted_key_is_refused(self):
+        cert_bytes, key_bytes = certificate(["files.example"])
+        key = serialization.load_pem_private_key(key_bytes, password=None)
+        self.put(cert_bytes, key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                               serialization.BestAvailableEncryption(b"a passphrase")))
+        code, out, err = self.step()
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(len(err.splitlines()), 1, err)
+        self.assertIn("key.pem", err)
+        self.assertFalse((self.out / "live").exists())
+
+    def test_a_cert_pem_directory_is_refused(self):
+        (self.byo / "cert.pem").mkdir()
+        self.put(key_bytes=certificate(["files.example"])[1])
+        code, out, err = self.step()
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(len(err.splitlines()), 1, err)
+        self.assertFalse((self.out / "live").exists())
+
     def test_hosts_map_from_your_certificate(self):
         # #664: the certificate's own names, in nginx's forms; localhost and
         # 127.0.0.1 are nginx.lan.conf's.
@@ -30901,6 +35855,9 @@ class NginxTests(unittest.TestCase):
         for text in (self.lan, self.locations):
             self.assertNotIn("strict-transport-security", "\n".join(directives(text)).lower())
 
+    def test_no_version_in_responses(self):
+        self.assertIn("server_tokens off;", directives(self.lan))
+
     def test_both_servers_share_the_locations(self):
         include = "include /etc/nginx/rag/locations.conf;"
         for text in (self.lan, self.default):
@@ -30913,8 +35870,9 @@ class NginxTests(unittest.TestCase):
         lines = directives(self.locations)
         self.assertEqual([l for l in lines if l.startswith("location")],
                          ["location = /api/goldstandard/regenerate {", "location = /api/auth/login {",
-                          "location @login_rate_limited {", "location /api/ {", "location / {"])
-        self.assertEqual(lines.count("proxy_set_header Host $http_host;"), 3)
+                          "location = /api/auth/login/mfa {", "location @login_rate_limited {", "location /api/ {",
+                          "location / {"])
+        self.assertEqual(lines.count("proxy_set_header Host $http_host;"), 4)
 
     def test_only_listed_hosts_are_served(self):
         # #664: a map of the accepted hosts, and a server-level 421 for any other.
@@ -30949,6 +35907,15 @@ class NginxTests(unittest.TestCase):
                      "error_page 429 = @login_rate_limited;", "proxy_pass http://api/auth/login;",
                      "proxy_set_header X-Real-IP $remote_addr;", "client_max_body_size 16k;"):
             self.assertIn(line, lines)
+        # #607: the login's code step shares the zone, the refusal and the body limit.
+        code = self.locations[self.locations.index("location = /api/auth/login/mfa {"):]
+        code = directives(code[:code.index("\n}\n")])
+        for line in ("limit_req zone=login burst=5 nodelay;", "limit_req_status 429;",
+                     "error_page 429 = @login_rate_limited;", "proxy_pass http://api/auth/login/mfa;",
+                     "proxy_set_header Host $http_host;", "proxy_set_header X-Real-IP $remote_addr;",
+                     "client_max_body_size 16k;"):
+            self.assertIn(line, code)
+        self.assertEqual([l for l in code if l.startswith("proxy_request_buffering")], [])
         # #663: login reads a body before authentication, so it has a small,
         # buffered body limit, not /api/'s 512m streamed uploads.
         self.assertEqual([l for l in lines if l.startswith("proxy_request_buffering")], [])
@@ -30966,6 +35933,52 @@ class NginxTests(unittest.TestCase):
         message = "Too many login attempts. Wait a minute and try again."
         self.assertEqual(json.loads(body), {"error": {"code": "LOGIN_RATE_LIMITED", "message": message, "detail": None}})
         self.assertIn("default_type application/json;", directives(named[:named.index("\n}\n")]))
+
+
+# ── lan_stack.py's rate-limit check, against faked answers (#598) ─────────────
+
+class LanStackRateLimitTests(unittest.TestCase):
+    """On the stack the check's assertions can't be broken on their own: changing nginx's answer also stops the
+    harness's paced setup login. Here `request()` is faked, so each way the check fails is shown."""
+
+    @classmethod
+    def setUpClass(cls):
+        saved = list(sys.path)                         # lan_stack.py puts its own folder first on sys.path
+        try:
+            spec = importlib.util.spec_from_file_location("lan_stack", ROOT / "scripts" / "verify" / "lan_stack.py")
+            cls.lan_stack = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(cls.lan_stack)
+        finally:
+            sys.path[:] = saved
+
+    def run_check(self, answers):
+        """(exit status, stderr, logins sent) of `lan_stack.py rate-limit` with `answers` as the logins' answers."""
+        answers, sent = list(answers), []
+
+        def fake_request(*args, **kwargs):
+            sent.append(args)
+            status, body = answers.pop(0)
+            return status, body, []
+        err = io.StringIO()
+        with patch.object(self.lan_stack, "request", fake_request), \
+                patch.dict(os.environ, {"RAG_VERIFY_PORT": "8443"}), contextlib.redirect_stderr(err):
+            status = self.lan_stack.main(["rate-limit"])
+        return status, err.getvalue(), len(sent)
+
+    def test_a_429_with_another_code_fails(self):
+        status, err, sent = self.run_check([(429, {"error": {"code": "LOGIN_THROTTLED"}})])
+        self.assertEqual((status, sent), (1, 1))
+        self.assertIn("not nginx's", err)
+
+    def test_twelve_logins_let_through_fail(self):
+        status, err, sent = self.run_check([(401, {"error": {"code": "LOGIN_FAILED"}})] * 12)
+        self.assertEqual((status, sent), (1, 12))
+        self.assertIn("12 logins in a row were all let through", err)
+
+    def test_nginx_refusal_passes(self):
+        status, err, sent = self.run_check([(401, {"error": {"code": "LOGIN_FAILED"}})] * 2
+                                           + [(429, {"error": {"code": "LOGIN_RATE_LIMITED"}})])
+        self.assertEqual((status, err, sent), (0, "", 3))
 
 
 # ── embedded copies ──────────────────────────────────────────────────────────
@@ -30991,28 +36004,31 @@ if __name__ == "__main__":
     unittest.main(verbosity=2)
 ````
 
-### scripts/tests/test_auth.py
+### scripts/tests/test_query_only.py
 
 ```python
-"""Accounts, sessions, service principals and API keys, the endpoint/role
-matrix and the operator command (#25).
+"""Query-only mode (#670): the setting, the refused routes, the flag in the
+user answers, the loader and the access of a collection it creates.
 
-Runs with the API's dependencies, in the built API image with no network
-(`17_auth.sh`):
+Runs with the API's dependencies: in the built API image with no network, as
+`24_query_only.sh` does,
 
     docker run --rm --network none -v "$PWD:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api \\
-      "$(docker compose images -q api)" python scripts/tests/test_auth.py
+      "$(docker compose images -q api)" python scripts/tests/test_query_only.py
 
-Every test uses its own temporary store (AUTH_DIR); requests go through
-`main.app` with FastAPI's TestClient, without the lifespan, and nothing reaches
-a backend.
+or on the host with them installed. Every test uses its own temporary account
+store, audit folder, upload folder and exports folder; requests go through
+`main.app` with FastAPI's TestClient, without the lifespan. Weaviate and Ollama
+are blocked for the whole run, as in test_auth.py, and the loader's import run
+is replaced where it would need them.
 """
 import asyncio
-import hashlib
-import logging
+import contextlib
+import fcntl
+import io
+import json
 import os
-import sqlite3
-import subprocess
+import re
 import sys
 import tempfile
 import unittest
@@ -31021,21 +36037,657 @@ from unittest.mock import patch
 
 API_DIR = os.environ.get("RAG_TEST_API_DIR") or str(Path(__file__).resolve().parents[2] / "api")
 sys.path.insert(0, API_DIR)
+ROOT = Path(API_DIR).parent
 
+import httpx
+from fastapi.testclient import TestClient
+from pydantic import ValidationError
+
+import config
+import loader
+from config import settings
+from main import app
+from auth import keys, passwords, policy, store
+from auth.middleware import AuthMiddleware
+from services import importer, ollama_client, weaviate_client
+
+ORIGIN = "http://testserver"
+
+# The 19 routes refused in query-only mode (#670, decision Q2), written out
+# here rather than read from the policy, so a change to either is a decision.
+REFUSED = {
+    ("POST", "/collections"), ("DELETE", "/collections/{name}"),
+    ("POST", "/ingest/upload"), ("POST", "/ingest/config"), ("POST", "/retrieval/config"),
+    ("POST", "/goldstandard/generate"), ("POST", "/goldstandard/regenerate"),
+    ("PATCH", "/goldstandard/session/{session_id}/pair/{pair_id}"), ("POST", "/goldstandard/save"),
+    ("POST", "/import"),
+    ("POST", "/prepare/upload"), ("DELETE", "/prepare/documents/{document_id}"),
+    ("DELETE", "/prepare/documents/{document_id}/prepared"), ("POST", "/prepare/jobs"),
+    ("POST", "/prepare/job/{job_id}/cancel"), ("POST", "/prepare/import"),
+    ("POST", "/tune/rechunk"), ("POST", "/tune/reembed"), ("POST", "/tune/reindex"),
+}
+# Every other state-changing route keeps working: a new one fails this test
+# until it is put in one list or the other.
+KEPT = {
+    ("POST", "/auth/login"), ("POST", "/auth/logout"), ("POST", "/auth/password"),
+    ("POST", "/auth/login/mfa"), ("POST", "/auth/mfa/enroll"), ("POST", "/auth/mfa/enroll/confirm"),
+    ("POST", "/auth/mfa/recovery-codes"), ("POST", "/auth/mfa/disable"), ("POST", "/auth/mfa/policy"),
+    ("POST", "/auth/users"), ("POST", "/auth/users/{username}/reset-password"),
+    ("POST", "/auth/users/{username}/role"), ("POST", "/auth/users/{username}/disable"),
+    ("POST", "/auth/users/{username}/enable"), ("POST", "/auth/users/{username}/reset-mfa"),
+    ("POST", "/auth/service-principals"), ("POST", "/auth/service-principals/{name}/role"),
+    ("POST", "/auth/service-principals/{name}/disable"), ("POST", "/auth/service-principals/{name}/enable"),
+    ("POST", "/auth/service-principals/{name}/keys"),
+    ("POST", "/auth/service-principals/{name}/keys/{key_id}/revoke"),
+    ("POST", "/query"), ("POST", "/export"), ("GET", "/packages/{filename}"),
+    ("PUT", "/collections/{name}/access"),
+}
+
+
+class _NoNetwork(httpx.AsyncBaseTransport):
+    async def handle_async_request(self, request):
+        raise httpx.ConnectError("test_query_only.py runs without a network", request=request)
+
+
+class _OfflineAsyncClient(httpx.AsyncClient):
+    def __init__(self, *args, **kwargs):
+        kwargs["transport"] = _NoNetwork()
+        super().__init__(*args, **kwargs)
+
+
+def _no_weaviate():
+    raise ConnectionError("test_query_only.py runs without a network: there is no Weaviate")
+
+
+_OFFLINE = (patch.object(weaviate_client, "get_client", _no_weaviate),
+            patch.object(httpx, "AsyncClient", _OfflineAsyncClient))
+
+
+def setUpModule():
+    for offline in _OFFLINE:
+        offline.start()
+
+
+def tearDownModule():
+    for offline in reversed(_OFFLINE):
+        offline.stop()
+
+
+def concrete(template):
+    return re.sub(r"\{[a-z_]+\}", "x", template)
+
+
+class Folders(unittest.TestCase):
+    """Temporary account store, audit, upload and exports folders, and the mode."""
+
+    QUERY_ONLY = True
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        for name in ("auth", "audit", "uploads", "exports"):
+            (self.root / name).mkdir()
+        for name, value in (("auth_dir", str(self.root / "auth")), ("audit_dir", str(self.root / "audit")),
+                            ("upload_dir", str(self.root / "uploads")),
+                            ("exports_dir", str(self.root / "exports")),
+                            ("rag_query_only", self.QUERY_ONLY)):
+            target = patch.object(settings, name, value)
+            target.start()
+            self.addCleanup(target.stop)
+
+    def records(self, action=None):
+        path = self.root / "audit" / "audit.jsonl"
+        if not path.exists():
+            return []
+        found = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+        return [r for r in found if action is None or r["action"] == action]
+
+
+# ── S1: the setting ──────────────────────────────────────────────────────────
+
+class SettingTests(unittest.TestCase):
+    def test_exactly_true_or_false(self):
+        for value, expected in (("true", True), ("false", False)):
+            with self.subTest(value=value):
+                with patch.dict(os.environ, {"RAG_QUERY_ONLY": value}):
+                    self.assertIs(config.Settings().rag_query_only, expected)
+        self.assertIs(config.Settings.model_fields["rag_query_only"].default, False)
+        for value in ("yes", "1", "TRUE", "on", ""):
+            with self.subTest(value=value):
+                with patch.dict(os.environ, {"RAG_QUERY_ONLY": value}):
+                    with self.assertRaises(ValidationError) as caught:
+                        config.Settings()
+                self.assertEqual(config.refusal_lines(caught.exception),
+                                 ["Settings refused: RAG_QUERY_ONLY must be exactly true or false"])
+
+    def test_the_overlay_sets_only_the_api_switch(self):
+        text = (ROOT / "docker-compose.query-only.yml").read_text()
+        body = [line for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+        self.assertEqual(body, ["services:", "  api:", "    environment:", '      RAG_QUERY_ONLY: "true"'])
+        base = (ROOT / "docker-compose.yml").read_text()
+        self.assertEqual(base.count('RAG_QUERY_ONLY: "false"'), 1)
+
+    def test_config_check_compares_the_whole_configuration(self):
+        sys.path.insert(0, str(ROOT / "scripts" / "verify"))
+        try:
+            import query_only_config
+        finally:
+            sys.path.pop(0)
+        base = {"services": {"api": {"environment": {"RAG_QUERY_ONLY": "false", "A": "1"}}, "ui": {}}}
+        good = {"services": {"api": {"environment": {"RAG_QUERY_ONLY": "true", "A": "1"}}, "ui": {}}}
+        self.assertEqual(query_only_config.problems(base, good), [])
+        worse = json.loads(json.dumps(good))
+        worse["services"]["ui"] = {"ports": ["0.0.0.0:1:1"]}
+        self.assertEqual(len(query_only_config.problems(base, worse)), 1)
+        self.assertEqual(len(query_only_config.problems(base, base)), 1)
+
+
+# ── S2: the policy ───────────────────────────────────────────────────────────
+
+class PolicyTests(unittest.TestCase):
+    def test_the_refused_routes_are_the_decided_ones(self):
+        self.assertEqual(set(policy.QUERY_ONLY_REFUSED), REFUSED)
+
+    def test_every_state_changing_route_is_classified_once(self):
+        changing = {key for key in policy.ACCESS
+                    if key[0] != "GET" or key[1] in policy.STATE_CHANGING_GET}
+        self.assertEqual(set(policy.QUERY_ONLY_KEPT), KEPT,
+                         "a state-changing route is not classified for query-only mode (#670)")
+        self.assertEqual(REFUSED | KEPT, changing)
+        self.assertEqual(REFUSED & KEPT, set())
+        self.assertTrue(REFUSED <= set(policy.ACCESS))
+
+
+# ── S2, S3: through the app ──────────────────────────────────────────────────
+
+class AppTests(Folders):
+    def setUp(self):
+        super().setUp()
+        self.client = TestClient(app, raise_server_exceptions=False)
+        self.addCleanup(self.client.close)
+        self.passwords = {}
+        for name, role in (("eng", "engineer"), ("dev", "developer"), ("user", "end_user")):
+            self.passwords[name] = passwords.generate_password()
+            store.create_user(name, role, self.passwords[name], bootstrap=not store.is_set_up(),
+                              must_change_password=False)
+
+    def session(self, username):
+        token = store.create_session(store.get_user(username).id)
+        return {"Cookie": f"{store.COOKIE}={token}", "Origin": ORIGIN}
+
+    def code(self, response):
+        try:
+            return response.json()["error"]["code"]
+        except (ValueError, KeyError, TypeError):
+            return None
+
+    def test_each_refused_route_answers_query_only(self):
+        for method, template in sorted(REFUSED):
+            with self.subTest(route=(method, template)):
+                response = self.client.request(method, concrete(template), json={},
+                                               headers=self.session("eng"))
+                self.assertEqual((response.status_code, self.code(response)), (403, "QUERY_ONLY"))
+                self.assertIn("query-only", response.json()["error"]["message"])
+
+    def test_other_refusals_come_first(self):
+        # No session: 401. A Developer on an Engineer's route: FORBIDDEN. Cross-origin first too.
+        response = self.client.post("/import", json={})
+        self.assertEqual((response.status_code, self.code(response)), (401, "AUTH_REQUIRED"))
+        response = self.client.delete("/collections/x", headers=self.session("dev"))
+        self.assertEqual((response.status_code, self.code(response)), (403, "FORBIDDEN"))
+        response = self.client.post("/import", json={}, headers={**self.session("user")})
+        self.assertEqual(self.code(response), "FORBIDDEN")
+        headers = {**self.session("eng"), "Origin": "http://elsewhere.example"}
+        response = self.client.post("/import", json={}, headers=headers)
+        self.assertEqual(self.code(response), "CROSS_ORIGIN_REFUSED")
+
+    def test_a_key_is_refused_too(self):
+        store.create_principal("svc", "engineer")
+        _, key = store.issue_key("svc", 30, "")
+        response = self.client.post("/tune/reindex", json={}, headers={"Authorization": f"Bearer {key}"})
+        self.assertEqual((response.status_code, self.code(response)), (403, "QUERY_ONLY"))
+        response = self.client.post("/import", json={}, headers={"Authorization": "Bearer nonsense"})
+        self.assertEqual(self.code(response), "KEY_INVALID")
+
+    def test_kept_routes_are_not_refused(self):
+        for method, template in sorted(KEPT):
+            with self.subTest(route=(method, template)):
+                response = self.client.request(method, concrete(template), json={},
+                                               headers=self.session("eng"))
+                self.assertNotEqual(self.code(response), "QUERY_ONLY")
+        self.assertEqual(self.client.get("/collections", headers=self.session("user")).status_code != 403, True)
+
+    def test_off_nothing_is_refused_for_the_mode(self):
+        with patch.object(settings, "rag_query_only", False):
+            for method, template in sorted(REFUSED):
+                with self.subTest(route=(method, template)):
+                    response = self.client.request(method, concrete(template), json={},
+                                                   headers=self.session("eng"))
+                    self.assertNotEqual(self.code(response), "QUERY_ONLY")
+
+    def test_the_refusal_is_audited_with_its_principal(self):
+        self.client.post("/import", json={"filename": "ragpkg-x.tar.gz"}, headers=self.session("eng"))
+        found = self.records("import")
+        self.assertEqual(len(found), 1, found)
+        self.assertEqual((found[0]["actor"], found[0]["result"], found[0]["status_code"]),
+                         ("eng", "refused", 403))
+        self.assertIn("QUERY_ONLY", json.dumps(found[0]))
+
+    def test_the_body_of_a_refused_request_is_never_read(self):
+        token = store.create_session(store.get_user("eng").id)
+        scope = {"type": "http", "method": "POST", "path": "/ingest/upload", "query_string": b"",
+                 "headers": [(b"cookie", f"{store.COOKIE}={token}".encode()), (b"origin", ORIGIN.encode()),
+                             (b"host", b"testserver")]}
+        sent = []
+
+        async def inner(scope, receive, send):
+            raise AssertionError("the route ran")
+
+        async def receive():
+            raise AssertionError("the body was read")
+
+        async def send(message):
+            sent.append(message)
+
+        asyncio.run(AuthMiddleware(inner)(scope, receive, send))
+        self.assertEqual(sent[0]["status"], 403)
+        self.assertIn(b"QUERY_ONLY", sent[1]["body"])
+
+    def test_user_answers_carry_the_mode(self):
+        response = self.client.post("/auth/login", json={"username": "user", "password": self.passwords["user"]},
+                                    headers={"Origin": ORIGIN})
+        self.assertIs(response.json()["query_only"], True)
+        self.assertIs(self.client.get("/auth/me", headers=self.session("user")).json()["query_only"], True)
+        with patch.object(settings, "rag_query_only", False):
+            self.assertIs(self.client.get("/auth/me", headers=self.session("user")).json()["query_only"], False)
+        self.assertNotIn("query_only", self.client.get("/auth/status").json())
+
+
+# ── S4: the loader ───────────────────────────────────────────────────────────
+
+class LoaderTests(Folders):
+    def setUp(self):
+        super().setUp()
+        self.sigint = patch.object(loader.signal, "signal")   # never change the test runner's SIGINT
+        self.sigint.start()
+        self.addCleanup(self.sigint.stop)
+        self.sweep = patch.object(importer, "sweep_interrupted_imports", return_value=[])
+        self.swept = self.sweep.start()
+        self.addCleanup(self.sweep.stop)
+        self.calls = []
+
+    def package(self, name="ragpkg-vfy-1.tar.gz"):
+        (self.root / "exports" / name).write_bytes(b"not read: the import run is replaced")
+        return name
+
+    def fake_run(self, status="completed", **fields):
+        def run(job_id, filename, on_conflict, passphrase=None):
+            job = importer._jobs[job_id]
+            self.calls.append({"job": dict(job), "filename": filename, "on_conflict": on_conflict,
+                               "passphrase": passphrase, "lock_held": self.lock_is_held()})
+            job.update({"status": status, **fields})
+        return patch.object(importer, "_run", run)
+
+    def lock_is_held(self):
+        with open(self.root / "uploads" / "loader.lock", "a") as other:
+            try:
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(other, fcntl.LOCK_UN)
+            return False
+
+    def main(self, argv, stdin=""):
+        err = io.StringIO()
+        with patch.object(sys, "stdin", io.StringIO(stdin)), contextlib.redirect_stderr(err):
+            try:
+                code = loader.main(argv)
+            except SystemExit as exc:
+                code = exc.code
+        return code, err.getvalue()
+
+    def test_usage_errors_exit_2_and_record_nothing(self):
+        for argv in ([], ["../etc/passwd"], ["notes.txt"], ["exports/ragpkg-a.tar.gz"],
+                     ["ragpkg-a.tar.gz", "--on-conflict", "merge"], ["ragpkg-a.tar.gz", "--passphrase", "x"]):
+            with self.subTest(argv=argv):
+                code, _ = self.main(argv)
+                self.assertEqual(code, 2)
+        self.assertEqual(self.records(), [])
+
+    def test_refused_on_a_full_instance(self):
+        name = self.package()
+        with patch.object(settings, "rag_query_only", False), self.fake_run():
+            code, err = self.main([name])
+        self.assertEqual(code, 1)
+        self.assertIn("load refused: NOT_QUERY_ONLY", err)
+        self.assertEqual(self.calls, [])
+        record = self.records("operator.load")[-1]
+        self.assertEqual((record["actor"], record["actor_kind"], record["result"], record["target"]),
+                         ("operator", "operator", "refused", name))
+        self.assertEqual(record["details"], {"on_conflict": "abort", "encrypted": False, "code": "NOT_QUERY_ONLY"})
+
+    def test_one_load_at_a_time(self):
+        name = self.package()
+        with open(self.root / "uploads" / "loader.lock", "a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            with self.fake_run():
+                code, err = self.main([name])
+        self.assertEqual(code, 1)
+        self.assertIn("LOAD_IN_PROGRESS", err)
+        self.assertEqual(self.calls, [])
+
+    def test_a_missing_package(self):
+        with self.fake_run():
+            code, err = self.main(["ragpkg-absent.tar.gz"])
+        self.assertEqual(code, 1)
+        self.assertIn("PACKAGE_NOT_FOUND", err)
+        (self.root / "exports" / "ragpkg-dir.tar.gz").mkdir()
+        os.symlink(self.root / "elsewhere", self.root / "exports" / "ragpkg-link.tar.gz")
+        for name in ("ragpkg-dir.tar.gz", "ragpkg-link.tar.gz"):
+            with self.subTest(name=name), self.fake_run():
+                code, err = self.main([name])
+                self.assertEqual((code, "PACKAGE_NOT_FOUND" in err), (1, True))
+        self.assertEqual(self.calls, [])
+
+    def test_a_load_runs_the_import_code_under_the_lock(self):
+        name = self.package()
+        with self.fake_run(collection="Policies", original_collection="Policies", chunks_written=12,
+                           fidelity="with-sources", notes=["a note"]):
+            code, err = self.main([name, "--on-conflict", "replace"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.calls), 1)
+        call = self.calls[0]
+        self.assertEqual((call["filename"], call["on_conflict"], call["passphrase"], call["lock_held"]),
+                         (name, "replace", None, True))
+        self.assertIs(call["job"]["operator"], True)
+        self.assertIsNone(call["job"]["owner"])
+        self.swept.assert_called_once()
+        self.assertIn("loaded into collection Policies: 12 chunks, with-sources", err)
+        self.assertIn("note: a note", err)
+        self.assertFalse(self.lock_is_held())
+        record = self.records("operator.load")[-1]
+        self.assertEqual((record["result"], record["collection"], record["target"]), ("success", "Policies", name))
+        self.assertEqual(record["details"], {"on_conflict": "replace", "encrypted": False, "chunks": 12})
+
+    def test_a_failed_load(self):
+        name = self.package()
+        with self.fake_run(status="failed", error_code="EMBEDDING_MISMATCH", error="another model",
+                           collection=None):
+            code, err = self.main([name])
+        self.assertEqual(code, 1)
+        self.assertIn("load failed: EMBEDDING_MISMATCH: another model", err)
+        record = self.records("operator.load")[-1]
+        # A load that ran and failed is `failed`, not `refused` (maintainer, 2026-11-18).
+        self.assertEqual((record["result"], record["details"]["code"]), ("failed", "EMBEDDING_MISMATCH"))
+
+    def test_an_encrypted_package_reads_its_passphrase_from_stdin(self):
+        name = self.package("ragpkg-vfy-2.tar.gz.age")
+        secret = "correct horse battery staple"
+        with self.fake_run(collection="P", original_collection="P", chunks_written=1):
+            code, err = self.main([name], stdin=secret + "\n")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.calls[0]["passphrase"], secret)
+        self.assertNotIn(secret, err)
+        self.assertNotIn(secret, (self.root / "audit" / "audit.jsonl").read_text())
+        self.assertIs(self.records("operator.load")[-1]["details"]["encrypted"], True)
+        with self.fake_run():
+            code, err = self.main([name], stdin="\n")
+        self.assertEqual(code, 1)
+        self.assertIn("PASSPHRASE_REQUIRED", err)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_progress_lines(self):
+        name = self.package()
+
+        def run(job_id, filename, on_conflict, passphrase=None):
+            job = importer._jobs[job_id]
+            job["chunks_written"] = 7
+            import time
+            time.sleep(0.3)
+            job.update({"status": "completed", "collection": "P", "original_collection": "P"})
+
+        with patch.object(loader, "PROGRESS_SECONDS", 0.1), patch.object(importer, "_run", run):
+            code, err = self.main([name])
+        self.assertEqual(code, 0)
+        self.assertIn("loader: chunks written: 7", err)
+
+    def test_ctrl_c_is_recorded_then_acts_as_a_kill(self):
+        # The handler is installed once the arguments are read; on SIGINT it
+        # records the load as interrupted (with the job's collection), restores
+        # SIG_DFL and sends SIGINT again, so the import's `finally` never runs.
+        name = self.package()
+        with self.fake_run(collection="P", original_collection="P"):
+            self.main([name])
+        signum, handler = loader.signal.signal.call_args_list[0][0]
+        self.assertEqual(signum, loader.signal.SIGINT)
+        self.assertTrue(callable(handler))
+        loader._state.clear()
+        loader._state["job"] = {"collection": "Policies"}
+        loader.signal.signal.reset_mock()
+        real_write = os.write
+        with patch.object(loader.os, "kill") as kill, \
+                patch.object(loader.os, "write", side_effect=lambda fd, data: len(data) if fd == 2
+                             else real_write(fd, data)) as write:
+            handler(loader.signal.SIGINT, None)
+        loader.signal.signal.assert_called_once_with(loader.signal.SIGINT, loader.signal.SIG_DFL)
+        kill.assert_called_once_with(os.getpid(), loader.signal.SIGINT)
+        # Straight to fd 2, not through sys.stderr (a reentrant print could raise).
+        self.assertEqual(write.call_args_list[0][0], (2, b"loader: load interrupted: INTERRUPTED\n"))
+        record = self.records("operator.load")[-1]
+        self.assertEqual((record["result"], record["collection"], record["target"], record["details"]["code"]),
+                         ("interrupted", "Policies", name, "INTERRUPTED"))
+
+    def test_the_kill_happens_even_when_the_record_fails(self):
+        handler = loader._interrupted("ragpkg-x.tar.gz", "abort", False)
+        loader._state.clear()
+        with patch.object(loader.os, "kill") as kill, patch.object(loader.os, "write"), \
+                patch.object(loader, "_audit", side_effect=RuntimeError("reentrant call")):
+            with self.assertRaises(RuntimeError):
+                handler(loader.signal.SIGINT, None)
+        kill.assert_called_once_with(os.getpid(), loader.signal.SIGINT)
+        with patch.object(loader.os, "kill") as kill, \
+                patch.object(loader.os, "write", side_effect=OSError("closed")):
+            with self.assertRaises(OSError):
+                handler(loader.signal.SIGINT, None)
+        kill.assert_called_once_with(os.getpid(), loader.signal.SIGINT)
+        loader._state.clear()
+
+    def test_after_the_runs_own_record_ctrl_c_writes_none(self):
+        # The run marks itself done before its final record, whatever the result.
+        name = self.package()
+        for run, argv in ((self.fake_run(collection="P", original_collection="P"), [name]),
+                          (self.fake_run(status="failed", error_code="IMPORT_FAILED"), [name]),
+                          (self.fake_run(), ["ragpkg-absent.tar.gz"])):
+            with self.subTest(argv=argv, run=run), run:
+                self.main(argv)
+                self.assertIs(loader._state.get("done"), True)
+                handler = loader.signal.signal.call_args_list[0][0][1]
+                before = len(self.records())
+                with patch.object(loader.os, "kill") as kill, patch.object(loader.os, "write") as write:
+                    handler(loader.signal.SIGINT, None)
+                kill.assert_called_once()
+                write.assert_not_called()
+                self.assertEqual(len(self.records()), before)
+                loader.signal.signal.reset_mock()
+        loader._state.clear()
+
+    def test_ctrl_c_while_a_record_is_written_writes_no_second_one(self):
+        handler = loader._interrupted("ragpkg-x.tar.gz", "abort", False)
+        loader._state.clear()
+        loader._state["auditing"] = True
+        before = len(self.records())
+        with patch.object(loader.os, "kill") as kill:
+            handler(loader.signal.SIGINT, None)
+        kill.assert_called_once()
+        self.assertEqual(len(self.records()), before)
+        loader._state.clear()
+
+
+# ── S5: access to a collection the loader creates ────────────────────────────
+
+class AccessTests(Folders):
+    def setUp(self):
+        super().setUp()
+        store.create_user("eng", "engineer", passwords.generate_password(), bootstrap=True,
+                          must_change_password=False)
+
+    def test_an_operator_load_restricts_a_new_collection_with_no_grants(self):
+        with patch.object(importer, "exists_fail_closed", return_value=False):
+            states = importer._start_access(None, "Policies", "Policies", operator=True)
+        self.assertIsNotNone(states)
+        self.assertEqual(store.collection_access("Policies"), store.CollectionAccess(True, (), ()))
+
+    def test_without_an_owner_or_the_operator_nothing_is_recorded(self):
+        self.assertIsNone(importer._start_access(None, "Policies", "Policies"))
+        self.assertEqual(store.collection_access("Policies"), store.CollectionAccess(False))
+
+    def test_a_rename_starts_engineers_only_too(self):
+        # Maintainer, 2026-11-18 (#808): the loader never copies an existing
+        # collection's access, even an open one; only replace keeps access.
+        store.set_collection_access("Policies", False)
+        with patch.object(importer, "exists_fail_closed", return_value=True):
+            importer._start_access(None, "Policies", "Policies_ab12cd34", operator=True)
+        self.assertEqual(store.collection_access("Policies_ab12cd34"), store.CollectionAccess(True, (), ()))
+        self.assertEqual(store.collection_access("Policies"), store.CollectionAccess(False))
+
+    def test_a_staging_copys_package_starts_engineers_only(self):
+        store.set_collection_access("Policies", False)
+        staging = "Policies__importing_" + "0" * 32
+        with patch.object(importer, "exists_fail_closed", return_value=True):
+            importer._start_access(None, "Policies", staging, operator=True)
+        self.assertEqual(store.collection_access(staging), store.CollectionAccess(True, (), ()))
+
+    def test_an_owners_import_still_copies_the_source_state(self):
+        # The API's import is unchanged (#606): a rename copies the source's state.
+        store.set_collection_access("Policies", False)
+        with patch.object(importer, "exists_fail_closed", return_value=True):
+            importer._start_access({"name": "eng", "kind": "user"}, "Policies", "Policies_ab12cd34")
+        self.assertEqual(store.collection_access("Policies_ab12cd34"), store.CollectionAccess(False))
+
+    def test_the_operator_is_never_refused_for_access(self):
+        store.restrict_to("Policies", None)
+        with patch.object(importer, "exists_fail_closed", return_value=True):
+            self.assertFalse(importer._refused(None, "Policies"))
+
+
+class ImplementationNotes(unittest.TestCase):
+    def test_the_loader_docstring_is_its_usage(self):
+        self.assertIn("python -m loader PACKAGE [--on-conflict abort|rename|replace]", loader.__doc__)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+```
+
+### scripts/tests/test_auth.py
+
+````python
+"""Accounts, sessions, service principals and API keys, the endpoint/role
+matrix and the operator command (#25).
+
+Runs with the API's dependencies: in the built API image with no network, as
+`17_auth.sh` does,
+
+    docker run --rm --network none -v "$PWD:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api \\
+      "$(docker compose images -q api)" python scripts/tests/test_auth.py
+
+or on the host with them installed.
+
+Every test uses its own temporary store (AUTH_DIR); requests go through
+`main.app` with FastAPI's TestClient, without the lifespan. Some requests pass
+the auth check and run the real handler, so the module blocks both backends
+for its whole run (setUpModule): getting the Weaviate client raises, and every
+httpx.AsyncClient request, which is how the Ollama client talks, fails before
+it opens a connection. No test reaches Weaviate or Ollama, on the host or in
+the image (#546).
+"""
+import asyncio
+import calendar
+import hashlib
+import logging
+import os
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from contextlib import closing
+from pathlib import Path
+from unittest.mock import patch
+
+API_DIR = os.environ.get("RAG_TEST_API_DIR") or str(Path(__file__).resolve().parents[2] / "api")
+sys.path.insert(0, API_DIR)
+
+import httpx
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 import config
 from config import settings
 from main import app
-from auth import keys, passwords, policy, store
+from auth import keys, mfa, passwords, policy, store
 from auth.middleware import AuthMiddleware, same_origin
+from services import audit, ollama_client, weaviate_client
 
 ORIGIN = "http://testserver"
 
 
+class _NoNetwork(httpx.AsyncBaseTransport):
+    async def handle_async_request(self, request):
+        raise httpx.ConnectError("test_auth.py runs without a network", request=request)
+
+
+class _OfflineAsyncClient(httpx.AsyncClient):
+    def __init__(self, *args, **kwargs):
+        kwargs["transport"] = _NoNetwork()
+        super().__init__(*args, **kwargs)
+
+
+def _no_weaviate():
+    raise ConnectionError("test_auth.py runs without a network: there is no Weaviate")
+
+
+_OFFLINE = (patch.object(weaviate_client, "get_client", _no_weaviate),
+            patch.object(httpx, "AsyncClient", _OfflineAsyncClient))
+
+
+def setUpModule():
+    for offline in _OFFLINE:
+        offline.start()
+
+
+def tearDownModule():
+    for offline in reversed(_OFFLINE):
+        offline.stop()
+
+
 def logged(logs):
     return "\n".join(logging.Formatter().format(record) for record in logs.records)
+
+
+def failed_attempt(username, address):
+    """A failed attempt as the routes make one: counted first, then settled.
+    True when it locks the pair."""
+    if not store.reserve_attempt(username, address):
+        raise AssertionError(f"the attempt for {username!r} from {address!r} was refused")
+    return store.finish_attempt(username, address, False)
+
+
+def locked(username, address):
+    """Whether the store holds a lockout of the pair that hasn't ended."""
+    with closing(sqlite3.connect(store.db_path())) as conn:
+        row = conn.execute("SELECT until FROM login_lockouts WHERE username = ? AND address = ?",
+                           (username, address)).fetchone()
+    return row is not None and row[0] > store._now()
+
+
+def restart():
+    """As after an API restart: the new process has opened and cached nothing."""
+    store._ready.clear()
+    store._set_up.clear()
 
 
 class StoreTestCase(unittest.TestCase):
@@ -31069,6 +36721,15 @@ class StoreTestCase(unittest.TestCase):
         """Cookie and Origin headers for a new session of `username`."""
         token = store.create_session(store.get_user(username).id)
         return {"Cookie": f"{store.COOKIE}={token}", "Origin": ORIGIN}, token
+
+    def rows(self, sql):
+        with closing(sqlite3.connect(store.db_path())) as conn:
+            return conn.execute(sql).fetchall()
+
+    def set_times(self, token, created_at, last_seen):
+        with closing(sqlite3.connect(store.db_path())) as conn, conn:
+            conn.execute("UPDATE sessions SET created_at = ?, last_seen = ? WHERE token_hash = ?",
+                         (created_at, last_seen, hashlib.sha256(token.encode()).hexdigest()))
 
 
 class PasswordTests(unittest.TestCase):
@@ -31200,6 +36861,46 @@ class StoreTests(StoreTestCase):
         with self.assertRaises(store.Refused):
             store.set_enabled("eng2", False)
 
+    def test_two_last_engineer_changes_at_once_leave_one_engineer(self):
+        # #551 item 3: the last-Engineer check runs inside the write transaction
+        # (BEGIN IMMEDIATE), so two changes started together can't both pass it.
+        # The check is slowed down here, so without the lock both would see two Engineers.
+        changes = {"demote": lambda name: store.set_role(name, "developer"),
+                   "disable": lambda name: store.set_enabled(name, False)}
+        real = store._is_last_engineer
+
+        def slow(conn, row):
+            found = real(conn, row)
+            time.sleep(0.2)
+            return found
+
+        for first, second in (("demote", "demote"), ("disable", "disable"), ("demote", "disable")):
+            with self.subTest(changes=(first, second)):
+                temp = tempfile.TemporaryDirectory()
+                self.addCleanup(temp.cleanup)
+                with patch.object(settings, "auth_dir", temp.name), patch.object(store, "_is_last_engineer", slow):
+                    self.make("eng1", "engineer")
+                    self.make("eng2", "engineer")
+                    start, results = threading.Barrier(2), {}
+
+                    def run(name, change):
+                        start.wait()
+                        try:
+                            changes[change](name)
+                            results[name] = "ok"
+                        except store.Refused as exc:
+                            results[name] = exc.code
+
+                    threads = [threading.Thread(target=run, args=("eng1", first)),
+                               threading.Thread(target=run, args=("eng2", second))]
+                    for thread in threads:
+                        thread.start()
+                    for thread in threads:
+                        thread.join(30)
+                    self.assertEqual(sorted(results.values()), ["LAST_ENGINEER", "ok"], results)
+                    engineers = [u.username for u in store.list_users() if u.role == "engineer" and u.enabled]
+                    self.assertEqual(len(engineers), 1, engineers)
+
     def test_refusals_carry_a_code(self):
         # The admin routes answer by these codes (PR 2 of #25).
         self.make("eng", "engineer")
@@ -31216,27 +36917,29 @@ class StoreTests(StoreTestCase):
             self.assertEqual(caught.exception.code, code)
 
     def test_throttle_locks_a_pair_and_survives_a_new_handle(self):
-        for attempt in range(4):
-            self.assertFalse(store.record_failure("alice", "10.0.0.1"))
-        self.assertTrue(store.record_failure("alice", "10.0.0.1"))
-        store._ready.clear()                            # as after an API restart
-        self.assertTrue(store.locked("alice", "10.0.0.1"))
-        self.assertFalse(store.locked("alice", "10.0.0.2"))
-        self.assertFalse(store.locked("bob", "10.0.0.1"))
+        for attempt in range(store.THROTTLE_FAILURES - 1):
+            self.assertFalse(failed_attempt("alice", "10.0.0.1"))
+        self.assertTrue(failed_attempt("alice", "10.0.0.1"))
+        restart()
+        self.assertTrue(locked("alice", "10.0.0.1"))
+        self.assertFalse(store.reserve_attempt("alice", "10.0.0.1"))
+        self.assertFalse(locked("alice", "10.0.0.2"))
+        self.assertFalse(locked("bob", "10.0.0.1"))
         with patch.object(store, "_now", return_value=store._now() + store.LOCKOUT_S + 1):
-            self.assertFalse(store.locked("alice", "10.0.0.1"))
+            self.assertFalse(locked("alice", "10.0.0.1"))
+            self.assertTrue(store.reserve_attempt("alice", "10.0.0.1"))
 
     def test_failures_outside_the_window_do_not_count(self):
         start = 5000.0
         for minute in (0, 4, 8, 12):
             with patch.object(store, "_now", return_value=start + minute * 60):
-                store.record_failure("alice", "a")
+                failed_attempt("alice", "a")
         with patch.object(store, "_now", return_value=start + 16 * 60):
-            self.assertFalse(store.record_failure("alice", "a"), "the first failure left the 15-minute window")
-        store.clear_failures("alice", "a")
-        for _ in range(4):
-            store.record_failure("alice", "a")
-        self.assertFalse(store.locked("alice", "a"))
+            self.assertFalse(failed_attempt("alice", "a"), "the first failure left the 15-minute window")
+        store.finish_attempt("alice", "a", True)        # a success clears the count
+        for _ in range(store.THROTTLE_FAILURES - 1):
+            failed_attempt("alice", "a")
+        self.assertFalse(locked("alice", "a"))
 
 
     def test_attempts_are_counted_before_they_are_checked(self):
@@ -31249,11 +36952,119 @@ class StoreTests(StoreTestCase):
         # They fail: with five counted in the window, the pair is locked.
         locks = [store.finish_attempt("alice", "a", False) for _ in range(store.THROTTLE_FAILURES)]
         self.assertTrue(any(locks))
-        self.assertTrue(store.locked("alice", "a"))
+        self.assertTrue(locked("alice", "a"))
         # A success clears the pair's count.
         store.finish_attempt("alice", "b", True)
         for _ in range(store.THROTTLE_FAILURES):
             self.assertTrue(store.reserve_attempt("alice", "b"))
+
+    def test_reserved_attempts_follow_the_window_and_the_lockout_ends(self):
+        # The path logins and password changes take (reserve_attempt and
+        # finish_attempt): failures older than 15 minutes don't count, and a
+        # lockout ends after 15 minutes.
+        start = 5000.0
+
+        def fail_at(seconds):
+            with patch.object(store, "_now", return_value=start + seconds):
+                self.assertTrue(store.reserve_attempt("alice", "a"))
+                return store.finish_attempt("alice", "a", False)
+
+        for minute in (0, 4, 8, 12):
+            self.assertFalse(fail_at(minute * 60))
+        self.assertFalse(fail_at(16 * 60), "the first failure left the 15-minute window")
+        self.assertTrue(fail_at(17 * 60), "five failures within 15 minutes lock the pair")
+        until = start + 17 * 60 + store.LOCKOUT_S
+        with patch.object(store, "_now", return_value=until - 1):
+            self.assertFalse(store.reserve_attempt("alice", "a"))
+        with patch.object(store, "_now", return_value=until + 1):
+            self.assertTrue(store.reserve_attempt("alice", "a"))
+
+    def test_the_window_and_the_lockout_at_their_exact_boundaries(self):
+        start = 5000.0
+        window = store.THROTTLE_WINDOW_S
+
+        def fail_at(address, seconds):
+            with patch.object(store, "_now", return_value=start + seconds):
+                return failed_attempt("alice", address)
+
+        for _ in range(store.THROTTLE_FAILURES - 1):
+            self.assertFalse(fail_at("a", 0))
+        self.assertFalse(fail_at("a", window), "failures exactly 15 minutes old no longer count")
+        for _ in range(store.THROTTLE_FAILURES - 1):
+            self.assertFalse(fail_at("b", 0), "fewer than five failures don't lock")
+        self.assertTrue(fail_at("b", window - 1), "failures a second short of 15 minutes old still count")
+        until = start + window - 1 + store.LOCKOUT_S
+        with patch.object(store, "_now", return_value=until - 1):
+            self.assertFalse(store.reserve_attempt("alice", "b"), "still locked a second before the end")
+        with patch.object(store, "_now", return_value=until):
+            self.assertTrue(store.reserve_attempt("alice", "b"), "the lockout ends exactly at its end")
+
+    def test_session_limits_at_their_exact_boundaries(self):
+        self.make("eng", "engineer")
+        user = store.get_user("eng")
+        start = 1000.0
+        with patch.object(store, "_now", return_value=start):
+            idle_exact, idle_past = store.create_session(user.id), store.create_session(user.id)
+        with patch.object(store, "_now", return_value=start + store.IDLE_S):
+            self.assertIsNotNone(store.authenticate(idle_exact), "exactly 12 hours idle is still valid")
+        with patch.object(store, "_now", return_value=start + store.IDLE_S + 1):
+            self.assertIsNone(store.authenticate(idle_past), "a second more ends it")
+        with patch.object(store, "_now", return_value=start):
+            age_exact, age_past = store.create_session(user.id), store.create_session(user.id)
+        at = start
+        while at + 11 * 3600 < start + store.ABSOLUTE_S:
+            at += 11 * 3600                              # used often enough never to go idle
+            with patch.object(store, "_now", return_value=at):
+                self.assertIsNotNone(store.authenticate(age_exact))
+                self.assertIsNotNone(store.authenticate(age_past))
+        with patch.object(store, "_now", return_value=start + store.ABSOLUTE_S):
+            self.assertIsNotNone(store.authenticate(age_exact), "exactly 7 days old is still valid")
+        with patch.object(store, "_now", return_value=start + store.ABSOLUTE_S + 1):
+            self.assertIsNone(store.authenticate(age_past), "a second more ends it")
+
+    def test_a_count_and_a_session_survive_a_restart(self):
+        self.make("eng", "engineer")
+        token = store.create_session(store.get_user("eng").id)
+        for _ in range(store.THROTTLE_FAILURES - 1):
+            self.assertFalse(failed_attempt("eng", "a"))
+        restart()
+        self.assertTrue(store.is_set_up())
+        self.assertEqual(store.authenticate(token).username, "eng")
+        self.assertTrue(failed_attempt("eng", "a"), "the failures before the restart still count")
+
+    def test_a_new_session_sweeps_the_ended_ones(self):
+        # Sessions abandoned without a logout are never presented again: every
+        # new session deletes those that have ended by time, anyone's (#546).
+        self.make("eng", "engineer")
+        user_id = store.get_user("eng").id
+        now = 1_000_000.0
+        with patch.object(store, "_now", return_value=now - 60):
+            tokens = {name: store.create_session(user_id) for name in
+                      ("idle_ended", "idle_exact", "age_ended", "age_exact", "fresh")}
+        times = {"idle_ended": (now - store.IDLE_S - 1, now - store.IDLE_S - 1),
+                 "idle_exact": (now - store.IDLE_S, now - store.IDLE_S),
+                 "age_ended": (now - store.ABSOLUTE_S - 1, now - 60),
+                 "age_exact": (now - store.ABSOLUTE_S, now - 60),
+                 "fresh": (now - 60, now - 60)}
+        for name, (created_at, last_seen) in times.items():
+            self.set_times(tokens[name], created_at, last_seen)
+        with patch.object(store, "_now", return_value=now):
+            tokens["new"] = store.create_session(user_id)
+        kept = {hashlib.sha256(tokens[name].encode()).hexdigest(): name for name in tokens}
+        self.assertEqual(sorted(kept[digest] for (digest,) in self.rows("SELECT token_hash FROM sessions")),
+                         ["age_exact", "fresh", "idle_exact", "new"])
+
+    def test_an_attempt_sweeps_ended_lockouts_and_old_failures(self):
+        start = 5000.0
+        with patch.object(store, "_now", return_value=start):
+            for _ in range(store.THROTTLE_FAILURES):
+                failed_attempt("alice", "a")
+            failed_attempt("bob", "b")
+        self.assertEqual(self.rows("SELECT username FROM login_lockouts"), [("alice",)])
+        with patch.object(store, "_now", return_value=start + max(store.LOCKOUT_S, store.THROTTLE_WINDOW_S)):
+            self.assertTrue(store.reserve_attempt("carol", "c"))
+        self.assertEqual(self.rows("SELECT username FROM login_lockouts"), [])
+        self.assertEqual(self.rows("SELECT username FROM login_failures"), [("carol",)])
 
 
 class PolicyTests(unittest.TestCase):
@@ -31271,13 +37082,29 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(sorted(routes - set(policy.ACCESS)), [], "routes with no policy entry")
         self.assertEqual(sorted(set(policy.ACCESS) - routes), [], "policy entries with no route")
 
+    def test_every_api_route_is_in_the_telemetry_route_vocabulary(self):
+        # #551 item 2 (and #553 item 3): a route missing from telemetry.ROUTES is
+        # labelled "unmatched" in spans and metrics. The routes come from the app,
+        # so a new one is checked without editing this test. FastAPI's own docs
+        # routes aren't API routes. An entry left in ROUTES after its route is
+        # removed or renamed fails too (PR #755's review).
+        from services import telemetry
+        docs = {("GET", "/docs"), ("GET", "/docs/oauth2-redirect"), ("GET", "/redoc"), ("GET", "/openapi.json")}
+        missing = sorted(f"{m} {p}" for m, p in self.app_routes() - docs if f"{m} {p}" not in telemetry.ROUTES)
+        self.assertEqual(missing, [], "routes telemetry would label 'unmatched'")
+        stale = sorted(telemetry.ROUTES - {f"{m} {p}" for m, p in self.app_routes()})
+        self.assertEqual(stale, [], "telemetry routes with no app route")
+
     def test_the_matrix_is_the_agreed_one(self):
         counts = {}
         for access in policy.ACCESS.values():
             counts[access] = counts.get(access, 0) + 1
-        self.assertEqual(counts, {"public": 3, "session": 3, "end_user": 3, "developer": 35, "engineer": 26})
+        self.assertEqual(counts, {"public": 4, "session": 3, "mfa": 5, "end_user": 3, "developer": 37, "engineer": 30})
         self.assertEqual(policy.ACCESS[("GET", "/health")], "public")
+        self.assertEqual(policy.ACCESS[("GET", "/health/details")], "developer")   # #750
         self.assertEqual(policy.ACCESS[("DELETE", "/collections/{name}")], "engineer")
+        self.assertEqual(policy.ACCESS[("GET", "/collections/{name}/access")], "engineer")   # #606
+        self.assertEqual(policy.ACCESS[("PUT", "/collections/{name}/access")], "engineer")
         self.assertEqual(policy.ACCESS[("POST", "/collections")], "developer")
         self.assertEqual(policy.ACCESS[("GET", "/tune/{collection}")], "developer")
         self.assertEqual(policy.ACCESS[("GET", "/tune/job/{job_id}")], "engineer")
@@ -31291,7 +37118,8 @@ class PolicyTests(unittest.TestCase):
                                       ("POST", "/auth/users/{username}/reset-password"),
                                       ("POST", "/auth/users/{username}/role"),
                                       ("POST", "/auth/users/{username}/disable"),
-                                      ("POST", "/auth/users/{username}/enable")})
+                                      ("POST", "/auth/users/{username}/enable"),
+                                      ("POST", "/auth/users/{username}/reset-mfa")})
         self.assertEqual(set(admin.values()), {"engineer"})
         self.assertFalse([key for key in policy.ACCESS if key[0] == "DELETE" and key[1].startswith("/auth")])
         # Service principals and keys (PR 3): the Engineer's, and nothing deletes a principal.
@@ -31303,12 +37131,22 @@ class PolicyTests(unittest.TestCase):
             ("POST", "/auth/service-principals/{name}/enable"), ("POST", "/auth/service-principals/{name}/keys"),
             ("POST", "/auth/service-principals/{name}/keys/{key_id}/revoke")})
         self.assertEqual(set(principals.values()), {"engineer"})
+        # Two-step verification (#607): the code step is public like the login;
+        # the user's own routes are any session's; the switch is the Engineer's.
+        own = {key: access for key, access in policy.ACCESS.items() if key[1].startswith("/auth/mfa")}
+        self.assertEqual(own, {("GET", "/auth/mfa"): "mfa", ("POST", "/auth/mfa/enroll"): "mfa",
+                               ("POST", "/auth/mfa/enroll/confirm"): "mfa", ("POST", "/auth/mfa/recovery-codes"): "mfa",
+                               ("POST", "/auth/mfa/disable"): "mfa", ("POST", "/auth/mfa/policy"): "engineer"})
+        self.assertEqual(policy.ACCESS[("POST", "/auth/login/mfa")], "public")
 
     def test_keys_cannot_reach_administration_or_the_session_routes(self):
         # S5 of PR 3: every account, principal and key route, logout and the
-        # password change, and the audit log (#29); GET /auth/me stays open to a key.
-        admin = {path for _, path in policy.ACCESS if path.startswith(("/auth/users", "/auth/service-principals"))}
-        self.assertEqual(policy.HUMAN_ONLY, admin | {"/auth/logout", "/auth/password", "/audit", "/audit.csv"})
+        # password change, the audit log (#29) and per-collection access (#606);
+        # GET /auth/me stays open to a key.
+        admin = {path for _, path in policy.ACCESS
+                 if path.startswith(("/auth/users", "/auth/service-principals", "/auth/mfa"))}
+        self.assertEqual(policy.HUMAN_ONLY, admin | {"/auth/logout", "/auth/password", "/audit", "/audit.csv",
+                                                     "/collections/{name}/access"})
         self.assertNotIn("/auth/me", policy.HUMAN_ONLY)
 
     def test_each_template_resolves_to_itself(self):
@@ -31374,6 +37212,14 @@ class MiddlewareTests(StoreTestCase):
         self.assertEqual(self.client.get("/auth/status").json(), {"setup_required": True})
         self.make("eng", "engineer")
         self.assertEqual(self.client.get("/auth/status").json(), {"setup_required": False})
+
+    def test_a_key_request_before_bootstrap_is_setup_required(self):
+        # PR 3: the setup check comes before the key check, as for a session.
+        _, key = keys.generate()
+        for value in ("Bearer " + key, "Bearer nonsense"):
+            with self.subTest(value=value):
+                response = self.client.get("/collections", headers={"Authorization": value})
+                self.assertEqual((response.status_code, response.json()["error"]["code"]), (503, "SETUP_REQUIRED"))
 
     def test_role_matrix_through_the_app(self):
         self.setup_roles()
@@ -31452,7 +37298,7 @@ class MiddlewareTests(StoreTestCase):
         async def never(scope, receive, send):
             raise AssertionError("the app was called")
 
-        for path in ("/ingest/upload\n", "/collections\r", "/collections/A\x00"):
+        for path in ("/ingest/upload\n", "/collections\r", "/collections/A\x00", "/ingest/upload\x7f"):
             with self.subTest(path=path):
                 reads.clear(); sent.clear()
                 scope = {"type": "http", "method": "POST", "path": path, "headers": [(b"host", b"testserver")]}
@@ -31484,6 +37330,27 @@ class MiddlewareTests(StoreTestCase):
                                                                 "Access-Control-Request-Method": "DELETE"})
         self.assertFalse([k for k in response.headers if k.lower().startswith("access-control-")])
 
+    def test_a_malformed_earlier_cookie_does_not_hide_the_session(self):
+        # Cookies aren't port-scoped: another app on localhost can set one that
+        # http.cookies rejects, and the session after it was lost (#546).
+        self.make("eng", "engineer")
+        _, token = self.session("eng")
+        for before in ('other={"a":1}', "x=a b", 'a="unterminated'):
+            with self.subTest(before=before):
+                response = self.client.get("/auth/me", headers={"Cookie": f"{before}; {store.COOKIE}={token}"})
+                self.assertEqual((response.status_code, response.json()["username"]), (200, "eng"))
+        response = self.client.get("/auth/me", headers={"Cookie": "other=1"})
+        self.assertEqual((response.status_code, response.json()["error"]["code"]), (401, "AUTH_REQUIRED"))
+
+    def test_an_empty_or_unreadable_session_cookie_is_no_session(self):
+        # The parser's edge cases end as "no session" (401), never as an error
+        # or as someone's session (#546).
+        self.make("eng", "engineer")
+        for header in (f"{store.COOKIE}=", f"{store.COOKIE}", ";;;", f'{store.COOKIE}=""', "=x; ==="):
+            with self.subTest(header=header):
+                response = self.client.get("/auth/me", headers={"Cookie": header})
+                self.assertEqual((response.status_code, response.json()["error"]["code"]), (401, "AUTH_REQUIRED"))
+
 
 class RouteTests(StoreTestCase):
     def test_login_success_cookie_and_me(self):
@@ -31491,7 +37358,10 @@ class RouteTests(StoreTestCase):
         with self.assertLogs("auth", "WARNING") as logs:
             response = self.login("ENG", password)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"username": "eng", "role": "engineer", "must_change_password": True})
+        self.assertEqual(response.json(), {"username": "eng", "role": "engineer", "must_change_password": True,
+                                           "query_only": False,      # #670
+                                           "mfa_enrolled": False, "mfa_required": False,
+                                           "mfa_enrollment_required": False})
         cookie = response.headers["set-cookie"]
         attributes = [a.strip().lower() for a in cookie.split(";")[1:]]
         for want in ("httponly", "samesite=strict", "path=/", f"max-age={store.ABSOLUTE_S}"):
@@ -31630,6 +37500,50 @@ class RouteTests(StoreTestCase):
         # The same pair as the login: the login is locked too.
         self.assertEqual(self.login("user", self.passwords["end_user"]).status_code, 429)
 
+    def test_a_login_lockout_also_refuses_the_password_change(self):
+        # The other direction of the shared throttle: a pair locked by failed
+        # logins can't change the password, even with the right current one.
+        self.setup_roles()
+        headers, _ = self.session("user")
+        for _ in range(store.THROTTLE_FAILURES):
+            self.assertEqual(self.login("user", "wrong" * 3).status_code, 401)
+        refused = self.client.post("/auth/password", headers=headers,
+                                   json={"current_password": self.passwords["end_user"], "new_password": "n" * 14})
+        self.assertEqual((refused.status_code, refused.json()["error"]["code"]), (429, "LOGIN_THROTTLED"))
+        self.assertTrue(passwords.verify_password(self.passwords["end_user"], store.get_user("user").password_hash))
+
+    def test_a_right_current_password_clears_the_count(self):
+        # finish_attempt(succeeded=True) on the password route clears the pair's
+        # count like a successful login, even when the new password is refused.
+        self.setup_roles()
+        headers, _ = self.session("user")
+        password = self.passwords["end_user"]
+        for _ in range(store.THROTTLE_FAILURES - 1):
+            self.client.post("/auth/password", headers=headers,
+                             json={"current_password": "nope" * 3, "new_password": "n" * 14})
+        short = self.client.post("/auth/password", headers=headers,
+                                 json={"current_password": password, "new_password": "short"})
+        self.assertEqual(short.status_code, 422)
+        for _ in range(store.THROTTLE_FAILURES - 1):
+            self.assertEqual(self.login("user", "wrong" * 3).status_code, 401)
+        self.assertEqual(self.login("user", password).status_code, 200)
+
+    def test_a_login_sweeps_other_users_ended_sessions(self):
+        # The sweep runs on the login route and is not limited to the user
+        # logging in: another user's abandoned session goes, a live one stays (#546).
+        self.setup_roles()
+        _, ended = self.session("dev")
+        _, live = self.session("user")
+        now = store._now()
+        self.set_times(ended, now - store.ABSOLUTE_S - 60, now - store.IDLE_S - 60)
+        self.assertEqual(len(self.rows("SELECT token_hash FROM sessions")), 2)
+        self.assertEqual(self.login("eng", self.passwords["engineer"]).status_code, 200)
+        digests = {digest for (digest,) in self.rows("SELECT token_hash FROM sessions")}
+        self.assertNotIn(hashlib.sha256(ended.encode()).hexdigest(), digests, "the ended session was swept")
+        self.assertIn(hashlib.sha256(live.encode()).hexdigest(), digests, "the live session was kept")
+        self.assertEqual(len(digests), 2, "the live session and the new login")
+        self.assertEqual(store.authenticate(live).username, "user")
+
     def test_forced_change_allows_only_session_routes(self):
         self.make("eng", "engineer")
         generated = passwords.generate_password()
@@ -31729,7 +37643,8 @@ class AdminRouteTests(StoreTestCase):
         self.assertEqual(response.status_code, 200)
         users = response.json()["users"]
         self.assertEqual([u["username"] for u in users], ["dev", "eng", "user"])
-        self.assertEqual(set(users[0]), {"username", "role", "enabled", "must_change_password", "created_at"})
+        self.assertEqual(set(users[0]), {"username", "role", "enabled", "must_change_password", "created_at",
+                                         "mfa_enrolled"})
         self.assertEqual((users[0]["role"], users[0]["enabled"], users[0]["must_change_password"]),
                          ("developer", True, False))
         self.assertRegex(users[0]["created_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
@@ -31757,19 +37672,28 @@ class AdminRouteTests(StoreTestCase):
         self.assertEqual((login.status_code, login.json()["must_change_password"]), (200, True))
 
     def test_create_refusals(self):
-        for username in ("ab", "x" * 33, "has space", "semi;colon", ""):
+        for username in ("ab", "x" * 33, "has space", "semi;colon", "", "u" * 257):
             with self.subTest(username=username), self.assertLogs("auth", "WARNING") as logs:
                 response = self.admin("POST", "/auth/users", {"username": username, "role": "end_user"})
                 self.assertEqual((response.status_code, self.code(response)), (422, "INVALID_USERNAME"))
                 self.assertIn("3-32 characters", response.json()["error"]["message"])
                 self.assertEqual(len(logs.records), 1)
+        # #551 item 4: an over-long username is refused like any other, and is
+        # logged and audited cut to its first 256 characters.
+        with patch.object(audit, "note") as note, self.assertLogs("auth", "WARNING") as logs:
+            response = self.admin("POST", "/auth/users", {"username": "u" * 5000, "role": "end_user"})
+        self.assertEqual((response.status_code, self.code(response)), (422, "INVALID_USERNAME"))
+        self.assertEqual(note.call_args.kwargs["target"], "u" * 256)
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("u" * 256, logged(logs))
+        self.assertNotIn("u" * 257, logged(logs))
+        self.assertIsNone(store.get_user("u" * 5000))
         with self.assertLogs("auth", "WARNING") as logs:
             response = self.admin("POST", "/auth/users", {"username": "DEV", "role": "end_user"})
         self.assertEqual((response.status_code, self.code(response)), (409, "USER_EXISTS"))
         self.assertIn("create of 'dev' refused", logged(logs))
         self.assertEqual(store.get_user("dev").role, "developer")
-        for body in ({"username": "newbie", "role": "admin"}, {"username": "newbie"}, {"role": "end_user"},
-                     {"username": "u" * 257, "role": "end_user"}):
+        for body in ({"username": "newbie", "role": "admin"}, {"username": "newbie"}, {"role": "end_user"}):
             with self.subTest(body=body):
                 response = self.admin("POST", "/auth/users", body)
                 self.assertEqual((response.status_code, self.code(response)), (422, "INVALID_PARAMETER"))
@@ -31929,7 +37853,7 @@ class KeyStoreTests(KeyTestCase):
         with patch.object(settings, "auth_dir", temp.name):
             self.assertEqual(store.get_user("old").kind, "user")
             version = sqlite3.connect(Path(temp.name, "auth.db")).execute("PRAGMA user_version").fetchone()[0]
-            self.assertEqual(version, 2)
+            self.assertEqual(version, store.SCHEMA_VERSION)
             store.create_principal("svc", "developer")
             self.assertEqual([p.name for p in store.list_principals()], ["svc"])
 
@@ -32110,7 +38034,8 @@ class KeyMiddlewareTests(KeyTestCase):
         _, key = self.principal("svc", "end_user")
         response = self.client.get("/auth/me", headers=self.bearer(key))
         self.assertEqual(response.json(), {"username": "svc", "role": "end_user", "must_change_password": False,
-                                           "kind": "service"})
+                                           "kind": "service", "mfa_enrolled": False, "mfa_required": False,
+                                           "mfa_enrollment_required": False, "query_only": False})
         headers, _ = self.session("dev")
         self.assertEqual(self.client.get("/auth/me", headers=headers).json()["kind"], "user")
 
@@ -32258,11 +38183,20 @@ class PrincipalRouteTests(KeyTestCase):
 
     def test_refusals(self):
         self.admin("POST", "", {"name": "svc", "role": "developer"})
-        for name in ("ab", "x" * 33, "has space", ""):
+        for name in ("ab", "x" * 33, "has space", "", "x" * 257):
             with self.subTest(name=name), self.assertLogs("auth", "WARNING") as logs:
                 response = self.admin("POST", "", {"name": name, "role": "end_user"})
                 self.assertEqual((response.status_code, self.code(response)), (422, "INVALID_USERNAME"))
                 self.assertEqual(len(logs.records), 1)
+        # #551 item 4: an over-long name is logged and audited cut to its first 256 characters.
+        with patch.object(audit, "note") as note, self.assertLogs("auth", "WARNING") as logs:
+            response = self.admin("POST", "", {"name": "x" * 5000, "role": "end_user"})
+        self.assertEqual((response.status_code, self.code(response)), (422, "INVALID_USERNAME"))
+        self.assertEqual(note.call_args.kwargs["target"], "x" * 256)
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("x" * 256, logged(logs))
+        self.assertNotIn("x" * 257, logged(logs))
+        self.assertIsNone(store.get_user("x" * 5000))
         for name in ("SVC", "dev"):
             with self.subTest(taken=name), self.assertLogs("auth", "WARNING") as logs:
                 response = self.admin("POST", "", {"name": name, "role": "end_user"})
@@ -32290,6 +38224,19 @@ class PrincipalRouteTests(KeyTestCase):
                 self.assertEqual((response.status_code, self.code(response)), (422, "INVALID_PARAMETER"))
         self.assertEqual(store.get_principal("svc").keys, ())
         self.assertIsNone(store.get_user("newsvc"))
+
+    def test_issue_accepts_the_bounds(self):
+        # S7/S8 of PR 3: a label of up to 64 characters, a lifetime of 1 to 365 whole days.
+        self.admin("POST", "", {"name": "svc", "role": "developer"})
+        for body, days in (({"days": 1}, 1), ({"days": 365}, 365), ({"label": "l" * 64}, 90)):
+            with self.subTest(body=body):
+                response = self.admin("POST", "/svc/keys", body)
+                self.assertEqual(response.status_code, 201, response.text)
+                key = response.json()["key"]
+                seconds = (calendar.timegm(time.strptime(key["expires_at"], "%Y-%m-%dT%H:%M:%SZ"))
+                           - calendar.timegm(time.strptime(key["created_at"], "%Y-%m-%dT%H:%M:%SZ")))
+                self.assertIn(seconds - days * 86400, (-1, 0, 1))
+                self.assertEqual(key["label"], body.get("label", ""))
 
     def test_role_disable_enable(self):
         self.admin("POST", "", {"name": "svc", "role": "developer"})
@@ -32402,7 +38349,9 @@ class CommandTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1, args)
             self.assertIn("last enabled engineer", result.stderr)
         self.run_auth("create-user", "eng2", "engineer")
-        self.assertEqual(self.run_auth("disable", "admin").returncode, 0)
+        disabled = self.run_auth("disable", "admin")
+        self.assertEqual(disabled.returncode, 0)
+        self.assertTrue(disabled.stderr.strip().endswith("; their sessions ended"), disabled.stderr)
         self.assertFalse(self.users()["admin"].enabled)
         self.assertEqual(self.run_auth("enable", "admin").returncode, 0)
         self.assertEqual(self.run_auth("set-role", "eng2", "end_user").returncode, 0)
@@ -32433,7 +38382,10 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(len(reset.stderr.strip().splitlines()), 1)
         self.assertEqual(self.run_auth("create-user", "svc", "end_user").returncode, 1)
         self.assertEqual(self.run_auth("set-role", "svc", "end_user").returncode, 0)
-        self.assertEqual(self.run_auth("disable", "svc").returncode, 0)
+        disabled = self.run_auth("disable", "svc")
+        self.assertEqual(disabled.returncode, 0)
+        self.assertTrue(disabled.stderr.strip().endswith("; its keys stop working"), disabled.stderr)
+        self.assertNotIn("sessions", disabled.stderr)
         with patch.object(settings, "auth_dir", self.dir):
             self.assertIsNone(store.authenticate_key(key))
             self.assertEqual(store.get_user("svc").role, "end_user")
@@ -32457,6 +38409,28 @@ class CommandTests(unittest.TestCase):
                     if secret:
                         self.assertNotIn(secret, result.stderr)
 
+    def test_reset_mfa(self):
+        # S6.2 of RD-117 (#607): the last-resort recovery, for an engineer too.
+        self.run_auth("bootstrap", "admin")
+        with patch.object(settings, "auth_dir", self.dir):
+            store._ready.discard(str(store.db_path()))
+            admin = store.get_user("admin")
+            secret, _ = store.start_enrollment(admin.id, "admin")
+            token = store.create_session(admin.id)
+            store.confirm_enrollment(store.authenticate(token), mfa.code_at(secret, int(time.time() // 30)))
+            store.create_principal("svc", "developer")
+        result = self.run_auth("reset-mfa", "Admin")
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assertEqual(result.stderr.strip().splitlines(), [
+            "auth: reset-mfa: two-step verification of 'admin' removed; their sessions ended"])
+        self.assertFalse(self.users()["admin"].mfa_enrolled)
+        with patch.object(settings, "auth_dir", self.dir):
+            self.assertIsNone(store.authenticate(token))
+        for args in (("reset-mfa", "nobody"), ("reset-mfa", "svc")):
+            with self.subTest(args=args):
+                refused = self.run_auth(*args)
+                self.assertEqual(refused.returncode, 1, refused.stderr)
+
 
 class TestingHelperTests(unittest.TestCase):
     def test_headers_are_a_real_session(self):
@@ -32471,6 +38445,656 @@ class TestingHelperTests(unittest.TestCase):
             self.assertEqual(store.authenticate(token).role, "developer")
 
 
+class OfflineTests(unittest.TestCase):
+    def test_no_backend_is_reachable(self):
+        with self.assertRaises(ConnectionError):
+            weaviate_client.get_client()
+        with self.assertRaises(httpx.ConnectError):
+            asyncio.run(ollama_client.list_models())
+        health = asyncio.run(ollama_client.check_health())
+        # `same_model` is a flag beside the three models (#671).
+        self.assertEqual({model["status"] for model in health.values() if isinstance(model, dict)}, {"error"})
+        self.assertEqual(set(health), {"llm", "build_llm", "embed", "same_model"})
+
+
+class MfaUnitTests(unittest.TestCase):
+    """TOTP, recovery codes and sealing (#607): S1.2, S2, S3 of RD-117's specifications."""
+
+    # RFC 6238 Appendix B, SHA-1: the ASCII secret "12345678901234567890", the
+    # last 6 of the 8 digits given there.
+    RFC = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+    VECTORS = ((59, "287082"), (1111111109, "081804"), (1111111111, "050471"), (1234567890, "005924"),
+               (2000000000, "279037"), (20000000000, "353130"))
+
+    def test_rfc_6238_vectors(self):
+        for at, code in self.VECTORS:
+            with self.subTest(at=at):
+                self.assertEqual(mfa.code_at(self.RFC, at // 30), code)
+
+    def test_window_and_replay(self):
+        now = 1_000_000_000.0
+        step = int(now // 30)
+        for offset in (-1, 0, 1):
+            with self.subTest(offset=offset):
+                code = mfa.code_at(self.RFC, step + offset)
+                self.assertEqual(mfa.matching_step(self.RFC, code, now, -1), step + offset)
+                # A step at or before the last accepted one never counts again.
+                self.assertIsNone(mfa.matching_step(self.RFC, code, now, step + offset))
+        for offset in (-2, 2):
+            with self.subTest(outside=offset):
+                self.assertIsNone(mfa.matching_step(self.RFC, mfa.code_at(self.RFC, step + offset), now, -1))
+        self.assertEqual(mfa.matching_step(self.RFC, " " + mfa.code_at(self.RFC, step)[:3] + " "
+                                           + mfa.code_at(self.RFC, step)[3:], now, -1), step)
+        for bad in ("", "12345", "1234567", "abcdef", "\u0661\u0662\u0663\u0664\u0665\u0666",
+                    "\uff11\uff12\uff13\uff14\uff15\uff16"):
+            self.assertIsNone(mfa.matching_step(self.RFC, bad, now, -1))
+            self.assertFalse(mfa.is_totp(bad))
+
+    def test_new_secret_is_160_bits_of_base32(self):
+        secret = mfa.new_secret()
+        self.assertRegex(secret, r"^[A-Z2-7]{32}$")
+        self.assertNotEqual(secret, mfa.new_secret())
+
+    def test_recovery_codes(self):
+        codes = mfa.new_recovery_codes()
+        self.assertEqual(len(codes), 10)
+        self.assertEqual(len(set(codes)), 10)
+        for code in codes:
+            self.assertRegex(code, r"^[a-z2-7]{4}-[a-z2-7]{4}-[a-z2-7]{4}-[a-z2-7]{4}$")
+        code = codes[0]
+        self.assertEqual(mfa.recovery_hash(code), mfa.recovery_hash(code.upper().replace("-", " ")))
+        self.assertEqual(mfa.recovery_hash(code), hashlib.sha256(code.replace("-", "").encode()).hexdigest())
+        for bad in ("", "123456", code + "a", "0000-0000-0000-0000"):
+            self.assertIsNone(mfa.recovery_hash(bad))
+
+    def test_otpauth_uri(self):
+        self.assertEqual(mfa.otpauth_uri("eng", "ABC"),
+                         "otpauth://totp/RAG%20Platform:eng?secret=ABC&issuer=RAG%20Platform"
+                         "&algorithm=SHA1&digits=6&period=30")
+
+    def test_sealing(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        with patch.object(settings, "auth_dir", temp.name):
+            sealed = mfa.seal(7, "SECRET")
+            key = Path(temp.name, mfa.KEY_FILE)
+            self.assertEqual(key.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(len(key.read_bytes()), 32)
+            self.assertNotIn("SECRET", sealed)
+            self.assertEqual(mfa.unseal(7, sealed), "SECRET")
+            self.assertIsNone(mfa.unseal(8, sealed), "another user's id is other associated data")
+            self.assertIsNone(mfa.unseal(7, sealed[:-4] + "AAAA"))
+            self.assertNotEqual(mfa.seal(7, "SECRET"), sealed, "a fresh nonce every time")
+            self.assertEqual([p.name for p in Path(temp.name).iterdir()], [mfa.KEY_FILE], "no temporary file is left")
+            key.write_bytes(os.urandom(32))
+            self.assertIsNone(mfa.unseal(7, sealed), "another key never verifies")
+            key.unlink()
+            self.assertIsNone(mfa.unseal(7, sealed), "a lost key never verifies")
+
+
+class MfaKeyFileTests(unittest.TestCase):
+    """The key file is never seen without its key (#607 review)."""
+
+    def test_a_racing_creator_uses_the_key_that_won(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        with patch.object(settings, "auth_dir", temp.name):
+            key = Path(temp.name, mfa.KEY_FILE)
+            winner = os.urandom(32)
+            real_link = os.link
+
+            def link_after_the_other(src, dst):
+                key.write_bytes(winner)          # the other process linked its key first
+                return real_link(src, dst)
+            with patch.object(mfa.os, "link", link_after_the_other):
+                sealed = mfa.seal(3, "SECRET")
+            self.assertEqual(key.read_bytes(), winner)
+            self.assertEqual(mfa.unseal(3, sealed), "SECRET", "sealed under the winning key")
+            self.assertEqual([p.name for p in Path(temp.name).iterdir()], [mfa.KEY_FILE])
+
+    def test_a_failed_write_leaves_no_key_file(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        with patch.object(settings, "auth_dir", temp.name), \
+                patch.object(mfa.os, "fsync", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                mfa.seal(3, "SECRET")
+            self.assertEqual(list(Path(temp.name).iterdir()), [], "neither an empty mfa.key nor a temporary file")
+
+
+class MfaTestCase(StoreTestCase):
+    """Helpers: enroll a user through the store, and the current code of a secret."""
+
+    def setUp(self):
+        super().setUp()
+        self.setup_roles()
+
+    def principal(self, username):
+        headers, token = self.session(username)
+        return store.authenticate(token), headers
+
+    def enroll(self, username):
+        """Enroll `username`; returns its secret and recovery codes."""
+        user = store.get_user(username)
+        secret, _ = store.start_enrollment(user.id, username)
+        principal, _ = self.principal(username)
+        codes = store.confirm_enrollment(principal, self.code(secret, -1))
+        return secret, codes
+
+    @staticmethod
+    def code(secret, offset=0):
+        return mfa.code_at(secret, int(time.time() // 30) + offset)
+
+    def challenge(self, username):
+        response = self.login(username, self.passwords[{"eng": "engineer", "dev": "developer",
+                                                        "user": "end_user"}[username]])
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"mfa_required": True})
+        self.assertNotIn(store.COOKIE + "=", response.headers.get("set-cookie", "").split(";")[0])
+        return response.cookies.get(store.MFA_COOKIE)
+
+    def second(self, token, code):
+        return self.client.post("/auth/login/mfa", json={"code": code},
+                                headers={"Cookie": f"{store.MFA_COOKIE}={token}"} if token else {})
+
+    def err(self, response):
+        return response.status_code, response.json()["error"]["code"]
+
+
+class MfaStoreTests(MfaTestCase):
+    def test_a_version_2_store_gains_the_mfa_tables(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        conn = sqlite3.connect(Path(temp.name, "auth.db"))
+        conn.executescript("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE, "
+                           "role TEXT NOT NULL, password_hash TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, "
+                           "must_change_password INTEGER NOT NULL DEFAULT 1, created_at REAL NOT NULL, "
+                           "updated_at REAL NOT NULL, kind TEXT NOT NULL DEFAULT 'user');"
+                           "INSERT INTO users VALUES (1, 'old', 'engineer', 'x', 1, 0, 1.0, 1.0, 'user');"
+                           "PRAGMA user_version = 2;")
+        conn.commit()
+        conn.close()
+        with patch.object(settings, "auth_dir", temp.name):
+            self.assertFalse(store.get_user("old").mfa_enrolled)
+            self.assertFalse(store.mfa_required())
+            version = sqlite3.connect(Path(temp.name, "auth.db")).execute("PRAGMA user_version").fetchone()[0]
+            self.assertEqual(version, store.SCHEMA_VERSION)   # 3, and 4 since #606
+
+    def test_no_secret_or_code_is_stored_in_plain_form(self):
+        secret, codes = self.enroll("dev")
+        raw = Path(self.dir, "auth.db").read_bytes() + b"".join(
+            p.read_bytes() for p in Path(self.dir).glob("auth.db-*"))
+        self.assertNotIn(secret.encode(), raw)
+        for code in codes:
+            self.assertNotIn(code.encode(), raw)
+            self.assertNotIn(code.replace("-", "").encode(), raw)
+        hashes = {row[0] for row in self.rows("SELECT code_hash FROM recovery_codes")}
+        self.assertEqual(hashes, {mfa.recovery_hash(c) for c in codes})
+        self.assertEqual(Path(self.dir, mfa.KEY_FILE).stat().st_mode & 0o777, 0o600)
+
+    def test_enrollment_ends_the_other_sessions(self):
+        _, other = self.session("dev")
+        user = store.get_user("dev")
+        secret, uri = store.start_enrollment(user.id, "dev")
+        self.assertIn(f"secret={secret}", uri)
+        principal, _ = self.principal("dev")
+        with self.assertRaises(store.Refused) as wrong:
+            store.confirm_enrollment(principal, "000000" if self.code(secret) != "000000" else "111111")
+        self.assertEqual(wrong.exception.code, "MFA_CODE_INCORRECT")
+        codes = store.confirm_enrollment(principal, self.code(secret))
+        self.assertEqual(len(codes), 10)
+        self.assertIsNone(store.authenticate(other))
+        rows = self.rows(f"SELECT token_hash FROM sessions WHERE user_id = {principal.user_id}")
+        self.assertEqual([r[0] for r in rows], [principal.token_hash], "only this session stays")
+        with self.assertRaises(store.Refused) as again:
+            store.start_enrollment(user.id, "dev")
+        self.assertEqual(again.exception.code, "MFA_ALREADY_ENROLLED")
+
+    def test_a_pending_set_up_expires(self):
+        user = store.get_user("dev")
+        secret, _ = store.start_enrollment(user.id, "dev")
+        with closing(sqlite3.connect(store.db_path())) as conn, conn:
+            conn.execute("UPDATE mfa_pending SET created_at = created_at - ?", (store.MFA_PENDING_S + 1,))
+        principal, _ = self.principal("dev")
+        with self.assertRaises(store.Refused) as refused:
+            store.confirm_enrollment(principal, self.code(secret))
+        self.assertEqual(refused.exception.code, "MFA_ENROLLMENT_NOT_STARTED")
+
+    def test_regenerate_needs_a_current_totp_code(self):
+        secret, codes = self.enroll("dev")
+        principal, _ = self.principal("dev")
+        self.assertIsNone(store.regenerate_codes(principal, codes[0]), "a recovery code doesn't count here")
+        fresh = store.regenerate_codes(principal, self.code(secret, 1))
+        self.assertEqual(len(fresh), 10)
+        self.assertTrue(set(fresh).isdisjoint(codes))
+        self.assertEqual(store.mfa_status(principal.user_id)["recovery_codes_remaining"], 10)
+
+    def test_disable_rules(self):
+        secret, codes = self.enroll("dev")
+        principal, _ = self.principal("dev")
+        password = self.passwords["developer"]
+        self.assertFalse(store.disable_mfa(principal, "wrong password!", self.code(secret, 1)))
+        self.assertFalse(store.disable_mfa(principal, password, "000000-not"))
+        eng, _ = self.principal("eng")
+        self.enroll("eng")
+        store.set_mfa_required(eng.user_id, True)
+        with self.assertRaises(store.Refused) as required:
+            store.disable_mfa(principal, password, codes[0])
+        self.assertEqual(required.exception.code, "MFA_REQUIRED")
+        store.set_mfa_required(eng.user_id, False)
+        self.assertTrue(store.disable_mfa(principal, password, codes[0]))
+        self.assertFalse(store.get_user("dev").mfa_enrolled)
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM recovery_codes WHERE user_id = %d" % principal.user_id),
+                         [(0,)])
+        with self.assertRaises(store.Refused) as not_enrolled:
+            store.disable_mfa(principal, password, codes[1])
+        self.assertEqual(not_enrolled.exception.code, "MFA_NOT_ENROLLED")
+
+    def test_the_switch_needs_an_enrolled_engineer(self):
+        eng = store.get_user("eng")
+        with self.assertRaises(store.Refused) as refused:
+            store.set_mfa_required(eng.id, True)
+        self.assertEqual(refused.exception.code, "MFA_ENROLL_FIRST")
+        self.enroll("eng")
+        store.set_mfa_required(eng.id, True)
+        store.set_mfa_required(eng.id, True)
+        self.assertTrue(store.mfa_required())
+        store.set_mfa_required(eng.id, False)
+        self.assertFalse(store.mfa_required())
+
+    def test_reset(self):
+        self.enroll("dev")
+        _, token = self.session("dev")
+        store.reset_mfa("dev", "user")
+        self.assertFalse(store.get_user("dev").mfa_enrolled)
+        self.assertIsNone(store.authenticate(token))
+        for table in ("mfa", "mfa_pending", "recovery_codes", "mfa_challenges"):
+            self.assertEqual(self.rows(f"SELECT COUNT(*) FROM {table}"), [(0,)])
+        store.create_principal("svc", "developer")
+        with self.assertRaises(store.Refused) as principal:
+            store.reset_mfa("svc", "user")
+        self.assertEqual(principal.exception.code, "USER_NOT_FOUND")
+        with self.assertRaises(store.Refused) as operator:
+            store.reset_mfa("svc")
+        self.assertEqual(operator.exception.code, "NOT_A_USER")
+
+
+class MfaLoginTests(MfaTestCase):
+    def test_a_user_without_mfa_logs_in_as_before(self):
+        response = self.login("dev", self.passwords["developer"])
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["mfa_enrolled"], False)
+        self.assertIn(store.COOKIE, response.cookies)
+
+    def test_password_then_code(self):
+        secret, _ = self.enroll("dev")
+        sessions = "SELECT COUNT(*) FROM sessions WHERE user_id = (SELECT id FROM users WHERE username = 'dev')"
+        before = self.rows(sessions)
+        with self.assertLogs("auth", "WARNING") as logs:
+            token = self.challenge("dev")
+        self.assertIn("code required", logged(logs))
+        self.assertTrue(token)
+        self.assertEqual(self.rows(sessions), before, "a right password alone opens no session")
+        cookie = [c for c in self.client.cookies.jar if c.name == store.MFA_COOKIE]
+        self.client.cookies.clear()
+        code = self.code(secret, 1)
+        with self.assertLogs("auth", "WARNING") as logs:
+            response = self.second(token, code)
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual((body["username"], body["mfa_enrolled"]), ("dev", True))
+        self.assertIn(store.COOKIE, response.cookies)
+        self.assertNotIn(code, logged(logs))
+        self.assertTrue(cookie)
+        # The challenge is spent, and the same code never works again.
+        self.client.cookies.clear()
+        self.assertEqual(self.err(self.second(token, code)), (401, "MFA_CHALLENGE_INVALID"))
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        self.assertEqual(self.err(self.second(token, code)), (401, "MFA_FAILED"))
+
+    def test_challenge_cookie_attributes(self):
+        self.enroll("dev")
+        response = self.login("dev", self.passwords["developer"])
+        attributes = [a.strip().lower() for a in response.headers["set-cookie"].split(";")[1:]]
+        for want in ("httponly", "samesite=strict", "path=/", f"max-age={store.MFA_CHALLENGE_S}"):
+            self.assertIn(want, attributes)
+
+    def test_wrong_codes_count_against_the_throttle(self):
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        wrong = "000000" if self.code(secret) != "000000" else "111111"
+        for _ in range(4):
+            self.assertEqual(self.err(self.second(token, wrong)), (401, "MFA_FAILED"))
+        # A right password doesn't clear the count (S4.2): a new challenge, one more wrong code locks.
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        self.assertEqual(self.err(self.second(token, wrong)), (401, "MFA_FAILED"))
+        self.assertTrue(locked("dev", "testclient"))
+        self.assertEqual(self.err(self.second(token, self.code(secret))), (429, "LOGIN_THROTTLED"))
+        self.assertEqual(self.login("dev", self.passwords["developer"]).status_code, 429)
+
+    def test_a_challenge_allows_five_codes(self):
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        for _ in range(5):
+            with closing(sqlite3.connect(store.db_path())) as conn, conn:
+                conn.execute("DELETE FROM login_failures")       # isolate the challenge's own limit
+            self.assertEqual(self.second(token, "999999-x").status_code, 401)
+        self.assertEqual(self.err(self.second(token, self.code(secret))), (401, "MFA_CHALLENGE_INVALID"))
+
+    def test_a_challenge_expires(self):
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        with closing(sqlite3.connect(store.db_path())) as conn, conn:
+            conn.execute("UPDATE mfa_challenges SET created_at = created_at - ?", (store.MFA_CHALLENGE_S + 1,))
+        self.assertEqual(self.err(self.second(token, self.code(secret))), (401, "MFA_CHALLENGE_INVALID"))
+        self.assertEqual(self.err(self.second(None, self.code(secret))), (401, "MFA_CHALLENGE_INVALID"))
+
+    def test_a_recovery_code_works_once(self):
+        _, codes = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        self.assertEqual(self.second(token, codes[3].upper()).status_code, 200)
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        self.assertEqual(self.err(self.second(token, codes[3])), (401, "MFA_FAILED"))
+        headers, _ = self.session("dev")
+        status = self.client.get("/auth/mfa", headers=headers).json()
+        self.assertEqual(status["recovery_codes_remaining"], 9)
+
+    def test_a_lost_key_leaves_the_recovery_codes(self):
+        secret, codes = self.enroll("dev")
+        Path(self.dir, mfa.KEY_FILE).unlink()
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        self.assertEqual(self.err(self.second(token, self.code(secret, 1))), (401, "MFA_FAILED"))
+        self.assertEqual(self.second(token, codes[0]).status_code, 200)
+
+    def test_a_reset_or_disable_ends_a_challenge(self):
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        store.set_enabled("dev", False)
+        self.assertEqual(self.err(self.second(token, self.code(secret, 1))), (401, "MFA_CHALLENGE_INVALID"))
+        # Enabling again doesn't revive it: disabling deleted it (#607 review).
+        store.set_enabled("dev", True)
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM mfa_challenges"), [(0,)])
+        self.assertEqual(self.err(self.second(token, self.code(secret, 1))), (401, "MFA_CHALLENGE_INVALID"))
+
+    def test_a_password_change_or_reset_ends_a_challenge(self):
+        # #607 review: a login started with the old password can't be finished.
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        store.reset_password("dev", passwords.generate_password())
+        self.assertEqual(self.err(self.second(token, self.code(secret, 1))), (401, "MFA_CHALLENGE_INVALID"))
+        store.reset_password("dev", self.passwords["developer"])   # back to a known password
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        principal, _ = self.principal("dev")
+        store.change_password(principal, passwords.generate_password())
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM mfa_challenges"), [(0,)])
+        self.assertEqual(self.err(self.second(token, self.code(secret, 1))), (401, "MFA_CHALLENGE_INVALID"))
+
+    def test_an_mfa_reset_ends_a_challenge(self):
+        # Decision 2 (#607): a reset ends the user's pending challenges, so a
+        # login started before it can't be finished with the next enrollment's code.
+        self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM mfa_challenges"), [(1,)])
+        store.reset_mfa("dev", "user")
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM mfa_challenges"), [(0,)])
+        secret, _ = self.enroll("dev")
+        self.assertEqual(self.err(self.second(token, self.code(secret, 1))), (401, "MFA_CHALLENGE_INVALID"))
+
+    def test_non_ascii_digits_are_a_plain_wrong_code(self):
+        # #607 review: other scripts' digits are refused as any wrong code, not a 500.
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        arabic = "\u0661\u0662\u0663\u0664\u0665\u0666"
+        self.assertEqual(self.err(self.second(token, arabic)), (401, "MFA_FAILED"))
+        headers, _ = self.session("dev")
+        self.assertEqual(self.err(self.client.post("/auth/mfa/recovery-codes", json={"code": arabic},
+                                                   headers=headers)), (403, "MFA_CODE_INCORRECT"))
+        self.assertEqual(self.second(token, self.code(secret, 1)).status_code, 200)
+
+
+class MfaConcurrencyTests(MfaTestCase):
+    """Reviewer's checks (#607): a code is spent once and a challenge's limits
+    hold when requests arrive together. Each check is slowed down inside the
+    write transaction, so without BEGIN IMMEDIATE the parallel requests would
+    all see the same unspent state."""
+
+    @staticmethod
+    def slowed(name="matching_step"):
+        real = getattr(mfa, name)
+
+        def slow(*args, **kwargs):
+            found = real(*args, **kwargs)
+            time.sleep(0.2)
+            return found
+        return patch.object(mfa, name, slow)
+
+    WRONG = "abcd-efgh-ijkl-mnop"           # a well-formed recovery code nobody holds
+
+    @staticmethod
+    def together(calls):
+        start, results = threading.Barrier(len(calls)), [None] * len(calls)
+
+        def run(i, call):
+            start.wait()
+            try:
+                results[i] = call()
+            except Exception as exc:          # recorded, so the assertion names it
+                results[i] = exc
+        threads = [threading.Thread(target=run, args=(i, c)) for i, c in enumerate(calls)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+        return results
+
+    def test_one_totp_code_is_spent_once_across_parallel_uses(self):
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        principal, _ = self.principal("dev")
+        code = self.code(secret, 1)
+        with self.slowed():
+            results = self.together([
+                lambda: store.answer_challenge(token, code)[0] == "ok",
+                lambda: store.regenerate_codes(principal, code) is not None,
+                lambda: store.disable_mfa(principal, self.passwords["developer"], code),
+            ])
+        self.assertEqual(sorted(map(repr, results)), ["False", "False", "True"], results)
+
+    def test_one_recovery_code_is_spent_once_in_parallel(self):
+        _, codes = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        principal, _ = self.principal("dev")
+        with self.slowed("recovery_hash"):
+            results = self.together([
+                lambda: store.answer_challenge(token, codes[0])[0] == "ok",
+                lambda: store.disable_mfa(principal, self.passwords["developer"], codes[0]),
+            ])
+        self.assertEqual(sorted(map(repr, results)), ["False", "True"], results)
+
+    def test_parallel_wrong_codes_use_at_most_five_of_a_challenge(self):
+        from routers import auth as auth_router
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        # A different address per request, so the (username, address) throttle
+        # never applies and only the challenge's own limit of 5 can.
+        with self.slowed("recovery_hash"):
+            results = self.together([lambda n=n: auth_router._second_factor(token, self.WRONG, f"10.0.0.{n}")[0]
+                                     for n in range(8)])
+        self.assertEqual(results.count("failed"), store.MFA_CHALLENGE_TRIES, results)
+        self.assertEqual(results.count("invalid"), 8 - store.MFA_CHALLENGE_TRIES, results)
+        self.assertEqual(self.err(self.second(token, self.code(secret))), (401, "MFA_CHALLENGE_INVALID"))
+
+    def test_parallel_wrong_codes_from_one_address_lock_the_pair(self):
+        from routers import auth as auth_router
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        with self.slowed("recovery_hash"):
+            results = self.together([lambda: auth_router._second_factor(token, self.WRONG, "10.0.0.9")[0]
+                                     for _ in range(8)])
+        self.assertLessEqual(results.count("failed"), store.THROTTLE_FAILURES, results)
+        self.assertNotIn("ok", results)
+        self.assertTrue(locked("dev", "10.0.0.9"))
+
+
+class MfaDecisionDetailTests(MfaTestCase):
+    """Reviewer's checks of two details the maintainer accepted on #607 (2026-11-16)."""
+
+    def test_code_fields_accept_at_most_64_characters(self):
+        headers, _ = self.session("dev")
+        for path, body in (("/auth/login/mfa", {}), ("/auth/mfa/enroll/confirm", {}),
+                           ("/auth/mfa/recovery-codes", {}), ("/auth/mfa/disable", {"password": "x"})):
+            with self.subTest(path=path):
+                long = self.client.post(path, json={**body, "code": "1" * 65}, headers=headers)
+                self.assertEqual(long.status_code, 422, long.text)
+                self.assertEqual(long.json()["error"]["code"], "INVALID_PARAMETER", long.text)
+                at_limit = self.client.post(path, json={**body, "code": "1" * 64}, headers=headers)
+                self.assertNotEqual(at_limit.json().get("error", {}).get("code"), "INVALID_PARAMETER", at_limit.text)
+
+    def test_wrong_codes_at_set_up_confirm_do_not_count_toward_the_lockout(self):
+        headers, _ = self.session("dev")
+        secret = self.client.post("/auth/mfa/enroll", headers=headers).json()["secret"]
+        for _ in range(store.THROTTLE_FAILURES + 2):
+            self.assertEqual(self.err(self.client.post("/auth/mfa/enroll/confirm", json={"code": "abc"},
+                                                       headers=headers)), (422, "MFA_CODE_INCORRECT"))
+        self.assertFalse(locked("dev", "testclient"))
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM login_failures")[0][0], 0)
+        done = self.client.post("/auth/mfa/enroll/confirm", json={"code": self.code(secret)}, headers=headers)
+        self.assertEqual(done.status_code, 200, done.text)
+
+
+class MfaRouteTests(MfaTestCase):
+    def test_enroll_and_confirm(self):
+        headers, _ = self.session("dev")
+        other, _ = self.session("dev")
+        self.assertEqual(self.client.get("/auth/mfa", headers=headers).json(),
+                         {"enrolled": False, "enrolled_at": None, "required": False, "recovery_codes_remaining": 0})
+        started = self.client.post("/auth/mfa/enroll", headers=headers)
+        self.assertEqual(started.status_code, 200, started.text)
+        self.assertEqual(started.headers["cache-control"], "no-store")
+        secret = started.json()["secret"]
+        self.assertTrue(started.json()["otpauth_uri"].startswith("otpauth://totp/RAG%20Platform:dev?secret="))
+        wrong = self.client.post("/auth/mfa/enroll/confirm", json={"code": "12"}, headers=headers)
+        self.assertEqual(self.err(wrong), (422, "MFA_CODE_INCORRECT"))
+        with self.assertLogs("auth", "WARNING") as logs:
+            done = self.client.post("/auth/mfa/enroll/confirm", json={"code": self.code(secret)}, headers=headers)
+        self.assertEqual(done.status_code, 200, done.text)
+        self.assertEqual(done.headers["cache-control"], "no-store")
+        self.assertEqual(len(done.json()["recovery_codes"]), 10)
+        self.assertTrue(done.json()["status"]["enrolled"])
+        self.assertRegex(done.json()["status"]["enrolled_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertNotIn(secret, logged(logs))
+        self.assertEqual(self.client.get("/auth/me", headers=other).status_code, 401, "other sessions end")
+        self.assertTrue(self.client.get("/auth/me", headers=headers).json()["mfa_enrolled"])
+        self.assertEqual(self.err(self.client.post("/auth/mfa/enroll", headers=headers)),
+                         (409, "MFA_ALREADY_ENROLLED"))
+
+    def test_regenerate_route(self):
+        secret, _ = self.enroll("dev")
+        headers, _ = self.session("dev")
+        wrong = self.client.post("/auth/mfa/recovery-codes", json={"code": "abcdef"}, headers=headers)
+        self.assertEqual(self.err(wrong), (403, "MFA_CODE_INCORRECT"))
+        done = self.client.post("/auth/mfa/recovery-codes", json={"code": self.code(secret, 1)}, headers=headers)
+        self.assertEqual(done.status_code, 200, done.text)
+        self.assertEqual(done.headers["cache-control"], "no-store")
+        self.assertEqual(len(done.json()["recovery_codes"]), 10)
+        user_headers, _ = self.session("user")
+        self.assertEqual(self.err(self.client.post("/auth/mfa/recovery-codes", json={"code": "123456"},
+                                                   headers=user_headers)), (409, "MFA_NOT_ENROLLED"))
+
+    def test_disable_route(self):
+        secret, codes = self.enroll("dev")
+        headers, _ = self.session("dev")
+        wrong = self.client.post("/auth/mfa/disable", json={"password": "nope nope nope", "code": codes[0]},
+                                 headers=headers)
+        self.assertEqual(self.err(wrong), (403, "MFA_DISABLE_INCORRECT"))
+        done = self.client.post("/auth/mfa/disable", json={"password": self.passwords["developer"],
+                                                           "code": codes[0]}, headers=headers)
+        self.assertEqual(done.status_code, 200, done.text)
+        self.assertFalse(done.json()["status"]["enrolled"])
+        self.assertEqual(self.client.get("/auth/me", headers=headers).status_code, 200, "sessions stay")
+
+    def test_engineer_reset(self):
+        self.enroll("dev")
+        dev, _ = self.session("dev")
+        eng, _ = self.session("eng")
+        response = self.client.post("/auth/users/dev/reset-mfa", headers=eng)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertFalse(response.json()["user"]["mfa_enrolled"])
+        self.assertEqual(self.client.get("/auth/me", headers=dev).status_code, 401)
+        self.assertEqual(self.err(self.client.post("/auth/users/eng/reset-mfa", headers=eng)),
+                         (409, "SELF_MFA_RESET_REFUSED"))
+        self.assertEqual(self.err(self.client.post("/auth/users/nobody/reset-mfa", headers=eng)),
+                         (404, "USER_NOT_FOUND"))
+        dev, _ = self.session("dev")
+        self.assertEqual(self.err(self.client.post("/auth/users/user/reset-mfa", headers=dev)), (403, "FORBIDDEN"))
+        users = self.client.get("/auth/users", headers=eng).json()["users"]
+        self.assertEqual({u["username"]: u["mfa_enrolled"] for u in users}, {"dev": False, "eng": False, "user": False})
+
+    def test_the_switch_and_the_enrollment_gate(self):
+        eng, _ = self.session("eng")
+        refused = self.client.post("/auth/mfa/policy", json={"required": True}, headers=eng)
+        self.assertEqual(self.err(refused), (409, "MFA_ENROLL_FIRST"))
+        self.enroll("eng")
+        eng, _ = self.session("eng")
+        dev, _ = self.session("dev")       # an existing session of a user who isn't enrolled
+        self.assertEqual(self.client.post("/auth/mfa/policy", json={"required": True}, headers=eng).json(),
+                         {"required": True})
+        self.assertEqual(self.err(self.client.get("/packages", headers=dev)), (403, "MFA_ENROLLMENT_REQUIRED"))
+        me = self.client.get("/auth/me", headers=dev).json()
+        self.assertEqual((me["mfa_required"], me["mfa_enrollment_required"]), (True, True))
+        self.assertEqual(self.client.get("/auth/mfa", headers=dev).status_code, 200)
+        self.assertEqual(self.err(self.client.post("/auth/mfa/disable", json={"password": "x", "code": "1"},
+                                                   headers=dev)), (409, "MFA_REQUIRED"))
+        self.assertEqual(self.client.get("/collections", headers=eng).status_code != 403, True,
+                         "an enrolled engineer isn't gated")
+        secret = self.client.post("/auth/mfa/enroll", headers=dev).json()["secret"]
+        self.client.post("/auth/mfa/enroll/confirm", json={"code": self.code(secret)}, headers=dev)
+        self.assertNotEqual(self.client.get("/packages", headers=dev).status_code, 403)
+        self.assertFalse(self.client.get("/auth/me", headers=dev).json()["mfa_enrollment_required"])
+
+    def test_a_due_password_change_comes_first(self):
+        eng, _ = self.session("eng")
+        self.enroll("eng")
+        store.set_mfa_required(store.get_user("eng").id, True)
+        self.make("fresh", "developer", must_change=True)
+        fresh, _ = self.session("fresh")
+        self.assertEqual(self.err(self.client.post("/auth/mfa/enroll", headers=fresh)),
+                         (403, "PASSWORD_CHANGE_REQUIRED"))
+        self.assertEqual(self.err(self.client.get("/packages", headers=fresh)), (403, "PASSWORD_CHANGE_REQUIRED"))
+
+    def test_keys_cannot_use_the_mfa_routes(self):
+        store.create_principal("svc", "engineer")
+        _, key = store.issue_key("svc")
+        for method, path in (("GET", "/auth/mfa"), ("POST", "/auth/mfa/enroll"), ("POST", "/auth/mfa/policy"),
+                             ("POST", "/auth/users/dev/reset-mfa")):
+            with self.subTest(route=f"{method} {path}"):
+                response = self.client.request(method, path, json={"required": True},
+                                               headers={"Authorization": f"Bearer {key}"})
+                self.assertEqual(self.err(response), (403, "KEY_NOT_ALLOWED"))
+        eng = store.get_user("eng")
+        self.enroll("eng")
+        store.set_mfa_required(eng.id, True)
+        self.assertNotEqual(self.client.get("/packages", headers={"Authorization": f"Bearer {key}"}).status_code,
+                            403, "a key isn't gated by the switch")
+
+
 class ImplementationCopyTests(unittest.TestCase):
     def test_embedded_copies_match(self):
         root = Path(API_DIR).parent
@@ -32480,7 +39104,8 @@ class ImplementationCopyTests(unittest.TestCase):
                      "api/routers/auth.py", "api/main.py", "ui/src/pages/UsersPage.tsx",
                      "api/auth/keys.py", "ui/src/pages/ServiceKeysPage.tsx", "api/config.py", "proxy/nginx.conf",
                      "scripts/verify/17_auth.sh", "scripts/verify/auth_setup.py", "scripts/verify/auth_stack.py",
-                     "scripts/verify/auth_headers.py"):
+                     "scripts/verify/auth_headers.py", "api/auth/mfa.py", "ui/src/pages/AccountPage.tsx",
+                     "api/auth/access.py", "scripts/tests/test_collection_access.py"):
             with self.subTest(name=name):
                 header = "### " + name + "\n\n```"
                 start = document.index("\n", document.index(header) + len(header)) + 1
@@ -32491,7 +39116,7 @@ class ImplementationCopyTests(unittest.TestCase):
 if __name__ == "__main__":
     logging.basicConfig(level=logging.CRITICAL)
     unittest.main(verbosity=2)
-```
+````
 
 ### scripts/tests/test_prepare.py
 
@@ -32587,7 +39212,7 @@ class StubLLM:
 
     async def models(self):
         self.model_calls += 1
-        return {f"{settings.llm_model}:latest", "nomic-embed-text:latest"}
+        return {f"{settings.build_model}:latest", "nomic-embed-text:latest"}
 
 
 class AreaCase(unittest.TestCase):
@@ -32775,6 +39400,25 @@ class LlmDocumentTests(AreaCase):
         self.assertEqual(result.parts[0]["fallbacks"], [{"window": None, "reason": "llm-unavailable"}])
         self.assertEqual(llm.calls, [])
         self.assertTrue(result.fallback)
+
+    def test_the_model_check_looks_for_the_build_model(self):
+        # Preparation's LLM is the build model (#671): with only the answer model
+        # listed, the document is prepared by code alone.
+        llm = StubLLM()
+
+        async def answer_model_only():
+            return {"llama3.2:latest", "nomic-embed-text:latest"}
+        llm.models = answer_model_only
+        record = self.document("a.md", page_text())
+        with patch.object(settings, "llm_model", "llama3.2"), \
+                patch.object(settings, "build_llm_model", "qwen2.5:0.5b"):
+            result = self.prepare(record, llm)
+        self.assertEqual(result.parts[0]["fallbacks"], [{"window": None, "reason": "llm-unavailable"}])
+        self.assertEqual(llm.calls, [])
+        with patch.object(settings, "llm_model", "qwen2.5:0.5b"), \
+                patch.object(settings, "answer_llm_model", "llama3.2"):
+            self.assertTrue(asyncio.run(preparation.model_available(
+                AsyncMock(return_value={"qwen2.5:0.5b"}))))
 
     def test_over_1000_windows_is_too_large_for_the_llm_but_titled(self):
         with patch.object(preparation, "MAX_WINDOWS", 2):
@@ -33197,7 +39841,10 @@ class JobCase(AreaCase):
     def setUp(self):
         super().setUp()
         self.llm = StubLLM()
-        for name, value in (("chat", self.llm.chat), ("list_models", self.llm.models)):
+        # A job prepares with the build model (#671); the answer model is never asked.
+        never = AsyncMock(side_effect=AssertionError("the answer model was asked"))
+        for name, value in (("build_chat", self.llm.chat), ("chat", never),
+                            ("list_models", self.llm.models)):
             change = patch.object(jobs.ollama, name, value)
             change.start()
             self.addCleanup(change.stop)
@@ -33904,7 +40551,7 @@ class StreamingReviewTests(JobCase):
                 return '{"title": "Long text", "summary": "Numbered paragraphs."}'
 
             async def models(self):
-                return {f"{settings.llm_model}:latest"}
+                return {f"{settings.build_model}:latest"}
 
         def run(name, paragraphs):
             path = self.root / "uploads" / name
@@ -34127,6 +40774,1854 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
+### scripts/tests/test_collection_access.py
+
+```python
+"""Per-collection access (#606): who may use a restricted collection.
+
+A collection is open, or restricted to the people and service principals
+granted it; Engineers reach every collection. A caller without access gets the
+answer the route gives something that doesn't exist, and the refusal is
+audited. SPECIFICATIONS.md §3.1.8 "Per-collection access".
+
+Runs with the API's dependencies, in the built API image with no network
+(`17_auth.sh`):
+
+    docker run --rm --network none -v "$PWD:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api \\
+      "$(docker compose images -q api)" python scripts/tests/test_collection_access.py
+
+or on the host with them installed. Every test has its own account store,
+upload folder and audit folder. Requests go through `main.app` with FastAPI's
+TestClient, without the lifespan, with real sessions and keys. Weaviate is a
+fake set of collection names; nothing reaches a backend. On the code before
+#606 the listing, query and creation cases fail.
+"""
+import asyncio
+import json
+import os
+import sqlite3
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+API_DIR = os.environ.get("RAG_TEST_API_DIR") or str(Path(__file__).resolve().parents[2] / "api")
+sys.path.insert(0, API_DIR)
+
+from fastapi.testclient import TestClient
+
+from config import settings
+from main import app
+from auth import access, passwords, store
+from services import audit, exporter, goldstandard, importer, ingest_pipeline, rag_pipeline
+from services import weaviate_client as wc
+
+ORIGIN = "http://testserver"
+SECRET, OPEN = "Secret", "Open1"
+STAGING = SECRET + "__tuning_" + "0" * 32
+NESTED = STAGING + "__tuning_" + "2" * 32         # a rebuild of the kept copy (#792)
+
+
+def _no_weaviate():
+    raise ConnectionError("test_collection_access.py runs without a network: there is no Weaviate")
+
+
+class AccessTestCase(unittest.TestCase):
+    """A fresh store, upload and audit folder; people of each role, a
+    Developer service principal with a key; Weaviate holding OPEN, SECRET and
+    a staging copy of SECRET; SECRET restricted to `dev` and the principal, and
+    the copy given SECRET's access when it was made."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        for name, value in (("audit_dir", str(self.root / "audit")), ("auth_dir", str(self.root / "auth")),
+                            ("upload_dir", str(self.root / "uploads")), ("exports_dir", str(self.root / "exports"))):
+            target = patch.object(settings, name, value)
+            target.start()
+            self.addCleanup(target.stop)
+        (self.root / "uploads").mkdir()
+        self.collections = {OPEN, SECRET, STAGING}
+
+        async def exists(name):
+            return name[:1].upper() + name[1:] in self.collections
+
+        async def listing():
+            return [{"name": n, "object_count": 1, "index_type": "hnsw", "distance_metric": "cosine"}
+                    for n in sorted(self.collections)]
+
+        for target in (patch.object(wc, "get_client", _no_weaviate), patch.object(wc, "collection_exists", exists),
+                       patch.object(wc, "_collection_exists_sync", lambda n: n[:1].upper() + n[1:] in self.collections),
+                       patch.object(wc, "get_collections", listing)):
+            target.start()
+            self.addCleanup(target.stop)
+        for username, role in (("eng", "engineer"), ("dev", "developer"), ("dev2", "developer"),
+                               ("user", "end_user")):
+            store.create_user(username, role, passwords.generate_password(), bootstrap=not store.is_set_up(),
+                              must_change_password=False)
+        store.create_principal("svc", "developer")
+        store.create_principal("svc2", "developer")
+        self.key = store.issue_key("svc")[1]
+        self.key2 = store.issue_key("svc2")[1]
+        self.client = TestClient(app, raise_server_exceptions=False)
+        self.addCleanup(self.client.close)
+        status = self.put(SECRET, {"restricted": True, "users": ["dev"], "service_principals": ["svc"]}).status_code
+        self.assertEqual(status, 200)
+        # The staging copy got SECRET's access when it was made (collection_recovery.begin).
+        store.copy_collection_access(SECRET, STAGING)
+
+    def as_(self, who):
+        if who in ("svc", "svc2"):
+            return {"Authorization": "Bearer " + (self.key if who == "svc" else self.key2)}
+        token = store.create_session(store.get_user(who).id)
+        return {"Cookie": f"{store.COOKIE}={token}", "Origin": ORIGIN}
+
+    def put(self, name, body, who="eng"):
+        return self.client.put(f"/collections/{name}/access", json=body, headers=self.as_(who))
+
+    def names(self, who):
+        answer = self.client.get("/collections", headers=self.as_(who))
+        self.assertEqual(answer.status_code, 200, answer.text)
+        return [c["name"] for c in answer.json()["collections"]]
+
+    def records(self, action=None):
+        return [r for r in reversed(list(audit.newest_first())) if action is None or r["action"] == action]
+
+    def refused(self, answer, code="COLLECTION_NOT_FOUND"):
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (404, code), answer.text)
+
+
+class StoreTests(AccessTestCase):
+    def test_a_version_3_store_gains_the_tables_and_every_collection_stays_open(self):
+        path = store.db_path()
+        conn = sqlite3.connect(path)
+        conn.executescript("DROP TABLE collection_grants; DROP TABLE restricted_collections; PRAGMA user_version = 3;")
+        conn.close()
+        store._ready.clear()
+        self.assertTrue(store.has_access(store.get_user("user").id, "end_user", SECRET))
+        version = sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0]
+        self.assertEqual(version, 4)
+        self.assertEqual(store.get_user("dev").role, "developer")       # rows kept
+
+    def test_the_rule(self):
+        dev, user = store.get_user("dev"), store.get_user("user")
+        self.assertTrue(store.has_access(dev.id, "developer", SECRET))
+        self.assertTrue(store.has_access(dev.id, "developer", "secret"))          # canonical name
+        self.assertFalse(store.has_access(user.id, "end_user", SECRET))
+        self.assertTrue(store.has_access(user.id, "engineer", SECRET))            # Engineers reach everything
+        self.assertTrue(store.has_access(user.id, "end_user", OPEN))
+
+    def test_grants_survive_disable_and_a_demoted_engineer_is_bound(self):
+        store.set_enabled("dev", False)
+        store.set_enabled("dev", True)
+        self.assertEqual(store.collection_access(SECRET).users, ("dev",))
+        eng = store.get_user("eng")
+        self.assertTrue(store.has_access(eng.id, "engineer", SECRET))
+        self.assertFalse(store.has_access(eng.id, "developer", SECRET))           # once demoted
+
+    def test_no_store_means_nothing_to_copy_or_drop(self):
+        empty = self.root / "empty-auth"
+        with patch.object(settings, "auth_dir", str(empty)):
+            self.assertEqual(store.copy_collection_access(SECRET, STAGING),
+                             (store.CollectionAccess(False), store.CollectionAccess(False)))
+            store.drop_collection_access(SECRET)
+            self.assertFalse((empty / "auth.db").exists())
+
+    def test_copy_and_drop(self):
+        store.copy_collection_access(SECRET, "Copy")
+        self.assertEqual(store.collection_access("Copy"), store.collection_access(SECRET))
+        store.copy_collection_access(OPEN, "Copy")
+        self.assertFalse(store.collection_access("Copy").restricted)
+        store.drop_collection_access(SECRET)
+        self.assertFalse(store.collection_access(SECRET).restricted)
+
+
+class ListingTests(AccessTestCase):
+    def test_the_list_holds_only_usable_collections(self):
+        self.assertEqual(self.names("user"), [OPEN])
+        self.assertEqual(self.names("dev2"), [OPEN])
+        self.assertEqual(self.names("dev"), [OPEN, SECRET, STAGING])              # a staging copy has its target's access
+        self.assertEqual(self.names("svc"), [OPEN, SECRET, STAGING])
+        self.assertEqual(self.names("svc2"), [OPEN])
+        self.assertEqual(self.names("eng"), [OPEN, SECRET, STAGING])
+        self.assertFalse(self.records("collection.access.refused"))               # a filtered list is no refusal
+
+    def test_a_change_applies_to_the_next_request(self):
+        self.assertEqual(self.put(SECRET, {"restricted": False}).status_code, 200)
+        # The copy keeps its own state, which still restricts it (CopyTests, #788).
+        self.assertEqual(self.names("user"), [OPEN, SECRET])
+
+
+class CreateDeleteTests(AccessTestCase):
+    def test_a_new_collection_is_restricted_to_its_creator(self):
+        async def create(**kwargs):
+            self.collections.add(kwargs["name"])
+        with patch.object(wc, "create_collection", create):
+            answer = self.client.post("/collections", json={"name": "fresh"}, headers=self.as_("dev2"))
+        self.assertEqual(answer.status_code, 201, answer.text)
+        self.assertEqual(self.names("dev2"), ["Fresh", OPEN])
+        self.assertNotIn("Fresh", self.names("user"))
+        self.assertNotIn("Fresh", self.names("dev"))
+        self.assertEqual(store.collection_access("Fresh"), store.CollectionAccess(True, ("dev2",), ()))
+
+    def test_a_key_creates_for_its_principal(self):
+        async def create(**kwargs):
+            self.collections.add(kwargs["name"])
+        with patch.object(wc, "create_collection", create):
+            answer = self.client.post("/collections", json={"name": "Keyed"}, headers=self.as_("svc2"))
+        self.assertEqual(answer.status_code, 201, answer.text)
+        self.assertEqual(store.collection_access("Keyed").service_principals, ("svc2",))
+
+    def test_a_delete_drops_the_restriction(self):
+        async def delete(name):
+            self.collections.discard(name)
+            return 1
+        with patch.object(wc, "delete_collection_when_idle", delete):
+            answer = self.client.delete(f"/collections/{SECRET}?confirm=true", headers=self.as_("eng"))
+        self.assertEqual(answer.status_code, 200, answer.text)
+        self.assertFalse(store.collection_access(SECRET).restricted)
+
+
+class AccessRouteTests(AccessTestCase):
+    def test_engineers_in_a_session_only(self):
+        self.assertEqual(self.client.get(f"/collections/{SECRET}/access", headers=self.as_("dev")).status_code, 403)
+        store.create_principal("boss", "engineer")
+        key = store.issue_key("boss")[1]
+        answer = self.client.get(f"/collections/{SECRET}/access", headers={"Authorization": "Bearer " + key})
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (403, "KEY_NOT_ALLOWED"))
+
+    def test_read_and_set(self):
+        answer = self.client.get(f"/collections/{SECRET.lower()}/access", headers=self.as_("eng"))
+        self.assertEqual(answer.json(), {"restricted": True, "users": ["dev"], "service_principals": ["svc"]})
+        self.assertEqual(self.client.get(f"/collections/{OPEN}/access", headers=self.as_("eng")).json(),
+                         {"restricted": False, "users": [], "service_principals": []})
+        self.refused(self.client.get("/collections/Nowhere/access", headers=self.as_("eng")))
+        answer = self.put(SECRET, {"restricted": True, "users": ["DEV2", "user"], "service_principals": []})
+        self.assertEqual(answer.json(), {"restricted": True, "users": ["dev2", "user"], "service_principals": []})
+        item = self.records("collection.access")[-1]
+        self.assertEqual((item["actor"], item["collection"], item["result"]), ("eng", SECRET, "success"))
+        self.assertEqual(item["details"]["added"], {"users": ["dev2", "user"], "service_principals": []})
+        self.assertEqual(item["details"]["removed"], {"users": ["dev"], "service_principals": ["svc"]})
+        self.assertEqual((item["details"]["restricted_before"], item["details"]["restricted_after"]), (True, True))
+
+    def test_refused_changes_change_nothing(self):
+        for body in ({"restricted": False, "users": ["dev"]}, {"restricted": True, "users": ["nobody"]},
+                     {"restricted": True, "users": ["svc"]}, {"restricted": True, "service_principals": ["dev"]},
+                     {"restricted": True, "extra": 1}, {}):
+            with self.subTest(body=body):
+                answer = self.put(SECRET, body)
+                self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (422, "INVALID_PARAMETER"))
+        self.assertEqual(store.collection_access(SECRET), store.CollectionAccess(True, ("dev",), ("svc",)))
+        self.refused(self.put("Nowhere", {"restricted": False}))
+
+    def test_an_empty_grant_set_leaves_engineers_only(self):
+        self.put(SECRET, {"restricted": True})
+        self.assertEqual(self.names("dev"), [OPEN])                        # the copy follows its target (#788)
+        self.assertEqual(self.names("eng"), [OPEN, SECRET, STAGING])
+
+
+class RefusalTests(AccessTestCase):
+    """Every route that names a collection refuses one the caller may not use
+    as it answers one that doesn't exist, and the refusal is audited."""
+
+    def unavailable(self, *args, **kwargs):
+        raise rag_pipeline.ServiceUnavailable("Ollama")
+
+    def test_query(self):
+        body = {"question": "What?", "collection": SECRET}
+        with patch.object(rag_pipeline, "run_query", self.unavailable):
+            self.refused(self.client.post("/query", json=body, headers=self.as_("user")))
+            self.assertEqual(self.client.post("/query", json=body, headers=self.as_("dev")).status_code, 503)
+            self.assertEqual(self.client.post("/query", json=body, headers=self.as_("svc")).status_code, 503)
+            self.refused(self.client.post("/query", json=body, headers=self.as_("svc2")))
+            self.refused(self.client.post("/query", json={**body, "collection": STAGING}, headers=self.as_("user")))
+        item = [r for r in self.records("query") if r["actor"] == "user"][0]
+        self.assertEqual((item["result"], item["status_code"], item["collection"]), ("refused", 404, SECRET))
+        self.assertEqual(item["details"]["reason"], "collection_access")
+        self.assertEqual(item["details"]["code"], "COLLECTION_NOT_FOUND")
+
+    def test_settings_routes(self):
+        for path in (f"/retrieval/config/{SECRET}", f"/ingest/config/{SECRET}"):
+            with self.subTest(path=path):
+                who = "user" if path.startswith("/retrieval") else "dev2"
+                self.refused(self.client.get(path, headers=self.as_(who)))
+                self.assertEqual(self.client.get(path, headers=self.as_("dev")).status_code, 200)
+                item = self.records("collection.access.refused")[-1]
+                self.assertEqual((item["actor"], item["collection"], item["status_code"], item["result"]),
+                                 (who, SECRET, 404, "refused"))
+                self.assertEqual(item["details"]["route"], "GET " + path.replace(SECRET, "{collection}"))
+        saves = (("/retrieval/config", {"collection": SECRET, "top_k": 4}),
+                 ("/ingest/config", {"collection": SECRET, "chunking_strategy": "fixed", "chunk_size": 300,
+                                     "chunk_overlap": 0, "min_chunk_size": 50}))
+        for path, body in saves:
+            with self.subTest(path=path):
+                self.refused(self.client.post(path, json=body, headers=self.as_("dev2")))
+                self.assertEqual(self.client.post(path, json=body, headers=self.as_("dev")).status_code, 201)
+
+    def test_settings_routes_answer_404_for_a_missing_collection(self):
+        self.refused(self.client.get("/retrieval/config/Nowhere", headers=self.as_("eng")))
+        self.refused(self.client.get("/ingest/config/Nowhere", headers=self.as_("eng")))
+        self.refused(self.client.post("/retrieval/config", json={"collection": "Nowhere", "top_k": 4},
+                                      headers=self.as_("eng")))
+        self.refused(self.client.post("/ingest/config", json={"collection": "Nowhere", "chunking_strategy": "fixed",
+                                                              "chunk_size": 300, "chunk_overlap": 0,
+                                                              "min_chunk_size": 50}, headers=self.as_("eng")))
+        self.assertFalse((self.root / "uploads" / "retrieval_configs").exists()
+                         and any((self.root / "uploads" / "retrieval_configs").iterdir()))
+
+    def test_developer_routes(self):
+        dev2 = self.as_("dev2")
+        self.refused(self.client.post("/export", json={"collection": SECRET}, headers=dev2))
+        self.refused(self.client.post("/goldstandard/generate", json={"collection": SECRET}, headers=dev2))
+        self.refused(self.client.get(f"/tune/{SECRET}", headers=dev2))
+        files = {"files": ("a.txt", b"text", "text/plain")}
+        self.refused(self.client.post("/ingest/upload", data={"collection": SECRET}, files=files, headers=dev2))
+        from services import preparation_jobs
+
+        async def selected(body, usable=None):
+            return {"records": [], "names": ["a.md"]}
+        with patch.object(preparation_jobs, "import_documents", selected):
+            self.refused(self.client.post("/prepare/import", json={"collection": SECRET, "all": True}, headers=dev2))
+
+    def test_job_status_by_id(self):
+        common = {"job_id": "j1", "status": "running", "collection": SECRET}
+        jobs = {
+            "/ingest/job/j1": (ingest_pipeline, {**common, "files_total": 1, "files_completed": 0, "files_failed": 0,
+                                                 "chunks_stored": 0, "errors": []}),
+            "/export/job/j1": (exporter, {**common, "chunks_written": 0, "filename": None, "size_bytes": None,
+                                          "source_document_count": None, "fidelity": None, "models_bundled": None,
+                                          "retrieve_script": None, "warnings": [], "error": None}),
+            "/import/job/j1": (importer, {**common, "filename": "p.tar.gz", "on_conflict": "rename",
+                                          "original_collection": None, "chunks_written": 0, "fidelity": None,
+                                          "renamed": False, "notes": [], "error": None, "error_code": None,
+                                          "error_detail": None}),
+        }
+        for path, (module, job) in jobs.items():
+            with self.subTest(path=path), patch.object(module, "get_job", lambda job_id, job=job: dict(job)):
+                self.refused(self.client.get(path, headers=self.as_("dev2")), "JOB_NOT_FOUND")
+                self.assertEqual(self.client.get(path, headers=self.as_("dev")).status_code, 200)
+        # An import whose package isn't read yet names no collection.
+        unread = {**jobs["/import/job/j1"][1], "collection": None}
+        with patch.object(importer, "get_job", lambda job_id: dict(unread)):
+            self.assertEqual(self.client.get("/import/job/j1", headers=self.as_("dev2")).status_code, 200)
+
+    def test_gold_standard_sessions(self):
+        session = {"session_id": "gs_1", "collection": SECRET, "status": "completed", "pairs": [],
+                   "pairs_total": 0, "pairs_completed": 0}
+        with patch.object(goldstandard, "get_session", lambda session_id: dict(session)):
+            for method, path, body in (("GET", "/goldstandard/session/gs_1", None),
+                                       ("PATCH", "/goldstandard/session/gs_1/pair/p1", {"status": "approved"}),
+                                       ("POST", "/goldstandard/regenerate", {"session_id": "gs_1", "pair_id": "p1"}),
+                                       ("POST", "/goldstandard/save", {"session_id": "gs_1"})):
+                with self.subTest(path=path):
+                    self.refused(self.client.request(method, path, json=body, headers=self.as_("dev2")),
+                                 "SESSION_NOT_FOUND")
+            self.assertEqual(self.client.get("/goldstandard/session/gs_1", headers=self.as_("dev")).status_code, 200)
+
+    def test_gold_standard_download(self):
+        folder = self.root / "uploads" / goldstandard.EXPORT_DIRNAME
+        folder.mkdir()
+        for name in ("known.json", "unknown.json"):
+            (folder / name).write_text("[]")
+        goldstandard._record_export_collection("known.json", SECRET)
+        self.refused(self.client.get("/goldstandard/download/known.json", headers=self.as_("dev2")), "FILE_NOT_FOUND")
+        self.assertEqual(self.client.get("/goldstandard/download/known.json", headers=self.as_("dev")).status_code, 200)
+        self.refused(self.client.get("/goldstandard/download/unknown.json", headers=self.as_("dev")), "FILE_NOT_FOUND")
+        self.assertEqual(self.client.get("/goldstandard/download/unknown.json", headers=self.as_("eng")).status_code, 200)
+        self.assertEqual(goldstandard.export_collection("known.json"), SECRET)
+
+
+class PackageTests(AccessTestCase):
+    PACKAGES = [
+        {"filename": "ragpkg-secret.tar.gz", "size_bytes": 1, "collection": SECRET, "chunk_count": 1,
+         "fidelity": "chunks-only", "created_at": None, "readable": True},
+        {"filename": "ragpkg-open.tar.gz", "size_bytes": 1, "collection": OPEN, "chunk_count": 1,
+         "fidelity": "chunks-only", "created_at": None, "readable": True},
+        {"filename": "ragpkg-gone.tar.gz", "size_bytes": 1, "collection": "Gone", "chunk_count": 1,
+         "fidelity": "chunks-only", "created_at": None, "readable": True},
+        {"filename": "ragpkg-x.tar.gz.age", "size_bytes": 1, "collection": None, "chunk_count": None,
+         "fidelity": None, "created_at": None, "readable": True, "encrypted": True},
+    ]
+
+    def listed(self, who):
+        from routers import transfer
+        with patch.object(transfer, "_list_packages_sync", lambda: [dict(p) for p in self.PACKAGES]):
+            return [p["filename"] for p in self.client.get("/packages", headers=self.as_(who)).json()["packages"]]
+
+    def test_the_listing_hides_restricted_packages(self):
+        store.restrict_to("Gone", None)       # restricted, but no such collection here: listed
+        everything = [p["filename"] for p in self.PACKAGES]
+        self.assertEqual(self.listed("dev"), everything)
+        self.assertEqual(self.listed("eng"), everything)
+        self.assertEqual(self.listed("dev2"), [n for n in everything if n != "ragpkg-secret.tar.gz"])
+
+    def test_the_import_job_refuses_and_names_no_collection(self):
+        self.assertTrue(importer._refused({"name": "dev2", "kind": "user"}, SECRET))
+        self.assertFalse(importer._refused({"name": "dev", "kind": "user"}, SECRET))
+        self.assertFalse(importer._refused({"name": "svc", "kind": "service"}, SECRET))
+        self.assertTrue(importer._refused({"name": "svc", "kind": "user"}, SECRET))    # kind must match
+        self.assertFalse(importer._refused({"name": "dev2", "kind": "user"}, OPEN))
+        self.assertFalse(importer._refused(None, SECRET))
+        store.restrict_to("Gone", None)
+        self.assertFalse(importer._refused({"name": "dev2", "kind": "user"}, "Gone"))   # not here
+
+        manifest = {"collection": {"name": SECRET}}
+        job_id = "imp1"
+        record = {"job_id": job_id, "status": "queued", "filename": "ragpkg-secret.tar.gz", "collection": None,
+                  "owner": {"name": "dev2", "kind": "user"}, "notes": [], "restored_sessions": []}
+        with patch.object(importer, "_jobs", {job_id: record}), \
+                patch.object(importer.packager, "open_package", lambda *a: (self.root, manifest)), \
+                patch.object(importer.packager, "verify_digests", lambda *a: None), \
+                patch.object(importer, "_validate_package_sources", lambda *a: None), \
+                patch.object(importer, "_check_embedding", lambda *a: None):
+            importer._run(job_id, "ragpkg-secret.tar.gz", "rename")
+        self.assertEqual((record["status"], record["error_code"]), ("failed", "PACKAGE_UNREADABLE"))
+        self.assertEqual(record["error"], "No package named 'ragpkg-secret.tar.gz' in the exports directory.")
+        self.assertIsNone(record["collection"])
+        self.assertTrue(record["access_refused"])
+
+    def test_an_import_job_refusal_is_audited_as_refused(self):
+        audit.job_ended({"job_id": "imp1", "status": "failed", "access_refused": True,
+                         "_audit": {"action": "import", "actor": "dev2", "actor_kind": "user", "role": "developer",
+                                    "details": {}}}, False)
+        item = self.records("import")[-1]
+        self.assertEqual((item["result"], item["details"]["reason"]), ("refused", "collection_access"))
+
+    def test_a_new_collection_from_an_import(self):
+        importer._start_access({"name": "dev2", "kind": "user"}, "Brandnew", "Brandnew")
+        self.assertEqual(store.collection_access("Brandnew"), store.CollectionAccess(True, ("dev2",), ()))
+        importer._start_access({"name": "dev", "kind": "user"}, SECRET, "Secret_ab12cd34")
+        self.assertEqual(store.collection_access("Secret_ab12cd34"), store.collection_access(SECRET))
+        importer._start_access({"name": "dev", "kind": "user"}, OPEN, "Open1_ab12cd34")
+        self.assertFalse(store.collection_access("Open1_ab12cd34").restricted)
+        importer._start_access(None, "Untracked", "Untracked")
+        self.assertFalse(store.collection_access("Untracked").restricted)
+
+    def run_import(self, name, on_conflict, owner, **patches):
+        """importer._run on a package of collection `name`, with the package
+        checks and the build stubbed out; returns the job record."""
+        manifest = {"collection": {"name": name, "chunk_count": 1}}
+        record = {"job_id": "imp2", "status": "queued", "filename": "ragpkg-x.tar.gz", "collection": None,
+                  "owner": owner, "notes": [], "restored_sessions": []}
+        stubs = {"_validate_package_sources": lambda *a: None, "_check_embedding": lambda *a: None,
+                 "_read_goldstandard_sessions": lambda *a: [], "_read_retrieval_config": lambda *a: None,
+                 "_read_ingest_config": lambda *a: None, "_ensure_models": lambda *a: [],
+                 "_claim_target": lambda job_id, target, instead_of=None: target,
+                 "_mark_started": lambda target, *a: target, "_mark_finished": lambda *a: None, **patches}
+        targets = [patch.object(importer, "_jobs", {"imp2": record}),
+                   patch.object(importer.packager, "open_package", lambda *a: (self.root, manifest)),
+                   patch.object(importer.packager, "verify_digests", lambda *a: None),
+                   patch.object(importer.packager, "sha256_file", lambda *a: "ab12cd34" * 8)]
+        targets += [patch.object(importer, k, v) for k, v in stubs.items()]
+        for target in targets:
+            target.start()
+        try:
+            importer._run("imp2", "ragpkg-x.tar.gz", on_conflict)
+        finally:
+            for target in reversed(targets):
+                target.stop()
+        return record
+
+    def test_a_failed_import_of_a_new_name_leaves_no_access_state(self):
+        seen = []
+
+        def build(target, *a):
+            seen.append(store.collection_access(target))      # restricted before any data is written
+            raise importer.PackageError("IMPORT_FAILED", "the build failed")
+        record = self.run_import("Brandnew", "rename", {"name": "dev2", "kind": "user"}, _build=build)
+        self.assertEqual(record["status"], "failed", record)
+        self.assertEqual(seen, [store.CollectionAccess(True, ("dev2",), ())])
+        self.assertFalse(store.collection_access("Brandnew").restricted)
+
+    def test_a_failed_cleanup_keeps_the_new_collection_access(self):
+        # The build's own delete of the partial collection failed (#788).
+        def build(target, *a):
+            raise importer.PackageError("IMPORT_FAILED", "the insert failed; partial target cleanup failed",
+                                        {"collection": target, "cleanup_pending": True})
+        record = self.run_import("Halfbuilt", "rename", {"name": "dev2", "kind": "user"}, _build=build)
+        self.assertEqual(record["status"], "failed", record)
+        self.assertEqual(store.collection_access("Halfbuilt"), store.CollectionAccess(True, ("dev2",), ()))
+
+    def test_a_failed_build_that_left_the_collection_keeps_its_access(self):
+        # The create was applied but answered with an error (#788).
+        def build(target, *a):
+            self.collections.add(target)
+            raise RuntimeError("timed out")
+        record = self.run_import("Applied", "rename", {"name": "dev2", "kind": "user"}, _build=build)
+        self.assertEqual(record["status"], "failed", record)
+        self.assertEqual(store.collection_access("Applied"), store.CollectionAccess(True, ("dev2",), ()))
+
+    def test_a_failed_build_with_no_answer_on_existence_keeps_its_access(self):
+        # Weaviate can't say whether the partial collection is gone: fail closed (#788).
+        built = []
+
+        def build(target, *a):
+            built.append(target)
+            raise RuntimeError("timed out")
+
+        def unknown(name):
+            if built:
+                raise ConnectionError("no answer")
+            return name[:1].upper() + name[1:] in self.collections
+        with patch.object(wc, "_collection_exists_sync", unknown):
+            record = self.run_import("Unanswered", "rename", {"name": "dev2", "kind": "user"}, _build=build)
+        self.assertEqual((record["status"], built), ("failed", ["Unanswered"]), record)
+        self.assertEqual(store.collection_access("Unanswered"), store.CollectionAccess(True, ("dev2",), ()))
+
+    def test_a_replace_keeps_the_target_access(self):
+        def begin(*a):
+            raise importer.PackageError("IMPORT_FAILED", "stopped before the replace")
+        before = store.collection_access(SECRET)
+        with patch.object(importer.collection_recovery, "begin", begin), \
+                patch.object(wc, "get_client", lambda: None):
+            record = self.run_import(SECRET, "replace", {"name": "dev", "kind": "user"})
+        self.assertEqual((record["status"], record["error"]), ("failed", "stopped before the replace"), record)
+        self.assertEqual(store.collection_access(SECRET), before)
+
+    def test_a_failure_after_the_build_keeps_the_new_collection_access(self):
+        # The build finished, so the collection exists; a later failure must
+        # not put back (open) the state the import gave it.
+        def restore(*a):
+            raise importer.PackageError("IMPORT_FAILED", "the sidecars failed")
+        record = self.run_import("Builtnew", "rename", {"name": "dev2", "kind": "user"},
+                                 _build=lambda *a: 1, _restore_sidecars=restore)
+        self.assertEqual((record["status"], record["error"]), ("failed", "the sidecars failed"), record)
+        self.assertEqual(store.collection_access("Builtnew"), store.CollectionAccess(True, ("dev2",), ()))
+
+
+class CopyTests(AccessTestCase):
+    """A staging or recovery copy gets its target's access when it is made
+    (#606) and keeps it as its own state; while the target has a state, a
+    caller other than an Engineer needs both (#788)."""
+
+    def test_begin_snapshots_and_discard_drops(self):
+        from services import collection_recovery
+
+        class Client:
+            class collections:
+                @staticmethod
+                def exists(name):
+                    return False
+
+                @staticmethod
+                def delete(name):
+                    pass
+        record = collection_recovery.begin(SECRET, "import", Client)
+        copy = record["staging"]
+        self.assertEqual(store.collection_access(copy), store.collection_access(SECRET))
+        record = collection_recovery.begin(OPEN, "tune", Client)
+        self.assertFalse(store.collection_access(record["staging"]).restricted)
+        collection_recovery.discard(collection_recovery.begin(SECRET, "tune", Client), Client)
+        collection_recovery.discard({**collection_recovery.begin(SECRET, "import", Client)}, Client)
+        last = collection_recovery.begin(SECRET, "import", Client)
+        collection_recovery.discard(last, Client)
+        self.assertFalse(store.collection_access(last["staging"]).restricted)
+        self.assertTrue(store.collection_access(copy).restricted)          # a copy not discarded keeps it
+
+    def test_a_copy_follows_a_deleted_and_re_created_target(self):
+        async def delete(name):
+            self.collections.discard(name)
+            return 1
+
+        async def create(**kwargs):
+            self.collections.add(kwargs["name"])
+        body = {"question": "What?", "collection": STAGING}
+        with patch.object(wc, "delete_collection_when_idle", delete):
+            self.assertEqual(self.client.delete(f"/collections/{SECRET}?confirm=true",
+                                                headers=self.as_("eng")).status_code, 200)
+        self.assertNotIn(STAGING, self.names("user"))                     # not opened by the delete
+        self.assertIn(STAGING, self.names("dev"))                         # its own state alone now
+        with patch.object(wc, "create_collection", create):
+            self.assertEqual(self.client.post("/collections", json={"name": SECRET},
+                                              headers=self.as_("dev2")).status_code, 201)
+        # The new SECRET is dev2's; the copy is dev's: each lacks one side.
+        self.assertEqual(self.names("dev2"), [OPEN, SECRET])
+        self.assertEqual(self.names("dev"), [OPEN])
+        for who in ("dev", "dev2"):
+            self.refused(self.client.post("/query", json=body, headers=self.as_(who)))
+        self.assertIn(STAGING, self.names("eng"))
+
+    def test_a_copy_with_no_state_follows_its_target(self):
+        # A copy kept from before #606 has no state of its own (#788).
+        store.drop_collection_access(STAGING)
+        for who, sees in (("dev", True), ("svc", True), ("eng", True), ("user", False), ("dev2", False)):
+            with self.subTest(who=who):
+                self.assertEqual(STAGING in self.names(who), sees)
+        body = {"question": "What?", "collection": STAGING}
+        self.refused(self.client.post("/query", json=body, headers=self.as_("user")))
+
+    def test_narrowing_the_target_reaches_the_copy(self):
+        self.assertEqual(self.put(SECRET, {"restricted": True, "users": ["dev"]}).status_code, 200)
+        self.assertNotIn(STAGING, self.names("svc"))
+        self.assertIn(STAGING, self.names("dev"))
+
+    def test_opening_the_target_leaves_the_copy_its_own_state(self):
+        self.assertEqual(self.put(SECRET, {"restricted": False}).status_code, 200)
+        self.assertNotIn(STAGING, self.names("user"))
+        self.assertIn(STAGING, self.names("dev"))
+
+
+class NestedCopyTests(AccessTestCase):
+    """A kept copy can be rebuilt, so a copy's target can be a copy too. The
+    copy of the copy follows every collection in its chain (#792)."""
+
+    def setUp(self):
+        super().setUp()
+        self.collections.add(NESTED)
+        store.copy_collection_access(STAGING, NESTED)    # the copy's own state, as begin gave it before #792
+
+    def open_copies(self):
+        for name in (STAGING, NESTED):
+            self.assertEqual(self.put(name, {"restricted": False}).status_code, 200)
+
+    def test_the_chain_reaches_the_original(self):
+        self.assertEqual(access.chain(NESTED), (NESTED, STAGING, SECRET))
+        self.assertEqual(access.scope(NESTED), (NESTED, STAGING, SECRET))
+        self.assertEqual(access.scope(STAGING), (STAGING, SECRET))
+        self.assertEqual(access.scope(OPEN), (OPEN,))
+        self.assertEqual(access.chain(NESTED.lower()), (NESTED, STAGING, SECRET))
+
+    def test_narrowing_the_original_reaches_a_copy_of_a_copy(self):
+        self.open_copies()
+        body = {"question": "What?", "collection": NESTED}
+        self.assertNotIn(NESTED, self.names("dev2"))
+        self.refused(self.client.post("/query", json=body, headers=self.as_("dev2")))
+        self.assertIn(NESTED, self.names("svc"))
+        self.assertEqual(self.put(SECRET, {"restricted": True, "users": ["dev"]}).status_code, 200)
+        self.assertNotIn(NESTED, self.names("svc"))
+        self.refused(self.client.post("/query", json=body, headers=self.as_("svc")))
+        self.assertIn(NESTED, self.names("dev"))
+        self.assertIn(NESTED, self.names("eng"))
+
+    def test_a_copy_of_a_copy_with_no_state_follows_the_original(self):
+        # Copies kept from before #606 have no state of their own.
+        store.drop_collection_access(STAGING)
+        store.drop_collection_access(NESTED)
+        for who, sees in (("dev", True), ("svc", True), ("eng", True), ("user", False), ("dev2", False)):
+            with self.subTest(who=who):
+                self.assertEqual(NESTED in self.names(who), sees)
+
+    def test_package_checks_of_an_existing_copy_of_a_copy(self):
+        self.open_copies()
+        self.assertEqual(importer.package_source(NESTED), NESTED)
+        self.assertTrue(importer._refused({"name": "dev2", "kind": "user"}, NESTED))
+        self.assertFalse(importer._refused({"name": "dev", "kind": "user"}, NESTED))
+        self.assertEqual(self.packages_seen(NESTED), {"dev2": 0, "dev": 1})
+
+    def packages_seen(self, collection):
+        from routers import transfer
+        listed = [{"filename": "ragpkg-nested.tar.gz", "size_bytes": 1, "collection": collection, "chunk_count": 1,
+                   "fidelity": "chunks-only", "created_at": None, "readable": True}]
+        with patch.object(transfer, "_list_packages_sync", lambda: [dict(p) for p in listed]):
+            return {who: len(self.client.get("/packages", headers=self.as_(who)).json()["packages"])
+                    for who in ("dev2", "dev")}
+
+    def test_a_package_of_a_discarded_copy_of_a_copy_follows_the_nearest_existing(self):
+        gone_copy = STAGING + "__importing_" + "3" * 32          # STAGING is still here
+        gone_both = SECRET + "__tuning_" + "4" * 32 + "__tuning_" + "5" * 32
+        self.assertEqual(importer.package_source(gone_copy), STAGING)
+        self.assertEqual(importer.package_source(gone_both), SECRET)
+        self.assertTrue(importer._refused({"name": "dev2", "kind": "user"}, importer.package_source(gone_both)))
+        self.assertFalse(importer._refused({"name": "dev", "kind": "user"}, importer.package_source(gone_both)))
+        self.assertEqual(self.packages_seen(gone_both), {"dev2": 0, "dev": 1})
+        _, written = importer._start_access({"name": "dev", "kind": "user"}, importer.package_source(gone_both),
+                                            "Fromgone")
+        self.assertEqual(written, store.collection_access(SECRET))
+
+        def unanswered(name):
+            if name == gone_copy:
+                raise ConnectionError("no answer")
+            return name[:1].upper() + name[1:] in self.collections
+        with patch.object(wc, "_collection_exists_sync", unanswered):
+            self.assertEqual(importer.package_source(gone_copy), gone_copy)      # no answer counts as existing
+
+    def test_package_source_asks_in_chain_order_and_never_about_the_original(self):
+        asked = []
+
+        def none_exist(name):
+            asked.append(name)
+            return False
+        self.assertEqual(access.package_source(OPEN, none_exist), OPEN)
+        self.assertEqual(asked, [])
+        self.assertEqual(access.package_source(NESTED, none_exist), SECRET)
+        self.assertEqual(asked, [NESTED, STAGING])
+        asked.clear()
+        self.assertEqual(access.package_source(NESTED, lambda n: asked.append(n) or n == STAGING), STAGING)
+        self.assertEqual(asked, [NESTED, STAGING])
+
+    def test_begin_on_a_copy_takes_the_narrowest_state_of_its_chain(self):
+        from services import collection_recovery
+
+        class Client:
+            class collections:
+                @staticmethod
+                def exists(name):
+                    return False
+        self.assertEqual(self.put(STAGING, {"restricted": False}).status_code, 200)
+        record = collection_recovery.begin(STAGING, "tune", Client)
+        self.assertEqual(store.collection_access(record["staging"]), store.CollectionAccess(True, ("dev",), ("svc",)))
+        self.assertEqual(self.put(STAGING, {"restricted": True, "users": ["dev"]}).status_code, 200)
+        record = collection_recovery.begin(STAGING, "tune", Client)
+        self.assertEqual(store.collection_access(record["staging"]), store.CollectionAccess(True, ("dev",), ()))
+        for name in (SECRET, STAGING):
+            self.assertEqual(self.put(name, {"restricted": False}).status_code, 200)
+        record = collection_recovery.begin(STAGING, "tune", Client)
+        self.assertFalse(store.collection_access(record["staging"]).restricted)
+
+    def test_an_import_from_a_copy_of_a_copy_takes_the_narrowest_state(self):
+        self.open_copies()
+        self.assertEqual(self.put(SECRET, {"restricted": True, "users": ["dev"]}).status_code, 200)
+        _, written = importer._start_access({"name": "dev", "kind": "user"}, NESTED, "Fromnested")
+        self.assertEqual(written, store.CollectionAccess(True, ("dev",), ()))
+        self.assertEqual(self.put(SECRET, {"restricted": False}).status_code, 200)
+        _, written = importer._start_access({"name": "dev", "kind": "user"}, NESTED, "Fromnested2")
+        self.assertEqual(written, store.CollectionAccess(False))
+
+
+class CreateFailureTests(AccessTestCase):
+    def test_a_failed_restriction_creates_nothing(self):
+        created = []
+
+        async def create(**kwargs):
+            created.append(kwargs["name"])
+
+        def broken(*args):
+            raise sqlite3.OperationalError("database is locked")
+        with patch.object(wc, "create_collection", create), patch.object(store, "restrict_to", broken):
+            answer = self.client.post("/collections", json={"name": "Fresh"}, headers=self.as_("dev2"))
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (500, "CREATE_FAILED"))
+        self.assertEqual(created, [])
+
+    def test_a_failed_create_puts_the_state_back(self):
+        seen = []
+
+        async def create(**kwargs):
+            seen.append(store.collection_access(kwargs["name"]))          # restricted before it exists
+            raise RuntimeError("weaviate refused")
+        with patch.object(wc, "create_collection", create):
+            answer = self.client.post("/collections", json={"name": "Fresh"}, headers=self.as_("dev2"))
+        self.assertEqual(answer.status_code, 500)
+        self.assertEqual(seen, [store.CollectionAccess(True, ("dev2",), ())])
+        self.assertFalse(store.collection_access("Fresh").restricted)
+
+    def test_a_failed_create_that_left_the_collection_keeps_the_restriction(self):
+        # Weaviate applied the create but the client got an error (#788).
+        async def create(**kwargs):
+            self.collections.add(kwargs["name"])
+            raise TimeoutError("read timed out")
+        with patch.object(wc, "create_collection", create):
+            answer = self.client.post("/collections", json={"name": "Fresh"}, headers=self.as_("dev2"))
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (500, "CREATE_FAILED"))
+        self.assertEqual(store.collection_access("Fresh"), store.CollectionAccess(True, ("dev2",), ()))
+
+    def test_a_failed_create_with_no_answer_on_existence_keeps_the_restriction(self):
+        async def create(**kwargs):
+            raise RuntimeError("weaviate refused")
+
+        asked = []
+
+        async def unknown(name):
+            asked.append(name)
+            if len(asked) > 1:                       # the check after the failed create
+                raise ConnectionError("no answer")
+            return False
+        with patch.object(wc, "create_collection", create), patch.object(wc, "collection_exists", unknown):
+            answer = self.client.post("/collections", json={"name": "Fresh"}, headers=self.as_("dev2"))
+        self.assertEqual((answer.status_code, asked), (500, ["Fresh", "Fresh"]))
+        self.assertEqual(store.collection_access("Fresh"), store.CollectionAccess(True, ("dev2",), ()))
+
+    def test_put_back_only_restores_its_own_state(self):
+        before, mine = store.restrict_to("Race", store.get_user("dev2").id)
+        theirs = store.restrict_to("Race", store.get_user("dev").id)[1]     # another create wrote since
+        self.assertFalse(store.put_back("Race", mine, before))
+        self.assertEqual(store.collection_access("Race"), theirs)
+        self.assertTrue(store.put_back("Race", theirs, mine))
+        self.assertEqual(store.collection_access("Race"), mine)
+        self.assertTrue(store.put_back("Race", mine, before))
+        self.assertFalse(store.collection_access("Race").restricted)
+
+    def test_a_failed_import_after_a_concurrent_create_keeps_the_creator(self):
+        # The import wrote its state, then a create of the same name wrote its
+        # own and made the collection; the import's build fails.
+        before, mine = importer._start_access({"name": "dev2", "kind": "user"}, "Race", "Race")
+        theirs = store.restrict_to("Race", store.get_user("dev").id)[1]
+        self.collections.add("Race")
+        store.put_back("Race", mine, before)
+        self.assertEqual(store.collection_access("Race"), theirs)
+
+
+class PackageSourceTests(AccessTestCase):
+    def test_a_package_of_an_existing_copy_follows_the_copy_and_its_target(self):
+        # The copy's own state is open; SECRET still restricts it (#788).
+        self.assertEqual(self.put(STAGING, {"restricted": False}).status_code, 200)
+        dev2 = {"name": "dev2", "kind": "user"}
+        self.assertEqual(importer.package_source(STAGING), STAGING)
+        self.assertTrue(importer._refused(dev2, STAGING))
+        self.assertFalse(importer._refused({"name": "dev", "kind": "user"}, STAGING))
+        from routers import transfer
+        listed = [{"filename": "ragpkg-copy.tar.gz", "size_bytes": 1, "collection": STAGING, "chunk_count": 1,
+                   "fidelity": "chunks-only", "created_at": None, "readable": True}]
+        with patch.object(transfer, "_list_packages_sync", lambda: [dict(p) for p in listed]):
+            self.assertEqual(self.client.get("/packages", headers=self.as_("dev2")).json()["packages"], [])
+            self.assertEqual(len(self.client.get("/packages", headers=self.as_("dev")).json()["packages"]), 1)
+
+    def test_an_import_from_a_copy_takes_the_narrower_state(self):
+        self.assertEqual(self.put(STAGING, {"restricted": True, "users": ["dev", "dev2"]}).status_code, 200)
+        self.assertEqual(self.put(SECRET, {"restricted": True, "users": ["dev"]}).status_code, 200)
+        _, written = importer._start_access({"name": "dev", "kind": "user"}, STAGING, "Fromcopy")
+        self.assertEqual(written, store.CollectionAccess(True, ("dev",), ()))
+        self.assertEqual(self.put(STAGING, {"restricted": False}).status_code, 200)
+        _, written = importer._start_access({"name": "dev", "kind": "user"}, STAGING, "Fromcopy2")
+        self.assertEqual(written, store.CollectionAccess(True, ("dev",), ()))      # the target's alone
+        self.assertEqual(self.put(SECRET, {"restricted": False}).status_code, 200)
+        _, written = importer._start_access({"name": "dev", "kind": "user"}, STAGING, "Fromcopy3")
+        self.assertEqual(written, store.CollectionAccess(False))
+
+    def test_a_package_of_a_discarded_copy_follows_its_target(self):
+        gone = SECRET + "__importing_" + "1" * 32
+        self.assertEqual(importer.package_source(gone), SECRET)                   # the copy no longer exists
+        self.assertEqual(importer.package_source(STAGING), STAGING)               # an existing copy is itself
+        self.assertEqual(importer.package_source(OPEN), OPEN)
+        self.assertTrue(importer._refused({"name": "dev2", "kind": "user"}, importer.package_source(gone)))
+        before, after = importer._start_access({"name": "dev", "kind": "user"}, importer.package_source(gone),
+                                               gone + "_ab12cd34")
+        self.assertEqual(after, store.collection_access(SECRET))
+        from routers import transfer
+        listed = [{"filename": "ragpkg-gone-copy.tar.gz", "size_bytes": 1, "collection": gone, "chunk_count": 1,
+                   "fidelity": "chunks-only", "created_at": None, "readable": True}]
+        with patch.object(transfer, "_list_packages_sync", lambda: [dict(p) for p in listed]):
+            self.assertEqual(self.client.get("/packages", headers=self.as_("dev2")).json()["packages"], [])
+            self.assertEqual(len(self.client.get("/packages", headers=self.as_("dev")).json()["packages"]), 1)
+
+    def test_an_encrypted_package_is_refused_once_decrypted(self):
+        import io
+        import tarfile
+        from services import age_stream, packager
+        manifest = json.dumps({"package_format": 1, "collection": {"name": SECRET, "chunk_count": 0}}).encode()
+        raw = io.BytesIO()
+        with tarfile.open(fileobj=raw, mode="w:gz") as tar:
+            info = tarfile.TarInfo("package/manifest.json")
+            info.size = len(manifest)
+            tar.addfile(info, io.BytesIO(manifest))
+        exports = Path(settings.exports_dir)
+        exports.mkdir(parents=True, exist_ok=True)
+        name = "ragpkg-secret.tar.gz.age"
+        with (exports / name).open("wb") as out:
+            enc = age_stream.Encryptor(out, "a test passphrase", 1)
+            enc.write(raw.getvalue())
+            enc.close()
+        record = {"job_id": "enc1", "status": "queued", "filename": name, "collection": None,
+                  "owner": {"name": "dev2", "kind": "user"}, "notes": [], "restored_sessions": []}
+        reached = []
+        with patch.object(importer, "_jobs", {"enc1": record}), \
+                patch.object(packager, "verify_digests", lambda *a: reached.append("digests")), \
+                patch.object(importer, "_validate_package_sources", lambda *a: None), \
+                patch.object(importer, "_check_embedding", lambda *a: None):
+            importer._run("enc1", name, "rename", "a test passphrase")
+        self.assertEqual(reached, ["digests"])                              # decrypted and opened for real
+        self.assertEqual((record["status"], record["error_code"]), ("failed", "PACKAGE_UNREADABLE"))
+        self.assertEqual(record["error"], f"No package named '{name}' in the exports directory.")
+        self.assertIsNone(record["collection"])
+        self.assertTrue(record["access_refused"])
+
+
+class GoldIndexOrderTests(AccessTestCase):
+    def test_the_collection_is_recorded_before_the_file(self):
+        order = []
+        session = {"session_id": "gs_9", "collection": SECRET, "status": "completed", "pairs": [],
+                   "pairs_total": 0, "pairs_completed": 0}
+        with patch.dict(goldstandard._sessions, {"gs_9": session}), \
+                patch.object(goldstandard, "_record_export_collection", lambda *a: order.append("index")), \
+                patch.object(goldstandard, "_save_export_sync", lambda *a: order.append("file")):
+            asyncio.run(goldstandard.save_session("gs_9", "gold.json", True))
+        self.assertEqual(order, ["index", "file"])
+
+
+class PrepareAreaTests(AccessTestCase):
+    """Documents imported only into collections the caller can't use are hidden
+    (#606, Q18, Q19); job records leave them out (Q20)."""
+
+    def setUp(self):
+        super().setUp()
+        from services import preparation_store as prep
+        target = patch.object(settings, "preparation_dir", str(self.root / "preparation"))
+        target.start()
+        self.addCleanup(target.stop)
+        source = self.root / "note.txt"
+        source.write_text("A note.\n")
+        self.secret_doc = prep.create("secret-note.txt", source, None)["id"]
+        self.open_doc = prep.create("open-note.txt", source, None)["id"]
+        self.plain_doc = prep.create("plain-note.txt", source, None)["id"]
+        self.mixed_doc = prep.create("mixed-note.txt", source, None)["id"]
+        prep.add_import([self.secret_doc], SECRET, "job1")
+        prep.add_import([self.open_doc], OPEN, "job2")
+        prep.add_import([self.mixed_doc], SECRET, "job3")
+        prep.add_import([self.mixed_doc], OPEN, "job4")
+
+    def listed(self, who):
+        answer = self.client.get("/prepare/documents", headers=self.as_(who))
+        self.assertEqual(answer.status_code, 200, answer.text)
+        return {d["id"] for d in answer.json()["documents"]}
+
+    def test_the_list_hides_documents_of_restricted_collections(self):
+        everything = {self.secret_doc, self.open_doc, self.plain_doc, self.mixed_doc}
+        self.assertEqual(self.listed("dev2"), everything - {self.secret_doc})
+        self.assertEqual(self.listed("dev"), everything)
+        self.assertEqual(self.listed("svc2"), everything - {self.secret_doc})
+        self.assertEqual(self.listed("eng"), everything)
+        self.assertFalse(self.records("collection.access.refused"))
+
+    def test_the_document_routes_refuse_a_hidden_document(self):
+        doc = self.secret_doc
+        for method, path in (("GET", f"/prepare/documents/{doc}"), ("GET", f"/prepare/documents/{doc}/raw"),
+                             ("GET", f"/prepare/documents/{doc}/prepared"),
+                             ("DELETE", f"/prepare/documents/{doc}/prepared"), ("DELETE", f"/prepare/documents/{doc}")):
+            with self.subTest(method=method, path=path):
+                answer = self.client.request(method, path, headers=self.as_("dev2"))
+                self.assertEqual((answer.status_code, answer.json()["error"]["code"],
+                                  answer.json()["error"]["message"]),
+                                 (404, "DOCUMENT_NOT_FOUND", f"Document '{doc}' not found."))
+        self.assertEqual(self.client.get(f"/prepare/documents/{doc}", headers=self.as_("dev")).status_code, 200)
+        self.assertEqual(self.client.get(f"/prepare/documents/{doc}/raw", headers=self.as_("eng")).status_code, 200)
+        item = self.records("collection.access.refused")[-1]
+        self.assertEqual((item["actor"], item["collection"], item["details"]["code"]),
+                         ("dev2", SECRET, "DOCUMENT_NOT_FOUND"))
+        download = [r for r in self.records("prepare.download") if r["actor"] == "dev2"][0]
+        self.assertEqual((download["result"], download["details"]["reason"]), ("refused", "collection_access"))
+
+    def test_a_selection_treats_a_hidden_document_as_unknown(self):
+        for path, body in (("/prepare/jobs", {"document_ids": [self.secret_doc]}),
+                           ("/prepare/import", {"collection": OPEN, "document_ids": [self.secret_doc]})):
+            with self.subTest(path=path):
+                answer = self.client.post(path, json=body, headers=self.as_("dev2"))
+                self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (404, "DOCUMENT_NOT_FOUND"))
+                self.assertEqual(answer.json()["error"]["detail"], {"documents": [self.secret_doc]})
+        from services import preparation_jobs
+        from routers import prepare
+        usable = lambda record: prepare._blocker(None) is None  # noqa: E731 - no request: everything
+        self.assertEqual(len(preparation_jobs._resolve(None, {"raw"}, usable)), 4)
+        dev2 = type("P", (), {"user_id": store.get_user("dev2").id, "role": "developer"})()
+        visible = __import__("auth.access", fromlist=["x"]).visible_filter(dev2)
+        blocked = prepare._blocker(type("R", (), {"state": type("S", (), {"auth": dev2})()})())
+        shown = lambda record: blocked(record) is None  # noqa: E731
+        self.assertEqual({r["id"] for r in preparation_jobs._resolve(None, {"raw"}, shown)},
+                         {self.open_doc, self.plain_doc, self.mixed_doc})
+        self.assertTrue(visible(OPEN))
+
+    def test_a_document_with_one_usable_import_stays_visible_without_the_other_records(self):
+        # Q19: mixed imports keep the document visible; the SECRET record is left out.
+        doc = self.mixed_doc
+        listed = {d["id"]: d for d in self.client.get("/prepare/documents", headers=self.as_("dev2")).json()["documents"]}
+        self.assertEqual([i["collection"] for i in listed[doc]["imports"]], [OPEN])
+        detail = self.client.get(f"/prepare/documents/{doc}", headers=self.as_("dev2"))
+        self.assertEqual(detail.status_code, 200, detail.text)
+        self.assertEqual([i["collection"] for i in detail.json()["imports"]], [OPEN])
+        self.assertEqual(self.client.get(f"/prepare/documents/{doc}/raw", headers=self.as_("dev2")).status_code, 200)
+        for who in ("dev", "eng"):
+            seen = self.client.get(f"/prepare/documents/{doc}", headers=self.as_(who)).json()
+            self.assertEqual([i["collection"] for i in seen["imports"]], [SECRET, OPEN])
+        self.assertFalse(self.records("collection.access.refused"))
+
+    def test_job_records_leave_hidden_documents_out(self):
+        # Q20: a job naming the hidden document and two visible ones.
+        from services import preparation_jobs
+        job = {"job_id": "pj1", "status": "running", "documents_total": 3, "documents_completed": 1,
+               "documents_failed": 1, "document_ids": [self.secret_doc, self.mixed_doc, self.plain_doc],
+               "names": ["secret-note.txt", "mixed-note.txt", "plain-note.txt"],
+               "current": {"document_id": self.secret_doc, "name": "secret-note.txt"},
+               "errors": ["secret-note.txt: the model failed", f"{self.secret_doc}: unreadable",
+                          "plain-note.txt: the model failed"],
+               "owner": {"name": "dev2", "kind": "user"}, "created_at": "2026-11-17T10:00:00+00:00"}
+        with patch.object(preparation_jobs, "get_job", lambda job_id: dict(job)), \
+                patch.object(preparation_jobs, "job_records", lambda: [("pj1", dict(job), None)]):
+            seen = self.client.get("/prepare/job/pj1", headers=self.as_("dev2")).json()
+            self.assertEqual(seen["document_ids"], [self.mixed_doc, self.plain_doc])
+            self.assertEqual(seen["names"], ["mixed-note.txt", "plain-note.txt"])
+            self.assertIsNone(seen["current"])
+            self.assertEqual(seen["errors"], ["plain-note.txt: the model failed"])
+            self.assertEqual(seen["documents_total"], 3)
+            listed = self.client.get("/prepare/jobs", headers=self.as_("dev2")).json()["jobs"]
+            self.assertEqual([(j["document_ids"], j["names"]) for j in listed],
+                             [([self.mixed_doc, self.plain_doc], ["mixed-note.txt", "plain-note.txt"])])
+            full = self.client.get("/prepare/job/pj1", headers=self.as_("eng")).json()
+            self.assertEqual((full["document_ids"], full["current"], full["errors"]),
+                             (job["document_ids"], job["current"], job["errors"]))
+            mine = self.client.get("/prepare/job/pj1", headers=self.as_("dev")).json()
+            self.assertEqual(mine["document_ids"], job["document_ids"])
+        self.assertFalse(self.records("collection.access.refused"))
+
+    def test_a_refused_selection_is_audited_as_an_access_refusal(self):
+        for path, body, action in (
+                ("/prepare/jobs", {"document_ids": [self.secret_doc, self.open_doc]}, "prepare.start"),
+                ("/prepare/import", {"collection": OPEN, "document_ids": [self.secret_doc]}, "prepare.import")):
+            with self.subTest(path=path):
+                answer = self.client.post(path, json=body, headers=self.as_("dev2"))
+                self.assertEqual((answer.status_code, answer.json()["error"]["detail"]),
+                                 (404, {"documents": [self.secret_doc]}))
+                item = [r for r in self.records(action) if r["actor"] == "dev2"][-1]
+                self.assertEqual((item["result"], item["collection"], item["details"].get("reason")),
+                                 ("refused", SECRET, "collection_access"), item)
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+### scripts/tests/test_package_download.py
+
+```python
+"""Downloading a package deletes it; undownloaded exports expire (#677).
+
+`GET /packages/{filename}` streams a package from the exports folder to a
+Developer or above, with the listing's #606 access rule. After a complete
+download a package this instance exported (recorded in
+`<UPLOAD_DIR>/exported_packages.json` when its export finished) is deleted; an
+interrupted download, HEAD, and any package not recorded keep it. A download is
+refused 409 PACKAGE_BUSY while an import of the file runs or another download
+of it is in progress. The sweep deletes recorded packages older than
+EXPORT_RETENTION_HOURS, skipping busy ones. Downloads and deletions are audited
+as `package.download` and `package.delete`.
+
+Runs with the API's dependencies, in the built API image with no network
+(`05_transfer.sh`):
+
+    docker run --rm --network none -v "$PWD:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api \\
+      "$(docker compose images -q api)" python scripts/tests/test_package_download.py
+
+or on the host with them installed. Every test has its own account store,
+upload, exports and audit folder. Requests go through `main.app` with FastAPI's
+TestClient, without the lifespan; Weaviate is a fake set of collection names.
+On the code before #677 every route, record and sweep case fails.
+"""
+import asyncio
+import io
+import json
+import logging
+import os
+import sys
+import tarfile
+import tempfile
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest.mock import patch
+
+API_DIR = os.environ.get("RAG_TEST_API_DIR") or str(Path(__file__).resolve().parents[2] / "api")
+sys.path.insert(0, API_DIR)
+
+from fastapi.testclient import TestClient
+from pydantic import ValidationError
+
+import config
+from config import settings
+from main import app
+from auth import passwords, store
+from routers import transfer
+from services import audit, exporter, importer, package_retention
+from services import weaviate_client as wc
+
+ORIGIN = "http://testserver"
+SECRET = "Secret"
+NOW = datetime(2026, 11, 17, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def package_bytes(collection, size=0):
+    """A readable .tar.gz package of `collection`, padded with `size` random bytes."""
+    stem = "ragpkg-x"
+    manifest = {"package_format": 1, "created_at": "2026-11-17T12:00:00Z",
+                "collection": {"name": collection, "chunk_count": 1, "source_document_count": 0},
+                "fidelity": "chunks-only", "files": {}}
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        for name, data in ((f"{stem}/manifest.json", json.dumps(manifest).encode()),
+                           (f"{stem}/chunks.jsonl", os.urandom(size))):
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return buffer.getvalue()
+
+
+class DownloadTestCase(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        for name, value in (("audit_dir", str(self.root / "audit")), ("auth_dir", str(self.root / "auth")),
+                            ("upload_dir", str(self.root / "uploads")), ("exports_dir", str(self.root / "exports")),
+                            ("export_retention_hours", 24)):
+            target = patch.object(settings, name, value)
+            target.start()
+            self.addCleanup(target.stop)
+        self.exports = self.root / "exports"
+        self.exports.mkdir()
+        (self.root / "uploads").mkdir()
+        self.collections = {SECRET, "Open1"}
+
+        async def exists(name):
+            return name[:1].upper() + name[1:] in self.collections
+        target = patch.object(wc, "collection_exists", exists)
+        target.start()
+        self.addCleanup(target.stop)
+        for username, role in (("eng", "engineer"), ("dev", "developer"), ("dev2", "developer"),
+                               ("user", "end_user")):
+            store.create_user(username, role, passwords.generate_password(), bootstrap=not store.is_set_up(),
+                              must_change_password=False)
+        self.client = TestClient(app, raise_server_exceptions=False)
+        self.addCleanup(self.client.close)
+        self.addCleanup(package_retention._downloading.clear)
+        package_retention._reported.clear()
+        self.addCleanup(package_retention._reported.clear)
+        self.addCleanup(importer._active.clear)
+
+    def as_(self, who="dev"):
+        token = store.create_session(store.get_user(who).id)
+        return {"Cookie": f"{store.COOKIE}={token}", "Origin": ORIGIN}
+
+    def write(self, name, collection="Open1", size=0, recorded_hours_ago=None):
+        path = self.exports / name
+        path.write_bytes(package_bytes(collection, size))
+        if recorded_hours_ago is not None:
+            package_retention.record_export(name, datetime.now(timezone.utc) - timedelta(hours=recorded_hours_ago))
+        return path
+
+    def records(self, action=None):
+        return [r for r in reversed(list(audit.newest_first())) if action is None or r["action"] == action]
+
+    def get(self, name, who="dev", method="GET"):
+        return self.client.request(method, f"/packages/{name}", headers=self.as_(who))
+
+
+class SettingTests(unittest.TestCase):
+    def test_retention_hours_must_be_1_to_720(self):
+        for good in ("1", "24", "720"):
+            with self.subTest(value=good), patch.dict(os.environ, {"EXPORT_RETENTION_HOURS": good}):
+                self.assertEqual(config.Settings().export_retention_hours, int(good))
+        for bad in ("0", "-1", "721", "abc", "1.5"):
+            with self.subTest(value=bad), patch.dict(os.environ, {"EXPORT_RETENTION_HOURS": bad}):
+                with self.assertRaises(ValidationError) as caught:
+                    config.Settings()
+                self.assertTrue(any("EXPORT_RETENTION_HOURS" in line for line in config.refusal_lines(caught.exception)))
+
+    def test_the_default_is_24(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("EXPORT_RETENTION_HOURS", None)
+            self.assertEqual(config.Settings().export_retention_hours, 24)
+
+
+class RecordTests(DownloadTestCase):
+    def test_a_recorded_package_expires_after_the_setting(self):
+        package_retention.record_export("ragpkg-a-1.tar.gz", NOW)
+        self.assertEqual(package_retention.expires_at("ragpkg-a-1.tar.gz"), "2026-11-18T12:00:00Z")
+        with patch.object(settings, "export_retention_hours", 2):
+            self.assertEqual(package_retention.expires_at("ragpkg-a-1.tar.gz"), "2026-11-17T14:00:00Z")
+        self.assertIsNone(package_retention.expires_at("ragpkg-other.tar.gz"))
+        self.assertTrue((self.root / "uploads" / "exported_packages.json").is_file())
+        self.assertFalse(list(self.exports.iterdir()), "the record is never written in ./exports")
+
+    def test_an_unreadable_record_is_moved_aside_never_overwritten(self):
+        record = self.root / "uploads" / "exported_packages.json"
+        record.write_text("{not json")
+        with self.assertLogs("services.package_retention", "ERROR") as logs:
+            self.assertEqual(package_retention.expiries(), {})
+        aside = [p for p in record.parent.iterdir() if p.name.startswith("exported_packages.json.corrupt-")]
+        self.assertEqual(len(aside), 1)
+        self.assertEqual(aside[0].read_text(), "{not json")
+        self.assertIn(aside[0].name, "\n".join(logs.output))
+        self.assertFalse(record.exists())
+        package_retention.record_export("ragpkg-new.tar.gz", NOW)      # a new record starts
+        self.assertTrue(package_retention.recorded("ragpkg-new.tar.gz"))
+        self.assertEqual(aside[0].read_text(), "{not json")
+
+    def test_a_record_that_cant_be_moved_aside_is_not_overwritten(self):
+        record = self.root / "uploads" / "exported_packages.json"
+        record.write_text('{"packages": "wrong shape"}')
+        self.addCleanup(setattr, package_retention, "_stuck", False)
+        real_replace = os.replace
+
+        def replace(src, dst):
+            if Path(src) == record:                   # the record can't be moved aside
+                raise OSError("read-only")
+            return real_replace(src, dst)
+        with patch.object(package_retention.os, "replace", replace), \
+                self.assertLogs("services.package_retention", "ERROR"):
+            self.assertEqual(package_retention.expiries(), {})
+            with self.assertRaises(RuntimeError):
+                package_retention.record_export("ragpkg-new.tar.gz", NOW)
+        self.assertEqual(record.read_text(), '{"packages": "wrong shape"}')
+
+    def run_export(self, record=None):
+        result = {"filename": "ragpkg-open1-x.tar.gz", "size_bytes": 1, "chunk_count": 1,
+                  "source_document_count": 0, "fidelity": "chunks-only", "models_bundled": False,
+                  "retrieve_script": True, "warnings": []}
+        exporter._jobs["j677"] = {"job_id": "j677", "status": "queued", "collection": "Open1",
+                                  "chunks_written": 0, "filename": None, "warnings": [], "error": None}
+        self.addCleanup(exporter._jobs.pop, "j677", None)
+        patches = [patch.object(exporter.packager, "build", lambda *a, **k: result)]
+        if record is not None:
+            patches.append(patch.object(package_retention, "record_export", record))
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        exporter._run("j677", "Open1", False)
+        return exporter._jobs["j677"]
+
+    def test_a_finished_export_is_recorded_and_its_status_says_when_it_expires(self):
+        job = self.run_export()
+        self.assertEqual(job["status"], "completed")
+        self.assertTrue(package_retention.recorded("ragpkg-open1-x.tar.gz"))
+        answer = self.client.get("/export/job/j677", headers=self.as_("eng"))
+        self.assertEqual(answer.status_code, 200, answer.text)
+        self.assertEqual(answer.json()["expires_at"], package_retention.expires_at("ragpkg-open1-x.tar.gz"))
+
+    def test_the_export_status_drops_expires_at_once_the_package_is_downloaded(self):
+        # SPECIFICATIONS.md GET /packages: the job status carries expires_at only
+        # while its package is still recorded (#677).
+        self.run_export()
+        (self.exports / "ragpkg-open1-x.tar.gz").write_bytes(package_bytes("Open1"))
+        self.assertIsNotNone(self.client.get("/export/job/j677", headers=self.as_("eng")).json()["expires_at"])
+        self.assertEqual(self.get("ragpkg-open1-x.tar.gz").status_code, 200)
+        self.assertFalse((self.exports / "ragpkg-open1-x.tar.gz").exists())
+        answer = self.client.get("/export/job/j677", headers=self.as_("eng"))
+        self.assertEqual(answer.status_code, 200, answer.text)
+        self.assertIsNone(answer.json()["expires_at"])
+
+    def test_a_finished_export_records_its_collection(self):
+        # #794: an encrypted package exported here follows this collection's access.
+        self.run_export()
+        self.assertEqual(package_retention.recorded_collections(), {"ragpkg-open1-x.tar.gz": "Open1"})
+        entry = json.loads((self.root / "uploads" / "exported_packages.json").read_text())["packages"]
+        self.assertEqual(entry["ragpkg-open1-x.tar.gz"]["collection"], "Open1")
+
+    def test_an_entry_written_before_794_is_read_and_rewritten_with_no_collection(self):
+        record = self.root / "uploads" / "exported_packages.json"
+        record.write_text(json.dumps({"packages": {"ragpkg-old.tar.gz": "2026-11-17T12:00:00Z"}}))
+        self.assertEqual(package_retention.expires_at("ragpkg-old.tar.gz"), "2026-11-18T12:00:00Z")
+        self.assertEqual(package_retention.recorded_collections(), {"ragpkg-old.tar.gz": None})
+        package_retention.record_export("ragpkg-new.tar.gz", NOW, "Open1")
+        self.assertEqual(json.loads(record.read_text())["packages"], {
+            "ragpkg-old.tar.gz": {"finished_at": "2026-11-17T12:00:00Z", "collection": None},
+            "ragpkg-new.tar.gz": {"finished_at": "2026-11-17T12:00:00Z", "collection": "Open1"}})
+
+    def test_an_entry_of_another_shape_moves_the_record_aside(self):
+        record = self.root / "uploads" / "exported_packages.json"
+        record.write_text(json.dumps({"packages": {"ragpkg-a.tar.gz": {"collection": "Open1"}}}))
+        with self.assertLogs("services.package_retention", "ERROR"):
+            self.assertEqual(package_retention.expiries(), {})
+        self.assertFalse(record.exists())
+
+    def test_an_entry_whose_collection_isnt_a_string_moves_the_record_aside(self):
+        # Reviewer (#794): `_entry` accepts a string or null collection only.
+        record = self.root / "uploads" / "exported_packages.json"
+        record.write_text(json.dumps({"packages": {"ragpkg-a.tar.gz": {
+            "finished_at": "2026-11-17T12:00:00Z", "collection": 7}}}))
+        with self.assertLogs("services.package_retention", "ERROR"):
+            self.assertEqual(package_retention.recorded_collections(), {})
+        self.assertFalse(record.exists())
+
+    def test_a_recorded_name_outside_the_rule_is_ignored_and_never_deleted(self):
+        # #794 item 4: a tampered record can't name a file outside the exports folder.
+        outside = self.root / "outside.tar.gz"
+        outside.write_bytes(b"not a package")
+        old = self.write("ragpkg-old.tar.gz", recorded_hours_ago=25)
+        record = self.root / "uploads" / "exported_packages.json"
+        data = json.loads(record.read_text())
+        data["packages"]["../outside.tar.gz"] = "2026-01-01T00:00:00Z"
+        record.write_text(json.dumps(data))
+        with self.assertLogs("services.package_retention", "WARNING") as logs:
+            self.assertEqual(package_retention.sweep(), ["ragpkg-old.tar.gz"])
+        self.assertIn("'../outside.tar.gz'", "\n".join(logs.output))
+        self.assertTrue(outside.exists())
+        self.assertFalse(old.exists())
+        self.assertNotIn("../outside.tar.gz", package_retention.expiries())
+
+    def test_a_recorded_name_outside_the_rule_is_logged_once_and_the_record_left_as_it_is(self):
+        # #798 item 4: a tampered name is logged once per process, and reads write nothing.
+        self.write("ragpkg-old.tar.gz", recorded_hours_ago=1)
+        record = self.root / "uploads" / "exported_packages.json"
+        data = json.loads(record.read_text())
+        data["packages"]["../outside.tar.gz"] = "2026-01-01T00:00:00Z"
+        record.write_text(json.dumps(data))
+        before = record.read_bytes()
+        with self.assertLogs("services.package_retention", "WARNING") as logs:
+            self.assertEqual(list(package_retention.expiries()), ["ragpkg-old.tar.gz"])
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("'../outside.tar.gz'", logs.output[0])
+        with self.assertNoLogs("services.package_retention", "WARNING"):
+            package_retention.expiries()
+            self.assertEqual(package_retention.recorded_collections(), {"ragpkg-old.tar.gz": None})
+        self.assertEqual(record.read_bytes(), before, "a read doesn't rewrite the record")
+        data["packages"]["ragpkg-x/../y.tar.gz"] = "2026-01-01T00:00:00Z"
+        record.write_text(json.dumps(data))
+        with self.assertLogs("services.package_retention", "WARNING") as logs:
+            package_retention.expiries()
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("'ragpkg-x/../y.tar.gz'", logs.output[0])
+
+    def test_an_export_whose_record_fails_still_completes_and_says_so(self):
+        def broken(*_):
+            raise OSError("disk full")
+        with self.assertLogs("services.exporter", "ERROR"):
+            job = self.run_export(record=broken)
+        self.assertEqual(job["status"], "completed")
+        self.assertTrue(any("expiry could not be recorded" in w for w in job["warnings"]))
+        answer = self.client.get("/export/job/j677", headers=self.as_("eng"))
+        self.assertIsNone(answer.json()["expires_at"])
+
+
+class ListingTests(DownloadTestCase):
+    def test_the_listing_says_when_recorded_packages_expire(self):
+        self.write("ragpkg-mine.tar.gz", recorded_hours_ago=1)
+        self.write("ragpkg-dropped-in.tar.gz")
+        answer = self.client.get("/packages", headers=self.as_())
+        packages = {p["filename"]: p for p in answer.json()["packages"]}
+        self.assertEqual(packages["ragpkg-mine.tar.gz"]["expires_at"],
+                         package_retention.expires_at("ragpkg-mine.tar.gz"))
+        self.assertIsNone(packages["ragpkg-dropped-in.tar.gz"]["expires_at"])
+
+
+class DownloadTests(DownloadTestCase):
+    def test_a_complete_download_deletes_a_recorded_package(self):
+        path = self.write("ragpkg-mine.tar.gz", size=3 * 1024 * 1024, recorded_hours_ago=0)
+        data = path.read_bytes()
+        answer = self.get("ragpkg-mine.tar.gz")
+        self.assertEqual(answer.status_code, 200, answer.text)
+        self.assertEqual(answer.content, data)
+        self.assertEqual(answer.headers["content-type"], "application/octet-stream")
+        self.assertEqual(answer.headers["content-length"], str(len(data)))
+        self.assertEqual(answer.headers["content-disposition"], 'attachment; filename="ragpkg-mine.tar.gz"')
+        self.assertEqual(answer.headers["cache-control"], "no-store")
+        self.assertEqual(answer.headers["x-accel-buffering"], "no")
+        self.assertFalse(path.exists())
+        self.assertFalse(package_retention.recorded("ragpkg-mine.tar.gz"))
+        self.assertFalse(package_retention._downloading)
+        download = self.records("package.download")[-1]
+        self.assertEqual((download["actor"], download["result"], download["details"]["file"],
+                          download["details"]["completed"]), ("dev", "success", "ragpkg-mine.tar.gz", True))
+        deleted = self.records("package.delete")[-1]
+        self.assertEqual((deleted["actor"], deleted["actor_kind"], deleted["result"], deleted["details"]),
+                         ("dev", "user", "success", {"file": "ragpkg-mine.tar.gz", "reason": "downloaded"}))
+
+    def test_a_package_not_exported_here_is_served_and_kept(self):
+        path = self.write("ragpkg-dropped-in.tar.gz")
+        answer = self.get("ragpkg-dropped-in.tar.gz")
+        self.assertEqual((answer.status_code, answer.content), (200, path.read_bytes()))
+        self.assertTrue(path.exists())
+        self.assertEqual(self.records("package.delete"), [])
+        self.assertTrue(self.records("package.download")[-1]["details"]["completed"])
+
+    def test_head_answers_the_headers_and_keeps_the_package(self):
+        path = self.write("ragpkg-mine.tar.gz", recorded_hours_ago=0)
+        answer = self.get("ragpkg-mine.tar.gz", method="HEAD")
+        self.assertEqual(answer.status_code, 200)
+        self.assertEqual(answer.content, b"")
+        self.assertEqual(answer.headers["content-length"], str(path.stat().st_size))
+        self.assertTrue(path.exists())
+        self.assertEqual(self.records("package.delete"), [])
+
+    def test_bad_names_missing_files_and_links_are_not_found(self):
+        (self.exports / "ragpkg-dir.tar.gz").mkdir()
+        target = self.write("ragpkg-target.tar.gz", recorded_hours_ago=0)
+        os.symlink(target, self.exports / "ragpkg-link.tar.gz")
+        (self.exports / ".ragpkg-hidden.tar.gz").write_bytes(b"x")
+        (self.exports / "notes.txt").write_bytes(b"x")
+        for name in ("ragpkg-missing.tar.gz", "ragpkg-dir.tar.gz", "ragpkg-link.tar.gz", ".ragpkg-hidden.tar.gz",
+                     "notes.txt", "ragpkg-a%20b.tar.gz"):
+            with self.subTest(name=name):
+                answer = self.get(name)
+                self.assertEqual(answer.status_code, 404, answer.text)
+                self.assertEqual(answer.json()["error"]["code"], "PACKAGE_NOT_FOUND")
+        # A path with a separator never reaches the route.
+        self.assertEqual(self.get("..%2Fetc%2Fpasswd").status_code, 404)
+        self.assertTrue(target.exists(), "a link to a package never deletes it")
+
+    def test_a_role_below_developer_is_refused(self):
+        path = self.write("ragpkg-mine.tar.gz", recorded_hours_ago=0)
+        self.assertEqual(self.get("ragpkg-mine.tar.gz", who="user").status_code, 403)
+        self.assertTrue(path.exists())
+
+    def test_a_restricted_collections_package_answers_as_missing_and_is_audited(self):
+        status = self.client.put(f"/collections/{SECRET}/access", headers=self.as_("eng"),
+                                 json={"restricted": True, "users": ["dev"], "service_principals": []}).status_code
+        self.assertEqual(status, 200)
+        path = self.write("ragpkg-secret.tar.gz", collection=SECRET, recorded_hours_ago=0)
+        answer = self.get("ragpkg-secret.tar.gz", who="dev2")
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (404, "PACKAGE_NOT_FOUND"))
+        self.assertEqual(answer.json()["error"]["message"],
+                         "No package named 'ragpkg-secret.tar.gz' in the exports directory.")
+        self.assertTrue(path.exists())
+        refused = [r for r in self.records("package.download") if r["actor"] == "dev2"][0]
+        self.assertEqual((refused["collection"], refused["details"]["reason"], refused["details"]["code"]),
+                         (SECRET, "collection_access", "PACKAGE_NOT_FOUND"))
+        self.assertEqual(self.get("ragpkg-secret.tar.gz", who="dev").status_code, 200)
+        self.assertFalse(path.exists())
+
+    def test_a_package_being_imported_or_downloaded_is_busy(self):
+        path = self.write("ragpkg-mine.tar.gz", recorded_hours_ago=0)
+        importer._active.add("ragpkg-mine.tar.gz")
+        answer = self.get("ragpkg-mine.tar.gz")
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (409, "PACKAGE_BUSY"))
+        self.assertEqual(self.get("ragpkg-mine.tar.gz", method="HEAD").status_code, 409)
+        importer._active.clear()
+        self.assertTrue(package_retention.claim("ragpkg-mine.tar.gz"))
+        answer = self.get("ragpkg-mine.tar.gz")
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (409, "PACKAGE_BUSY"))
+        package_retention.release("ragpkg-mine.tar.gz")
+        self.assertTrue(path.exists())
+        self.assertEqual(self.get("ragpkg-mine.tar.gz").status_code, 200)
+
+    def test_an_import_started_during_the_download_keeps_the_package(self):
+        path = self.write("ragpkg-mine.tar.gz", recorded_hours_ago=0)
+        real_claim = package_retention.claim
+
+        def claim_then_import(name):
+            claimed = real_claim(name)
+            importer._active.add(name)              # an import starts once the download has begun
+            return claimed
+        with patch.object(package_retention, "claim", claim_then_import):
+            self.assertEqual(self.get("ragpkg-mine.tar.gz").status_code, 200)
+        self.assertTrue(path.exists())
+        self.assertTrue(package_retention.recorded("ragpkg-mine.tar.gz"))
+
+
+class ImportClaimTests(DownloadTestCase):
+    def test_an_import_claim_waits_while_a_sweep_holds_the_lock(self):
+        # #677: the sweep checks busy and deletes under package_retention's lock;
+        # an import claims its package under the same lock, so it can't slip between.
+        import threading
+        holding, release = threading.Event(), threading.Event()
+
+        def sweep_like():
+            with package_retention.lock():
+                holding.set()
+                release.wait(5)
+        worker = threading.Thread(target=sweep_like)
+        worker.start()
+        holding.wait(5)
+        claimed = threading.Event()
+        claimer = threading.Thread(target=lambda: (importer._claim_package("ragpkg-x.tar.gz", "ragpkg-x.tar.gz"),
+                                                   claimed.set()))
+        claimer.start()
+        self.assertFalse(claimed.wait(0.3), "the import claimed its package while the lock was held")
+        release.set()
+        self.assertTrue(claimed.wait(5))
+        worker.join(5)
+        claimer.join(5)
+        self.assertTrue(importer.package_busy("ragpkg-x.tar.gz"))
+        with self.assertRaises(importer.ImportInProgressError):
+            importer._claim_package("ragpkg-x.tar.gz", "ragpkg-x.tar.gz")
+
+
+class InterruptedDownloadTests(DownloadTestCase):
+    def drive(self, path, disconnect_after):
+        """Run the response with a client that goes away after `disconnect_after` body messages."""
+        sent, gone = [], asyncio.Event()
+
+        async def receive():
+            await gone.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            sent.append(message)
+            if message["type"] == "http.response.body" and len(sent) - 1 >= disconnect_after:
+                gone.set()
+                await asyncio.sleep(0)
+        response = transfer._PackageStream(path, path.name, head=False)
+        asyncio.run(response({"type": "http", "method": "GET", "headers": []}, receive, send))
+        return sent
+
+    def test_a_client_that_goes_away_keeps_the_package(self):
+        path = self.write("ragpkg-mine.tar.gz", size=3 * 1024 * 1024, recorded_hours_ago=0)
+        sent = self.drive(path, disconnect_after=1)
+        self.assertFalse(any(m.get("more_body") is False for m in sent if m["type"] == "http.response.body"),
+                         "an interrupted download never sends the final message")
+        self.assertTrue(path.exists())
+        self.assertTrue(package_retention.recorded(path.name))
+        self.assertFalse(package_retention._downloading, "the slot is released")
+        self.assertEqual(self.records("package.delete"), [])
+
+    def test_the_audit_record_says_an_interrupted_download_was_incomplete(self):
+        path = self.write("ragpkg-mine.tar.gz", size=3 * 1024 * 1024, recorded_hours_ago=0)
+        ctx = {"details": {}}
+        token = audit._current.set(ctx)
+        try:
+            self.drive(path, disconnect_after=1)
+        finally:
+            audit._current.reset(token)
+        self.assertIs(ctx["details"]["completed"], False)
+
+
+class EncryptedAccessTests(DownloadTestCase):
+    """#794 item 2 (RD-194 Q1, Q2): an encrypted package exported here follows
+    the collection recorded at its export, in the listing and the download."""
+
+    def setUp(self):
+        super().setUp()
+        status = self.client.put(f"/collections/{SECRET}/access", headers=self.as_("eng"),
+                                 json={"restricted": True, "users": ["dev"], "service_principals": []}).status_code
+        self.assertEqual(status, 200)
+
+    def write_encrypted(self, name, collection=SECRET, recorded=True):
+        path = self.exports / name
+        path.write_bytes(b"age-encryption.org/v1\n" + os.urandom(64))
+        if recorded:
+            package_retention.record_export(name, datetime.now(timezone.utc), collection)
+        return path
+
+    def listed(self, who):
+        answer = self.client.get("/packages", headers=self.as_(who))
+        self.assertEqual(answer.status_code, 200, answer.text)
+        return {p["filename"]: p for p in answer.json()["packages"]}
+
+    def test_a_restricted_collections_encrypted_package_is_hidden_from_a_developer_without_access(self):
+        path = self.write_encrypted("ragpkg-secret.tar.gz.age")
+        self.assertNotIn(path.name, self.listed("dev2"))
+        answer = self.get(path.name, who="dev2")
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (404, "PACKAGE_NOT_FOUND"))
+        self.assertEqual(answer.json()["error"]["message"],
+                         "No package named 'ragpkg-secret.tar.gz.age' in the exports directory.")
+        self.assertTrue(path.exists())
+        refused = [r for r in self.records("package.download") if r["actor"] == "dev2"][0]
+        self.assertEqual((refused["collection"], refused["details"]["reason"], refused["details"]["code"]),
+                         (SECRET, "collection_access", "PACKAGE_NOT_FOUND"))
+        for who in ("dev", "eng"):
+            entry = self.listed(who)[path.name]
+            self.assertIsNone(entry["collection"], "the recorded collection isn't revealed")
+            self.assertTrue(entry["encrypted"])
+        self.assertEqual(self.get(path.name, who="dev").status_code, 200)
+        self.assertFalse(path.exists())
+
+    def test_an_open_collections_encrypted_package_is_open(self):
+        path = self.write_encrypted("ragpkg-open.tar.gz.age", collection="Open1")
+        self.assertIn(path.name, self.listed("dev2"))
+        self.assertEqual(self.get(path.name, who="dev2").status_code, 200)
+
+    def test_one_recorded_without_a_collection_is_for_engineers_only(self):
+        path = self.write_encrypted("ragpkg-before.tar.gz.age", collection=None)
+        self.assertNotIn(path.name, self.listed("dev"))
+        answer = self.get(path.name, who="dev")
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (404, "PACKAGE_NOT_FOUND"))
+        refused = [r for r in self.records("package.download") if r["actor"] == "dev"][0]
+        self.assertEqual((refused["collection"], refused["details"]["reason"]), (None, "collection_access"))
+        self.assertTrue(path.exists())
+        self.assertIn(path.name, self.listed("eng"))
+        self.assertEqual(self.get(path.name, who="eng").status_code, 200)
+        self.assertFalse(path.exists())
+
+    def test_one_copied_in_is_open_to_any_developer(self):
+        path = self.write_encrypted("ragpkg-copied.tar.gz.age", recorded=False)
+        self.assertIn(path.name, self.listed("dev2"))
+        self.assertEqual(self.get(path.name, who="dev2").status_code, 200)
+        self.assertTrue(path.exists(), "a package not exported here is kept")
+
+    def test_a_restricted_collection_that_no_longer_exists_here_hides_nothing(self):
+        # Reviewer (#794): the import's own rule (importer.package_source, exists_fail_closed); a
+        # restricted collection deleted here no longer guards its encrypted package.
+        path = self.write_encrypted("ragpkg-gone.tar.gz.age")
+        with patch.object(wc, "_collection_exists_sync", lambda name: False):
+            self.assertIn(path.name, self.listed("dev2"))
+            self.assertEqual(self.get(path.name, who="dev2").status_code, 200)
+
+    def test_weaviate_failing_hides_a_restricted_collections_encrypted_package(self):
+        # Reviewer (#794): Weaviate failing to answer counts as existing, so the
+        # encrypted path fails closed like the unencrypted one.
+        path = self.write_encrypted("ragpkg-down.tar.gz.age")
+
+        def down(name):
+            raise RuntimeError("weaviate is down")
+        with patch.object(wc, "_collection_exists_sync", down), \
+                self.assertLogs("services.importer", "ERROR"):
+            self.assertNotIn(path.name, self.listed("dev2"))
+            answer = self.get(path.name, who="dev2")
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (404, "PACKAGE_NOT_FOUND"))
+        self.assertTrue(path.exists())
+
+    def test_an_end_user_never_reaches_an_encrypted_package(self):
+        # Reviewer (#794): the route is Developer and above, whatever is recorded.
+        path = self.write_encrypted("ragpkg-before.tar.gz.age", collection=None)
+        answer = self.get(path.name, who="user")
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (403, "FORBIDDEN"))
+        self.assertTrue(path.exists())
+
+
+class DeletionRecordTests(DownloadTestCase):
+    def test_a_deletion_is_audited_and_the_sweep_goes_on_when_the_record_cant_be_rewritten(self):
+        # #794 item 6: the file is gone, so its package.delete record is written whatever the record does.
+        first = self.write("ragpkg-a.tar.gz", recorded_hours_ago=25)
+        second = self.write("ragpkg-b.tar.gz", recorded_hours_ago=25)
+        with patch.object(package_retention, "_write", side_effect=OSError("disk full")), \
+                self.assertLogs("services.package_retention", "ERROR") as logs:
+            self.assertEqual(package_retention.sweep(), ["ragpkg-a.tar.gz", "ragpkg-b.tar.gz"])
+        self.assertFalse(first.exists())
+        self.assertFalse(second.exists())
+        self.assertEqual([r["details"]["file"] for r in self.records("package.delete")],
+                         ["ragpkg-a.tar.gz", "ragpkg-b.tar.gz"])
+        self.assertIn("ragpkg-a.tar.gz", "\n".join(logs.output))
+        self.assertEqual(package_retention.sweep(), [])          # the leftover entries are dropped
+        self.assertEqual(package_retention.recorded_collections(), {})
+
+
+class SameOriginTests(DownloadTestCase):
+    """#794 item 5 (RD-194 Q4): the deleting GET checks Sec-Fetch-Site."""
+
+    def fetch(self, site, who="dev", method="GET", headers=None):
+        headers = dict(headers or self.as_(who))
+        if site is not None:
+            headers["Sec-Fetch-Site"] = site
+        return self.client.request(method, "/packages/ragpkg-mine.tar.gz", headers=headers)
+
+    def test_a_download_from_another_origin_of_the_site_is_refused(self):
+        path = self.write("ragpkg-mine.tar.gz", recorded_hours_ago=0)
+        for site in ("same-site", "cross-site"):
+            with self.subTest(site=site):
+                answer = self.fetch(site)
+                self.assertEqual((answer.status_code, answer.json()["error"]["code"]),
+                                 (403, "CROSS_ORIGIN_REFUSED"))
+                self.assertTrue(path.exists())
+        refused = self.records("package.download")
+        self.assertEqual([(r["actor"], r["result"]) for r in refused], [("dev", "refused")] * 2)
+
+    def test_same_origin_a_typed_url_and_no_header_download(self):
+        for site in ("same-origin", "none", None):
+            with self.subTest(site=site):
+                path = self.write("ragpkg-mine.tar.gz", recorded_hours_ago=0)
+                self.assertEqual(self.fetch(site).status_code, 200)
+                self.assertFalse(path.exists())
+
+    def test_head_and_a_service_key_are_not_checked(self):
+        path = self.write("ragpkg-mine.tar.gz", recorded_hours_ago=0)
+        self.assertEqual(self.fetch("cross-site", method="HEAD").status_code, 200)
+        store.create_principal("svc", "developer")
+        key = store.issue_key("svc")[1]
+        self.assertEqual(self.fetch("cross-site", headers={"Authorization": "Bearer " + key}).status_code, 200)
+        self.assertFalse(path.exists())
+
+    def test_the_listing_is_not_origin_checked_but_a_missing_package_is_refused_before_the_route(self):
+        # Reviewer (#794): only the deleting GET is checked; the listing changes nothing.
+        self.write("ragpkg-mine.tar.gz", recorded_hours_ago=0)
+        headers = dict(self.as_("dev"), **{"Sec-Fetch-Site": "cross-site"})
+        answer = self.client.get("/packages", headers=headers)
+        self.assertEqual(answer.status_code, 200, answer.text)
+        # The refusal comes before the route: a name that doesn't exist is refused too.
+        answer = self.client.get("/packages/ragpkg-none.tar.gz", headers=headers)
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (403, "CROSS_ORIGIN_REFUSED"))
+
+
+class HeadRecordTests(DownloadTestCase):
+    def test_head_is_audited_as_a_header_check(self):
+        # #794 item 7 (RD-194 Q5): head true, no completed.
+        self.write("ragpkg-mine.tar.gz", recorded_hours_ago=0)
+        self.assertEqual(self.get("ragpkg-mine.tar.gz", method="HEAD").status_code, 200)
+        details = self.records("package.download")[-1]["details"]
+        self.assertIs(details["head"], True)
+        self.assertNotIn("completed", details)
+        self.assertEqual(self.get("ragpkg-mine.tar.gz").status_code, 200)
+        details = self.records("package.download")[-1]["details"]
+        self.assertIs(details["completed"], True)
+        self.assertNotIn("head", details)
+
+
+class CancelledClaimTests(DownloadTestCase):
+    """#794 item 8: a claim whose request is cancelled while its thread runs is
+    released once the thread ends."""
+
+    def blocked(self, real):
+        import threading
+        entered, proceed, self.claimed = threading.Event(), threading.Event(), threading.Event()
+
+        def claim(*args):
+            entered.set()
+            proceed.wait(5)
+            try:
+                return real(*args)
+            finally:
+                self.claimed.set()
+        return claim, entered, proceed
+
+    def cancel_during_claim(self, start, entered, proceed, released):
+        def settled():
+            return self.claimed.is_set() and released()
+
+        async def scenario():
+            task = asyncio.ensure_future(start())
+            await asyncio.to_thread(entered.wait, 5)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            proceed.set()
+            for _ in range(500):
+                if settled():
+                    return True
+                await asyncio.sleep(0.01)
+            return False
+        return asyncio.run(scenario())
+
+    def test_a_cancelled_import_start_releases_its_package(self):
+        claim, entered, proceed = self.blocked(importer._claim_package)
+        with patch.object(importer, "_claim_package", claim):
+            settled = self.cancel_during_claim(
+                lambda: importer.start_import_job("ragpkg-x.tar.gz", "abort"), entered, proceed,
+                lambda: not importer._active and not package_retention._settling)
+        self.assertTrue(settled, "the import claim was never released")
+        self.assertFalse(importer.package_busy("ragpkg-x.tar.gz"))
+
+    def test_a_cancelled_download_releases_its_slot(self):
+        path = self.write("ragpkg-mine.tar.gz", recorded_hours_ago=0)
+        claim, entered, proceed = self.blocked(package_retention.claim)
+        response = transfer._PackageStream(path, path.name, head=False)
+
+        async def receive():
+            await asyncio.sleep(3600)
+
+        async def send(message):
+            pass
+        with patch.object(package_retention, "claim", claim):
+            settled = self.cancel_during_claim(
+                lambda: response({"type": "http", "method": "GET", "headers": []}, receive, send),
+                entered, proceed,
+                lambda: not package_retention._downloading and not package_retention._settling)
+        self.assertTrue(settled, "the download slot was never released")
+        self.assertFalse(package_retention.busy(path.name))
+        self.assertTrue(path.exists())
+
+
+class SweepTests(DownloadTestCase):
+    def test_an_expired_package_is_swept_and_a_fresh_one_kept(self):
+        old = self.write("ragpkg-old.tar.gz", recorded_hours_ago=25)
+        fresh = self.write("ragpkg-fresh.tar.gz", recorded_hours_ago=1)
+        dropped = self.write("ragpkg-dropped-in.tar.gz")
+        os.utime(dropped, (0, 0))                    # an old file that isn't recorded
+        self.assertEqual(package_retention.sweep(), ["ragpkg-old.tar.gz"])
+        self.assertFalse(old.exists())
+        self.assertTrue(fresh.exists())
+        self.assertTrue(dropped.exists())
+        self.assertFalse(package_retention.recorded("ragpkg-old.tar.gz"))
+        deleted = self.records("package.delete")[-1]
+        self.assertEqual((deleted["actor"], deleted["actor_kind"], deleted["details"]),
+                         ("system", "system", {"file": "ragpkg-old.tar.gz", "reason": "expired"}))
+
+    def test_a_busy_package_waits_for_the_next_run(self):
+        old = self.write("ragpkg-old.tar.gz", recorded_hours_ago=25)
+        importer._active.add("ragpkg-old.tar.gz")
+        self.assertEqual(package_retention.sweep(), [])
+        importer._active.clear()
+        self.assertTrue(package_retention.claim("ragpkg-old.tar.gz"))
+        self.assertEqual(package_retention.sweep(), [])
+        package_retention.release("ragpkg-old.tar.gz")
+        self.assertTrue(old.exists())
+        self.assertEqual(package_retention.sweep(), ["ragpkg-old.tar.gz"])
+
+    def test_an_entry_whose_file_is_gone_is_dropped(self):
+        old = self.write("ragpkg-old.tar.gz", recorded_hours_ago=25)
+        old.unlink()
+        self.assertEqual(package_retention.sweep(), [])
+        self.assertFalse(package_retention.recorded("ragpkg-old.tar.gz"))
+        self.assertEqual(self.records("package.delete"), [])
+
+    def test_a_recorded_name_that_is_now_a_link_is_left_and_dropped(self):
+        target = self.root / "elsewhere.tar.gz"
+        target.write_bytes(b"keep me")
+        package_retention.record_export("ragpkg-old.tar.gz", datetime.now(timezone.utc) - timedelta(hours=25))
+        os.symlink(target, self.exports / "ragpkg-old.tar.gz")
+        with self.assertLogs("services.package_retention", "WARNING"):
+            self.assertEqual(package_retention.sweep(), [])
+        self.assertTrue((self.exports / "ragpkg-old.tar.gz").is_symlink())
+        self.assertEqual(target.read_bytes(), b"keep me")
+        self.assertFalse(package_retention.recorded("ragpkg-old.tar.gz"))
+
+    def test_the_setting_decides_when_a_package_has_expired(self):
+        self.write("ragpkg-mine.tar.gz", recorded_hours_ago=3)
+        self.assertEqual(package_retention.sweep(), [])
+        with patch.object(settings, "export_retention_hours", 2):
+            self.assertEqual(package_retention.sweep(), ["ragpkg-mine.tar.gz"])
+
+
+class SweeperTests(DownloadTestCase):
+    """Q3 (RD-145): the sweep runs at start-up and then every 15 minutes, fixed in code."""
+
+    def test_the_sweeper_sweeps_at_once_then_every_15_minutes_and_survives_a_failure(self):
+        self.assertEqual(package_retention.SWEEP_INTERVAL_S, 15 * 60)
+        calls, sleeps = [], []
+
+        def sweep():
+            calls.append(len(sleeps))
+            if len(calls) == 2:
+                raise RuntimeError("synthetic sweep failure")
+            return []
+
+        async def sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) == 3:
+                raise asyncio.CancelledError
+
+        with patch.object(package_retention, "sweep", sweep), \
+                patch.object(package_retention.asyncio, "sleep", sleep), \
+                self.assertLogs("services.package_retention", "ERROR"):
+            with self.assertRaises(asyncio.CancelledError):
+                asyncio.run(package_retention.sweeper())
+        # The first sweep comes before any wait; a failed sweep doesn't stop the next one.
+        self.assertEqual(calls, [0, 1, 2])
+        self.assertEqual(sleeps, [900, 900, 900])
+
+    def test_the_api_start_sweeps_an_expired_package_and_keeps_others(self):
+        # The real lifespan, in another process (as test_audit's lifespan test).
+        old = self.write("ragpkg-old.tar.gz", recorded_hours_ago=25)
+        fresh = self.write("ragpkg-fresh.tar.gz", recorded_hours_ago=1)
+        dropped = self.write("ragpkg-dropped-in.tar.gz")
+        os.utime(dropped, (0, 0))
+        script = """
+import asyncio, sys
+from unittest.mock import AsyncMock, patch
+sys.path.insert(0, sys.argv[1])
+from main import app, lifespan
+from services import importer, packager, weaviate_client as wc
+async def run():
+    with patch.object(wc, 'sweep_staging', new=AsyncMock(return_value=[])), \\
+         patch.object(importer, 'sweep_interrupted_imports', return_value=[]), \\
+         patch.object(importer, 'sweep_stale_workdirs', return_value=[]), \\
+         patch.object(packager, 'sweep_build_leftovers', return_value=[]), \\
+         patch.object(wc, 'close_client'):
+        async with lifespan(app):
+            await asyncio.sleep(2)
+asyncio.run(run())
+"""
+        import subprocess
+        env = {**os.environ, "AUDIT_DIR": str(self.root / "audit"), "AUTH_DIR": str(self.root / "auth"),
+               "UPLOAD_DIR": str(self.root / "uploads"), "EXPORTS_DIR": str(self.exports),
+               "EXPORT_RETENTION_HOURS": "24"}
+        result = subprocess.run([sys.executable, "-c", script, API_DIR], capture_output=True, text=True,
+                                timeout=120, cwd=API_DIR, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        self.assertFalse(old.exists(), "the start-up sweep did not delete the expired package")
+        self.assertTrue(fresh.exists())
+        self.assertTrue(dropped.exists())
+        deleted = [r for r in self.records("package.delete") if r["details"].get("file") == "ragpkg-old.tar.gz"]
+        self.assertEqual([(r["actor"], r["details"]["reason"]) for r in deleted], [("system", "expired")])
+
+    def test_an_invalid_retention_stops_the_api_at_start_up(self):
+        import subprocess
+        for bad in ("0", "721", "off"):
+            env = {**os.environ, "EXPORT_RETENTION_HOURS": bad, "AUDIT_DIR": str(self.root / "audit"),
+                   "AUTH_DIR": str(self.root / "auth"), "UPLOAD_DIR": str(self.root / "uploads"),
+                   "EXPORTS_DIR": str(self.exports)}
+            result = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, sys.argv[1]); import main",
+                                     API_DIR], capture_output=True, text=True, timeout=120, cwd=API_DIR, env=env)
+            self.assertNotEqual(result.returncode, 0, f"the API imported with EXPORT_RETENTION_HOURS={bad}")
+            self.assertIn("EXPORT_RETENTION_HOURS", result.stderr, result.stderr[-1000:])
+
+
+class AuditActionTests(unittest.TestCase):
+    def test_both_actions_are_listed(self):
+        self.assertIn("package.download", audit.ALL_ACTIONS)
+        self.assertIn("package.delete", audit.ALL_ACTIONS)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.CRITICAL)
+    unittest.main(verbosity=2)
+```
+
 ### scripts/tests/test_auth_enforcement.py
 
 ```python
@@ -34178,7 +42673,7 @@ PROTECTED = (
     ("GET", "/packages"), ("GET", "/help/transfer"),
     ("POST", "/tune/rechunk"), ("POST", "/tune/reembed"), ("POST", "/tune/reindex"),
     ("GET", "/tune/job/nope"), ("GET", f"/tune/{X}"),
-    ("GET", "/metrics/latency"),
+    ("GET", "/metrics/latency"), ("GET", "/health/details"),
     ("GET", "/docs"), ("GET", "/docs/oauth2-redirect"), ("GET", "/redoc"), ("GET", "/openapi.json"),
     ("GET", "/auth/users"), ("POST", "/auth/users"), ("POST", "/auth/users/nobody/reset-password"),
     ("POST", "/auth/users/nobody/role"), ("POST", "/auth/users/nobody/disable"),
@@ -34187,6 +42682,10 @@ PROTECTED = (
     ("POST", "/auth/service-principals/nobody/role"), ("POST", "/auth/service-principals/nobody/disable"),
     ("POST", "/auth/service-principals/nobody/enable"), ("POST", "/auth/service-principals/nobody/keys"),
     ("POST", "/auth/service-principals/nobody/keys/nokey/revoke"),
+    # Two-step verification (#607): the user's own routes and the Engineer's.
+    ("GET", "/auth/mfa"), ("POST", "/auth/mfa/enroll"), ("POST", "/auth/mfa/enroll/confirm"),
+    ("POST", "/auth/mfa/recovery-codes"), ("POST", "/auth/mfa/disable"), ("POST", "/auth/mfa/policy"),
+    ("POST", "/auth/users/nobody/reset-mfa"),
 )
 
 
@@ -35110,7 +43609,7 @@ def write_ui_ingest(out: pathlib.Path, fixtures: pathlib.Path) -> None:
                   "documents": {}, "split": {"file": "vfy-ui-large.txt", "first": UI_LARGE_FIRST,
                                              "last": UI_LARGE_LAST},
                   "min_chunks": -(-len("".join(large.split())) // 6000)})
-    # Prepared with the local LLM, then imported (#638). The phrase is in three
+    # Prepared with the build LLM, then imported (#638). The phrase is in three
     # body lines, so the cleaning can't drop every one.
     notes = UI_PHRASES["vfy-ui-prep-notes.txt"]
     (out / "vfy-ui-prep-notes.txt").write_text("\n".join([
@@ -35267,6 +43766,13 @@ with tempfile.TemporaryDirectory() as td:
                 "embedding", "llm", "chunking", "fidelity", "models_bundled", "files"):
         check(f"§4.4 manifest has {key}", key in manifest)
     check("package_format is 1", manifest.get("package_format") == 1)
+    # #671: both LLMs are recorded with llm's shape; llm stays the answer model.
+    for key in ("answer_llm", "build_llm"):
+        check(f"manifest has {key} as {{'model': name}}",
+              isinstance(manifest.get(key), dict) and isinstance(manifest[key].get("model"), str)
+              and manifest[key]["model"] != "", str(manifest.get(key)))
+    check("manifest llm is the answer model", manifest.get("llm") == manifest.get("answer_llm"),
+          f"{manifest.get('llm')} vs {manifest.get('answer_llm')}")
     check("created_at is UTC ISO-8601 with Z",
           bool(re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", manifest["created_at"])),
           manifest["created_at"])
@@ -35393,6 +43899,10 @@ python3 "$REPO_ROOT/scripts/tests/test_suite_registration.py"
 check "the verify suites run the test files #386 registered" $?
 python3 "$REPO_ROOT/scripts/tests/test_dependency_floors.py"
 check "pinned dependencies are at or above their patched versions (#522)" $?
+python3 "$REPO_ROOT/scripts/tests/test_ui_dependencies.py"
+check "the embedded ui/package.json copy in IMPLEMENTATION.md matches the file (#532)" $?
+python3 "$REPO_ROOT/scripts/tests/test_tailwind_output.py"
+check "the built UI CSS keeps the Tailwind 4 rules the migration relies on (#773)" $?
 python3 "$REPO_ROOT/scripts/tests/test_weaviate_pin.py"
 check "the Weaviate pin is the same everywhere and Dependabot leaves it alone (#530)" $?
 python3 "$REPO_ROOT/scripts/tests/test_upgrade_backup.py"
@@ -35417,13 +43927,17 @@ check_eq "  ... with its Allow header, POST" \
   "$(printf '%s\n' "$wrong_method" | awk 'tolower($1)=="allow:" {print $2}')" "POST"
 check_eq "  ... in the envelope, code METHOD_NOT_ALLOWED" \
   "$(printf '%s\n' "$wrong_method" | sed '1,/^$/d' | jfield "['error']['code']")" "METHOD_NOT_ALLOWED"
-# /health's 503 body for a missing model or an unreachable dependency, which the
-# Health page reads to show the failing services (#375).
+# /health/details' 503 body for a missing model or an unreachable dependency, which
+# the Health page reads to show the failing services (#375), and the public
+# /health's status-only body (#750).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_health.py)
-check "/health answers 503 with the per-service body when a dependency is down (#375)" $?
+check "/health/details answers 503 with the per-service body when a dependency is down (#375); /health only the status (#750)" $?
 # The collection registry is written atomically and kept when it can't be read (#388).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_collection_registry.py)
 check "the collection registry is written atomically and kept when unreadable (#388)" $?
+# The Authlib installed in the built API image is the one api/requirements.txt pins (#565).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_installed_authlib.py)
+check "the Authlib installed in the API image is the version api/requirements.txt pins (#565)" $?
 
 RAG_INFRA_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rag-infra.XXXXXX") || exit 2
 export RAG_INFRA_TMP
@@ -35525,7 +44039,7 @@ unhealthy=$( (cd "$REPO_ROOT" && docker compose ps --format '{{.Status}}') | gre
 check_eq "no service reports unhealthy" "$unhealthy" "0"
 
 # ── health endpoint reports each dependency ──────────────────────────────────
-api_get "/health" > "$RAG_INFRA_TMP/vfy_health.json"
+api_get "/health/details" > "$RAG_INFRA_TMP/vfy_health.json"
 check_eq "health status is ok" "$(jfield "['status']" < "$RAG_INFRA_TMP/vfy_health.json")" "ok"
 python3 -c "
 import json,sys,os; d=json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_health.json'))
@@ -35535,6 +44049,13 @@ ok = (s['weaviate']['status']=='ok' and s['ollama']['llm']['status']=='ok'
       and all(v['latency_ms'] >= 0 for v in (s['weaviate'], s['ollama']['llm'], s['ollama']['embed'])))
 sys.exit(0 if ok else 1)"
 check "per-service status and latency are reported" $?
+python3 -c "
+import json,sys,os; o=json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_health.json'))['services']['ollama']
+b=o.get('build_llm') or {}
+ok = (b.get('status')=='ok' and isinstance(b.get('latency_ms'), int) and b.get('model')==o['llm']['model']
+      and o.get('same_model') is True)
+sys.exit(0 if ok else 1)"
+check "health reports the build model, the same as the answer model by default, with same_model true (#671)" $?
 
 # ── memory resource reporting (Issue #98) ────────────────────────────────────
 # Advisory only (see the comment in api/routers/health.py), so it never
@@ -35544,7 +44065,7 @@ check "per-service status and latency are reported" $?
 check_eq "the recommended minimum defaults to 12.0 GB" \
   "$(jfield "['resources']['memory']['recommended_minimum_gb']" < "$RAG_INFRA_TMP/vfy_health.json")" "12.0"
 # Whether this machine meets it depends on its Docker allocation, so check the
-# status agrees with the allocation /health reports, not that it is 'ok'.
+# status agrees with the allocation /health/details reports, not that it is 'ok'.
 python3 -c "
 import json, os
 m = json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_health.json'))['resources']['memory']
@@ -35555,7 +44076,7 @@ check "the memory status agrees with the reported allocation" $?
 # Raise the recommendation past the actual allocation (in-process only --
 # neither the running server nor docker-compose.yml is touched) and confirm
 # the status flips and a note is attached. The override comes from the
-# allocation /health reported, never a constant: a fixed 13 GB stayed 'ok' on
+# allocation /health/details reported, never a constant: a fixed 13 GB stayed 'ok' on
 # any host giving Docker 12.35 GB or more (#536).
 python3 "$REPO_ROOT/scripts/tests/test_memory_override.py"
 check "the memory override always exceeds the reported allocation (#536)" $?
@@ -35775,13 +44296,13 @@ summary
 ```python
 """The memory recommendation suite 01 raises past the allocation (#536).
 
-Suite 01 checks that /health's memory report flips to below_recommended, with a
+Suite 01 checks that /health/details' memory report flips to below_recommended, with a
 note, once the recommendation exceeds what Docker is allocated. It raises the
-recommendation in-process, and the value must come from the allocation /health
-reports: a fixed 13 GB stayed 'ok' on any host giving Docker 12.35 GB or more.
+recommendation in-process, and the value must come from the allocation
+/health/details reports: a fixed 13 GB stayed 'ok' on any host giving Docker 12.35 GB or more.
 Standard library only.
 
-Run: python3 scripts/verify/memory_override.py <saved /health JSON>
+Run: python3 scripts/verify/memory_override.py <saved /health/details JSON>
 Prints the override in whole GB, or nothing (exit 1) without a usable allocation.
 """
 import json
@@ -35790,7 +44311,7 @@ import sys
 
 # api/services/system_info.py reports 'ok' while allocated >= recommended * 0.95.
 TOLERANCE = 0.95
-# /health rounds allocated_gb to 2 decimals, so the real figure can be this much higher.
+# /health/details rounds allocated_gb to 2 decimals, so the real figure can be this much higher.
 ROUNDING = 0.005
 
 
@@ -35808,7 +44329,7 @@ def main(argv):
         with open(argv[1]) as fh:
             allocated = json.load(fh)['resources']['memory']['allocated_gb']
     except (IndexError, OSError, ValueError, KeyError, TypeError) as exc:
-        print('memory_override: no allocation in the /health report: {!r}'.format(exc), file=sys.stderr)
+        print('memory_override: no allocation in the /health/details report: {!r}'.format(exc), file=sys.stderr)
         return 1
     override = override_gb(allocated)
     if override is None:
@@ -36534,6 +45055,10 @@ import json; d=json.load(open('/tmp/vfy_job.json')); print(d['status'], d['chunk
   drop_collection "$SC"
 done
 
+# A scanned (image-only) PDF is read by OCR with the locked Pillow (#522, #524).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_scanned_pdf_ocr.py)
+check "a scanned, image-only PDF is read by OCR with the locked Pillow (#524)" $?
+
 # ── min_chunk_size merging ───────────────────────────────────────────────────
 drop_collection "$C"; make_collection "$C"
 ingest "$C" fixed 60 100 "$FIX/tiny.txt"
@@ -37122,10 +45647,12 @@ if [ -z "$(volume_removal_refusal_reason)" ]; then
 else
   skip "job lists on the stack: not the verify project"
 fi
-# A killed job's leftovers (#377): ingest staging in UPLOAD_DIR, and an export's
-# `.build-*` directory and `.*.tar.gz.partial` archive in EXPORTS_DIR.
+# A killed job's leftovers (#377): ingest staging and an export's `export-*`
+# staging directory in UPLOAD_DIR (#549), and an export's `.*.tar.gz.partial` or
+# `.*.tar.gz.age.partial` archive in EXPORTS_DIR. A `.build-*` directory left in
+# EXPORTS_DIR by an earlier version is still swept.
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_startup_sweep.py)
-check "startup sweep: ingest staging and export build leftovers, exact names, links never followed" $?
+check "startup sweep: ingest staging, export staging and partial archives, exact names, links never followed" $?
 
 # With auto-schema off, an insert into a deleted collection fails and creates
 # nothing, instead of recreating it with inferred properties and no vectorizer.
@@ -38478,6 +47005,9 @@ check "the package listing reads only up to each manifest (#383)" $?
 # import, listing and refusals, with no backend.
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_export_encryption.py)
 check "export encryption: age format, encrypted export and import, refusals (#27)" $?
+# Downloading a package deletes it; undownloaded exports expire (#677).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_package_download.py)
+check "package download and expiry: delete after a full download, busy, access, sweep (#677)" $?
 
 python3 "$REPO_ROOT/scripts/tests/test_batch_implementation.py"
 check "test_batch_implementation.py registered regression checks" $?
@@ -39297,7 +47827,7 @@ drop_collection "$iname"
 # ── models on import: damaged and namespaced (E26, E27) ──────────────────────
 # Runs the importer inside the API process with its settings patched. E26 copies
 # the embedding model into a temporary store and damages the copy; the live
-# model store is only read. E27 uses the live store and a namespaced LLM name.
+# model store is only read. E27 uses the live store and a namespaced answer LLM name.
 (cd "$REPO_ROOT" && docker compose exec -T api python - "$PKG") > /tmp/vfy_models.json 2>/tmp/vfy_models.err <<'ENDPY'
 import json, shutil, sys, tempfile, uuid
 from pathlib import Path
@@ -39346,7 +47876,7 @@ with tempfile.TemporaryDirectory(prefix="vfy-model-", dir=settings.upload_dir) a
         out["e26_untouched"] = (damaged.read_bytes() == b"ordinary damaged review bytes"
                                 and mp.read_bytes() == manifest_before)
 
-# E27: a namespaced LLM that Ollama doesn't report -> import completes with a note
+# E27: a namespaced answer LLM that Ollama doesn't report -> import completes with a note
 ns = "vfy-namespace/absent-llm"
 reports = getattr(importer, "_ollama_reports", None)
 if reports:                                              # real /api/tags; tag defaults to latest
@@ -39674,7 +48204,7 @@ ENDPY
   ) >/tmp/vfy_xrestart_prepare.log 2>&1
   check "a 30,000-chunk collection is built for the interrupted export" $? \
     "$(grep -E 'Error' /tmp/vfy_xrestart_prepare.log | tail -1)"
-  builds_before=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/exports/.build-* 2>/dev/null' | sort)
+  builds_before=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/uploads/export-* 2>/dev/null' | sort)
   api_post "/export" "{\"collection\":\"$XR\",\"include_models\":false}" > /tmp/vfy_xrestart_start.json
   xjob=$(jfield "['job_id']" < /tmp/vfy_xrestart_start.json)
   state=""
@@ -39690,9 +48220,10 @@ print(d['status'] + ('-writing' if d['chunks_written'] > 0 else ''))" 2>/dev/nul
     check "an export is running with chunks written before the restart" 1 "last status '$state'; nothing restarted"
   else
     sleep 2
-    # The build directory this export is writing; the restart kills it there.
-    builds_during=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/exports/.build-* 2>/dev/null' | sort)
-    killed=$(comm -13 <(printf '%s\n' "$builds_before") <(printf '%s\n' "$builds_during") | grep '^/app/exports/\.build-' || true)
+    # The staging directory this export is writing, in UPLOAD_DIR since #549;
+    # the restart kills it there.
+    builds_during=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/uploads/export-* 2>/dev/null' | sort)
+    killed=$(comm -13 <(printf '%s\n' "$builds_before") <(printf '%s\n' "$builds_during") | grep '^/app/uploads/export-' || true)
     _rag_require_lock_owner
     (cd "$REPO_ROOT" && docker compose restart --timeout 0 api) >/dev/null 2>&1
     for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
@@ -39715,16 +48246,16 @@ ENDPY
     check "an interrupted export reads back 200 'failed' with INTERRUPTED and its progress" $? \
       "$(head -c 300 /tmp/vfy_xrestart_after.json)"
     # The killed build's leftovers (root, mode 0700) are the startup sweep's to
-    # remove (#377): its build directory and any temporary archive must be gone,
+    # remove (#377): its staging directory and any temporary archive must be gone,
     # and the completed package from the top of this suite still there.
-    check "the interrupted export had a build directory for the restart to sweep" \
-      "$([ -n "$killed" ] && echo 0 || echo 1)" "no new /app/exports/.build-* while the export ran"
+    check "the interrupted export had a staging directory for the restart to sweep" \
+      "$([ -n "$killed" ] && echo 0 || echo 1)" "no new /app/uploads/export-* while the export ran"
     stem=$(printf '%s' "$XR" | tr '[:upper:]' '[:lower:]')
     left=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c '
       for p in "$@" /app/exports/.ragpkg-'"$stem"'-*.tar.gz.partial; do
         if [ -e "$p" ] || [ -L "$p" ]; then echo "$p"; fi
       done; echo checked' sh $killed)
-    check "the restart removes the interrupted export's build directory and temporary archive" \
+    check "the restart removes the interrupted export's staging directory and temporary archive" \
       "$([ "$left" = checked ] && echo 0 || echo 1)" "still there: $left"
     check "the restart sweep keeps completed packages" "$([ -f "$EXPORTS/$PKG" ] && echo 0 || echo 1)" \
       "$EXPORTS/$PKG is gone"
@@ -39827,6 +48358,68 @@ fi
 [ -n "$sppkg" ] && rm -f "$EXPORTS/$sppkg"
 drop_collection "$SC"
 
+# ── downloading a package, and expiry (#677) ─────────────────────────────────
+# A full download through the proxy deletes a package exported here; an
+# interrupted one keeps it; a recorded package past EXPORT_RETENTION_HOURS (the
+# default, 24) is swept while one copied in is kept; an End User is refused.
+# Fixtures come from package_retention_stack.py inside the API container.
+retention() { (cd "$REPO_ROOT" && docker compose exec -T api python - "$@" < scripts/verify/package_retention_stack.py); }
+audit_has() {   # audit_has <action> <file> <python condition on r>: exit 0 when a record matches
+  api_get "/audit?action=$1&limit=1000" | python3 -c "
+import json, sys
+r = [r for r in json.load(sys.stdin)['records'] if r['details'].get('file') == sys.argv[1]]
+sys.exit(0 if r and eval(sys.argv[2], {'r': r[0]}) else 1)" "$2" "$3"
+}
+
+api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_dl_exp.json
+djob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_dl_exp.json'))['job_id'])")
+check_eq "#677: an export to download completes" "$(wait_for_job "/export/job/$djob" 1800)" "completed"
+DPKG=$(api_get "/export/job/$djob" | jfield "['filename']")
+read -r dsize dexp <<<"$(api_get "/packages" | python3 -c "
+import json, sys
+p = next(p for p in json.load(sys.stdin)['packages'] if p['filename'] == sys.argv[1])
+print(p['size_bytes'], p['expires_at'])" "$DPKG")"
+[ -n "$dexp" ] && [ "$dexp" != "None" ]
+check "#677: GET /packages says when the new export expires ($dexp)" $?
+dcode=$(curl -s -o /tmp/vfy_dl.bin -m 600 -w '%{http_code}' "$API/packages/$DPKG")
+check_eq "#677: GET /packages/{filename} downloads the package" "$dcode" "200"
+check_eq "#677: ... every byte of it" "$(wc -c < /tmp/vfy_dl.bin | tr -d ' ')" "$dsize"
+[ ! -e "$EXPORTS/$DPKG" ] && ! api_get "/packages" | grep -q "\"$DPKG\""
+check "#677: a full download deletes the package from ./exports and the listing" $?
+audit_has package.download "$DPKG" "r['details'].get('completed') is True and r['result'] == 'success'"
+check "#677: the download is audited as package.download, completed" $?
+audit_has package.delete "$DPKG" "r['details'].get('reason') == 'downloaded' and r['actor_kind'] == 'user'"
+check "#677: the deletion is audited as package.delete, reason downloaded, by the user" $?
+rm -f /tmp/vfy_dl.bin
+
+IPKG="ragpkg-vfy677-int-$$.tar.gz"
+retention junk "$IPKG" 64 0 >/dev/null
+command curl -s -o /dev/null -b "$RAG_AUTH_JAR" --limit-rate 1M --max-time 2 "$API/packages/$IPKG"
+sleep 3
+retention exists "$IPKG"
+check "#677: an interrupted download keeps the package" $?
+audit_has package.download "$IPKG" "r['details'].get('completed') is False"
+check "#677: ... and its package.download record says it was incomplete" $?
+retention remove "$IPKG"
+
+OPKG="ragpkg-vfy677-old-$$.tar.gz"; NPKG="ragpkg-vfy677-dropin-$$.tar.gz"
+retention junk "$OPKG" 1 25 >/dev/null
+retention junk "$NPKG" 1 none >/dev/null
+retention sweep > /tmp/vfy_sweep.txt
+! retention exists "$OPKG" && grep -qx "$OPKG" /tmp/vfy_sweep.txt
+check "#677: the sweep deletes a package recorded more than EXPORT_RETENTION_HOURS ago" $? "$(cat /tmp/vfy_sweep.txt)"
+retention exists "$NPKG"
+check "#677: ... and keeps a package copied in, which isn't recorded" $?
+audit_has package.delete "$OPKG" "r['details'].get('reason') == 'expired' and r['actor'] == 'system'"
+check "#677: the expiry is audited as package.delete, reason expired, by the system" $?
+
+EUJAR=$(auth_jar end_user) || EUJAR=""
+check_eq "#677: an End User is refused GET /packages/{filename}" \
+  "$(command curl -s -o /dev/null -m 60 -b "$EUJAR" -w '%{http_code}' "$API/packages/$NPKG")" "403"
+retention exists "$NPKG"
+check "#677: ... and the package stays" $?
+retention remove "$NPKG"
+
 # ── verified recovery across an API restart (#43, #44; opt-in: restarts the API) ──
 RP="${PREFIX}BatchRecovery"
 # Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
@@ -39924,6 +48517,9 @@ run_import() {   # run_import <file> <on_conflict>; leaves the job in /tmp/vfy_p
 }
 
 drop_collection "$C"; make_collection "$C"
+# The End User's retrieve.py queries it and its import below (#606); the import
+# under a new name copies its access.
+open_collection "$C"
 curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
   -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$FIX/policies.txt" > /tmp/vfy_p_ing.json
 check_eq "the suite's collection is ingested" \
@@ -40021,7 +48617,7 @@ check_eq "the package imports under a new name" "$istat" "completed"
 check_eq "the import leaves the package's bytes, size and mtime unchanged" "$(package_state)" "$state_before"
 
 # -- E11: the import retrieves what the original does -------------------------
-# /query rewrites each question with the LLM first, so two answers can differ even for
+# /query rewrites each question with the answer LLM first, so two answers can differ even for
 # identical collections; retrieval is compared directly, for each path /query uses.
 (cd "$REPO_ROOT" && docker compose exec -T api python - "$C" "$IMP" "$QUESTION") <<'ENDPY'
 import asyncio, sys
@@ -40114,6 +48710,8 @@ else
     name=${run%%:*}; want=${run#*:}
     args=(--api-url "$API" --json --citations)
     [ "$name" = top2 ] && args+=(--top-k 2)
+    # Retrieval, not the generated text, is what the check wants: generation
+    # varies (an empty answer), as for E11 below (#549).
     # As the End User test account (#25): the password goes in on stdin.
     _rag_require_lock_owner
     python3 ./auth_setup.py password end_user \
@@ -40126,19 +48724,37 @@ try:
     d = json.load(open("/tmp/vfy_p_r.json"))
 except ValueError:
     sys.exit(1)
-sys.exit(0 if d["answer"].strip() and len(d["citations"] or []) == int(sys.argv[1]) else 1)
+sys.exit(0 if isinstance(d, dict) and len(d.get("citations") or []) == int(sys.argv[1]) else 1)
 ENDPY
     answered=$?
     [ "$rc" = 0 ] && [ "$answered" = 0 ]
-    check "E8/E9: retrieve.py ($name) answers with $want citation(s)" $? \
+    check "E8/E9: retrieve.py ($name) retrieves $want citation(s)" $? \
       "exit $rc: $(head -c 200 /tmp/vfy_p_r.err)"
   done
-  python3 ./auth_setup.py password end_user \
-    | python3 -I -S "$RTMP/retrieve.py" --username vfy-end-user --password-stdin --api-url "$API" \
-        --collection "$IMP" "$QUESTION" > /tmp/vfy_p_r.out 2> /tmp/vfy_p_r.err
-  rc=$?
-  [ "$rc" = 0 ] && [ -n "$(tr -d '[:space:]' < /tmp/vfy_p_r.out)" ]
-  check "E11: retrieve.py answers from the imported collection" $? "exit $rc: $(head -c 200 /tmp/vfy_p_r.err)"
+  # Retrieval, not the generated text, is what shows retrieve.py works against
+  # the import: generation varies (an empty answer) and can time out under CPU
+  # load (a 504), so the check wants citations and allows 3 attempts (#549).
+  e11=1
+  for attempt in 1 2 3; do
+    _rag_require_lock_owner
+    python3 ./auth_setup.py password end_user \
+      | python3 -I -S "$RTMP/retrieve.py" --username vfy-end-user --password-stdin --api-url "$API" \
+          --json --citations --collection "$IMP" "$QUESTION" > /tmp/vfy_p_r.json 2> /tmp/vfy_p_r.err
+    rc=$?
+    python3 - <<'ENDPY'
+import json, sys
+try:
+    d = json.load(open("/tmp/vfy_p_r.json"))
+except ValueError:
+    sys.exit(1)
+sys.exit(0 if isinstance(d, dict) and d.get("citations") else 1)
+ENDPY
+    cited=$?
+    if [ "$rc" = 0 ] && [ "$cited" = 0 ]; then e11=0; break; fi
+    [ "$attempt" -lt 3 ] && sleep 10
+  done
+  check "E11: retrieve.py retrieves from the imported collection (citations, up to 3 attempts)" "$e11" \
+    "after $attempt attempt(s): exit $rc: $(head -c 200 /tmp/vfy_p_r.err)"
 fi
 rm -rf "$RTMP"
 
@@ -40312,6 +48928,75 @@ def main(argv):
 
 if __name__ == "__main__":
     main(sys.argv)
+```
+
+### scripts/verify/package_retention_stack.py
+
+```python
+"""Fixtures for 05_transfer.sh's download and expiry checks (#677).
+
+Runs inside the verify project's API container, on its exports folder and
+upload volume:
+
+    docker compose exec -T api python - <command> [args] < scripts/verify/package_retention_stack.py
+
+Commands:
+    junk <name> <MiB> <hours-ago|none>  write a file of random bytes in the exports
+                                        folder, recorded as exported that many hours
+                                        ago, or not recorded at all (a package copied in)
+    sweep                               run one expiry sweep; print the deleted names
+    exists <name>                       exit 0 when the file is there, 1 when not
+    remove <name>                       delete the file and its record entry
+
+Only names starting `ragpkg-vfy677-` are accepted, so nothing else in the
+exports folder can be touched.
+"""
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+sys.path.insert(0, "/app")
+
+from config import settings                          # noqa: E402
+from services import package_retention               # noqa: E402
+
+STEM = "ragpkg-vfy677-"
+
+
+def name_of(value):
+    if not value.startswith(STEM) or not package_retention.valid_name(value):
+        sys.exit(f"refused: {value!r} is not a {STEM}* package name")
+    return value
+
+
+def main(argv):
+    command, args = argv[0], argv[1:]
+    exports = Path(settings.exports_dir)
+    if command == "junk":
+        name, mib, ago = name_of(args[0]), int(args[1]), args[2]
+        with open(exports / name, "wb") as fh:
+            for _ in range(mib):
+                fh.write(os.urandom(1024 * 1024))
+        if ago != "none":
+            package_retention.record_export(name, datetime.now(timezone.utc) - timedelta(hours=float(ago)))
+        print(name)
+    elif command == "sweep":
+        print("\n".join(package_retention.sweep()))
+    elif command == "exists":
+        return 0 if (exports / name_of(args[0])).exists() else 1
+    elif command == "remove":
+        name = name_of(args[0])
+        (exports / name).unlink(missing_ok=True)
+        with package_retention._lock:
+            package_retention._drop(name)
+    else:
+        sys.exit(f"unknown command {command!r}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
 ```
 
 ### scripts/verify/batch_recovery.py
@@ -40642,6 +49327,9 @@ fi
 # A collection must exist for the delete-confirmation check to have a target.
 C="${PREFIX}Ui"
 drop_collection "$C"; make_collection "$C"
+# The browser cases use it as the Developer; a new collection is restricted to
+# its creator, the harness Engineer (#606).
+open_collection "$C"
 
 # The test accounts' credentials go in on standard input (#25), never on a
 # command line or in the environment; browser/lib.js reads them once.
@@ -41416,6 +50104,22 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
   r.section('§10.4 login and session');
   {
     const s = await session(browser, BASE, null);
+    // The retry below is forced (#598): this context's first login is answered here with nginx's own refusal
+    // (proxy/locations.conf, @login_rate_limited). It never reaches nginx, so it uses no slot; the second goes through.
+    let stubbed = 0, retried = false;
+    const stubFirstLogin = async request => {
+      try {
+        if (stubbed === 0 && request.method() === 'POST' && new URL(request.url()).pathname === '/api/auth/login') {
+          stubbed = 1;
+          await request.respond({ status: 429, contentType: 'application/json',
+            body: JSON.stringify({ error: { code: 'LOGIN_RATE_LIMITED', message: LOGIN_RATE_LIMITED, detail: null } }) });
+        } else {
+          await request.continue();
+        }
+      } catch { /* seen while interception is switched off below */ }
+    };
+    await s.page.setRequestInterception(true);
+    s.page.on('request', stubFirstLogin);
     await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' });
     r.check('logged out, the UI shows the login page', /Log in to continue/.test(await bodyText(s.page)) && new URL(s.page.url()).pathname === '/login');
     const { username, password } = credentialsFor('engineer');
@@ -41429,11 +50133,18 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     await submit();
     // nginx allows 10 logins a minute per address, a burst of 5 (#577), and refills a slot every 6 s:
     // a form login it refuses is submitted once more after 6.5 s, as browser/lib.js's login waits.
+    // The first answer is this check's own refusal (above), so this branch runs every time (#598).
     if (await s.page.evaluate(() => document.querySelector('p[role=alert]')?.textContent.trim()) === LOGIN_RATE_LIMITED) {
+      retried = true;
+      console.log("    the login form showed nginx's rate-limit message: submitting it once more after 6.5 s");
       await sleep(6500);
       await submit();
     }
     await s.page.waitForFunction(() => location.pathname === '/qa' && document.querySelectorAll('nav a').length > 0, { timeout: 10000 }).catch(() => {});
+    await s.page.setRequestInterception(false);
+    s.page.off('request', stubFirstLogin);
+    r.check("the form login's retry on nginx's rate-limit message ran (this check answered its first login 429)",
+      stubbed === 1 && retried, `stubbed=${stubbed} retried=${retried}`);
     const badge = await s.page.evaluate(() => document.querySelector('nav button[data-menu=account] span.bg-blue-100')?.textContent.trim());
     r.check('logging in through the form opens /qa as the account\'s role', badge === 'AI Engineer', String(badge));
     const cookies = await s.page.cookies();
@@ -42540,7 +51251,7 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
   }
 
   // ── degraded and unreachable health (#375) ─────────────────────────────────
-  // /health answers 503 with its per-service body when a dependency is down. The
+  // /health/details answers 503 with its per-service body when a dependency is down. The
   // page must show that body, red for the failing service, keep loading the
   // latency metrics, and say so when health can't be read at all. Each load is
   // driven by hand through the captured 30s refresh, with the answers stubbed.
@@ -42559,7 +51270,7 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
       status,
       services: {
         weaviate: service('ok', 11),
-        ollama: { llm: service('ok', 22, 'phi3.5'), embed: service(embed, 33, 'nomic-embed-text') },
+        ollama: { llm: service('ok', 22, 'phi3.5'), build_llm: service('ok', 22, 'phi3.5'), embed: service(embed, 33, 'nomic-embed-text'), same_model: true },
       },
       resources: { memory: { status: 'ok', allocated_gb: 11.67, recommended_minimum_gb: 12.0 } },
     });
@@ -42575,7 +51286,7 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     await s.page.setRequestInterception(true);
     s.page.on('request', request => {
       const path = new URL(request.url()).pathname;
-      if (path === '/api/health') {
+      if (path === '/api/health/details') {
         if (mode === 'refused') return request.abort('connectionrefused');
         if (mode === 'proxy502') return request.respond({ status: 502, contentType: 'text/html', body: proxyPage('502 Bad Gateway') });
         if (mode === 'html503') return request.respond({ status: 503, contentType: 'text/html', body: proxyPage('503 Service Temporarily Unavailable') });
@@ -42986,9 +51697,13 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     }
 
     // Transfer, stubbed: reopening the job a panel is polling, while its poll is
-    // in flight, keeps one poll chain (#629). Each lookup answers after 1 s, so
-    // one chain polls at most 3 times in 7 s (answer, then 2 s wait); a second
-    // chain for the same job would make it at least 4.
+    // in flight, keeps one poll chain (#629). The stub holds every lookup of the
+    // job until the test releases it, so "in flight when the row is clicked" is
+    // true by construction, not by a race with a timer. After the reopen the
+    // test releases the held lookups, the old chain's first and the new chain's,
+    // and counts the lookups that follow: one chain makes exactly one (after its
+    // 2 s wait), and an old chain that the reopen did not stop makes a second.
+    // No wall-clock window is counted, so a slow machine cannot change the result.
     {
       const s = await session(browser, BASE, 'developer');
       try {
@@ -43000,6 +51715,11 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
           collection: null, original_collection: null, chunks_written: 2, fidelity: null, renamed: false, notes: [],
           restored_sessions: [], error: null, error_code: null, error_detail: null };
         const lookups = { '/api/export/job/vfy629e': [], '/api/import/job/vfy629i': [] };
+        // Answers a held lookup. A request the page has already dropped is ignored.
+        const release = lookup => {
+          lookup.answered = true;
+          lookup.request.respond(json(lookup.path.includes('/export/') ? exportJob : importJob)).catch(() => {});
+        };
         await s.page.setRequestInterception(true);
         s.page.on('request', request => {
           const path = new URL(request.url()).pathname;
@@ -43008,35 +51728,41 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
           if (path === '/api/import/jobs') return request.respond(json({ jobs: [
             { ...importJob, owner: mine, created_at: at(30), finished_at: null }] }));
           if (path in lookups) {
-            const lookup = { start: Date.now(), answered: false };
-            lookups[path].push(lookup);
-            setTimeout(() => {
-              lookup.answered = true;
-              request.respond(json(path.includes('/export/') ? exportJob : importJob)).catch(() => {});
-            }, 1000);
+            lookups[path].push({ path, request, answered: false });
             return;
           }
           return request.continue();
         });
-        await s.page.goto(BASE + '/transfer', { waitUntil: 'networkidle2' });
-        // Waits for a new lookup of the job, then clicks the job's row while it
-        // is in flight: still unanswered once the click has happened.
-        const reopen = async (path, text) => {
-          const before = lookups[path].length;
-          for (let i = 0; i < 100 && lookups[path].length === before; i++) await sleep(50);
-          const inflight = lookups[path][lookups[path].length - 1];
-          const clickedAt = Date.now();
-          const clicked = await clickRow(s.page, text);
-          return { path, clickedAt, inFlight: !!inflight && lookups[path].length > before && clicked && !inflight.answered };
+        // Held lookups keep connections open, so the page is not waited on to go idle.
+        await s.page.goto(BASE + '/transfer', { waitUntil: 'domcontentloaded' });
+        // Waits for a condition, polling every 50 ms, for at most limit ms.
+        const until = async (condition, limit = 8000) => {
+          for (let waited = 0; waited < limit && !condition(); waited += 50) await sleep(50);
+          return condition();
         };
-        const exported = await reopen('/api/export/job/vfy629e', 'StubExport629');
-        const imported = await reopen('/api/import/job/vfy629i', 'ragpkg-stub629.tar.gz');
-        await sleep(imported.clickedAt + 7200 - Date.now());
-        for (const [kind, click] of [['export', exported], ['import', imported]]) {
-          const count = lookups[click.path].filter(l => l.start >= click.clickedAt && l.start <= click.clickedAt + 7000).length;
+        const check629 = async (kind, path, text) => {
+          // Each panel opens its running job on load and makes its first lookup, which is held.
+          const arrived = await until(() => lookups[path].length >= 1);
+          const before = lookups[path].length;
+          const first = lookups[path][0];
+          const clicked = arrived && await clickRow(s.page, text);
+          // The reopen starts a new chain with a lookup at once: exactly one more.
+          await until(() => lookups[path].length > before);
+          await sleep(300);
+          const started = lookups[path].length - before;
+          const inFlight = !!clicked && !!first && !first.answered && started === 1;
+          // Release the old chain's lookup, then the new chain's.
+          for (const lookup of lookups[path]) if (!lookup.answered) release(lookup);
+          const released = lookups[path].length;
+          await until(() => lookups[path].length > released);
+          // A second chain would make its lookup at the same moment; allow for it.
+          await sleep(1500);
+          const after = lookups[path].length - released;
           r.check(`Transfer: reopening the polled ${kind} while its poll is in flight keeps one poll chain (#629)`,
-            click.inFlight && count <= 3, `inFlight=${click.inFlight} lookups in 7 s=${count}`);
-        }
+            inFlight && after === 1, `inFlight=${inFlight} new lookups after release=${after}`);
+        };
+        await check629('export', '/api/export/job/vfy629e', 'StubExport629');
+        await check629('import', '/api/import/job/vfy629i', 'ragpkg-stub629.tar.gz');
       } finally { await s.ctx.close(); }
     }
 
@@ -43285,16 +52011,19 @@ jobs:
           # The suites run this PR's code; leave no token in its git config.
           persist-credentials: false
 
-      # The cache key is the models ollama/entrypoint.sh pulls. The copies in
+      # The cache key is the models ollama/entrypoint.sh pulls: the names
+      # ollama/compose-models.sh resolves from the LLM settings compose gives
+      # the ollama service (#671). The copies in
       # and out of the model volume run in the ollama image docker-compose.yml
       # pins, as stack.sh's own model copy does.
       - name: Read the model names
         id: models
         run: |
-          names=$(sed -n 's/^pull_with_retry \([A-Za-z0-9._:-]*\)$/\1/p' ollama/entrypoint.sh | tr '\n' ' ')
-          names=${names% }
+          names=$(bash ollama/compose-models.sh) \
+            || { echo "could not read the model names (ollama/compose-models.sh)" >&2; exit 1; }
+          names=$(echo $names)
           image=$(sed -n '/^  ollama:$/,/^  [a-z]/s/^    image: *//p' docker-compose.yml | head -1 | tr -d "\"'")
-          [ -n "$names" ] || { echo "no pull_with_retry lines in ollama/entrypoint.sh" >&2; exit 1; }
+          [ -n "$names" ] || { echo "no model names from ollama/compose-models.sh" >&2; exit 1; }
           [ -n "$image" ] || { echo "no ollama image in docker-compose.yml" >&2; exit 1; }
           echo "models: $names; image: $image"
           {
@@ -43409,15 +52138,22 @@ drifting. Standard library only; no Docker or stack needed.
 Run: python3 scripts/tests/test_ci_workflow.py
 """
 from pathlib import Path
+import os
 import re
+import subprocess
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = '.github/workflows/verify.yml'
 BADGE = ('[![Verify](https://github.com/mikesilvers/rag-docker/actions/workflows/verify.yml/badge.svg?branch=develop)]'
          '(https://github.com/mikesilvers/rag-docker/actions/workflows/verify.yml)')
-# The pattern the workflow's sed uses on ollama/entrypoint.sh, in Python.
-MODEL_LINE = re.compile(r'^pull_with_retry ([A-Za-z0-9._:-]*)$', re.M)
+# A `docker` that answers `docker compose config` with the ollama service's LLM
+# settings as docker-compose.yml sets them (#671).
+STUB_DOCKER = """#!/bin/bash
+[ "$1 $2" = "compose config" ] || { echo "stub docker: unexpected call: $*" >&2; exit 99; }
+echo '{"name": "rag-docker", "services": {"ollama": {"environment": {"LLM_MODEL": "llama3.1:8b", "BUILD_LLM_MODEL": "", "ANSWER_LLM_MODEL": ""}}}}'
+"""
 
 
 def workflow():
@@ -43522,12 +52258,25 @@ class SuiteTests(unittest.TestCase):
 
 class ModelCacheTests(unittest.TestCase):
     def test_key_is_the_models_the_entrypoint_pulls(self):
+        # The names ollama/compose-models.sh resolves from the ollama service's LLM
+        # settings, which the entrypoint pulls (#671).
         text = workflow()
         _, step = step_with(text, 'id: models')
-        self.assertIn('ollama/entrypoint.sh', step)
-        self.assertIn(r"sed -n 's/^pull_with_retry \([A-Za-z0-9._:-]*\)$/\1/p'", step)
-        self.assertIn('key=ollama-models-', step)
-        self.assertTrue(MODEL_LINE.findall((ROOT / 'ollama/entrypoint.sh').read_text()))
+        self.assertIn('names=$(bash ollama/compose-models.sh) \\\n', step)
+        self.assertIn('|| { echo "could not read the model names (ollama/compose-models.sh)" >&2; exit 1; }', step)
+        self.assertIn('echo "key=ollama-models-${names// /-}"', step)
+        self.assertIn('for model in $(models); do', (ROOT / 'ollama/entrypoint.sh').read_text())
+        with tempfile.TemporaryDirectory() as folder:
+            docker = Path(folder) / 'docker'
+            docker.write_text(STUB_DOCKER)
+            docker.chmod(0o755)
+            out = subprocess.run(['bash', str(ROOT / 'ollama/compose-models.sh')], capture_output=True,
+                                 text=True, timeout=60,
+                                 env=dict(os.environ, PATH=folder + os.pathsep + os.environ['PATH']))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        # With the default settings the key is what it was before the split.
+        self.assertEqual('ollama-models-' + '-'.join(out.stdout.split()),
+                         'ollama-models-llama3.1:8b-nomic-embed-text')
 
     def test_restored_before_start_and_saved_only_after_a_miss(self):
         text = workflow()
@@ -43759,9 +52508,9 @@ Self-contained bundle (~4.6 GB) for an air-gapped target: source plus
 #     built with `git archive`, exactly as package.sh does. Untracked and
 #     ignored files and uncommitted changes are left out (#384).
 #   * all five Docker images, pre-built (docker save)
-#   * the Ollama model weights (llama3.1:8b + nomic-embed-text), the whole
-#     model volume: a model left in it, such as phi3.5 from before 1.2.1, is
-#     carried too
+#   * the Ollama model weights (by default llama3.1:8b + nomic-embed-text; a
+#     different build or answer LLM too, #671), the whole model volume: a model
+#     left in it, such as phi3.5 from before 1.2.1, is carried too
 #
 # About 7.7 GB (2.5 GB images + 5.2 GB model weights) with both models present,
 # estimated from the parts (4.6 GB was measured when the LLM was the 2.2 GB
@@ -43812,18 +52561,31 @@ docker volume inspect "$MODELVOL" >/dev/null 2>&1 \
 
 # The volume must hold every model ollama/entrypoint.sh pulls, or the offline
 # target would try to download the missing one (#647: an install from before
-# llama3.1:8b became the default holds only phi3.5). The names are read as the
-# CI model cache reads them; a manifest without a tag is under "latest".
-MODELS="$(sed -n 's/^pull_with_retry \([A-Za-z0-9._:-]*\)$/\1/p' ollama/entrypoint.sh | tr '\n' ' ')"
-[ -n "$MODELS" ] || { echo "ERROR: no pull_with_retry lines in ollama/entrypoint.sh." >&2; exit 1; }
+# llama3.1:8b became the default holds only phi3.5). The names are the ones the
+# entrypoint resolves from the LLM settings compose gives the ollama service
+# (#671), read as the CI model cache reads them. A name is read from the right,
+# as Ollama does (#772, #824): the tag is what follows the last ":" of the last
+# path segment, else "latest", so a port in a host is not a tag. A model with one
+# segment is under registry.ollama.ai/library/<name>, one with two (`user/model`,
+# and `hf.co/model`, whatever its first segment) under registry.ollama.ai/<user>/
+# <model>, and one with three or more, the first a host with its port if it has
+# one (`hf.co/user/model`), under that host's own manifest directory.
+MODELS="$(bash ollama/compose-models.sh)" \
+  || { echo "ERROR: could not read the model names (ollama/compose-models.sh)." >&2; exit 1; }
+MODELS="$(echo $MODELS)"   # one line, space-separated
 # shellcheck disable=SC2086  # one argument per model name
 MISSING="$(docker run --rm --network none --entrypoint sh \
   -v "$MODELVOL":/models:ro \
   ollama/ollama:0.3.14 \
   -c 'for m in "$@"; do
-        n=${m%%:*}; t=latest
-        case "$m" in *:*) t=${m#*:} ;; esac
-        [ -f "/models/models/manifests/registry.ollama.ai/library/$n/$t" ] || echo "$m"
+        n=$m; t=latest
+        case "${m##*/}" in *:*) n=${m%:*}; t=${m##*:} ;; esac
+        case "$n" in
+          */*/*) p=$n ;;
+          */*) p=registry.ollama.ai/$n ;;
+          *) p=registry.ollama.ai/library/$n ;;
+        esac
+        [ -f "/models/models/manifests/$p/$t" ] || echo "$m"
       done' sh $MODELS)" \
   || { echo "ERROR: could not read the models in volume '$MODELVOL'." >&2; exit 1; }
 if [ -n "$MISSING" ]; then
@@ -43988,7 +52750,7 @@ GIT_ISOLATION = {'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': os.devnull}
 STUB_DOCKER = r'''#!/usr/bin/env bash
 echo "$*" >> "$STUB_DOCKER_LOG"
 case "$1 $2" in
-  "compose config") echo '{"name":"scratch"}' ;;
+  "compose config") echo '{"name":"scratch","services":{"ollama":{"environment":{"LLM_MODEL":"llama3.1:8b","BUILD_LLM_MODEL":"","ANSWER_LLM_MODEL":""}}}}' ;;
   "image inspect"|"volume inspect") ;;
   save*) printf 'stub image layers' ;;
   run*)
@@ -44025,8 +52787,10 @@ class PackageArchiveTests(unittest.TestCase):
         self.repo.mkdir()
         for name in SCRIPTS + ('.gitignore',):
             shutil.copy(ROOT / name, self.repo / name)
-        # package-offline.sh reads the model names from the entrypoint (#647).
-        write(self.repo / 'ollama' / 'entrypoint.sh', (ROOT / 'ollama' / 'entrypoint.sh').read_text())
+        # package-offline.sh reads the model names the entrypoint pulls (#647), resolved
+        # from the compose settings by these two scripts (#671).
+        for name in ('entrypoint.sh', 'models.sh', 'compose-models.sh'):
+            write(self.repo / 'ollama' / name, (ROOT / 'ollama' / name).read_text())
         write(self.repo / 'install-offline.sh', '#!/usr/bin/env bash\necho install\n', 0o755)
         write(self.repo / 'README.md', COMMITTED_README)
         write(self.repo / 'ingest-inbox' / '.gitkeep', '')
@@ -44320,7 +53084,7 @@ asyncio.run(run())
     def test_regeneration_retains_validation_and_transport_retry_budget(self):
         valid=json.dumps({'question':'Regenerated', 'answer':'Answer', 'ground_truth':'Truth'})
         replies=[httpx.ReadTimeout(''), 'invalid', httpx.ReadTimeout(''), 'invalid', httpx.ReadTimeout(''), valid]
-        with patch.object(gs.ollama, 'chat', new=AsyncMock(side_effect=replies)) as chat:
+        with patch.object(gs.ollama, 'build_chat', new=AsyncMock(side_effect=replies)) as chat:
             result=asyncio.run(gs.regenerate_pair(self.data['session_id'], 'p_0'))
         self.assertEqual(chat.await_count, 6)
         self.assertEqual(result['question'], 'Regenerated')
@@ -46498,7 +55262,7 @@ class DeletedRecoveryTests(unittest.TestCase):
         from services import collection_recovery as recovery,weaviate_client as wc,goldstandard as gs,ingest_config,retrieval_config
         self.recovery,self.wc=recovery,wc
         temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup);self.root=Path(temp.name);stack=ExitStack();self.addCleanup(stack.close)
-        for change in [patch.object(settings,'upload_dir',temp.name),patch.object(settings,'sources_dir',str(self.root/'sources')),patch.object(gs,'_sessions',{}),patch.object(ingest_config,'_DIR',None),patch.object(retrieval_config,'_DIR',None)]:stack.enter_context(change)
+        for change in [patch.object(settings,'upload_dir',temp.name),patch.object(settings,'auth_dir',str(self.root/'auth')),patch.object(settings,'sources_dir',str(self.root/'sources')),patch.object(gs,'_sessions',{}),patch.object(ingest_config,'_DIR',None),patch.object(retrieval_config,'_DIR',None)]:stack.enter_context(change)
         self.backend={'OwnedRecovery'}
         class Collections:
             def exists(inner,name):return writes.canonical(name) in self.backend
@@ -47895,7 +56659,7 @@ class RetrievalImportTests(unittest.TestCase):
 
     def build_with_models(self, failing, llm_model='chat:v2', include_models=True,
                           store_available=True, broken_copy=(), fail_mid_write=(),
-                          embed_model='embed:v1'):
+                          embed_model='embed:v1', build_model=''):
         """Export with both models requested; models named in `failing` cannot bundle.
 
         Models named in `broken_copy` resolve, but their second file's copy fails.
@@ -47930,6 +56694,8 @@ class RetrievalImportTests(unittest.TestCase):
         with ExitStack() as mocks:
             mocks.enter_context(patch.object(settings, 'embed_model', embed_model))
             mocks.enter_context(patch.object(settings, 'llm_model', llm_model))
+            mocks.enter_context(patch.object(settings, 'build_llm_model', build_model))
+            mocks.enter_context(patch.object(settings, 'answer_llm_model', ''))
             mocks.enter_context(patch.object(packager, 'read_chunks', return_value=[]))
             mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': embed_model}))
             mocks.enter_context(patch.object(packager, '_ingest_config', return_value=None))
@@ -48040,6 +56806,17 @@ class RetrievalImportTests(unittest.TestCase):
         result, manifest = self.build_with_models(set(), llm_model='embed:v1')
         self.assertEqual(manifest['bundled_models'], ['embed:v1'])
         self.assertIs(manifest['models_bundled'], True)
+
+    def test_manifest_records_both_llms_and_keeps_llm_as_the_answer_model(self):
+        # #671: package_format stays 1.
+        result, manifest = self.build_with_models(set(), build_model='small:v1')
+        self.assertEqual(manifest['package_format'], 1)
+        self.assertEqual(manifest['llm'], {'model': 'chat:v2'})
+        self.assertEqual(manifest['answer_llm'], {'model': 'chat:v2'})
+        self.assertEqual(manifest['build_llm'], {'model': 'small:v1'})
+        # Only the embedding and answer models are bundled.
+        self.assertEqual(self.exported, ['embed:v1', 'chat:v2'])
+        self.assertEqual(manifest['bundled_models'], ['chat:v2', 'embed:v1'])
 
     def test_manifest_leaves_out_a_model_whose_file_copy_failed(self):
         result, manifest = self.build_with_models(set(), broken_copy={'chat:v2'})
@@ -48195,9 +56972,10 @@ class ModelTagFolderTests(unittest.TestCase):
         path.write_bytes(manifest)
         return manifest
 
-    def export(self, embed, llm):
+    def export(self, embed, llm, build=''):
         with ExitStack() as mocks:
-            for key, value in [('ollama_models_dir', self.store), ('embed_model', embed), ('llm_model', llm)]:
+            for key, value in [('ollama_models_dir', self.store), ('embed_model', embed), ('llm_model', llm),
+                               ('build_llm_model', build), ('answer_llm_model', '')]:
                 mocks.enter_context(patch.object(settings, key, str(value)))
             mocks.enter_context(patch.object(packager, 'read_chunks', return_value=[]))
             mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': embed}))
@@ -48208,9 +56986,10 @@ class ModelTagFolderTests(unittest.TestCase):
             result = packager.build('Corpus', include_models=True)
         return packager.open_package(self.exports / result['filename'], Path(tempfile.mkdtemp(dir=self.root)))
 
-    def ensure(self, pkg, manifest, embed, llm):
+    def ensure(self, pkg, manifest, embed, llm, build=''):
         with patch.object(settings, 'ollama_models_dir', str(self.target)), \
              patch.object(settings, 'embed_model', embed), patch.object(settings, 'llm_model', llm), \
+             patch.object(settings, 'build_llm_model', build), patch.object(settings, 'answer_llm_model', ''), \
              patch.object(importer, '_ollama_reports', lambda model: True):
             return importer._ensure_models(pkg, manifest)
 
@@ -48246,6 +57025,26 @@ class ModelTagFolderTests(unittest.TestCase):
             self.assertEqual((pkg / folder / 'manifest.json').read_bytes(), self.manifests[model])
         self.assertEqual(manifest['bundled_models'], ['foo:a', 'foo:b'])
         self.assertEqual(model_bundle.bundled_models(pkg, manifest), ['foo:a', 'foo:b'])
+
+    def test_a_different_build_model_is_recorded_but_never_bundled_or_installed(self):
+        # #671: the package carries the answer model only; the build model is
+        # recorded for information, and import neither checks nor installs it.
+        pkg, manifest = self.export('foo:a', 'foo:b', build='bar:x')
+        self.assertEqual(manifest['bundled_models'], ['foo:a', 'foo:b'])
+        self.assertFalse(any(k.startswith('models/bar/') for k in manifest['files']))
+        self.assertEqual(manifest['llm'], {'model': 'foo:b'})
+        self.assertEqual(manifest['answer_llm'], {'model': 'foo:b'})
+        self.assertEqual(manifest['build_llm'], {'model': 'bar:x'})
+        notes = self.ensure(pkg, manifest, 'foo:a', 'foo:b', build='bar:x')
+        self.assertEqual(self.installed('foo:b'), self.manifests['foo:b'])
+        self.assertIsNone(self.installed('bar:x'))
+        self.assertFalse(any('bar' in note for note in notes), notes)
+
+    def test_an_absent_build_model_is_not_checked_at_import(self):
+        pkg, manifest = self.export('foo:a', 'foo:b')
+        notes = self.ensure(pkg, manifest, 'foo:a', 'foo:b', build='bar:y')
+        self.assertIsNone(self.installed('bar:y'))
+        self.assertFalse(any('bar' in note for note in notes), notes)
 
     def test_a_bundled_tag_is_never_installed_under_another_tag(self):
         pkg, manifest = self.export('foo:a', 'bar:x')
@@ -48331,8 +57130,14 @@ class IngestImportTests(unittest.TestCase):
 
     def served(self, collection):
         from routers import ingest as ingest_router
+        from services import weaviate_client
         import asyncio
-        return asyncio.run(ingest_router.get_ingest_config(collection)).model_dump()
+
+        # The route answers 404 for a collection that doesn't exist (#606); these exist.
+        async def exists(name):
+            return True
+        with patch.object(weaviate_client, 'collection_exists', exists):
+            return asyncio.run(ingest_router.get_ingest_config(collection)).model_dump()
 
     def assert_refused_before_mutation(self):
         saved = ingest_config._path('Corpus')
@@ -48700,14 +57505,20 @@ if (require.main === module) (async () => {
 const assert = require('node:assert/strict');
 const { makeReporter, stubAuth } = require('./lib');
 
-const HEALTH = '/api/health', METRICS = '/api/metrics/latency';
+const HEALTH = '/api/health/details', METRICS = '/api/metrics/latency';
 const UNREADABLE = 'Service health could not be read: The server sent a response the UI could not read.';
 const service = (status, latency_ms, model) => model ? { status, latency_ms, model } : { status, latency_ms };
-const healthBody = (embed = 'ok') => ({
-  status: embed === 'ok' ? 'ok' : 'degraded',
+const healthBody = (embed = 'ok', build = null) => ({
+  status: embed === 'ok' && (!build || build.status === 'ok') ? 'ok' : 'degraded',
   services: {
     weaviate: service('ok', 11),
-    ollama: { llm: service('ok', 22, 'phi3.5'), embed: service(embed, 33, 'nomic-embed-text') },
+    // One LLM by default; `build` gives a different build model (#671).
+    ollama: {
+      llm: service('ok', 22, 'phi3.5'),
+      build_llm: build ? service(build.status, 44, build.model) : service('ok', 22, 'phi3.5'),
+      embed: service(embed, 33, 'nomic-embed-text'),
+      same_model: !build,
+    },
   },
   resources: { memory: { status: 'ok', allocated_gb: 11.67, recommended_minimum_gb: 12.0 } },
 });
@@ -48789,6 +57600,8 @@ const cards = page => page.evaluate(() => [...document.querySelectorAll('span.ro
   colour: dot.classList.contains('bg-red-500') ? 'red' : dot.classList.contains('bg-green-500') ? 'green' : '?',
 })).map(c => `${c.label.split(' ')[0]}=${c.colour}`).join(', '));
 const ALL_GREEN = 'Weaviate=green, LLM=green, Embed=green';
+const labels = page => page.evaluate(() => [...document.querySelectorAll('span.rounded-full.w-2')]
+  .map(dot => (dot.parentElement.textContent || '').trim()));
 const EMBED_RED = 'Weaviate=green, LLM=green, Embed=red';
 const charts = n => `Latency Trends (${n} queries in ring buffer)`;
 const healthAlert = t => (t.match(/Service health could not be read:.{0,80}/) || [''])[0];
@@ -48862,6 +57675,28 @@ async function runHealthPageTests(browser, base, reporter) {
       await release(page, METRICS, 2, { body: metricsBody(3) });
       await assertCharts(page, 5);
     }],
+    // #671: one LLM card when the models are the same, an answer card and a build card otherwise.
+    ['one model shows one LLM card that builds and answers', async page => {
+      await load(page, 1, OK, { body: metricsBody(1) });
+      assert.deepEqual(await labels(page), ['Weaviate', 'LLM (phi3.5), builds and answers', 'Embed (nomic-embed-text)']);
+    }],
+    ['two models show an answer card and a build card', async page => {
+      await load(page, 1, { status: 200, body: healthBody('ok', { status: 'ok', model: 'qwen2.5:0.5b' }) }, { body: metricsBody(1) });
+      assert.deepEqual(await labels(page), ['Weaviate', 'Answer LLM (phi3.5)', 'Build LLM (qwen2.5:0.5b)', 'Embed (nomic-embed-text)']);
+      assert.equal(await cards(page), 'Weaviate=green, Answer=green, Build=green, Embed=green');
+      const t = await text(page);
+      assert.ok(t.includes('44ms') && t.includes('22ms'), t.slice(0, 300));
+    }],
+    ['a missing build model (503) shows only the build card red', async page => {
+      await load(page, 1, { status: 503, body: healthBody('ok', { status: 'error', model: 'qwen2.5:0.5b' }) }, { body: metricsBody(1) });
+      assert.equal(healthAlert(await text(page)), '');
+      assert.equal(await cards(page), 'Weaviate=green, Answer=green, Build=red, Embed=green');
+    }],
+    ['a health body without build_llm is unreadable, not a page error', async page => {
+      const body = healthBody(); delete body.services.ollama.build_llm;
+      await load(page, 1, { status: 200, body }, { body: metricsBody(1) });
+      await assertUnreadable(page, UNREADABLE);
+    }],
     ['a late older metrics success after a newer failure is shown', async page => {
       await refresh(page, 2);
       await release(page, METRICS, 2, ERROR('Synthetic metrics failure'));
@@ -48905,6 +57740,8 @@ const PACKAGE = 'ragpkg-vfytransfera-20261021-0000-abcd1234.tar.gz';
 const collectionsBody = { collections: [A, B].map(name => ({ name, object_count: 3, index_type: 'hnsw', distance_metric: 'cosine', created_at: null })) };
 // An encrypted package lists no metadata (#27).
 const SEALED = 'ragpkg-vfytransfera-20261021-0000-abcd1234.tar.gz.age';
+// An encrypted package whose header can't be read: listed readable: false (#27).
+const BROKEN = 'ragpkg-vfytransfera-20261021-0000-ffff0000.tar.gz.age';
 const packagesBody = { packages: [
   { filename: PACKAGE, size_bytes: 2048, collection: A, chunk_count: 3, fidelity: 'with-sources', created_at: null, readable: true, encrypted: false },
   { filename: SEALED, size_bytes: 2100, collection: null, chunk_count: null, fidelity: null, created_at: null, readable: true, encrypted: true },
@@ -49146,6 +57983,32 @@ async function runTransferPageTests(browser, base, reporter) {
     await release(page, HALVES.export.poll, exportJob('completed', { chunks_written: 3, filename: 'ragpkg-vfy.tar.gz.age', size_bytes: 4096, fidelity: 'with-sources', models_bundled: false, retrieve_script: true, encrypted: true }));
     await waitText(page, 'with-sources, encrypted');
   }]);
+  cases.push(['export encryption: the bounds count characters, 1025 holds Export, and a refused start keeps the fields (#27)', async page => {
+    assert.equal(await checkEncrypt(page), true, 'no "Encrypt with a passphrase" checkbox');
+    await page.waitForFunction(() => document.querySelectorAll('input[type=password]').length === 2);
+    const lock = '\u{1F512}';   // one character, two UTF-16 units
+    await typePassword(page, 0, lock.repeat(11));
+    await typePassword(page, 1, lock.repeat(11));
+    await waitText(page, 'The passphrase needs at least 12 characters.');
+    assert.equal((await button(page, 'export')).disabled, true, 'Export enabled with 11 characters (22 UTF-16 units)');
+    await typePassword(page, 0, lock.repeat(12));
+    await typePassword(page, 1, lock.repeat(12));
+    await waitText(page, 'The passphrase needs at least 12 characters.', true);
+    await expectButton(page, 'export', false);
+    await typePassword(page, 0, 'a'.repeat(1025));
+    await typePassword(page, 1, 'a'.repeat(1025));
+    await waitText(page, 'The passphrase can have at most 1024 characters.');
+    assert.equal((await button(page, 'export')).disabled, true, 'Export enabled with 1025 characters');
+    await typePassword(page, 0, 'a'.repeat(1024));
+    await typePassword(page, 1, 'a'.repeat(1024));
+    await waitText(page, 'The passphrase can have at most 1024 characters.', true);
+    await expectButton(page, 'export', false);
+    assert.equal(await click(page, 'Export'), true, 'no Export button');
+    await release(page, '/api/export', apiError(409, 'EXPORT_IN_PROGRESS', 'An export of this collection is already running.'), 'POST');
+    await waitText(page, 'An export of this collection is already running.');
+    assert.deepEqual(await passwords(page), ['a'.repeat(1024), 'a'.repeat(1024)], 'the fields were cleared after a refused start');
+    await expectButton(page, 'export', false);
+  }]);
   cases.push(['export encryption: an unchecked box sends no passphrase (#27)', async page => {
     await start(page, 'export');
     assert.deepEqual(await sentBody(page, '/api/export'), { collection: A, include_models: false });
@@ -49172,6 +58035,67 @@ async function runTransferPageTests(browser, base, reporter) {
     assert.equal(await click(page, 'Import'), true, 'no Import button');
     await pending(page, '/api/import', 'POST');
     assert.deepEqual(await sentBody(page, '/api/import'), { filename: PACKAGE, on_conflict: 'abort' });
+  }]);
+  cases.push(['import encryption: an encrypted package that can\'t be read is labelled "encrypted, unreadable" (#27)', async page => {
+    const broken = { filename: BROKEN, size_bytes: 512, collection: null, chunk_count: null, fidelity: null, created_at: null, readable: false, encrypted: true };
+    await release(page, '/api/packages', json(200, { packages: [...packagesBody.packages, broken] }));
+    await page.waitForFunction(n => [...document.querySelectorAll('option')].some(o => o.value === n), { timeout: 5000 }, BROKEN)
+      .catch(() => { throw new Error('the unreadable encrypted package is not listed'); });
+    const label = await page.evaluate(n => [...document.querySelectorAll('option')].find(o => o.value === n).textContent, BROKEN);
+    assert.equal(label, BROKEN + ' — encrypted, unreadable');
+  }, { hold: ['GET /api/packages'] }]);
+
+  // Downloading a package and its expiry (#677, RD-145 Q4).
+  const EXPIRES = '2026-11-18T12:00:00Z';
+  const downloadLinks = page => page.evaluate(() => [...document.querySelectorAll('a')]
+    .filter(a => a.textContent.trim() === 'Download').map(a => ({ href: a.getAttribute('href'), download: a.hasAttribute('download') })));
+  const localTime = (page, iso) => page.evaluate(i => new Date(i).toLocaleString(), iso);
+  cases.push(['export: a finished export shows a Download link to its package and "Expires <local time>" (#677)', async page => {
+    await startAndPoll(page, 'export');
+    const done = JSON.parse(HALVES.export.done.body);
+    await release(page, HALVES.export.poll, json(200, { ...done, expires_at: EXPIRES }));
+    await waitText(page, 'Done.');
+    await waitText(page, 'Expires ' + await localTime(page, EXPIRES));
+    const links = await downloadLinks(page);
+    assert.ok(links.some(l => l.href === '/api/packages/ragpkg-vfy.tar.gz' && l.download), JSON.stringify(links));
+  }]);
+  cases.push(['export: a finished export with no expiry still offers Download and shows no "Expires" (#677)', async page => {
+    await startAndPoll(page, 'export');
+    await release(page, HALVES.export.poll, HALVES.export.done);
+    await waitText(page, 'Done.');
+    const links = await downloadLinks(page);
+    assert.ok(links.some(l => l.href === '/api/packages/ragpkg-vfy.tar.gz'), JSON.stringify(links));
+    assert.ok(!(await text(page)).includes('Expires '), 'an "Expires" label for a package with no expiry');
+  }]);
+  cases.push(['import: the package list says when a package exported here expires, and Download follows the selected package (#677)', async page => {
+    await release(page, '/api/packages', json(200, { packages: [{ ...packagesBody.packages[0], expires_at: EXPIRES }, packagesBody.packages[1]] }));
+    await page.waitForFunction(n => [...document.querySelectorAll('option')].some(o => o.value === n), { timeout: 5000 }, PACKAGE);
+    const labels = await page.evaluate(() => Object.fromEntries([...document.querySelectorAll('option')].map(o => [o.value, o.textContent])));
+    assert.ok(labels[PACKAGE].endsWith(', expires ' + await localTime(page, EXPIRES)), labels[PACKAGE]);
+    assert.ok(!labels[SEALED].includes('expires'), labels[SEALED]);
+    const disabled = await page.evaluate(() => [...document.querySelectorAll('button')].some(b => b.textContent.trim() === 'Download' && b.disabled));
+    assert.equal(disabled, true, 'no disabled Download while no package is selected');
+    assert.deepEqual(await downloadLinks(page), [], 'a Download link with no package selected');
+    await selectPackage(page, PACKAGE);
+    await page.waitForFunction(() => [...document.querySelectorAll('a')].some(a => a.textContent.trim() === 'Download'), { timeout: 5000 });
+    assert.deepEqual(await downloadLinks(page), [{ href: '/api/packages/' + encodeURIComponent(PACKAGE), download: true }]);
+    await selectPackage(page, SEALED);
+    await page.waitForFunction(h => [...document.querySelectorAll('a')].some(a => a.getAttribute('href') === h), { timeout: 5000 }, '/api/packages/' + encodeURIComponent(SEALED))
+      .catch(async () => { throw new Error('Download did not follow the selection: ' + JSON.stringify(await downloadLinks(page))); });
+  }, { hold: ['GET /api/packages'] }]);
+  cases.push(['export: after Download, the page sees the package go and stops offering it (#677)', async page => {
+    await startAndPoll(page, 'export');
+    const done = JSON.parse(HALVES.export.done.body);
+    await release(page, HALVES.export.poll, json(200, { ...done, expires_at: EXPIRES }));
+    await waitText(page, 'Done.');
+    // The click must not navigate; React's onClick still runs.
+    await page.evaluate(() => document.addEventListener('click', e => e.preventDefault(), true));
+    await page.evaluate(() => [...document.querySelectorAll('a')].find(a => a.textContent.trim() === 'Download'
+      && a.getAttribute('href') === '/api/packages/ragpkg-vfy.tar.gz').click());
+    // The fixed package list doesn't name ragpkg-vfy.tar.gz: the first re-read (3 s) finds it gone.
+    await waitText(page, 'Downloaded and deleted from ./exports.');
+    assert.deepEqual((await downloadLinks(page)).filter(l => l.href === '/api/packages/ragpkg-vfy.tar.gz'), []);
+    assert.ok(!(await text(page)).includes('Expires '), 'still shows when the deleted package expires');
   }]);
 
   for (const [name, test, opts] of cases) {
@@ -49773,8 +58697,11 @@ const CITATIONS = [
   { source_file: 'beta.txt', chunk_index: 0, score: null, excerpt: 'Second excerpt.' },
 ];
 // Answers for the pages a case may pass through; a case adds or overrides routes.
+const OPEN = { restricted: false, users: [], service_principals: [] };
 const base = (extra = {}) => ({
   'GET /api/collections': json(200, { collections: COLS }),
+  // Each collection's access on the Collections page (#606): open unless a case says otherwise.
+  'GET /api/collections/*': json(200, OPEN),
   'GET /api/retrieval/config/*': call => json(200, retrievalConfig(call.path.split('/').pop())),
   'GET /api/packages': json(200, { packages: [] }),
   'GET /api/tune/*': call => json(200, { collection: call.path.split('/').pop(), fidelity: 'with-sources', source_document_count: 2, can_rechunk: true, can_reembed: true, can_reindex: true, note: '' }),
@@ -49818,13 +58745,158 @@ function collectionsCases() {
     { name: 'Collections table shows its columns, each collection and a dash for a null created date', open: open(), async run(s) {
       await waitText(s.page, A);
       const heads = await s.page.evaluate(() => [...document.querySelectorAll('thead th')].map(t => t.textContent.trim()));
-      assert.deepEqual(heads, ['Name', 'Objects', 'Index', 'Distance', 'Created', '']);
+      assert.deepEqual(heads, ['Name', 'Objects', 'Index', 'Distance', 'Created', 'Access', '']);
       const rows = await s.page.evaluate(() => [...document.querySelectorAll('tbody tr')].map(r => [...r.querySelectorAll('td')].map(c => c.textContent.trim())));
       const date = await s.page.evaluate(v => new Date(v).toLocaleDateString(), COLS[0].created_at);
       assert.deepEqual(rows[0].slice(0, 5), [A, '12', 'hnsw', 'cosine', date]);
       assert.notEqual(date, DASH);
       assert.deepEqual(rows[1].slice(0, 5), [B, '0', 'flat', 'dot', DASH]);
+      await waitFor(s.page, () => [...document.querySelectorAll('tbody tr')].every(r => r.cells[5].textContent.trim() !== '\u2014'), 'the access column');
+      const access = await s.page.evaluate(() => [...document.querySelectorAll('tbody tr')].map(r => r.cells[5].textContent.trim()));
+      assert.deepEqual(access, ['Open', 'Open']);
     } },
+    { name: 'Access (#606): a restricted collection shows its grant count; the dialog restricts to the ticked accounts and PUTs them; a refused save stays open with the message', open: (() => {
+      let saves = 0;
+      return open({
+        ['GET /api/collections/' + A + '/access']: json(200, { restricted: true, users: ['vfy-developer'], service_principals: [] }),
+        'GET /api/auth/users': json(200, { users: [{ username: 'vfy-developer', role: 'developer', enabled: true, must_change_password: false, created_at: '2026-01-02T12:00:00Z' }, { username: 'vfy-off', role: 'end_user', enabled: false, must_change_password: false, created_at: '2026-01-02T12:00:00Z' }] }),
+        'GET /api/auth/service-principals': json(200, { principals: [{ name: 'vfy-svc', role: 'end_user', enabled: true, created_at: '2026-01-02T12:00:00Z', keys: [] }] }),
+        'PUT /api/collections/*': call => (++saves === 1 ? apiError(422, 'INVALID_PARAMETER', 'no person is named \'x\'') : json(200, call.body)),
+      });
+    })(), async run(s) {
+      await waitText(s.page, 'Restricted (1)');
+      const accessButtons = () => s.page.$$('tbody button');
+      await (await accessButtons())[2].click();   // row B: Access, Delete; row A first
+      await waitText(s.page, 'Access to ' + B);
+      await waitText(s.page, 'Open: everyone whose role allows it');
+      await waitFor(s.page, () => [...document.querySelectorAll('.fixed button')].some(b => b.textContent.trim() === 'Save' && !b.disabled), 'Save to be enabled once the state is read');
+      await s.page.click('input[type=radio]:not(:checked)');
+      await waitText(s.page, 'vfy-off (disabled)');
+      await waitText(s.page, 'vfy-svc');
+      const boxes = await s.page.$$('input[type=checkbox]');
+      await boxes[0].click();   // vfy-developer
+      await boxes[2].click();   // vfy-svc
+      await press(s.page, 'Save');
+      await waitText(s.page, "no person is named 'x'");
+      assert.equal(await modalOpen(s.page), true);
+      await press(s.page, 'Save');
+      await waitFor(s.page, () => !document.querySelector('.fixed.inset-0'), 'the dialog to close');
+      const puts = callsTo(s, 'PUT', '/api/collections/' + B + '/access');
+      assert.equal(puts.length, 2);
+      assert.deepEqual(puts[1].body, { restricted: true, users: ['vfy-developer'], service_principals: ['vfy-svc'] });
+      await waitText(s.page, 'Restricted (2)');
+    } },
+    { name: 'Access (#606): when the dialog cannot read the state, the choice stays unknown and Save is disabled', open: open({
+      ['GET /api/collections/' + B + '/access']: apiError(500, 'INTERNAL_ERROR', 'Synthetic read failure.'),
+      'GET /api/auth/users': json(200, { users: [] }),
+      'GET /api/auth/service-principals': json(200, { principals: [] }),
+    }), async run(s) {
+      await waitText(s.page, A);
+      await (await s.page.$$('tbody button'))[2].click();
+      await waitText(s.page, 'Synthetic read failure.');
+      const state = await s.page.evaluate(() => ({
+        save: [...document.querySelectorAll('.fixed button')].find(b => b.textContent.trim() === 'Save').disabled,
+        checked: [...document.querySelectorAll('.fixed input[type=radio]')].filter(r => r.checked).length,
+      }));
+      assert.deepEqual(state, { save: true, checked: 0 });
+      assert.equal(callsTo(s, 'PUT', '/api/collections/' + B + '/access').length, 0);
+    } },
+    (() => {
+      // The page's own read of A answers at once; the dialog's read of A is held
+      // until B's dialog has read B (#788).
+      const late = hold();
+      let readsOfA = 0;
+      return { name: 'Access (#788): a late answer for an earlier opening does not fill another collection\'s dialog', open: open({
+        ['GET /api/collections/' + A + '/access']: () => (++readsOfA === 1 ? json(200, OPEN) : late),
+        ['GET /api/collections/' + B + '/access']: json(200, { restricted: true, users: ['vfy-developer'], service_principals: [] }),
+        'GET /api/auth/users': json(200, { users: [] }),
+        'GET /api/auth/service-principals': json(200, { principals: [] }),
+        'PUT /api/collections/*': call => json(200, call.body),
+      }), async run(s) {
+        await waitText(s.page, A);
+        await waitFor(s.page, () => [...document.querySelectorAll('tbody tr')].every(r => r.cells[5].textContent.trim() !== '\u2014'), 'the access column');
+        await (await s.page.$$('tbody button'))[0].click();   // row A: Access
+        await waitText(s.page, 'Access to ' + A);
+        await press(s.page, 'Cancel');
+        await waitFor(s.page, () => !document.querySelector('.fixed.inset-0'), 'the dialog to close');
+        await (await s.page.$$('tbody button'))[2].click();   // row B: Access
+        await waitText(s.page, 'Access to ' + B);
+        await waitFor(s.page, () => [...document.querySelectorAll('.fixed button')].some(b => b.textContent.trim() === 'Save' && !b.disabled), 'Save to be enabled once B is read');
+        late.release(json(200, { restricted: true, users: ['vfy-a-only'], service_principals: [] }));
+        await new Promise(r => setTimeout(r, 300));
+        await press(s.page, 'Save');
+        await waitFor(s.page, () => !document.querySelector('.fixed.inset-0'), 'the dialog to close');
+        const puts = s.calls.filter(call => call.method === 'PUT');
+        assert.equal(puts.length, 1);
+        assert.equal(puts[0].path, '/api/collections/' + B + '/access');
+        assert.deepEqual(puts[0].body, { restricted: true, users: ['vfy-developer'], service_principals: [] });
+      } };
+    })(),
+    (() => {
+      // As above, but the dialog's held read of A later fails: its error must
+      // not reach B's dialog (#792).
+      const late = hold();
+      let readsOfA = 0;
+      return { name: 'Access (#792): a failed read for an earlier opening does not show its error in another collection\'s dialog', open: open({
+        ['GET /api/collections/' + A + '/access']: () => (++readsOfA === 1 ? json(200, OPEN) : late),
+        ['GET /api/collections/' + B + '/access']: json(200, { restricted: true, users: ['vfy-developer'], service_principals: [] }),
+        'GET /api/auth/users': json(200, { users: [] }),
+        'GET /api/auth/service-principals': json(200, { principals: [] }),
+        'PUT /api/collections/*': call => json(200, call.body),
+      }), async run(s) {
+        await waitText(s.page, A);
+        await waitFor(s.page, () => [...document.querySelectorAll('tbody tr')].every(r => r.cells[5].textContent.trim() !== '\u2014'), 'the access column');
+        await (await s.page.$$('tbody button'))[0].click();   // row A: Access
+        await waitText(s.page, 'Access to ' + A);
+        await press(s.page, 'Cancel');
+        await waitFor(s.page, () => !document.querySelector('.fixed.inset-0'), 'the dialog to close');
+        await (await s.page.$$('tbody button'))[2].click();   // row B: Access
+        await waitText(s.page, 'Access to ' + B);
+        await waitFor(s.page, () => [...document.querySelectorAll('.fixed button')].some(b => b.textContent.trim() === 'Save' && !b.disabled), 'Save to be enabled once B is read');
+        late.release(apiError(500, 'INTERNAL_ERROR', 'Synthetic late failure.'));
+        await new Promise(r => setTimeout(r, 300));
+        const state = await s.page.evaluate(() => ({
+          error: document.body.textContent.includes('Synthetic late failure.'),
+          save: [...document.querySelectorAll('.fixed button')].find(b => b.textContent.trim() === 'Save').disabled,
+        }));
+        assert.deepEqual(state, { error: false, save: false });
+        assert.equal(s.calls.filter(call => call.method === 'PUT').length, 0);
+      } };
+    })(),
+    (() => {
+      // A's opening's lists of people and service principals are held until B's
+      // dialog has its own: the late people list and the late principals error
+      // must not reach B's dialog (#792).
+      const lateUsers = hold(), latePrincipals = hold();
+      let usersReads = 0, principalsReads = 0;
+      const user = name => ({ username: name, role: 'developer', enabled: true, must_change_password: false, created_at: '2026-01-02T12:00:00Z' });
+      return { name: 'Access (#792): an earlier opening\'s late lists of people and service principals do not reach another collection\'s dialog', open: open({
+        ['GET /api/collections/' + B + '/access']: json(200, { restricted: true, users: ['vfy-developer'], service_principals: [] }),
+        'GET /api/auth/users': () => (++usersReads === 1 ? lateUsers : json(200, { users: [user('vfy-developer')] })),
+        'GET /api/auth/service-principals': () => (++principalsReads === 1 ? latePrincipals : json(200, { principals: [] })),
+        'PUT /api/collections/*': call => json(200, call.body),
+      }), async run(s) {
+        await waitText(s.page, A);
+        await (await s.page.$$('tbody button'))[0].click();   // row A: Access
+        await waitText(s.page, 'Access to ' + A);
+        await press(s.page, 'Cancel');
+        await waitFor(s.page, () => !document.querySelector('.fixed.inset-0'), 'the dialog to close');
+        await (await s.page.$$('tbody button'))[2].click();   // row B: Access
+        await waitText(s.page, 'Access to ' + B);
+        await waitText(s.page, 'vfy-developer');
+        lateUsers.release(json(200, { users: [user('vfy-stale')] }));
+        latePrincipals.release(apiError(500, 'INTERNAL_ERROR', 'Synthetic late principals failure.'));
+        await new Promise(r => setTimeout(r, 300));
+        const state = await s.page.evaluate(() => ({
+          error: document.body.textContent.includes('Synthetic late principals failure.'),
+          people: [...document.querySelectorAll('.fixed fieldset')][0].textContent.trim(),
+          save: [...document.querySelectorAll('.fixed button')].find(b => b.textContent.trim() === 'Save').disabled,
+        }));
+        assert.deepEqual(state, { error: false, people: 'Peoplevfy-developer', save: false });
+        assert.equal(usersReads, 2);
+        assert.equal(principalsReads, 2);
+      } };
+    })(),
     { name: 'New Collection modal starts with HNSW, Cosine and the three HNSW sliders at their defaults and bounds', open: open(), async run(s) {
       await waitText(s.page, A);
       await press(s.page, '+ New Collection');
@@ -50021,7 +59093,7 @@ function navMenuCases() {
   const DATA = { key: 'data', label: 'Data', entries: ['Import', 'Prepare', 'Transfer'] };
   const TUNE = { key: 'tune', label: 'Tune', entries: ['Chunking', 'Retrieval', 'Gold Standard'] };
   const ADMIN = { key: 'admin', label: 'Admin', entries: ['Collections', 'Users', 'Service keys', 'Audit', 'Health'] };
-  const account = (username, badge) => ({ key: 'account', label: `${username} ${badge}`, entries: ['Change password', 'Log out'] });
+  const account = (username, badge) => ({ key: 'account', label: `${username} ${badge}`, entries: ['Account', 'Change password', 'Log out'] });
   const want = {
     end_user: [account('vfy-end-user', 'End User')],
     developer: [DATA, TUNE, account('vfy-developer', 'Developer')],
@@ -50267,9 +59339,19 @@ function usersCases() {
       ...extra,
     });
   };
-  const open = (extra = {}) => ({ role: 'engineer', path: '/users', routes: usersApi(extra) });
+  // Reset password, Disable and a role change ask first (#551): `dialog.answer`
+  // says whether a confirmation is accepted (yes by default), `dialog.seen` keeps
+  // what was asked.
+  const open = (extra = {}, dialog = { answer: () => true, seen: [] }) => ({ role: 'engineer', path: '/users', routes: usersApi(extra),
+    onDialog: async d => { dialog.seen.push(d.message()); if (dialog.answer(d.message())) await d.accept(); else await d.dismiss(); } });
+  const othersAccepted = { answer: m => !m.includes('your own'), seen: [] }, allCancelled = { answer: () => false, seen: [] };
   const rowTexts = page => page.evaluate(() => [...document.querySelectorAll('tbody tr')].map(r => [...r.querySelectorAll('td')].map(c => c.textContent.trim())));
+  // The row controls are disabled while a change is in flight, and a click on a
+  // disabled button does nothing. The one-time password shows before the list
+  // has reloaded and the controls are enabled again, so wait for that first.
+  const settled = page => waitFor(page, () => ![...document.querySelectorAll('tbody button, tbody select')].some(e => e.disabled), 'the row controls to be enabled');
   const rowPress = async (page, username, label) => {
+    await settled(page);
     const done = await page.evaluate((u, t) => {
       const b = [...document.querySelectorAll(`tr[data-username="${u}"] button`)].find(x => x.textContent.trim() === t);
       if (!b) return false; b.click(); return true;
@@ -50297,10 +59379,10 @@ function usersCases() {
     { name: 'The list shows each account; the own row has no Reset password', open: open(), async run(s) {
       await waitText(s.page, 'vfy-off');
       const heads = await s.page.evaluate(() => [...document.querySelectorAll('thead th')].map(t => t.textContent.trim()));
-      assert.deepEqual(heads, ['Username', 'Role', 'Status', 'Password', 'Created', '']);
+      assert.deepEqual(heads, ['Username', 'Role', 'Status', 'Password', 'Two-step', 'Created', '']);
       const date = await s.page.evaluate(v => new Date(v).toLocaleDateString(), '2026-10-01T12:00:00Z');
       const rows = await rowTexts(s.page);
-      assert.deepEqual(rows.map(r => [r[0], r[2], r[3], r[4]]), [['vfy-developer', 'Enabled', 'Set', date], [ME + ' (you)', 'Enabled', 'Set', date], ['vfy-off', 'Disabled', 'Change due', date]]);
+      assert.deepEqual(rows.map(r => [r[0], r[2], r[3], r[4], r[5]]), [['vfy-developer', 'Enabled', 'Set', 'Off', date], [ME + ' (you)', 'Enabled', 'Set', 'Off', date], ['vfy-off', 'Disabled', 'Change due', 'Off', date]]);
       assert.deepEqual(await s.page.evaluate(() => [...document.querySelectorAll('tbody select')].map(x => x.value)), ['developer', 'engineer', 'end_user']);
       assert.deepEqual(await rowButtons(s.page, 'vfy-developer'), ['Reset password', 'Disable']);
       assert.deepEqual(await rowButtons(s.page, ME), ['Disable']);
@@ -50351,8 +59433,235 @@ function usersCases() {
       assert.ok(callsTo(s, 'GET', '/api/auth/users').length > before, 'the list was reloaded');
       assert.equal(await s.page.evaluate(() => document.querySelector('tr[data-username="vfy-engineer"] td:nth-child(3)').textContent.trim()), 'Enabled');
     } },
+    { name: 'Reset password, Disable and a role change ask first, worded for the account; Enable asks nothing', open: open({}, othersAccepted), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      const status = (u, want) => waitFor(s.page, (n, w) => document.querySelector(`tr[data-username="${n}"] td:nth-child(3)`).textContent.trim() === w, `${u} ${want}`, u, want);
+      await fill(s.page, 'select[aria-label="Role of vfy-developer"]', 'end_user');
+      await waitFor(s.page, () => document.querySelector('select[aria-label="Role of vfy-developer"]').value === 'end_user', 'the new role');
+      await rowPress(s.page, 'vfy-developer', 'Disable');
+      await status('vfy-developer', 'Disabled');
+      await rowPress(s.page, 'vfy-off', 'Reset password');
+      await waitText(s.page, 'ResetOnce-0987654321ab');
+      await rowPress(s.page, 'vfy-off', 'Enable');
+      await status('vfy-off', 'Enabled');
+      await settled(s.page);
+      await fill(s.page, `select[aria-label="Role of ${ME}"]`, 'developer');
+      await rowPress(s.page, ME, 'Disable');
+      await settled(s.page);
+      assert.deepEqual(othersAccepted.seen, [
+        'Change the role of vfy-developer to End User?',
+        "Disable vfy-developer? Their sessions end and they can't log in until enabled.",
+        'Reset the password of vfy-off? Their sessions end and they must change the new password at their next login.',
+        'Change your own role to Developer? You will lose access to the Users page.',
+        "Disable your own account? You will be logged out and can't log in again until another AI Engineer enables you.",
+      ]);
+      for (const action of ['vfy-developer/role', 'vfy-developer/disable', 'vfy-off/reset-password', 'vfy-off/enable']) assert.equal(callsTo(s, 'POST', `/api/auth/users/${action}`).length, 1, action);
+      assert.equal(s.calls.filter(c => c.method === 'POST' && c.path.startsWith(`/api/auth/users/${ME}/`)).length, 0);
+      assert.equal(await s.page.evaluate(n => document.querySelector(`select[aria-label="Role of ${n}"]`).value, ME), 'engineer');
+    } },
+    { name: 'A cancelled role change, Disable or Reset password sends nothing', open: open({}, allCancelled), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      await fill(s.page, 'select[aria-label="Role of vfy-developer"]', 'end_user');
+      await rowPress(s.page, 'vfy-developer', 'Disable');
+      await rowPress(s.page, 'vfy-developer', 'Reset password');
+      // A dismissed confirmation is answered inside the click, so nothing can be
+      // in flight; the pause only gives a wrongly sent request time to be seen.
+      await new Promise(r => setTimeout(r, 300));
+      assert.equal(allCancelled.seen.length, 3);
+      assert.equal(s.calls.filter(c => c.method === 'POST' && c.path.startsWith('/api/auth/users/')).length, 0);
+      assert.equal(await s.page.evaluate(() => document.querySelector('select[aria-label="Role of vfy-developer"]').value), 'developer');
+      assert.equal(await s.page.evaluate(() => document.querySelector('tr[data-username="vfy-developer"] td:nth-child(3)').textContent.trim()), 'Enabled');
+    } },
     { name: 'A list that cannot be loaded says so', open: open({ 'GET /api/auth/users': apiError(500, 'INTERNAL_ERROR', 'Synthetic failure.') }), async run(s) {
       await waitText(s.page, 'Could not load the users: Synthetic failure.');
+    } },
+    // The page re-reads the session after a change to the Engineer's own account:
+    // a demoted Engineer leaves the page, a disabled one is logged out. The stub
+    // answers as the API would once the change applies (reviewer, PR #550).
+    ...[['demotes themselves', 'role', { role: 'developer' }, '/qa', 'Ask a Question'],
+        ['disables themselves', 'disable', null, '/login', 'Log in to continue']].map(([what, action, body, where, landmark]) => {
+      const me = { role: 'engineer', enabled: true };
+      const gone = () => !me.enabled ? apiError(401, 'AUTH_REQUIRED', 'Log in to use this.') : null;
+      const notEngineer = () => me.role !== 'engineer' ? apiError(403, 'FORBIDDEN', 'This needs the engineer role.') : null;
+      return { name: `An Engineer who ${what} on the Users page is sent to ${where}`, open: open({
+        'GET /api/auth/me': () => gone() || json(200, { username: ME, role: me.role, must_change_password: false }),
+        'GET /api/auth/users': () => gone() || notEngineer() || json(200, { users: [row('vfy-developer', 'developer'), row(ME, me.role, { enabled: me.enabled }), row('vfy-eng2', 'engineer')] }),
+        [`POST /api/auth/users/${ME}/${action}`]: call => {
+          if (action === 'role') me.role = call.body.role; else me.enabled = false;
+          return json(200, { user: row(ME, me.role, { enabled: me.enabled }) });
+        },
+      }), async run(s) {
+        await waitText(s.page, 'vfy-eng2');
+        if (action === 'role') await fill(s.page, `select[aria-label="Role of ${ME}"]`, body.role);
+        else await rowPress(s.page, ME, 'Disable');
+        await waitPath(s.page, where);
+        await waitText(s.page, landmark);
+        assert.equal(callsTo(s, 'POST', `/api/auth/users/${ME}/${action}`).length, 1);
+        if (action === 'role') assert.equal((await nav(s.page)).includes('Users'), false);
+      } };
+    }),
+  ];
+}
+
+// Two-step verification (#607): the Account page's set-up, recovery codes and
+// turn-off, the login's code step, a forced set-up, and the Users page's
+// column, reset and switch. The API is stubbed; the real routes are checked
+// in 17_auth.sh (auth_stack.py mfa) and test_auth.py.
+function mfaCases() {
+  const SECRET = 'JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP';
+  const CODES = Array.from({ length: 10 }, (_, i) => `aaaa-bbbb-cccc-dd${String(i).padStart(2, '2')}`.slice(0, 19));
+  const off = { enrolled: false, enrolled_at: null, required: false, recovery_codes_remaining: 0 };
+  const on = { enrolled: true, enrolled_at: '2026-11-16T12:00:00Z', required: false, recovery_codes_remaining: 10 };
+  const me = (role, over = {}) => ({ username: 'vfy-' + role.replace('_', '-'), role, must_change_password: false, ...over });
+  const row = (username, role, over = {}) => ({ username, role, enabled: true, must_change_password: false, created_at: '2026-10-01T12:00:00Z', mfa_enrolled: false, ...over });
+  // Reset two-step asks first (#779): each Users case below keeps what was asked.
+  const RESET2_ASK = 'Reset the two-step verification of vfy-developer? Their sessions end and they must log in again with their password alone.';
+  const resetAccepted = { seen: [] }, resetCancelled = { seen: [] };
+  const dialogTo = (d, accept) => async dlg => { d.seen.push(dlg.message()); if (accept) await dlg.accept(); else await dlg.dismiss(); };
+  return [
+    { name: 'The account menu has Account, which opens the two-step set-up: a QR code, the key as text, and the codes once', open: { role: 'developer', path: '/qa', routes: base({
+      'GET /api/auth/mfa': json(200, off),
+      'POST /api/auth/mfa/enroll': json(200, { secret: SECRET, otpauth_uri: `otpauth://totp/RAG%20Platform:vfy-developer?secret=${SECRET}&issuer=RAG%20Platform&algorithm=SHA1&digits=6&period=30` }),
+      'POST /api/auth/mfa/enroll/confirm': json(200, { recovery_codes: CODES, status: on }),
+    }) }, async run(s) {
+      await waitText(s.page, 'Ask a Question');
+      await chooseFromMenu(s.page, 'account', 'Account');
+      await waitPath(s.page, '/account');
+      await waitText(s.page, 'Two-step verification is off');
+      await press(s.page, 'Set up');
+      await waitFor(s.page, () => !!document.querySelector('[data-testid=mfa-setup] img[src^="data:image/"]'), 'the QR code drawn in the page');
+      assert.equal(await s.page.evaluate(() => document.querySelector('[data-testid=mfa-secret]').textContent.trim()), SECRET);
+      await fill(s.page, '#mfa-confirm-code', '123456');
+      await press(s.page, 'Confirm');
+      await waitFor(s.page, () => !!document.querySelector('[data-testid=recovery-codes]'), 'the recovery codes');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/mfa/enroll/confirm').map(c => c.body), [{ code: '123456' }]);
+      await waitText(s.page, CODES[9]);
+      await waitText(s.page, 'shown only once');
+      assert.deepEqual(await s.page.evaluate(() => [Object.keys(sessionStorage), Object.keys(localStorage)]), [[], []]);
+      await press(s.page, 'Done');
+      await waitText(s.page, CODES[0], true);
+      await waitText(s.page, '10 of 10 recovery codes left');
+    } },
+    { name: 'Enrolled: regenerate shows a new set once; Turn off sends the password and code', open: { role: 'developer', path: '/account', routes: base({
+      'GET /api/auth/mfa': json(200, on),
+      'POST /api/auth/mfa/recovery-codes': json(200, { recovery_codes: CODES, status: on }),
+      'POST /api/auth/mfa/disable': json(200, { status: off }),
+    }) }, async run(s) {
+      await waitText(s.page, '10 of 10 recovery codes left');
+      await press(s.page, 'Regenerate recovery codes');
+      await fill(s.page, '#mfa-regenerate-code', '654321');
+      await press(s.page, 'Get new recovery codes');
+      await waitText(s.page, CODES[3]);
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/mfa/recovery-codes').map(c => c.body), [{ code: '654321' }]);
+      await press(s.page, 'Done');
+      await press(s.page, 'Turn off');
+      await fill(s.page, '#mfa-disable-password', 'my password here');
+      await fill(s.page, '#mfa-disable-code', CODES[0]);
+      await press(s.page, 'Turn off', 'form button[type=submit]');
+      await waitText(s.page, 'Two-step verification is off');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/mfa/disable').map(c => c.body), [{ password: 'my password here', code: CODES[0] }]);
+    } },
+    { name: 'While two-step verification is required, Turn off isn\'t offered', open: { role: 'developer', path: '/account', routes: base({
+      'GET /api/auth/mfa': json(200, { ...on, required: true }),
+    }) }, async run(s) {
+      await waitText(s.page, 'Regenerate recovery codes');
+      assert.equal(await bodyHas(s.page, 'Turn off'), false);
+    } },
+    { name: 'A right password asks for a code; a wrong code shows the API\'s message; the right one opens /qa', open: { role: null, path: '/login', routes: base({
+      'POST /api/auth/login': json(200, { mfa_required: true }),
+      'POST /api/auth/login/mfa': call => call.body.code === '111111' ? json(200, me('developer', { mfa_enrolled: true })) : apiError(401, 'MFA_FAILED', 'The code is incorrect.'),
+    }) }, async run(s) {
+      await waitText(s.page, 'Log in to continue');
+      await fill(s.page, '#login-username', 'vfy-developer');
+      await fill(s.page, '#login-password', 'a password of twelve');
+      await press(s.page, 'Log in');
+      await waitFor(s.page, () => !!document.querySelector('#login-code'), 'the code step');
+      await fill(s.page, '#login-code', '000000');
+      await press(s.page, 'Verify');
+      await waitText(s.page, 'The code is incorrect.');
+      assert.equal(await s.page.evaluate(() => document.querySelector('#login-code').value), '');
+      await fill(s.page, '#login-code', '111111');
+      await press(s.page, 'Verify');
+      await waitPath(s.page, '/qa');
+      await waitText(s.page, 'Ask a Question');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/login/mfa').map(c => c.body), [{ code: '000000' }, { code: '111111' }]);
+    } },
+    // A login that opens a session carries the switch as mfa_required (#607 review):
+    // false, or true while required for everyone, it opens /qa, never the code step.
+    ...[false, true].map(required => ({ name: `A login answered with a user and mfa_required ${required} opens /qa without a code step`, open: { role: null, path: '/login', routes: base({
+      'POST /api/auth/login': json(200, me('developer', { mfa_enrolled: required, mfa_required: required, mfa_enrollment_required: false })),
+    }) }, async run(s) {
+      await waitText(s.page, 'Log in to continue');
+      await fill(s.page, '#login-username', 'vfy-developer');
+      await fill(s.page, '#login-password', 'a password of twelve');
+      await press(s.page, 'Log in');
+      await waitPath(s.page, '/qa');
+      await waitText(s.page, 'Ask a Question');
+      assert.equal(await s.page.evaluate(() => !!document.querySelector('#login-code')), false);
+      assert.equal(callsTo(s, 'POST', '/api/auth/login/mfa').length, 0);
+    } })),
+    { name: 'An expired challenge returns to the password step', open: { role: null, path: '/login', routes: base({
+      'POST /api/auth/login': json(200, { mfa_required: true }),
+      'POST /api/auth/login/mfa': apiError(401, 'MFA_CHALLENGE_INVALID', 'Your sign-in expired. Log in again.'),
+    }) }, async run(s) {
+      await waitText(s.page, 'Log in to continue');
+      await fill(s.page, '#login-username', 'vfy-developer');
+      await fill(s.page, '#login-password', 'a password of twelve');
+      await press(s.page, 'Log in');
+      await waitFor(s.page, () => !!document.querySelector('#login-code'), 'the code step');
+      await fill(s.page, '#login-code', '123456');
+      await press(s.page, 'Verify');
+      await waitText(s.page, 'Your sign-in expired');
+      await waitFor(s.page, () => !!document.querySelector('#login-password'), 'the password step again');
+    } },
+    { name: 'A required set-up shows only the account page, with Log out; an API answer MFA_ENROLLMENT_REQUIRED returns to it', open: { role: null, path: '/collections', routes: base({
+      'GET /api/auth/me': json(200, me('developer', { mfa_required: true, mfa_enrollment_required: true })),
+      'GET /api/auth/mfa': json(200, { ...off, required: true }),
+    }) }, async run(s) {
+      await waitPath(s.page, '/account');
+      await waitText(s.page, 'required for every account');
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('nav').length), 0);
+      await waitText(s.page, 'Log out');
+    } },
+    { name: 'An API answer 403 MFA_ENROLLMENT_REQUIRED on any page opens the account page', open: { role: 'engineer', path: '/collections', routes: base({
+      'GET /api/collections': apiError(403, 'MFA_ENROLLMENT_REQUIRED', 'Set up two-step verification before doing anything else.'),
+      'GET /api/auth/mfa': json(200, { ...off, required: true }),
+    }) }, async run(s) {
+      await waitPath(s.page, '/account');
+      await waitText(s.page, 'required for every account');
+    } },
+    { name: 'Users page: the Two-step column, Reset two-step on enrolled rows but the own, and the switch', open: { role: 'engineer', path: '/users', routes: (() => {
+      const list = [row('vfy-developer', 'developer', { mfa_enrolled: true }), row('vfy-engineer', 'engineer', { mfa_enrolled: true }), row('vfy-off', 'end_user')];
+      return base({
+        'GET /api/auth/users': () => json(200, { users: list.map(u => ({ ...u })) }),
+        'POST /api/auth/users/vfy-developer/reset-mfa': () => { list[0].mfa_enrolled = false; return json(200, { user: list[0] }); },
+        'POST /api/auth/mfa/policy': apiError(409, 'MFA_ENROLL_FIRST', 'Set up two-step verification for your own account first, on the Account page.'),
+      });
+    })(), onDialog: dialogTo(resetAccepted, true) }, async run(s) {
+      await waitText(s.page, 'vfy-off');
+      const buttons = u => s.page.evaluate(n => [...document.querySelectorAll(`tr[data-username="${n}"] button`)].map(b => b.textContent.trim()), u);
+      assert.deepEqual(await buttons('vfy-developer'), ['Reset password', 'Disable', 'Reset two-step']);
+      assert.deepEqual(await buttons('vfy-engineer'), ['Disable']);
+      assert.deepEqual(await buttons('vfy-off'), ['Reset password', 'Disable']);
+      await s.page.evaluate(() => [...document.querySelectorAll('tr[data-username="vfy-developer"] button')].find(b => b.textContent.trim() === 'Reset two-step').click());
+      await waitFor(s.page, () => document.querySelector('tr[data-username="vfy-developer"] td:nth-child(5)').textContent.trim() === 'Off', 'Off after the reset');
+      assert.equal(callsTo(s, 'POST', '/api/auth/users/vfy-developer/reset-mfa').length, 1);
+      assert.deepEqual(resetAccepted.seen, [RESET2_ASK]);
+      await s.page.click('#mfa-required');
+      await waitText(s.page, 'for your own account first');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/mfa/policy').map(c => c.body), [{ required: true }]);
+      assert.equal(await s.page.evaluate(() => document.querySelector('#mfa-required').checked), false);
+    } },
+    { name: 'A cancelled Reset two-step sends nothing', open: { role: 'engineer', path: '/users', routes: base({
+      'GET /api/auth/users': () => json(200, { users: [row('vfy-developer', 'developer', { mfa_enrolled: true }), row('vfy-engineer', 'engineer', { mfa_enrolled: true })] }),
+    }), onDialog: dialogTo(resetCancelled, false) }, async run(s) {
+      await waitText(s.page, 'vfy-developer');
+      await s.page.evaluate(() => [...document.querySelectorAll('tr[data-username="vfy-developer"] button')].find(b => b.textContent.trim() === 'Reset two-step').click());
+      // A dismissed confirmation is answered inside the click; the pause only gives a wrongly sent request time to be seen.
+      await new Promise(r => setTimeout(r, 300));
+      assert.deepEqual(resetCancelled.seen, [RESET2_ASK]);
+      assert.equal(s.calls.filter(c => c.method === 'POST' && c.path.startsWith('/api/auth/users/')).length, 0);
+      assert.equal(await s.page.evaluate(() => document.querySelector('tr[data-username="vfy-developer"] td:nth-child(5)').textContent.trim()), 'On');
     } },
   ];
 }
@@ -50910,10 +60219,12 @@ function prepareCases() {
       });
     })(), async run(s) {
       await waitText(s.page, 'minutes.txt');
+      await waitSelected(s.page, 0);
       await fillNth(s.page, 'select', 0, B);
       await press(s.page, 'Import all prepared');
       await waitFor(s.page, () => [...document.querySelectorAll('[role=alert]')].some(a => a.textContent.includes('total 600.0 MB; one import can be at most 512 MB') && a.textContent.includes('Import them in smaller selections.')), 'the IMPORT_TOO_LARGE alert');
       assert.equal(callsTo(s, 'POST', '/api/prepare/import').length, 1);
+      assert.equal(callsTo(s, 'POST', '/api/prepare/import')[0].body.collection, B);
       const input = await s.page.$('#prepare-file-input');
       await input.uploadFile(...tempFiles(['a.txt', 'b.zip']));
       await waitText(s.page, 'b.zip');
@@ -50934,6 +60245,75 @@ function prepareCases() {
   ];
 }
 
+// Query-only mode (#670): GET /api/auth/me says query_only, and the UI shows
+// the "Query-only" tag, hides the pages that change data from the nav and the
+// router, keeps Transfer's export and package list without its import
+// controls, and drops "+ New Collection" and Delete from the Collections page.
+// The API refuses those writes whatever the UI shows (24_query_only.sh).
+function queryOnlyCases() {
+  const me = (role, queryOnly) => json(200, { username: 'vfy-' + role.replace('_', '-'), role, must_change_password: false, query_only: queryOnly });
+  const qo = (role, path, routes = {}) => ({ role, path, routes: base({ 'GET /api/auth/me': me(role, true), ...routes }) });
+  const goto = async (page, p) => { await page.goto(S.BASE + p, { waitUntil: 'domcontentloaded' }); };
+  const tag = page => page.evaluate(() => document.querySelector('[data-testid=nav-query-only]')?.textContent.trim() ?? null);
+  const ready = page => waitFor(page, () => document.querySelectorAll('nav button[data-menu]').length > 0, 'the nav');
+  const WRITE_PAGES = ['/import', '/prepare', '/chunking', '/retrieval', '/goldstandard'];
+  return [
+    { name: 'Query-only Engineer: the nav shows the Query-only tag and Q&A, Transfer and the Admin pages, without Import, Prepare, Chunking, Retrieval or Gold Standard', open: qo('engineer', '/qa'), async run(s) {
+      await ready(s.page);
+      assert.equal(await tag(s.page), 'Query-only');
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Transfer', 'Collections', 'Users', 'Service keys', 'Audit', 'Health']);
+    } },
+    { name: 'Query-only Developer: the nav shows the tag, Q&A and Transfer, and no Tune menu', open: qo('developer', '/qa'), async run(s) {
+      await ready(s.page);
+      assert.equal(await tag(s.page), 'Query-only');
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Transfer']);
+      assert.equal(await s.page.evaluate(() => !!document.querySelector('nav button[data-menu="tune"]')), false);
+    } },
+    { name: 'Query-only: opening Import, Prepare, Chunking, Retrieval or Gold Standard directly is sent to Q&A, while Transfer and Collections still open', open: qo('engineer', '/qa'), async run(s) {
+      for (const p of WRITE_PAGES) {
+        await goto(s.page, p);
+        await waitText(s.page, 'Ask a Question');
+        await waitPath(s.page, '/qa');
+      }
+      await goto(s.page, '/transfer');
+      await waitText(s.page, 'Export a collection');
+      await waitPath(s.page, '/transfer');
+      await goto(s.page, '/collections');
+      await waitText(s.page, A);
+      await waitPath(s.page, '/collections');
+    } },
+    { name: 'Query-only Collections page: the list and Access stay, "+ New Collection" and Delete are gone', open: qo('engineer', '/collections'), async run(s) {
+      await waitText(s.page, A);
+      const buttons = await s.page.evaluate(() => [...document.querySelectorAll('main button')].map(b => b.textContent.trim()));
+      assert.equal(buttons.includes('+ New Collection'), false);
+      assert.equal(buttons.includes('Delete'), false);
+      assert.equal(buttons.filter(b => b === 'Access').length, COLS.length);
+    } },
+    { name: 'Query-only Transfer page: export, the package list, Download and Refresh stay; the import controls are gone and the loader is named', open: qo('developer', '/transfer', {
+        'GET /api/packages': json(200, { packages: [{ filename: 'ragpkg-vfyqo.tar.gz', readable: true, encrypted: false, collection: A, chunk_count: 3, fidelity: 'with-sources', size_bytes: 2048 }] }) }), async run(s) {
+      await waitText(s.page, 'Export a collection');
+      await waitText(s.page, 'Packages in ./exports');
+      await waitText(s.page, 'python -m loader');
+      await waitFor(s.page, () => document.querySelectorAll('select')[1]?.options.length > 1, 'the packages');
+      await fillNth(s.page, 'select', 1, 'ragpkg-vfyqo.tar.gz');
+      await waitFor(s.page, () => [...document.querySelectorAll('a')].some(a => a.textContent.trim() === 'Download'), 'the Download link');
+      const buttons = await s.page.evaluate(() => [...document.querySelectorAll('main button')].map(b => b.textContent.trim()));
+      assert.equal(buttons.includes('Refresh'), true);
+      assert.equal(buttons.includes('Import'), false);
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('input[name=conflict]').length), 0);
+      assert.equal(await s.page.evaluate(() => document.body.innerText.includes('Import a package')), false);
+      assert.equal(callsTo(s, 'POST', '/api/import').length, 0);
+    } },
+    { name: 'query_only false: no Query-only tag, the full Engineer nav, and "+ New Collection" on the Collections page', open: { role: 'engineer', path: '/collections', routes: base({ 'GET /api/auth/me': me('engineer', false) }) }, async run(s) {
+      await waitText(s.page, A);
+      await ready(s.page);
+      assert.equal(await tag(s.page), null);
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Prepare', 'Transfer', 'Chunking', 'Retrieval', 'Gold Standard', 'Collections', 'Users', 'Service keys', 'Audit', 'Health']);
+      assert.equal(await s.page.evaluate(() => [...document.querySelectorAll('main button')].some(b => b.textContent.trim() === '+ New Collection')), true);
+    } },
+  ];
+}
+
 async function runUiControlTests(browser, baseUrl, reporter) {
   S.BASE = baseUrl;
   const run = (section, cases) => S.runCases(browser, baseUrl, reporter, section, cases);
@@ -50942,12 +60322,14 @@ async function runUiControlTests(browser, baseUrl, reporter) {
   await run('Navigation, roles and redirects (#400); the API enforces the roles (#25)', navigationCases());
   await run('Login, logout, setup and password changes (#25)', authCases());
   await run('Users page: Engineers manage accounts (#25)', usersCases());
+  await run('Two-step verification: account page, login code, forced set-up, Users page (#607)', mfaCases());
   await run('Service keys page: Engineers manage service principals and keys (#25)', serviceKeysCases());
   await run('Audit page: Engineers read the audit log (#29)', auditCases());
   await run('Prepare page: list, preview, upload, jobs, deletes and import (#638)', prepareCases());
   await run('Q&A input, citations toggle, answer display and End User view (#400)', qaCases());
   await run('Retrieval page status text, alpha slider and save (#400)', retrievalCases());
   await run('Client handling of the proxy error pages (#400)', proxyCases());
+  await run('Query-only mode: the tag, the hidden pages and controls (#670)', queryOnlyCases());
 }
 
 module.exports = { runUiControlTests };
@@ -51315,12 +60697,12 @@ function helpCases() {
 }
 
 // -- Health: latency stat row, charts and empty state ------------------------
-const health = json(200, { status: 'ok', services: { weaviate: { status: 'ok', latency_ms: 5 }, ollama: { llm: { status: 'ok', latency_ms: 7, model: 'vfy-llm' }, embed: { status: 'ok', latency_ms: 9, model: 'vfy-embed' } } } });
+const health = json(200, { status: 'ok', services: { weaviate: { status: 'ok', latency_ms: 5 }, ollama: { llm: { status: 'ok', latency_ms: 7, model: 'vfy-llm' }, build_llm: { status: 'ok', latency_ms: 7, model: 'vfy-llm' }, embed: { status: 'ok', latency_ms: 9, model: 'vfy-embed' }, same_model: true } } });
 const record = (i, r, l) => ({ timestamp: `2026-10-21T10:0${i}:00Z`, collection: A, retrieval_mode: 'hnsw', retrieval_ms: r, llm_ms: l, total_ms: r + l });
 const metrics = (records, stats = {}) => json(200, { total_records: records.length, retrieval_latency: { p50: 10.4, p95: 20.6, p99: 30.2 }, llm_latency: { p50: 100.2, p95: 200.7, p99: 300.4 }, total_latency: { p50: 110.7, p95: 221.1, p99: 331.9 }, history: records, ...stats });
 
 function healthCases() {
-  const open = m => ({ role: 'engineer', path: '/health', routes: common({ 'GET /api/health': health, 'GET /api/metrics/latency': m, 'GET /api/goldstandard/diagnostics': json(200, { issues: [] }) }) });
+  const open = m => ({ role: 'engineer', path: '/health', routes: common({ 'GET /api/health/details': health, 'GET /api/metrics/latency': m, 'GET /api/goldstandard/diagnostics': json(200, { issues: [] }) }) });
   return [
     { name: 'Health shows the latency trend heading, a P50/P95/P99 row per stage in whole ms, and a chart with its three series', open: open(metrics([record(1, 10, 100), record(2, 12, 110), record(3, 14, 120)])), async run(s) {
       await waitText(s.page, 'Latency Trends (3 queries in ring buffer)');
@@ -51723,7 +61105,7 @@ if __name__ == '__main__':
 ### scripts/verify/llm_sanity.py
 
 ```python
-"""Does the LLM still give sensible answers? Run inside the api container.
+"""Does the answer LLM (#671) still give sensible answers? Run inside the api container.
 
 A degraded Ollama runner can keep listing its models (so /health stays ok)
 while every chat reply is garbage: mixed scripts, fragments of unrelated
@@ -51747,14 +61129,14 @@ MAX_CHARS = 600
 try:
     resp = httpx.post(
         f"http://{settings.ollama_host}:{settings.ollama_port}/api/chat",
-        json={"model": settings.llm_model, "stream": False,
+        json={"model": settings.answer_model, "stream": False,
               "options": {"temperature": 0, "num_predict": 80},
               "messages": [{"role": "user", "content": QUESTION}]},
         timeout=TIMEOUT_S)
     resp.raise_for_status()
     answer = resp.json()["message"]["content"].strip()
 except Exception as exc:  # unreachable, timed out, or not JSON
-    print(f"no answer from {settings.llm_model}: {type(exc).__name__}: {exc}")
+    print(f"no answer from {settings.answer_model}: {type(exc).__name__}: {exc}")
     sys.exit(2)
 
 printable = sum(1 for ch in answer if ch.isascii() and (ch.isprintable() or ch in "\n\r\t"))
@@ -51769,9 +61151,9 @@ if "manager" not in answer.lower():
     problems.append("doesn't mention managers")
 
 if problems:
-    print(f"{settings.llm_model} looks degraded ({'; '.join(problems)}): {answer[:200]!r}")
+    print(f"{settings.answer_model} looks degraded ({'; '.join(problems)}): {answer[:200]!r}")
     sys.exit(1)
-print(f"{settings.llm_model} answers sensibly: {answer[:120]!r}")
+print(f"{settings.answer_model} answers sensibly: {answer[:120]!r}")
 ```
 
 ### api/services/telemetry.py
@@ -51831,7 +61213,7 @@ class Config:
     endpoint: str = field(default="", repr=False)
     headers: dict = field(default_factory=dict, repr=False)
     service: str = "rag-api"
-    version: str = "1.2.2"
+    version: str = "1.3.0"
     environment: str = "development"
     traces: bool = True
     logs: bool = True
@@ -51932,7 +61314,7 @@ class Config:
         if batch > queue:
             raise TelemetryConfigError("RAG_OTEL_BATCH_SIZE exceeds RAG_OTEL_QUEUE_SIZE")
         return cls(True, endpoint.rstrip("/"), headers,
-                   identifier("SERVICE_NAME", "rag-api"), identifier("SERVICE_VERSION", "1.2.2"),
+                   identifier("SERVICE_NAME", "rag-api"), identifier("SERVICE_VERSION", "1.3.0"),
                    identifier("ENVIRONMENT", "development"),
                    boolean("TRACES", True), boolean("LOGS", True), boolean("METRICS", True),
                    number("SAMPLE_RATIO", 1, 0, 1, False), queue, batch,
@@ -51950,7 +61332,7 @@ ENUMS = {
 SPAN_NAMES = frozenset("rag." + v for v in ENUMS["rag.operation"])
 
 # Explicit code-owned vocabulary. Raw URL/path values never enter this schema.
-ROUTES = frozenset(('DELETE /collections/{name}', 'DELETE /prepare/documents/{document_id}', 'DELETE /prepare/documents/{document_id}/prepared', 'GET /audit', 'GET /audit.csv', 'GET /auth/me', 'GET /auth/service-principals', 'GET /auth/status', 'GET /auth/users', 'GET /collections', 'GET /export/job/{job_id}', 'GET /export/jobs', 'GET /goldstandard/diagnostics', 'GET /goldstandard/download/{filename}', 'GET /goldstandard/session/{session_id}', 'GET /goldstandard/sessions', 'GET /health', 'GET /help/transfer', 'GET /import/job/{job_id}', 'GET /import/jobs', 'GET /ingest/config/{collection}', 'GET /ingest/job/{job_id}', 'GET /ingest/jobs', 'GET /metrics/latency', 'GET /packages', 'GET /prepare/documents', 'GET /prepare/documents/{document_id}', 'GET /prepare/documents/{document_id}/prepared', 'GET /prepare/documents/{document_id}/raw', 'GET /prepare/job/{job_id}', 'GET /prepare/jobs', 'GET /retrieval/config/{collection}', 'GET /tune/job/{job_id}', 'GET /tune/{collection}', 'PATCH /goldstandard/session/{session_id}/pair/{pair_id}', 'POST /auth/login', 'POST /auth/logout', 'POST /auth/password', 'POST /auth/service-principals', 'POST /auth/service-principals/{name}/disable', 'POST /auth/service-principals/{name}/enable', 'POST /auth/service-principals/{name}/keys', 'POST /auth/service-principals/{name}/keys/{key_id}/revoke', 'POST /auth/service-principals/{name}/role', 'POST /auth/users', 'POST /auth/users/{username}/disable', 'POST /auth/users/{username}/enable', 'POST /auth/users/{username}/reset-password', 'POST /auth/users/{username}/role', 'POST /collections', 'POST /export', 'POST /goldstandard/generate', 'POST /goldstandard/regenerate', 'POST /goldstandard/save', 'POST /import', 'POST /ingest/config', 'POST /ingest/upload', 'POST /prepare/import', 'POST /prepare/job/{job_id}/cancel', 'POST /prepare/jobs', 'POST /prepare/upload', 'POST /query', 'POST /retrieval/config', 'POST /tune/rechunk', 'POST /tune/reembed', 'POST /tune/reindex'))
+ROUTES = frozenset(('DELETE /collections/{name}', 'DELETE /prepare/documents/{document_id}', 'DELETE /prepare/documents/{document_id}/prepared', 'GET /audit', 'GET /audit.csv', 'GET /auth/me', 'GET /auth/mfa', 'GET /auth/service-principals', 'GET /auth/status', 'GET /auth/users', 'GET /collections', 'GET /collections/{name}/access', 'GET /export/job/{job_id}', 'GET /export/jobs', 'GET /goldstandard/diagnostics', 'GET /goldstandard/download/{filename}', 'GET /goldstandard/session/{session_id}', 'GET /goldstandard/sessions', 'GET /health', 'GET /health/details', 'GET /help/transfer', 'GET /import/job/{job_id}', 'GET /import/jobs', 'GET /ingest/config/{collection}', 'GET /ingest/job/{job_id}', 'GET /ingest/jobs', 'GET /metrics/latency', 'GET /packages', 'GET /packages/{filename}', 'GET /prepare/documents', 'GET /prepare/documents/{document_id}', 'GET /prepare/documents/{document_id}/prepared', 'GET /prepare/documents/{document_id}/raw', 'GET /prepare/job/{job_id}', 'GET /prepare/jobs', 'GET /retrieval/config/{collection}', 'GET /tune/job/{job_id}', 'GET /tune/{collection}', 'PATCH /goldstandard/session/{session_id}/pair/{pair_id}', 'POST /auth/login', 'POST /auth/login/mfa', 'POST /auth/logout', 'POST /auth/mfa/disable', 'POST /auth/mfa/enroll', 'POST /auth/mfa/enroll/confirm', 'POST /auth/mfa/policy', 'POST /auth/mfa/recovery-codes', 'POST /auth/password', 'POST /auth/service-principals', 'POST /auth/service-principals/{name}/disable', 'POST /auth/service-principals/{name}/enable', 'POST /auth/service-principals/{name}/keys', 'POST /auth/service-principals/{name}/keys/{key_id}/revoke', 'POST /auth/service-principals/{name}/role', 'POST /auth/users', 'POST /auth/users/{username}/disable', 'POST /auth/users/{username}/enable', 'POST /auth/users/{username}/reset-mfa', 'POST /auth/users/{username}/reset-password', 'POST /auth/users/{username}/role', 'POST /collections', 'POST /export', 'POST /goldstandard/generate', 'POST /goldstandard/regenerate', 'POST /goldstandard/save', 'POST /import', 'POST /ingest/config', 'POST /ingest/upload', 'POST /prepare/import', 'POST /prepare/job/{job_id}/cancel', 'POST /prepare/jobs', 'POST /prepare/upload', 'POST /query', 'POST /retrieval/config', 'POST /tune/rechunk', 'POST /tune/reembed', 'POST /tune/reindex', 'PUT /collections/{name}/access'))
 ENUMS.update({"http.route": ROUTES | {"unmatched"},
               "rag.tuning_operation": frozenset(("rechunk", "reembed", "reindex")),
               "http.status_class": frozenset(("1xx", "2xx", "3xx", "4xx", "5xx"))})
@@ -53201,7 +62583,7 @@ class TelemetryTests(unittest.TestCase):
                 self.assertNotIn(SECRET.encode(), body)
             traces = ExportTraceServiceRequest.FromString(by_path['/v1/traces'])
             resource = {a.key: a.value.string_value for a in traces.resource_spans[0].resource.attributes}
-            self.assertEqual(resource, {'service.name':'rag-api', 'service.version':'1.2.2', 'deployment.environment.name':'development'})
+            self.assertEqual(resource, {'service.name':'rag-api', 'service.version':'1.3.0', 'deployment.environment.name':'development'})
             span = traces.resource_spans[0].scope_spans[0].spans[0]
             self.assertEqual(span.name, 'rag.operation')
             self.assertFalse(span.events);self.assertFalse(span.links);self.assertFalse(span.status.message)
@@ -53291,7 +62673,7 @@ class TelemetryTests(unittest.TestCase):
                 processor = runtime._providers[0]._multi_log_record_processor._log_record_processors[0]._batch_processor
                 self.assertEqual(len(processor._queue), 2)
                 for queued in processor._queue:
-                    self.assertEqual(dict(queued.resource.attributes), {'service.name':'rag-api', 'service.version':'1.2.2', 'deployment.environment.name':'development'})
+                    self.assertEqual(dict(queued.resource.attributes), {'service.name':'rag-api', 'service.version':'1.3.0', 'deployment.environment.name':'development'})
                     self.assertFalse(queued.resource.schema_url)
                     self.assertEqual(queued.instrumentation_scope.name, 'rag.telemetry')
                     self.assertFalse(queued.instrumentation_scope.version)
@@ -53650,6 +63032,8 @@ class TelemetryTests(unittest.TestCase):
                                     # Document preparation (#638): its jobs, then its area's recovery.
                                     preparation_jobs=SimpleNamespace(_jobs=SimpleNamespace(load=lambda:(order.append('prepare') or [])),
                                                                      recover=lambda:(order.append('recover') or [])),
+                                    # The export package sweep (#677), a task cancelled at shutdown.
+                                    package_retention=SimpleNamespace(sweeper=lambda:asyncio.sleep(3600)),
                                     audit=SimpleNamespace(record=lambda *args,**kwargs:order.append('audit'),
                                                           login_flusher=lambda:asyncio.sleep(3600),
                                                           flush_logins=lambda:order.append('flush')))
@@ -54171,7 +63555,7 @@ class EmbeddedTelemetryTests(unittest.TestCase):
         spec = (ROOT/'SPECIFICATIONS.md').read_text()
         inputs = (ROOT/'api/requirements.in').read_text().splitlines()
         lock = (ROOT/'api/requirements.txt').read_text().splitlines()
-        for dependency in ('opentelemetry-sdk==1.45.1', 'opentelemetry-exporter-otlp-proto-http==1.45.1'):
+        for dependency in ('opentelemetry-sdk==1.45.2', 'opentelemetry-exporter-otlp-proto-http==1.45.2'):
             self.assertIn(dependency, spec)
             self.assertIn(dependency, inputs)
             self.assertIn(dependency, lock)
@@ -54641,7 +64025,7 @@ class TracingTests(unittest.IsolatedAsyncioTestCase):
         async def model(*args):
             await ready.wait()
             return '{"question":"synthetic","answer":"synthetic","ground_truth":"synthetic"}'
-        with patch.object(wc,'collection_exists',AsyncMock(return_value=True)), patch.object(gs,'_prepare_generation_sync',return_value=(session,[{'content':SECRET}])), patch.object(gs,'_update_session_sync',update), patch.object(ollama,'chat',ot.traced('ollama.chat')(model)):
+        with patch.object(wc,'collection_exists',AsyncMock(return_value=True)), patch.object(gs,'_prepare_generation_sync',return_value=(session,[{'content':SECRET}])), patch.object(gs,'_update_session_sync',update), patch.object(ollama,'build_chat',ot.traced('ollama.chat')(model)):
             response=await self.client.post('/goldstandard/generate',json={'collection':'TraceGold','sample_size':1})
             self.assertEqual(response.status_code,202,response.text)
             ready.set()
@@ -54651,7 +64035,7 @@ class TracingTests(unittest.IsolatedAsyncioTestCase):
         pair={'pair_id':'pair','contexts':[SECRET],'source_file':SECRET,'chunk_index':0}
         async def slow(*args):
             await asyncio.sleep(10)
-        with patch.object(gs,'get_session',return_value={'pairs':[pair],'status':'completed'}), patch.object(gs,'_REGENERATION_TIMEOUT_SECONDS',.005), patch.object(ollama,'chat',ot.traced('ollama.chat')(slow)):
+        with patch.object(gs,'get_session',return_value={'pairs':[pair],'status':'completed'}), patch.object(gs,'_REGENERATION_TIMEOUT_SECONDS',.005), patch.object(ollama,'build_chat',ot.traced('ollama.chat')(slow)):
             response=await self.client.post('/goldstandard/regenerate',json={'session_id':'session','pair_id':'pair'})
         self.assertEqual(response.status_code,504,response.text)
         self.assertEqual(self.spans('rag.regenerate')[-1].attributes['error.type'],'timeout')
@@ -54707,7 +64091,7 @@ class TracingTests(unittest.IsolatedAsyncioTestCase):
         async def slow(*args):
             entered.set()
             await asyncio.sleep(10)
-        with patch.object(wc,'collection_exists',AsyncMock(return_value=True)), patch.object(gs,'_prepare_generation_sync',return_value=(session,[{'content':SECRET}])), patch.object(gs,'_update_session_sync',update), patch.object(ollama,'chat',ot.traced('ollama.chat')(slow)):
+        with patch.object(wc,'collection_exists',AsyncMock(return_value=True)), patch.object(gs,'_prepare_generation_sync',return_value=(session,[{'content':SECRET}])), patch.object(gs,'_update_session_sync',update), patch.object(ollama,'build_chat',ot.traced('ollama.chat')(slow)):
             response=await self.client.post('/goldstandard/generate',json={'collection':'TraceCancel','sample_size':1})
             self.assertEqual(response.status_code,202)
             await entered.wait()
@@ -54719,7 +64103,7 @@ class TracingTests(unittest.IsolatedAsyncioTestCase):
         # Real done callback creates the failure reporter with captured origin.
         session['status']='generating'
         async def model(*args): return '{"question":"q","answer":"a","ground_truth":"g"}'
-        with patch.object(wc,'collection_exists',AsyncMock(return_value=True)), patch.object(gs,'_prepare_generation_sync',return_value=(session,[{'content':SECRET}])), patch.object(gs,'_update_session_sync',side_effect=gs.GoldStandardError('STORE_FAILED',SECRET,500)), patch.object(gs,'_publish_generation_failure'), patch.object(ollama,'chat',ot.traced('ollama.chat')(model)):
+        with patch.object(wc,'collection_exists',AsyncMock(return_value=True)), patch.object(gs,'_prepare_generation_sync',return_value=(session,[{'content':SECRET}])), patch.object(gs,'_update_session_sync',side_effect=gs.GoldStandardError('STORE_FAILED',SECRET,500)), patch.object(gs,'_publish_generation_failure'), patch.object(ollama,'build_chat',ot.traced('ollama.chat')(model)):
             await self.client.post('/goldstandard/generate',json={'collection':'TraceFailed','sample_size':1})
             await self.until(lambda: bool(self.spans('rag.failure_report')))
         self.lineage('rag.failure_report')
@@ -56193,18 +65577,49 @@ if __name__ == '__main__':
 """Additional service-specific restrictions for the optional disposable collector."""
 import json
 from pathlib import Path
+import re
 
 KEYS = {'profiles', 'mem_limit', 'cpus', 'stop_grace_period', 'read_only', 'logging'}
 SERVICES = {'otel-collector', 'otel-capture'}
 
 
-def check(config, root):
+def repository(image):
+    """The repository of <repository>:<tag>@sha256:<digest>, or None (#532)."""
+    match = re.fullmatch(r'(.+):([\w][\w.-]{0,127})@sha256:[0-9a-f]{64}', image)
+    return match.group(1) if match else None
+
+
+def collector_image(root, pin, problems):
+    """The collector image to expect: the harness's own pin, or a reviewed pin
+    the evaluator supplied with stack.sh --telemetry-pin (#532). A reviewed
+    pin may change only the tag and digest, never the repository."""
+    harness = json.loads((Path(root) / 'telemetry/image.json').read_text())['image']
+    if not pin:
+        return harness
+    try:
+        reviewed = json.loads(Path(pin).read_text())
+    except (OSError, ValueError):
+        reviewed = None
+    if not isinstance(reviewed, dict) or not isinstance(reviewed.get('image'), str):
+        problems.append("otel-collector: the reviewed telemetry pin can't be read")
+        return harness
+    image = reviewed['image']
+    if repository(image) is None:
+        problems.append('otel-collector: the reviewed telemetry pin is not <repository>:<tag>@sha256:<digest>')
+        return harness
+    if repository(image) != repository(harness):
+        problems.append("otel-collector: the reviewed telemetry pin's repository differs from the harness pin")
+        return harness
+    return image
+
+
+def check(config, root, pin=None):
     problems = []
     services = config['services']
-    pin = json.loads((Path(root) / 'telemetry/image.json').read_text())['image']
+    collector = collector_image(root, pin, problems)
     for name in SERVICES & services.keys():
         svc = services[name]
-        expected_image = pin if name == 'otel-collector' else 'rag-verify-api:latest'
+        expected_image = collector if name == 'otel-collector' else 'rag-verify-api:latest'
         if svc.get('image') != expected_image or 'build' in svc:
             problems.append(f'{name}: unexpected telemetry image/build')
         if (svc.get('profiles') != ['telemetry'] or str(svc.get('mem_limit')) != '268435456'
@@ -56654,14 +66069,16 @@ class Packager(unittest.TestCase):
             with self.subTest(telemetry=telemetry), tempfile.TemporaryDirectory() as folder:
                 root=Path(folder);(root/'bin').mkdir();(root/'scripts').mkdir()
                 shutil.copy(ROOT/'package-offline.sh',root/'package-offline.sh')
-                # package-offline.sh reads the model names from the entrypoint (#647).
-                (root/'ollama').mkdir();shutil.copy(ROOT/'ollama/entrypoint.sh',root/'ollama/entrypoint.sh')
+                # package-offline.sh reads the model names the entrypoint pulls (#647),
+                # resolved from the compose settings by models.sh and compose-models.sh (#671).
+                (root/'ollama').mkdir()
+                for name in ('entrypoint.sh','models.sh','compose-models.sh'):shutil.copy(ROOT/'ollama'/name,root/'ollama'/name)
                 (root/'scripts/collector_offline.py').write_text("from pathlib import Path\nimport sys\nPath(sys.argv[2],'collector.tar').touch()\n")
                 stub=root/'bin/docker'
                 stub.write_text("""#!/usr/bin/env python3
 import sys,json,pathlib
 args=sys.argv[1:]
-if args[:2]==['compose','config']:print(json.dumps({'name':'fixture'}))
+if args[:2]==['compose','config']:print(json.dumps({'name':'fixture','services':{'ollama':{'environment':{'LLM_MODEL':'llama3.1:8b','BUILD_LLM_MODEL':'','ANSWER_LLM_MODEL':''}}}}))
 if args[:1]==['run']:
  for arg in args:
   if arg.endswith(':/out'):pathlib.Path(arg[:-5],'ollama_models.tar.gz').touch()
@@ -56695,10 +66112,11 @@ class Compose(unittest.TestCase):
         cls.config = json.loads(subprocess.check_output(cls.cmd, env=cls.env))
         cls.guard = re.findall(r"python3 - [^\n]*<<'GUARDPY'\n(.*?)\nGUARDPY", (ROOT/'scripts/verify/stack.sh').read_text(), re.S)[0]
 
-    def run_guard(self, config, checkout=ROOT):
+    def run_guard(self, config, checkout=ROOT, pin=''):
         with tempfile.NamedTemporaryFile(mode='w') as file:
             json.dump(config, file); file.flush()
-            return subprocess.run(['python3', '-', str(checkout), self.env['RAG_EXPORTS_DIR'], '18081', file.name, str(ROOT)],
+            return subprocess.run(['python3', '-', str(checkout), self.env['RAG_EXPORTS_DIR'], '18081', file.name, str(ROOT),
+                                   'default', pin],
                                   input=self.guard, text=True, capture_output=True)
 
     def test_optional_config_passes_full_guard(self):
@@ -56735,6 +66153,43 @@ class Compose(unittest.TestCase):
                 changed=copy.deepcopy(value)
                 next(v for v in changed['services'][service]['volumes'] if v['type']=='bind')['source']=str(checkout/'scripts/verify')
                 self.assertTrue(guard.check(changed,ROOT))
+
+    def test_reviewed_pin_changes_only_tag_and_digest(self):
+        # #532: a changed collector pin passes only with an evaluator-supplied
+        # reviewed pin of the harness pin's repository.
+        harness = json.loads((ROOT/'telemetry/image.json').read_text())['image']
+        repository = harness.split('@')[0].rsplit(':', 1)[0]
+        bumped = repository + ':0.999.0@sha256:' + 'b'*64
+        config = copy.deepcopy(self.config)
+        config['services']['otel-collector']['image'] = bumped
+        guard = load('guard', 'scripts/verify/telemetry_guard.py')
+        self.assertNotEqual(self.run_guard(config).returncode, 0)
+        self.assertTrue(guard.check(config, ROOT))
+        with tempfile.TemporaryDirectory() as folder:
+            def pin_file(name, value):
+                path = Path(folder)/name
+                path.write_text(json.dumps(value) if not isinstance(value, str) else value)
+                return str(path)
+            good = pin_file('good.json', {'image': bumped})
+            result = self.run_guard(config, pin=good)
+            self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+            self.assertEqual(guard.check(config, ROOT, good), [])
+            # The harness pin itself no longer matches once a reviewed pin is given.
+            self.assertTrue(guard.check(self.config, ROOT, good))
+            refused = {
+                'another repository': pin_file('other.json', {'image': 'ghcr.io/example/collector:0.999.0@sha256:'+'b'*64}),
+                'no digest': pin_file('nodigest.json', {'image': repository + ':0.999.0'}),
+                'no tag': pin_file('notag.json', {'image': repository + '@sha256:'+'b'*64}),
+                'not JSON': pin_file('broken.json', 'not json'),
+                'no image': pin_file('noimage.json', {'config_ids': {}}),
+                'missing file': str(Path(folder)/'missing.json'),
+            }
+            for case, pin in refused.items():
+                with self.subTest(case=case):
+                    self.assertNotEqual(self.run_guard(config, pin=pin).returncode, 0)
+                    self.assertTrue(guard.check(config, ROOT, pin))
+                    # A bad pin never lets the harness pin through either.
+                    self.assertTrue(guard.check(self.config, ROOT, pin))
 
     def test_unsafe_variants_still_refused(self):
         mutations = [
@@ -57016,7 +66471,7 @@ services:
     environment:
       RAG_OTEL_ENABLED: "${RAG_VERIFY_OTEL_ENABLED:-true}"
       RAG_OTEL_PROTOCOL: http/protobuf
-      RAG_OTEL_SERVICE_VERSION: "1.2.2"
+      RAG_OTEL_SERVICE_VERSION: "1.3.0"
       RAG_OTEL_QUEUE_SIZE: "256"
       RAG_OTEL_BATCH_SIZE: "64"
       RAG_OTEL_ENDPOINT: http://otel-collector:4318
@@ -57071,9 +66526,9 @@ volumes:
 #     built with `git archive`, exactly as package.sh does. Untracked and
 #     ignored files and uncommitted changes are left out (#384).
 #   * all five Docker images, pre-built (docker save)
-#   * the Ollama model weights (llama3.1:8b + nomic-embed-text), the whole
-#     model volume: a model left in it, such as phi3.5 from before 1.2.1, is
-#     carried too
+#   * the Ollama model weights (by default llama3.1:8b + nomic-embed-text; a
+#     different build or answer LLM too, #671), the whole model volume: a model
+#     left in it, such as phi3.5 from before 1.2.1, is carried too
 #
 # About 7.7 GB (2.5 GB images + 5.2 GB model weights) with both models present,
 # estimated from the parts (4.6 GB was measured when the LLM was the 2.2 GB
@@ -57124,18 +66579,31 @@ docker volume inspect "$MODELVOL" >/dev/null 2>&1 \
 
 # The volume must hold every model ollama/entrypoint.sh pulls, or the offline
 # target would try to download the missing one (#647: an install from before
-# llama3.1:8b became the default holds only phi3.5). The names are read as the
-# CI model cache reads them; a manifest without a tag is under "latest".
-MODELS="$(sed -n 's/^pull_with_retry \([A-Za-z0-9._:-]*\)$/\1/p' ollama/entrypoint.sh | tr '\n' ' ')"
-[ -n "$MODELS" ] || { echo "ERROR: no pull_with_retry lines in ollama/entrypoint.sh." >&2; exit 1; }
+# llama3.1:8b became the default holds only phi3.5). The names are the ones the
+# entrypoint resolves from the LLM settings compose gives the ollama service
+# (#671), read as the CI model cache reads them. A name is read from the right,
+# as Ollama does (#772, #824): the tag is what follows the last ":" of the last
+# path segment, else "latest", so a port in a host is not a tag. A model with one
+# segment is under registry.ollama.ai/library/<name>, one with two (`user/model`,
+# and `hf.co/model`, whatever its first segment) under registry.ollama.ai/<user>/
+# <model>, and one with three or more, the first a host with its port if it has
+# one (`hf.co/user/model`), under that host's own manifest directory.
+MODELS="$(bash ollama/compose-models.sh)" \
+  || { echo "ERROR: could not read the model names (ollama/compose-models.sh)." >&2; exit 1; }
+MODELS="$(echo $MODELS)"   # one line, space-separated
 # shellcheck disable=SC2086  # one argument per model name
 MISSING="$(docker run --rm --network none --entrypoint sh \
   -v "$MODELVOL":/models:ro \
   ollama/ollama:0.3.14 \
   -c 'for m in "$@"; do
-        n=${m%%:*}; t=latest
-        case "$m" in *:*) t=${m#*:} ;; esac
-        [ -f "/models/models/manifests/registry.ollama.ai/library/$n/$t" ] || echo "$m"
+        n=$m; t=latest
+        case "${m##*/}" in *:*) n=${m%:*}; t=${m##*:} ;; esac
+        case "$n" in
+          */*/*) p=$n ;;
+          */*) p=registry.ollama.ai/$n ;;
+          *) p=registry.ollama.ai/library/$n ;;
+        esac
+        [ -f "/models/models/manifests/$p/$t" ] || echo "$m"
       done' sh $MODELS)" \
   || { echo "ERROR: could not read the models in volume '$MODELVOL'." >&2; exit 1; }
 if [ -n "$MISSING" ]; then

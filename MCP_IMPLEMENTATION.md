@@ -240,7 +240,7 @@ outside-pointing symlink all rejected with the contract message.
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
-server = MCPServer(name="rag", version="1.2.2")
+server = MCPServer(name="rag", version="1.3.0")
 
 @server.tool(
     name="rag_query",
@@ -281,7 +281,7 @@ from logging_setup import configure_logging
 configure_logging(config.LOG_LEVEL)          # 1. FIRST, before anything logs
 
 from mcp.server.mcpserver import MCPServer    # 2. then the SDK
-server = MCPServer(name="rag", version="1.2.2",
+server = MCPServer(name="rag", version="1.3.0",
                    instructions="Tools for a local retrieval-augmented "
                                 "generation stack: query, manage collections, "
                                 "ingest documents and build evaluation sets.")
@@ -335,9 +335,10 @@ Argument validation raised inside a tool body must also use `ToolError`, not
 `ValueError`.
 
 `rag_health` is the one endpoint that must not raise on a 4xx/5xx: the API
-answers `503` with a full body naming the failing component. `ragclient.request`
-takes an `allow_status` tuple so that status returns normally and the structured
-body reaches the caller intact.
+answers `503` with `{"status": "degraded"}` when a dependency is down (since
+#750 the per-service body is at `/health/details`, behind a login).
+`ragclient.request` takes an `allow_status` tuple so that status returns
+normally and the body reaches the caller intact.
 
 ### 6.5 Bounded polling (spec §4.3)
 

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+
+from auth import access
 
 from models.schemas import QueryRequest, QueryResponse
 from config import settings
@@ -33,12 +35,15 @@ def _unavailable(collection: str, exc: rag_pipeline.ServiceUnavailable) -> JSONR
 
 
 @router.post("", response_model=QueryResponse)
-async def run_query(body: QueryRequest):
+async def run_query(body: QueryRequest, request: Request = None):
     # The audit record's parameters (#29); the question only when the operator
     # turned AUDIT_LOG_QUESTIONS on, and never the answer.
     audit.note(collection=body.collection, retrieval_mode=body.retrieval_mode, top_k=body.top_k,
                alpha=body.alpha, response_format=body.response_format, include_citations=body.include_citations,
                **({"question": body.question} if settings.audit_log_questions else {}))
+    # A collection the caller may not use answers as one that doesn't exist (#606).
+    if not await access.check(request, body.collection):
+        return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{body.collection}' not found.")
     try:
         exists = await wc.collection_exists(body.collection)
     except Exception:                                 # noqa: BLE001

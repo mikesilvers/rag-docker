@@ -3,8 +3,8 @@
 # Run the verification suite on a disposable compose project, never on the
 # live stack (#152).
 #
-#   bash scripts/verify/stack.sh run [--checkout DIR] [--telemetry | --lan] [suite ...]
-#   bash scripts/verify/stack.sh up [--checkout DIR] [--pull] [--lan]
+#   bash scripts/verify/stack.sh run [--checkout DIR] [--telemetry [--telemetry-pin FILE] | --lan | --query-only] [suite ...]
+#   bash scripts/verify/stack.sh up [--checkout DIR] [--pull] [--telemetry [--telemetry-pin FILE] | --lan | --query-only]
 #   bash scripts/verify/stack.sh down
 #
 # `run` brings the verify project up, runs that checkout's all.sh against it
@@ -49,6 +49,26 @@
 # exactly proxy:127.0.0.1:<verify port>->443/tcp. The suites then reach it at
 # https://localhost:<port>/api and trust the certificate it generated, copied
 # into the private folder. Without suite names, a --lan run runs 18_lan.
+#
+# --query-only (#670) runs the verify project in its default configuration,
+# where 24_query_only builds and exports a collection; that suite then calls
+# `stack.sh query-only-mode --package NAME` under the inherited lock, which
+# carries the package out of the exports folder, removes the project's
+# containers, network and volumes (its images and the model copy stay), puts
+# the package back alone in an empty exports folder and starts the project
+# again in query-only mode (the checkout's docker-compose.query-only.yml): a
+# second instance with its own empty volumes, as on another machine, never two
+# at once. Without suite names, a --query-only run runs 24_query_only.
+#
+# --telemetry checks the collector image against this checkout's own
+# telemetry/image.json, so a PR that changes the pin is refused. To evaluate
+# one, the evaluator checks the PR's pin against the registry, copies its
+# telemetry/image.json outside the checkout and passes it with
+# --telemetry-pin FILE (#532). The guard then expects that image, which may
+# change only the tag and digest of this checkout's pin, never the
+# repository. Nothing here contacts a registry, and no file in the checkout
+# is read as a pin: the file is checked by device and inode, for telemetry-mode's
+# inherited pin too.
 #
 # What this does not do: the suites, and anything else the checkout runs on the
 # host, still have full access to Docker. It keeps verification away from the
@@ -95,15 +115,23 @@ private_problem() {
 # ── arguments, checked before any Docker command ─────────────────────────────
 [ "$#" -ge 1 ] || usage
 CMD="$1"; shift
-case "$CMD" in up|down|run|telemetry-mode) ;; *) usage ;; esac
+case "$CMD" in up|down|run|telemetry-mode|query-only-mode) ;; *) usage ;; esac
 if [ "$CMD" = telemetry-mode ]; then
   [ "${RAG_VERIFY_LOCK_HELD:-}" = 1 ] || fail "telemetry-mode requires an inherited verification lock"
+fi
+if [ "$CMD" = query-only-mode ]; then
+  [ "${RAG_VERIFY_LOCK_HELD:-}" = 1 ] || fail "query-only-mode requires an inherited verification lock"
+  [ "${RAG_VERIFY_QUERY_ONLY:-}" = 1 ] || fail "query-only-mode runs only in a stack.sh run --query-only"
 fi
 CHECKOUT="$HARNESS"
 PULL=""
 TELEMETRY=0
 LAN=0
+QUERY_ONLY=0
+QO_PACKAGE=""
 OTEL_ENABLED=true
+PIN=""
+PIN_SET=0
 ARGS=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -113,9 +141,18 @@ while [ "$#" -gt 0 ]; do
     --telemetry)
       [ "$CMD" != down ] || usage
       TELEMETRY=1; shift ;;
+    --telemetry-pin)
+      { [ "$CMD" = up ] || [ "$CMD" = run ]; } && [ "$#" -ge 2 ] || usage
+      PIN="$2"; PIN_SET=1; shift 2 ;;
     --lan)
       { [ "$CMD" = up ] || [ "$CMD" = run ]; } || usage
       LAN=1; shift ;;
+    --query-only)
+      { [ "$CMD" = up ] || [ "$CMD" = run ]; } || usage
+      QUERY_ONLY=1; shift ;;
+    --package)
+      [ "$CMD" = query-only-mode ] && [ "$#" -ge 2 ] || usage
+      QO_PACKAGE="$2"; shift 2 ;;
     --disabled)
       [ "$CMD" = telemetry-mode ] || usage
       OTEL_ENABLED=false; shift ;;
@@ -130,6 +167,14 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ "$TELEMETRY" = 0 ] || [ "$LAN" = 0 ] || fail "--lan and --telemetry can't be combined."
+[ "$QUERY_ONLY" = 0 ] || { [ "$TELEMETRY" = 0 ] && [ "$LAN" = 0 ]; } \
+  || fail "--query-only can't be combined with --lan or --telemetry."
+if [ "$CMD" = query-only-mode ]; then
+  # A package name as the loader takes it (#670): no path, no other file.
+  printf '%s' "$QO_PACKAGE" | grep -Eqx 'ragpkg-[A-Za-z0-9._-]+\.tar\.gz(\.age)?' \
+    || fail "query-only-mode needs --package with a package name (ragpkg-*.tar.gz), not '$QO_PACKAGE'."
+fi
+[ "$PIN_SET" = 0 ] || [ "$TELEMETRY" = 1 ] || fail "--telemetry-pin requires --telemetry."
 
 PORT="${RAG_VERIFY_PORT:-8081}"
 case "$PORT" in
@@ -144,6 +189,52 @@ if [ "$CMD" != down ]; then
   { [ -d "$CHECKOUT" ] && [ -f "$CHECKOUT/docker-compose.yml" ]; } \
     || fail "--checkout must be a checkout of this project (a folder with docker-compose.yml): $CHECKOUT"
   CHECKOUT="$(cd "$CHECKOUT" && pwd -P)"
+fi
+
+# The reviewed collector pin (#532): the evaluator's file, never the checkout's.
+# --telemetry-pin and the inherited pin of telemetry-mode (#764) get one check:
+# the file exists, and neither it nor a directory above it is the checkout,
+# compared by device and inode so letter case on a case-insensitive volume
+# doesn't matter, and it has no second hard link (one could be in the checkout).
+check_pin() {
+  [ -f "$PIN" ] || fail "$1 must name an existing file: $PIN"
+  PIN="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$PIN")" \
+    || fail "could not resolve the $1 path."
+  local rc=0
+  python3 - "$PIN" "$CHECKOUT" <<'PINPY' || rc=$?
+import os, sys
+
+# Exit 1: the pin is in the checkout. 3: it has a second hard link. 4: an OS error.
+pin, checkout = sys.argv[1:3]
+try:
+    if os.stat(pin).st_nlink > 1:
+        sys.exit(3)
+    folder = os.path.dirname(pin)
+    while True:
+        if os.path.samefile(folder, checkout):
+            sys.exit(1)
+        parent = os.path.dirname(folder)
+        if parent == folder:
+            break
+        folder = parent
+except OSError:
+    sys.exit(4)
+PINPY
+  case "$rc" in
+    0) ;;
+    3) fail "$1 has a second hard link, which could be a file in the checkout under test: $PIN" ;;
+    4) fail "$1 could not be checked against the checkout under test: $PIN" ;;
+    *) fail "$1 must be outside the checkout under test: $PIN" ;;
+  esac
+}
+if [ "$PIN_SET" = 1 ]; then
+  check_pin "--telemetry-pin"
+fi
+# telemetry-mode, run by a suite under the inherited lock, keeps the run's
+# reviewed pin, checked again here; up and run take it only from --telemetry-pin.
+if [ "$CMD" = telemetry-mode ] && [ -n "${RAG_VERIFY_TELEMETRY_PIN:-}" ]; then
+  PIN="$RAG_VERIFY_TELEMETRY_PIN"
+  check_pin "RAG_VERIFY_TELEMETRY_PIN"
 fi
 
 # The private folder, checked before any Docker command; up and run create it.
@@ -202,6 +293,7 @@ export RAG_VERIFY_TELEMETRY="$TELEMETRY"
 export RAG_VERIFY_OTEL_ENABLED="$OTEL_ENABLED"
 export RAG_VERIFY_HARNESS="$HARNESS"
 export RAG_VERIFY_CHECKOUT="$CHECKOUT"
+export RAG_VERIFY_TELEMETRY_PIN="$PIN"
 if [ "$TELEMETRY" = 1 ]; then
   export COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$CHECKOUT/docker-compose.telemetry.yml:$HARNESS/docker-compose.verify.yml:$HARNESS/docker-compose.telemetry.verify.yml"
   export COMPOSE_PROFILES=telemetry
@@ -209,6 +301,12 @@ fi
 # LAN mode's configuration, switched to once the default one is up and set up.
 LAN_COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$CHECKOUT/docker-compose.lan.yml:$HARNESS/docker-compose.verify.yml:$HARNESS/docker-compose.lan.verify.yml"
 export RAG_VERIFY_LAN="$LAN"
+# Query-only mode's configuration (#670), switched to by query-only-mode.
+QUERY_ONLY_COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$CHECKOUT/docker-compose.query-only.yml:$HARNESS/docker-compose.verify.yml"
+[ "$CMD" != query-only-mode ] || QUERY_ONLY="${RAG_VERIFY_QUERY_ONLY:-0}"
+export RAG_VERIFY_QUERY_ONLY="$QUERY_ONLY"
+# Where query-only-mode keeps the package while the exports folder is replaced.
+QO_CARRY="$PRIVATE/query-only-carry"
 export RAG_VERIFY_PORT="$PORT"
 export RAG_API="http://localhost:$PORT/api"
 export RAG_EXPECTED_PROXY_PORT="$PORT"
@@ -248,6 +346,11 @@ do_down() {
   fi
   [ ! -d "$EXPORTS" ] || rm -rf "$EXPORTS"
   rm -f "$LAN_CERT"
+  if [ -L "$QO_CARRY" ]; then
+    printf 'stack.sh: %s is a symlink; not removing it.\n' "$QO_CARRY" >&2
+    return 2
+  fi
+  [ ! -d "$QO_CARRY" ] || rm -rf "$QO_CARRY"
   left="$(docker ps -aq --filter "$filter")$(docker network ls -q --filter "$filter")$(docker volume ls -q --filter "$filter" | grep -vx "$MODELS")$(labelled_images)"
   if [ -e "$EXPORTS" ] || [ -L "$EXPORTS" ]; then
     left="$left $EXPORTS"
@@ -335,7 +438,7 @@ do_guard() {
     rm -f "$config"
     fail "docker compose config failed for $CHECKOUT."
   fi
-  python3 - "$CHECKOUT" "$EXPORTS" "$PORT" "$config" "$HARNESS" "$GUARD_MODE" <<'GUARDPY'
+  python3 - "$CHECKOUT" "$EXPORTS" "$PORT" "$config" "$HARNESS" "$GUARD_MODE" "$PIN" <<'GUARDPY'
 import json, os, sys
 
 checkout, exports, port, path = sys.argv[1:5]
@@ -393,8 +496,9 @@ for svc, service in services.items():
 if {'otel-collector', 'otel-capture'} & services.keys():
     import runpy
     harness = sys.argv[5] if len(sys.argv) > 5 else checkout
+    pin = sys.argv[7] if len(sys.argv) > 7 else ''
     guard = runpy.run_path(os.path.join(harness, 'scripts/verify/telemetry_guard.py'))
-    problems.extend(guard['check'](config, harness))
+    problems.extend(guard['check'](config, harness, pin or None))
 
 # (i) builds: only a context and a Dockerfile, both inside the checkout
 for svc, service in services.items():
@@ -571,6 +675,49 @@ lan_switch() {
   [ "$code" = 200 ] || fail "$RAG_API/health did not return 200 over TLS within 60 seconds (last: $code)."
 }
 
+# ── query-only mode (#670) ───────────────────────────────────────────────────
+# Called by 24_query_only under the inherited lock, once it has exported a
+# package from the default configuration: the same project comes up again in
+# query-only mode with its own empty volumes and only that package in its
+# exports folder, as another machine would have it. Images are kept (no build),
+# and so is the model copy, an external volume `down -v` doesn't remove.
+query_only_switch() {
+  local i code=000 service state health
+  [ -f "$EXPORTS/$QO_PACKAGE" ] && [ ! -L "$EXPORTS/$QO_PACKAGE" ] \
+    || fail "query-only-mode: no package $QO_PACKAGE in $EXPORTS."
+  { [ ! -e "$QO_CARRY" ] && [ ! -L "$QO_CARRY" ]; } || rm -rf "$QO_CARRY" \
+    || fail "query-only-mode: could not clear $QO_CARRY."
+  mkdir -m 700 "$QO_CARRY" && cp -p "$EXPORTS/$QO_PACKAGE" "$QO_CARRY/" \
+    || fail "query-only-mode: could not copy the package out of the exports folder."
+  printf 'removing the default instance (its containers, network and volumes)...\n'
+  docker compose -p "$PROJECT" down -v --remove-orphans >/dev/null 2>&1 \
+    || fail "query-only-mode: could not remove the default instance."
+  { [ ! -L "$EXPORTS" ] && rm -rf "$EXPORTS" && mkdir -p "$EXPORTS" \
+      && cp -p "$QO_CARRY/$QO_PACKAGE" "$EXPORTS/" && rm -rf "$QO_CARRY"; } \
+    || fail "query-only-mode: could not put the package back alone in $EXPORTS."
+  export COMPOSE_FILE="$QUERY_ONLY_COMPOSE_FILE"
+  do_guard
+  printf 'starting the query-only instance...\n'
+  if ! docker compose -p "$PROJECT" up -d --no-build --pull never --wait --wait-timeout 900; then
+    docker compose -p "$PROJECT" ps -a --format '{{.Service}} {{.State}} {{.Health}}' \
+      | while read -r service state health; do
+          case "$state/${health:-}" in
+            running/healthy|running/) ;;
+            *) printf '\n── %s (%s %s) ──\n' "$service" "$state" "${health:-}"
+               docker compose -p "$PROJECT" logs --tail 50 "$service" ;;
+          esac
+        done
+    fail "the verify project did not come up in query-only mode."
+  fi
+  for i in $(seq 1 60); do
+    code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "$RAG_API/health" 2>/dev/null)
+    [ "$code" = 200 ] && break
+    sleep 1
+  done
+  [ "$code" = 200 ] || fail "$RAG_API/health did not return 200 within 60 seconds in query-only mode (last: $code)."
+  printf 'the verify project is up in query-only mode with %s\n' "$QO_PACKAGE"
+}
+
 # ── up ───────────────────────────────────────────────────────────────────────
 do_up() {
   local i code=000 service state health
@@ -605,7 +752,7 @@ do_up() {
   [ "$code" = 200 ] || fail "$RAG_API/health did not return 200 within 60 seconds (last: $code)."
   [ "$LAN" = 0 ] || lan_switch
   printf '\nThe verify project is up at %s. To point commands at it:\n\n' "${RAG_API%/api}"
-  for var in COMPOSE_PROJECT_NAME COMPOSE_FILE RAG_API RAG_EXPECTED_PROXY_PORT RAG_EXPORTS_DIR RAG_VERIFY_PORT RAG_VERIFY_TELEMETRY RAG_VERIFY_LAN; do
+  for var in COMPOSE_PROJECT_NAME COMPOSE_FILE RAG_API RAG_EXPECTED_PROXY_PORT RAG_EXPORTS_DIR RAG_VERIFY_PORT RAG_VERIFY_TELEMETRY RAG_VERIFY_LAN RAG_VERIFY_QUERY_ONLY; do
     printf 'export %s=%q\n' "$var" "${!var}"
   done
   if [ "$LAN" = 1 ]; then
@@ -614,7 +761,7 @@ do_up() {
     done
   fi
   if [ "$TELEMETRY" = 1 ]; then
-    for var in COMPOSE_PROFILES RAG_VERIFY_HARNESS RAG_VERIFY_CHECKOUT RAG_VERIFY_OTEL_ENABLED; do
+    for var in COMPOSE_PROFILES RAG_VERIFY_HARNESS RAG_VERIFY_CHECKOUT RAG_VERIFY_OTEL_ENABLED RAG_VERIFY_TELEMETRY_PIN; do
       printf 'export %s=%q\n' "$var" "${!var}"
     done
   fi
@@ -627,6 +774,9 @@ case "$CMD" in
     [ "$TELEMETRY" = 1 ] || fail "telemetry-mode requires --telemetry"
     do_guard
     docker compose -p "$PROJECT" up -d --no-deps --no-build --pull never --wait --wait-timeout 120 api || fail "API telemetry reconfiguration failed" ;;
+  query-only-mode)
+    # Called only by 24_query_only under the inherited lock of a --query-only run.
+    query_only_switch ;;
   down)
     do_down || exit 2 ;;
   up)
@@ -637,6 +787,8 @@ case "$CMD" in
     rc=0
     # A LAN run checks LAN mode; other suites assume the default configuration.
     [ "$LAN" = 0 ] || [ "${#ARGS[@]}" -gt 0 ] || ARGS=(18_lan)
+    # A query-only run checks query-only mode (#670).
+    [ "$QUERY_ONLY" = 0 ] || [ "${#ARGS[@]}" -gt 0 ] || ARGS=(24_query_only)
     # In the background with job control on, all.sh leads a process group of
     # its own (pgid $!), which stop_suite ends; and `wait`, unlike a foreground
     # command, returns as soon as INT or TERM arrives, so the traps act at once.

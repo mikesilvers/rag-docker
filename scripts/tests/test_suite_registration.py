@@ -26,9 +26,12 @@ REGISTERED = (
     ('scripts/tests/test_corpus_rules_estimates.py', '02_ingest.sh', True),
     ('scripts/tests/test_retrieval_controls.py', '11_retrieval.sh', True),
     ('scripts/tests/test_export_encryption.py', '05_transfer.sh', True),
+    ('scripts/tests/test_package_download.py', '05_transfer.sh', True),
     ('scripts/tests/test_prepare.py', '21_prepare.sh', True),
     ('scripts/tests/test_offline_ingest.py', '20_offline_model.sh', True),
     ('scripts/verify/ui_ingest_weaviate.py', '22_ui_ingest.sh', False),
+    ('scripts/tests/test_installed_authlib.py', '01_infrastructure.sh', True),
+    ('scripts/tests/test_scanned_pdf_ocr.py', '02_ingest.sh', True),
 )
 
 

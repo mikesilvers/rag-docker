@@ -58,6 +58,8 @@ def exports_dir() -> Path:
 # which a hard kill skips: each killed export left them in ./exports for good,
 # hidden and root-owned, about 2.3 GB with models. Matched by exact name pattern
 # and by kind, never by age; anything else in the folder is left alone.
+# Staging is now `{UPLOAD_DIR}/export-*`, swept with the other work directories
+# there (#549); `.build-*` is staging left here by earlier versions.
 _BUILD_DIR = ".build-*"
 # An encrypted export is written as `.<stem>.tar.gz.age.partial` (#27).
 _PARTIAL_ARCHIVES = (".*.tar.gz.partial", ".*.tar.gz.age.partial")
@@ -278,7 +280,7 @@ def render_help(embed_dimensions: int | str) -> str:
     return _render("help_transfer.md.tmpl", {
         "EMBED_MODEL": settings.embed_model,
         "EMBED_DIMENSIONS": embed_dimensions,
-        "LLM_MODEL": settings.llm_model,
+        "LLM_MODEL": settings.answer_model,
     })
 
 
@@ -403,8 +405,13 @@ def build(
     out_dir = exports_dir()
     warnings: list[str] = []
 
-    # Staged inside exports_dir so the final rename is on the same filesystem.
-    stage = Path(tempfile.mkdtemp(dir=out_dir, prefix=".build-"))
+    # Staged in UPLOAD_DIR, a volume only the container sees (#549): the package's
+    # unencrypted files, originals included and for an encrypted export too,
+    # never sit in the host's ./exports. Only the archive goes there, written as
+    # `.<filename>.partial` and renamed in place.
+    upload = Path(settings.upload_dir)
+    upload.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(dir=upload, prefix="export-"))
     tmp_archive: Path | None = None
     try:
         b = _Builder(stage)
@@ -496,7 +503,9 @@ def build(
             # models/<name>/<tag>/ folder (#487), so removing a failed copy
             # never removes another model's files.
             wanted: dict[str, str] = {}
-            for model in (settings.embed_model, settings.llm_model):
+            # Only the answer model: an imported collection is queried, never
+            # prepared, so the build model stays behind (#671).
+            for model in (settings.embed_model, settings.answer_model):
                 try:
                     key = model_bundle.model_ref(model)
                 except ValueError:
@@ -560,7 +569,10 @@ def build(
                 "model": settings.embed_model,
                 "dimensions": dimensions,
             },
-            "llm": {"model": settings.llm_model},
+            # `llm` is the answer model, kept for older readers (#671).
+            "llm": {"model": settings.answer_model},
+            "answer_llm": {"model": settings.answer_model},
+            "build_llm": {"model": settings.build_model},
             "chunking": chunking,
             "fidelity": fidelity,
             # What the package actually carries, not what was asked for: a

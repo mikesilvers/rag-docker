@@ -809,7 +809,7 @@ def _parse_gs_json(text: str) -> dict:
 
 
 async def _chat_once(system: str, user: str) -> str:
-    """One chat call, retried once if the transport fails.
+    """One call to the build model (#671), retried once if the transport fails.
 
     Ollama serialises requests per model, so generating while someone is
     querying can push a call past the client timeout. `httpx.ReadTimeout`
@@ -817,10 +817,10 @@ async def _chat_once(system: str, user: str) -> str:
     empty string. A transient timeout should cost a retry, not a pair.
     """
     try:
-        return await ollama.chat(system, user)
+        return await ollama.build_chat(system, user)
     except (httpx.TimeoutException, httpx.TransportError) as exc:
         log.warning("Ollama call failed (%s); retrying once", type(exc).__name__)
-        return await ollama.chat(system, user)
+        return await ollama.build_chat(system, user)
 
 
 # One initial attempt plus two reprompts. The model's failure mode is malformed
@@ -1231,6 +1231,46 @@ def _save_export_sync(out_path: Path, ragas: list[dict]) -> None:
     _replace_durably(out_path, json.dumps(ragas, indent=2))
 
 
+# Which collection each saved export came from (#606), so a download can be
+# checked against that collection's access. Kept beside the exports folder,
+# never in it, so it is never served; the exports stay plain RAGAS lists. A file
+# with no entry (saved before #606, or put there by hand) is served to Engineers
+# only. An unreadable index is treated as empty, which only narrows downloads.
+EXPORT_INDEX_NAME = "goldstandard_export_collections.json"
+_export_index_lock = threading.Lock()
+
+
+def _export_index_path() -> Path:
+    return Path(settings.upload_dir).resolve() / EXPORT_INDEX_NAME
+
+
+def _read_export_index() -> dict:
+    try:
+        data = json.loads(_export_index_path().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        log.exception("The gold-standard export index can't be read; its files are served to Engineers only")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _record_export_collection(filename: str, collection: str | None) -> None:
+    with _export_index_lock:
+        index = _read_export_index()
+        if collection:
+            index[filename] = collection
+        else:
+            index.pop(filename, None)
+        _replace_durably(_export_index_path(), json.dumps(index, indent=2, sort_keys=True))
+
+
+def export_collection(filename: str) -> str | None:
+    """The collection a saved export came from, or None when it isn't known."""
+    value = _read_export_index().get(filename)
+    return value if isinstance(value, str) and value else None
+
+
 async def save_session(session_id: str, filename: str | None, allow_historical: bool = False) -> dict | None:
     session = _sessions.get(session_id)
     if session is None:
@@ -1276,6 +1316,9 @@ async def save_session(session_id: str, filename: str | None, allow_historical: 
         }
         for p in approved
     ]
+    # The collection is recorded before the file is written (#606): a failure
+    # or a race in between narrows who may download it, never widens it.
+    await asyncio.to_thread(_record_export_collection, filename, session.get("collection"))
     await asyncio.to_thread(_save_export_sync, out_path, ragas)
 
     return {

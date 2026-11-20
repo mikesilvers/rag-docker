@@ -14,6 +14,8 @@ const PACKAGE = 'ragpkg-vfytransfera-20261021-0000-abcd1234.tar.gz';
 const collectionsBody = { collections: [A, B].map(name => ({ name, object_count: 3, index_type: 'hnsw', distance_metric: 'cosine', created_at: null })) };
 // An encrypted package lists no metadata (#27).
 const SEALED = 'ragpkg-vfytransfera-20261021-0000-abcd1234.tar.gz.age';
+// An encrypted package whose header can't be read: listed readable: false (#27).
+const BROKEN = 'ragpkg-vfytransfera-20261021-0000-ffff0000.tar.gz.age';
 const packagesBody = { packages: [
   { filename: PACKAGE, size_bytes: 2048, collection: A, chunk_count: 3, fidelity: 'with-sources', created_at: null, readable: true, encrypted: false },
   { filename: SEALED, size_bytes: 2100, collection: null, chunk_count: null, fidelity: null, created_at: null, readable: true, encrypted: true },
@@ -255,6 +257,32 @@ async function runTransferPageTests(browser, base, reporter) {
     await release(page, HALVES.export.poll, exportJob('completed', { chunks_written: 3, filename: 'ragpkg-vfy.tar.gz.age', size_bytes: 4096, fidelity: 'with-sources', models_bundled: false, retrieve_script: true, encrypted: true }));
     await waitText(page, 'with-sources, encrypted');
   }]);
+  cases.push(['export encryption: the bounds count characters, 1025 holds Export, and a refused start keeps the fields (#27)', async page => {
+    assert.equal(await checkEncrypt(page), true, 'no "Encrypt with a passphrase" checkbox');
+    await page.waitForFunction(() => document.querySelectorAll('input[type=password]').length === 2);
+    const lock = '\u{1F512}';   // one character, two UTF-16 units
+    await typePassword(page, 0, lock.repeat(11));
+    await typePassword(page, 1, lock.repeat(11));
+    await waitText(page, 'The passphrase needs at least 12 characters.');
+    assert.equal((await button(page, 'export')).disabled, true, 'Export enabled with 11 characters (22 UTF-16 units)');
+    await typePassword(page, 0, lock.repeat(12));
+    await typePassword(page, 1, lock.repeat(12));
+    await waitText(page, 'The passphrase needs at least 12 characters.', true);
+    await expectButton(page, 'export', false);
+    await typePassword(page, 0, 'a'.repeat(1025));
+    await typePassword(page, 1, 'a'.repeat(1025));
+    await waitText(page, 'The passphrase can have at most 1024 characters.');
+    assert.equal((await button(page, 'export')).disabled, true, 'Export enabled with 1025 characters');
+    await typePassword(page, 0, 'a'.repeat(1024));
+    await typePassword(page, 1, 'a'.repeat(1024));
+    await waitText(page, 'The passphrase can have at most 1024 characters.', true);
+    await expectButton(page, 'export', false);
+    assert.equal(await click(page, 'Export'), true, 'no Export button');
+    await release(page, '/api/export', apiError(409, 'EXPORT_IN_PROGRESS', 'An export of this collection is already running.'), 'POST');
+    await waitText(page, 'An export of this collection is already running.');
+    assert.deepEqual(await passwords(page), ['a'.repeat(1024), 'a'.repeat(1024)], 'the fields were cleared after a refused start');
+    await expectButton(page, 'export', false);
+  }]);
   cases.push(['export encryption: an unchecked box sends no passphrase (#27)', async page => {
     await start(page, 'export');
     assert.deepEqual(await sentBody(page, '/api/export'), { collection: A, include_models: false });
@@ -281,6 +309,67 @@ async function runTransferPageTests(browser, base, reporter) {
     assert.equal(await click(page, 'Import'), true, 'no Import button');
     await pending(page, '/api/import', 'POST');
     assert.deepEqual(await sentBody(page, '/api/import'), { filename: PACKAGE, on_conflict: 'abort' });
+  }]);
+  cases.push(['import encryption: an encrypted package that can\'t be read is labelled "encrypted, unreadable" (#27)', async page => {
+    const broken = { filename: BROKEN, size_bytes: 512, collection: null, chunk_count: null, fidelity: null, created_at: null, readable: false, encrypted: true };
+    await release(page, '/api/packages', json(200, { packages: [...packagesBody.packages, broken] }));
+    await page.waitForFunction(n => [...document.querySelectorAll('option')].some(o => o.value === n), { timeout: 5000 }, BROKEN)
+      .catch(() => { throw new Error('the unreadable encrypted package is not listed'); });
+    const label = await page.evaluate(n => [...document.querySelectorAll('option')].find(o => o.value === n).textContent, BROKEN);
+    assert.equal(label, BROKEN + ' — encrypted, unreadable');
+  }, { hold: ['GET /api/packages'] }]);
+
+  // Downloading a package and its expiry (#677, RD-145 Q4).
+  const EXPIRES = '2026-11-18T12:00:00Z';
+  const downloadLinks = page => page.evaluate(() => [...document.querySelectorAll('a')]
+    .filter(a => a.textContent.trim() === 'Download').map(a => ({ href: a.getAttribute('href'), download: a.hasAttribute('download') })));
+  const localTime = (page, iso) => page.evaluate(i => new Date(i).toLocaleString(), iso);
+  cases.push(['export: a finished export shows a Download link to its package and "Expires <local time>" (#677)', async page => {
+    await startAndPoll(page, 'export');
+    const done = JSON.parse(HALVES.export.done.body);
+    await release(page, HALVES.export.poll, json(200, { ...done, expires_at: EXPIRES }));
+    await waitText(page, 'Done.');
+    await waitText(page, 'Expires ' + await localTime(page, EXPIRES));
+    const links = await downloadLinks(page);
+    assert.ok(links.some(l => l.href === '/api/packages/ragpkg-vfy.tar.gz' && l.download), JSON.stringify(links));
+  }]);
+  cases.push(['export: a finished export with no expiry still offers Download and shows no "Expires" (#677)', async page => {
+    await startAndPoll(page, 'export');
+    await release(page, HALVES.export.poll, HALVES.export.done);
+    await waitText(page, 'Done.');
+    const links = await downloadLinks(page);
+    assert.ok(links.some(l => l.href === '/api/packages/ragpkg-vfy.tar.gz'), JSON.stringify(links));
+    assert.ok(!(await text(page)).includes('Expires '), 'an "Expires" label for a package with no expiry');
+  }]);
+  cases.push(['import: the package list says when a package exported here expires, and Download follows the selected package (#677)', async page => {
+    await release(page, '/api/packages', json(200, { packages: [{ ...packagesBody.packages[0], expires_at: EXPIRES }, packagesBody.packages[1]] }));
+    await page.waitForFunction(n => [...document.querySelectorAll('option')].some(o => o.value === n), { timeout: 5000 }, PACKAGE);
+    const labels = await page.evaluate(() => Object.fromEntries([...document.querySelectorAll('option')].map(o => [o.value, o.textContent])));
+    assert.ok(labels[PACKAGE].endsWith(', expires ' + await localTime(page, EXPIRES)), labels[PACKAGE]);
+    assert.ok(!labels[SEALED].includes('expires'), labels[SEALED]);
+    const disabled = await page.evaluate(() => [...document.querySelectorAll('button')].some(b => b.textContent.trim() === 'Download' && b.disabled));
+    assert.equal(disabled, true, 'no disabled Download while no package is selected');
+    assert.deepEqual(await downloadLinks(page), [], 'a Download link with no package selected');
+    await selectPackage(page, PACKAGE);
+    await page.waitForFunction(() => [...document.querySelectorAll('a')].some(a => a.textContent.trim() === 'Download'), { timeout: 5000 });
+    assert.deepEqual(await downloadLinks(page), [{ href: '/api/packages/' + encodeURIComponent(PACKAGE), download: true }]);
+    await selectPackage(page, SEALED);
+    await page.waitForFunction(h => [...document.querySelectorAll('a')].some(a => a.getAttribute('href') === h), { timeout: 5000 }, '/api/packages/' + encodeURIComponent(SEALED))
+      .catch(async () => { throw new Error('Download did not follow the selection: ' + JSON.stringify(await downloadLinks(page))); });
+  }, { hold: ['GET /api/packages'] }]);
+  cases.push(['export: after Download, the page sees the package go and stops offering it (#677)', async page => {
+    await startAndPoll(page, 'export');
+    const done = JSON.parse(HALVES.export.done.body);
+    await release(page, HALVES.export.poll, json(200, { ...done, expires_at: EXPIRES }));
+    await waitText(page, 'Done.');
+    // The click must not navigate; React's onClick still runs.
+    await page.evaluate(() => document.addEventListener('click', e => e.preventDefault(), true));
+    await page.evaluate(() => [...document.querySelectorAll('a')].find(a => a.textContent.trim() === 'Download'
+      && a.getAttribute('href') === '/api/packages/ragpkg-vfy.tar.gz').click());
+    // The fixed package list doesn't name ragpkg-vfy.tar.gz: the first re-read (3 s) finds it gone.
+    await waitText(page, 'Downloaded and deleted from ./exports.');
+    assert.deepEqual((await downloadLinks(page)).filter(l => l.href === '/api/packages/ragpkg-vfy.tar.gz'), []);
+    assert.ok(!(await text(page)).includes('Expires '), 'still shows when the deleted package expires');
   }]);
 
   for (const [name, test, opts] of cases) {

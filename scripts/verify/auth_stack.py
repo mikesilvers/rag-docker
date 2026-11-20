@@ -11,12 +11,16 @@ that create throwaway accounts (vfy-t-<random>), service principals
 it up. No password, session token or API key is printed; keys are held in
 memory only.
 """
+import base64
 import hashlib
+import hmac
 import json
 import os
 import secrets
+import struct
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -55,9 +59,15 @@ MATRIX = (
     ("GET", "/import/job/vfy-no-such-job", None, "developer"),
     ("GET", "/import/jobs", None, "developer"),
     ("GET", "/packages", None, "developer"),
+    # Downloading a package (#677): an allowed request finds no such package, 404.
+    ("GET", "/packages/ragpkg-vfy-no-such.tar.gz", None, "developer"),
     ("GET", "/help/transfer", None, "developer"),
     ("GET", "/tune/" + X, None, "developer"),
+    ("GET", "/health/details", None, "developer"),       # the full health report (#750)
     ("DELETE", "/collections/" + X + "?confirm=true", None, "engineer"),
+    # Per-collection access (#606): a 404 for no such collection, a 422 for no value.
+    ("GET", "/collections/" + X + "/access", None, "engineer"),
+    ("PUT", "/collections/" + X + "/access", {}, "engineer"),
     ("POST", "/tune/rechunk", {}, "engineer"),
     ("POST", "/tune/reembed", {}, "engineer"),
     ("POST", "/tune/reindex", {}, "engineer"),
@@ -87,10 +97,15 @@ MATRIX = (
     ("POST", "/auth/service-principals/vfy-no-such-svc/enable", None, "engineer"),
     ("POST", "/auth/service-principals/vfy-no-such-svc/keys", {}, "engineer"),
     ("POST", "/auth/service-principals/vfy-no-such-svc/keys/nosuchkey123/revoke", None, "engineer"),
+    # Two-step verification (#607): a 404 for no such account, a 422 for no value.
+    ("POST", "/auth/users/vfy-no-such-user/reset-mfa", None, "engineer"),
+    ("POST", "/auth/mfa/policy", {}, "engineer"),
 )
 # Routes an API key can't use whatever its role (S5 of PR 3): every account,
 # principal and key route, logout and the password change; and the audit log (#29).
-KEY_REFUSED = ("/auth/users", "/auth/service-principals", "/auth/logout", "/auth/password", "/audit")
+KEY_REFUSED = ("/auth/users", "/auth/service-principals", "/auth/logout", "/auth/password", "/audit", "/auth/mfa")
+# And per-collection access (#606), by its path's end.
+KEY_REFUSED_SUFFIX = "/access"
 SESSION_ROUTES = (("GET", "/auth/me", None), ("POST", "/auth/logout", None), ("POST", "/auth/password", {}))
 
 
@@ -136,6 +151,41 @@ def code(method, path, body=None, token=None, headers=None, paced=True):
             return error.code, error.read(), error.headers
 
     return auth_setup.paced(path, send) if paced else send()
+
+
+def upload(token, filename, content):
+    """POST /prepare/upload of one file as a same-origin browser would.
+    Returns (status, parsed body or None)."""
+    boundary = "vfy" + secrets.token_hex(8)
+    data = ('--{}\r\nContent-Disposition: form-data; name="files"; filename="{}"\r\n'
+            'Content-Type: application/octet-stream\r\n\r\n'.format(boundary, filename).encode()
+            + content + "\r\n--{}--\r\n".format(boundary).encode())
+    headers = {"Origin": auth_setup.origin(), "Cookie": "rag_session=" + token,
+               "Content-Type": "multipart/form-data; boundary=" + boundary}
+    req = urllib.request.Request(auth_setup.api_base() + "/prepare/upload", data=data, method="POST",
+                                 headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            status, raw = response.status, response.read()
+    except urllib.error.HTTPError as error:
+        status, raw = error.code, error.read()
+    try:
+        return status, json.loads(raw)
+    except ValueError:
+        return status, None
+
+
+def wait_job(token, path, timeout=600):
+    """GET `path` every 2 s until the job ends; returns its record."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status, raw, _ = code("GET", path, token=token)
+        expect(status == 200, "{} answered {}".format(path, status))
+        job = json.loads(raw)
+        if job["status"] in ("completed", "failed", "partial", "cancelled"):
+            return job
+        time.sleep(2)
+    raise CheckFailed("{} didn't end within {}s".format(path, timeout))
 
 
 def error_code(raw):
@@ -221,7 +271,7 @@ def check_key_matrix(role, operator_ok):
     try:
         for method, path, body, need in MATRIX:
             status, raw, _ = code(method, path, body, headers=bearer(key))
-            if path.startswith(KEY_REFUSED):
+            if path.startswith(KEY_REFUSED) or path.endswith(KEY_REFUSED_SUFFIX):
                 ok = status == 403 and error_code(raw) == "KEY_NOT_ALLOWED"
             elif ROLES.index(role) < ROLES.index(need):
                 ok = status == 403 and error_code(raw) == "FORBIDDEN"
@@ -343,6 +393,12 @@ def check_service_keys(operator_ok):
 def check_public(operator_ok):
     status, raw, _ = code("GET", "/health", headers={})
     expect(status in (200, 503), "GET /health without a session answered {}".format(status))
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        body = None
+    expect(body in ({"status": "ok"}, {"status": "degraded"}),
+           "GET /health without a session answered {} {!r}, not a status-only body".format(status, raw[:200]))
     status, raw, _ = code("GET", "/auth/status", headers={})
     expect(status == 200 and json.loads(raw) == {"setup_required": False},
            "GET /auth/status answered {} {!r}".format(status, raw[:200]))
@@ -371,7 +427,8 @@ def check_login_logout(operator_ok):
     status, raw, _ = code("GET", "/auth/me", token=token)
     body = json.loads(raw)
     expect(status == 200 and body == {"username": "vfy-developer", "role": "developer", "must_change_password": False,
-                                      "kind": "user"},
+                                      "kind": "user", "mfa_enrolled": False, "mfa_required": False,
+                                      "mfa_enrollment_required": False, "query_only": False},
            "GET /auth/me answered {} {}".format(status, body))
     status, _, _ = code("POST", "/auth/logout", token=token)
     expect(status == 200, "logout answered {}".format(status))
@@ -424,6 +481,31 @@ def check_origin(operator_ok):
                 name, status, error_code(raw)))
     status, _, _ = code("GET", "/collections", token=token, headers={"Origin": "http://evil.example"})
     expect(status == 200, "a cross-origin GET answered {} (reads aren't origin-checked)".format(status))
+    # #794: the deleting GET /packages/{filename} refuses a cookie request whose
+    # Sec-Fetch-Site is present and not same-origin or none, through nginx. The
+    # package doesn't exist, so an allowed request is a 404 and deletes nothing.
+    package = "/packages/ragpkg-vfy-no-such.tar.gz"
+    for method, site, want in (("GET", "cross-site", 403), ("GET", "same-site", 403),
+                               ("GET", "same-origin", 404), ("GET", "none", 404), ("GET", None, 404),
+                               ("HEAD", "cross-site", 404)):
+        headers = {"Origin": auth_setup.origin()}
+        if site is not None:
+            headers["Sec-Fetch-Site"] = site
+        status, raw, _ = code(method, package, token=token, headers=headers)
+        if want == 403:
+            expect(status == 403 and error_code(raw) == "CROSS_ORIGIN_REFUSED",
+                   "{} {} with Sec-Fetch-Site {}: answered {} {}".format(method, package, site, status,
+                                                                         error_code(raw)))
+        elif method == "HEAD":
+            # A HEAD answer has no body, so only its status can be checked.
+            expect(status == 404, "{} {} with Sec-Fetch-Site {}: answered {}, wanted the 404 of an "
+                   "allowed request".format(method, package, site, status))
+        else:
+            expect(status == 404 and error_code(raw) == "PACKAGE_NOT_FOUND",
+                   "{} {} with Sec-Fetch-Site {}: answered {} {}, wanted the 404 PACKAGE_NOT_FOUND of an "
+                   "allowed request".format(method, package, site, status, error_code(raw)))
+    status, _, _ = code("GET", "/packages", token=token, headers={"Sec-Fetch-Site": "cross-site"})
+    expect(status == 200, "the package listing with Sec-Fetch-Site cross-site answered {}".format(status))
     request("POST", "/auth/logout", token=token)
 
 
@@ -672,6 +754,197 @@ def check_no_secrets_logged(operator_ok):
            "the API log has no login line for vfy-engineer")
 
 
+def totp(secret, offset=0):
+    """RFC 6238 (SHA-1, 6 digits, 30 s), computed here from the secret the
+    set-up answered, so the API is checked against the standard, not itself."""
+    key = base64.b32decode(secret + "=" * (-len(secret) % 8))
+    digest = hmac.new(key, struct.pack(">Q", int(time.time() // 30) + offset), hashlib.sha1).digest()
+    at = digest[-1] & 0x0F
+    return str((struct.unpack(">I", digest[at:at + 4])[0] & 0x7FFFFFFF) % 1000000).zfill(6)
+
+
+def cookie_value(headers, name):
+    for cookie in headers.get_all("Set-Cookie") or []:
+        key, _, rest = cookie.partition("=")
+        if key.strip() == name:
+            return rest.split(";", 1)[0]
+    return None
+
+
+def second_factor(challenge, value):
+    """POST /auth/login/mfa with the challenge cookie; paced like a login,
+    since nginx limits it in the same zone."""
+    headers = {"Origin": auth_setup.origin(), "Cookie": "rag_mfa=" + challenge}
+    return auth_setup.paced(auth_setup.LOGIN_PATH, lambda: code(
+        "POST", "/auth/login/mfa", {"code": value}, headers=headers, paced=False))
+
+
+def password_step(username, password):
+    status, raw, headers = code("POST", "/auth/login", {"username": username, "password": password})
+    body = json.loads(raw) if status == 200 else {}
+    challenge = cookie_value(headers, "rag_mfa")
+    expect(status == 200 and body == {"mfa_required": True} and challenge
+           and cookie_value(headers, "rag_session") is None,
+           "the password step for an enrolled user answered {} {} (challenge {})".format(
+               status, body, "set" if challenge else "missing"))
+    return challenge
+
+
+def check_mfa(operator_ok):
+    """Two-step verification on the stack (#607): set-up, the two-step login,
+    no code twice, a recovery code once, and an Engineer's reset."""
+    username, password, token = throwaway("developer", operator_ok)
+    status, raw, headers = code("POST", "/auth/mfa/enroll", token=token)
+    expect(status == 200 and headers.get("Cache-Control") == "no-store", "set-up answered {} {}".format(
+        status, error_code(raw)))
+    secret = json.loads(raw)["secret"]
+    status, raw, _ = code("POST", "/auth/mfa/enroll/confirm", {"code": totp(secret, -1)}, token=token)
+    expect(status == 200, "confirming the set-up answered {} {}".format(status, error_code(raw)))
+    recovery = json.loads(raw)["recovery_codes"]
+    expect(len(recovery) == 10, "{} recovery codes".format(len(recovery)))
+
+    challenge = password_step(username, password)
+    accepted = totp(secret)
+    status, raw, headers = second_factor(challenge, accepted)
+    expect(status == 200 and cookie_value(headers, "rag_session"), "the right code answered {} {}".format(
+        status, error_code(raw)))
+    challenge = password_step(username, password)
+    status, raw, _ = second_factor(challenge, accepted)
+    expect(status == 401 and error_code(raw) == "MFA_FAILED", "a used code answered {} {}".format(
+        status, error_code(raw)))
+    status, raw, _ = second_factor(challenge, recovery[0])
+    expect(status == 200, "a recovery code answered {} {}".format(status, error_code(raw)))
+    challenge = password_step(username, password)
+    status, raw, _ = second_factor(challenge, recovery[0])
+    expect(status == 401 and error_code(raw) == "MFA_FAILED", "a used recovery code answered {} {}".format(
+        status, error_code(raw)))
+
+    admin = role_token("engineer")
+    try:
+        status, raw, _ = code("POST", "/auth/users/{}/reset-mfa".format(username), token=admin)
+        expect(status == 200 and json.loads(raw)["user"]["mfa_enrolled"] is False,
+               "the Engineer's reset answered {} {}".format(status, error_code(raw)))
+    finally:
+        request("POST", "/auth/logout", token=admin)
+    status, body, _ = request("POST", "/auth/login", {"username": username, "password": password})
+    expect(status == 200 and body.get("mfa_enrolled") is False, "after the reset the login answered {} {}".format(
+        status, body))
+    result = compose("logs", "--no-color", "api")
+    expect(all(value not in result.stdout + result.stderr for value in [secret, accepted] + recovery),
+           "a secret or code appears in the API log")
+
+
+def enroll(token):
+    """Set up two-step verification for the session `token` through the API; returns the secret."""
+    status, raw, _ = code("POST", "/auth/mfa/enroll", token=token)
+    expect(status == 200, "set-up answered {} {}".format(status, error_code(raw)))
+    secret = json.loads(raw)["secret"]
+    status, raw, _ = code("POST", "/auth/mfa/enroll/confirm", {"code": totp(secret, -1)}, token=token)
+    expect(status == 200, "confirming the set-up answered {} {}".format(status, error_code(raw)))
+    return secret
+
+
+def check_mfa_rate_limit(operator_ok):
+    """#607: nginx gives POST /auth/login/mfa the login's 16k body limit and its
+    rate zone, so codes and passwords from one address share 10 a minute."""
+    big = {"code": "x" * 17000}
+    status, raw, headers = code("POST", "/auth/login/mfa", big, paced=False)
+    expect(status == 413 and error_code(raw) is None
+           and not headers.get("Content-Type", "").startswith("application/json"),
+           "a {}-byte code body answered {} {} (not nginx's 413)".format(len(json.dumps(big)), status,
+                                                                        error_code(raw)))
+    refusal = None
+    for _ in range(12):
+        status, raw, _ = code("POST", "/auth/login/mfa", {"code": "123456"}, paced=False)
+        if status == 429:
+            refusal = raw
+            break
+        expect(status == 401 and error_code(raw) == "MFA_CHALLENGE_INVALID",
+               "a code with no challenge answered {} {}".format(status, error_code(raw)))
+    expect(refusal is not None, "12 codes in a row were all let through")
+    expect(json.loads(refusal) == {"error": {"code": "LOGIN_RATE_LIMITED", "detail": None,
+                                             "message": "Too many login attempts. Wait a minute and try again."}},
+           "the refusal is {}".format(refusal[:200]))
+    status, raw, _ = code("POST", "/auth/login", {"username": "vfy-rate-" + secrets.token_hex(3),
+                                                  "password": "x" * 12}, paced=False)
+    expect(status == 429 and error_code(raw) == "LOGIN_RATE_LIMITED",
+           "right after the codes were limited, a login answered {} {}: not the same zone".format(
+               status, error_code(raw)))
+
+
+def _set_required(token, required):
+    return code("POST", "/auth/mfa/policy", {"required": required}, token=token)
+
+
+def check_mfa_required(operator_ok):
+    """#607 on the stack: the switch needs an enrolled Engineer; while it is on,
+    an unenrolled session reaches only its session and MFA routes; the operator's
+    reset-mfa ends the sessions and the next login asks for no code; the policy,
+    reset and code attempts are audit records without a code."""
+    eng_name, eng_password, eng = throwaway("engineer", operator_ok)
+    dev_name, _, dev = throwaway("developer", operator_ok)
+    status, raw, _ = _set_required(eng, True)
+    expect(status == 409 and error_code(raw) == "MFA_ENROLL_FIRST",
+           "an unenrolled Engineer turning the switch on answered {} {}".format(status, error_code(raw)))
+    secret = enroll(eng)
+    switched = False
+    try:
+        status, raw, _ = _set_required(eng, True)
+        switched = status == 200
+        expect(switched, "an enrolled Engineer turning the switch on answered {} {}".format(status, error_code(raw)))
+        status, raw, _ = code("GET", "/collections", token=dev)
+        expect(status == 403 and error_code(raw) == "MFA_ENROLLMENT_REQUIRED",
+               "while required, an unenrolled session's GET /collections answered {} {}".format(
+                   status, error_code(raw)))
+        status, body, _ = request("GET", "/auth/me", token=dev)
+        expect(status == 200 and body.get("mfa_enrollment_required") is True,
+               "while required, /auth/me answered {} {}".format(status, body))
+        status, raw, _ = code("GET", "/auth/mfa", token=dev)
+        expect(status == 200 and json.loads(raw).get("required") is True,
+               "while required, GET /auth/mfa answered {} {}".format(status, error_code(raw)))
+        status, raw, _ = code("GET", "/collections", token=eng)
+        expect(status == 200, "while required, the enrolled Engineer's GET /collections answered {}".format(status))
+    finally:
+        if switched:
+            status, raw, _ = _set_required(eng, False)
+            expect(status == 200, "turning the switch off answered {} {}".format(status, error_code(raw)))
+    status, raw, _ = code("GET", "/collections", token=dev)
+    expect(status == 200, "after the switch went off, GET /collections answered {} {}".format(status, error_code(raw)))
+
+    challenge = password_step(eng_name, eng_password)
+    status, _, _ = second_factor(challenge, "abcd-efgh-ijkl-mnop")
+    expect(status == 401, "a wrong recovery code answered {}".format(status))
+    rc, _ = auth_setup.operator("reset-mfa", eng_name)
+    expect(rc == 0, "reset-mfa exited {}".format(rc))
+    status, _, _ = code("GET", "/auth/me", token=eng)
+    expect(status == 401, "after reset-mfa the Engineer's session answered {}".format(status))
+    status, body, eng = request("POST", "/auth/login", {"username": eng_name, "password": eng_password})
+    expect(status == 200 and eng and body.get("mfa_enrolled") is False,
+           "after reset-mfa the login answered {} {}".format(status, body))
+    request("POST", "/auth/logout", token=eng)
+    request("POST", "/auth/logout", token=dev)
+
+    admin = role_token("engineer")
+    try:
+        def records(action):
+            status, raw, _ = code("GET", "/audit?action={}&limit=1000".format(action), token=admin)
+            expect(status == 200, "GET /audit?action={} answered {}".format(action, status))
+            return json.loads(raw)["records"]
+        policy = [r for r in records("admin.mfa.policy") if r["actor"] == eng_name]
+        expect(sorted(r["details"].get("required") for r in policy if r["result"] == "success") == [False, True],
+               "the switch's audit records are {}".format(policy))
+        expect(any(r["actor"] == eng_name for r in records("auth.mfa.enroll")), "no auth.mfa.enroll record")
+        failed = [r for r in records("auth.mfa") if r["actor"] == eng_name]
+        expect(len(failed) == 1 and failed[0]["details"].get("method") == "recovery"
+               and failed[0]["result"] != "success",
+               "the failed code's audit records are {}".format(failed))
+        expect(any(r["target"] == eng_name for r in records("operator.reset-mfa")), "no operator.reset-mfa record")
+        expect("abcd" not in json.dumps(failed) and secret not in json.dumps(records("auth.mfa.enroll")),
+               "an audit record holds a code or secret")
+    finally:
+        request("POST", "/auth/logout", token=admin)
+
+
 STATE = "restart-state.json"
 
 
@@ -694,6 +967,119 @@ def check_restart_verify(operator_ok):
     expect(status == 200, "a session did not survive the API restart ({})".format(status))
     status, _, _ = code("POST", "/auth/login", {"username": state["locked"], "password": "x" * 12})
     expect(status == 429, "a lockout did not survive the API restart ({})".format(status))
+
+
+def check_collection_access(operator_ok):
+    """Per-collection access (#606) on the stack: a collection the harness
+    Engineer creates is restricted to it; a throwaway End User and Developer
+    and a Developer key can't see or use it until granted, and the access routes
+    refuse a key. Changes and refusals are in the audit log. In the Prepare
+    area, a document the granted Developer imports into it is hidden from a
+    Developer without access (#788)."""
+    expect(operator_ok, "creates accounts, a service principal and a collection, so it runs only on the verify project")
+    admin = role_token("engineer")
+    name = "VfyAccess" + secrets.token_hex(4)
+    users, principal = [], None
+    document, document_owner = None, None
+    try:
+        status, raw, _ = code("POST", "/collections", {"name": name}, token=admin)
+        expect(status == 201, "creating {} answered {} {}".format(name, status, error_code(raw)))
+        user, _, user_token = throwaway("end_user", operator_ok)
+        users.append(user)
+        dev, _, dev_token = throwaway("developer", operator_ok)
+        users.append(dev)
+        principal, _, key = new_principal(admin, "developer")
+        callers = {"End User": {"token": user_token}, "Developer": {"token": dev_token},
+                   "key": {"headers": bearer(key)}}
+
+        def listed(who):
+            status, raw, _ = code("GET", "/collections", **callers[who])
+            expect(status == 200, "{}: GET /collections answered {}".format(who, status))
+            return name in [c["name"] for c in json.loads(raw)["collections"]]
+
+        def answer(who, method, path, body=None):
+            status, raw, _ = code(method, path, body, **callers[who])
+            return status, error_code(raw)
+
+        missing = (404, "COLLECTION_NOT_FOUND")
+        for who in callers:
+            expect(not listed(who), "{} sees the new collection, restricted to its creator".format(who))
+            got = answer(who, "POST", "/query", {"question": "Is it there?", "collection": name})
+            expect(got == missing, "{}: the query answered {}".format(who, got))
+        for who in ("Developer", "key"):
+            got = answer(who, "POST", "/export", {"collection": name})
+            expect(got == missing, "{}: the export answered {}".format(who, got))
+        got = answer("key", "GET", "/retrieval/config/" + name)
+        expect(got == missing, "key: the retrieval settings answered {}".format(got))
+        expect(answer("End User", "GET", "/retrieval/config/VfyAccessNoSuch")[0] == 404,
+               "a missing collection's settings must be a 404 as well")
+
+        status, raw, _ = code("PUT", "/collections/{}/access".format(name),
+                              {"restricted": True, "users": [dev], "service_principals": [principal]}, token=admin)
+        expect(status == 200 and json.loads(raw) == {"restricted": True, "users": [dev], "service_principals": [principal]},
+               "granting answered {} {}".format(status, raw[:200]))
+        for who in ("Developer", "key"):
+            expect(listed(who), "{} doesn't see the collection once granted".format(who))
+            got = answer(who, "GET", "/ingest/config/" + name)
+            expect(got[0] == 200, "{}: the granted collection's settings answered {}".format(who, got))
+        expect(not listed("End User"), "the End User sees a collection not granted to it")
+
+        # The Prepare area (#606 Q18, #788): a .csv is labelled from its data,
+        # with no LLM call, so preparing it is quick.
+        status, body = upload(dev_token, "vfy-access-{}.csv".format(secrets.token_hex(3)), b"name,team\nAda,core\n")
+        expect(status == 201 and body and len(body["documents"]) == 1, "the upload answered {} {}".format(status, body))
+        document, document_owner = body["documents"][0]["id"], dev_token
+        status, raw, _ = code("POST", "/prepare/jobs", {"document_ids": [document]}, token=dev_token)
+        expect(status == 202, "starting the preparation answered {} {}".format(status, error_code(raw)))
+        job = wait_job(dev_token, "/prepare/job/" + json.loads(raw)["job_id"])
+        expect(job["status"] == "completed", "the preparation ended {}: {}".format(job["status"], job.get("errors")))
+        other, _, other_token = throwaway("developer", operator_ok)
+        users.append(other)
+
+        def prepared(token):
+            status, raw, _ = code("GET", "/prepare/documents", token=token)
+            expect(status == 200, "GET /prepare/documents answered {}".format(status))
+            return document in [d["id"] for d in json.loads(raw)["documents"]]
+        # A document with no imports is shared, so the hiding below comes from the import (#792).
+        expect(prepared(other_token), "a second Developer doesn't see a prepared document with no imports")
+        status, raw, _ = code("POST", "/prepare/import", {"collection": name, "document_ids": [document],
+                                                          "chunk_size": 500, "chunk_overlap": 50}, token=dev_token)
+        expect(status == 202, "the import into {} answered {} {}".format(name, status, error_code(raw)))
+        job = wait_job(dev_token, "/ingest/job/" + json.loads(raw)["job_id"])
+        expect(job["status"] == "completed", "the import ended {}: {}".format(job["status"], job.get("errors")))
+        expect(prepared(dev_token), "the granted Developer doesn't see the document it imported")
+        expect(not prepared(other_token), "a Developer without access sees a document imported only into {}".format(name))
+        status, raw, _ = code("GET", "/prepare/documents/" + document, token=other_token)
+        expect((status, error_code(raw)) == (404, "DOCUMENT_NOT_FOUND"),
+               "a Developer without access reading the document answered {} {}".format(status, error_code(raw)))
+        got = answer("key", "PUT", "/collections/{}/access".format(name), {"restricted": False})
+        expect(got == (403, "KEY_NOT_ALLOWED"), "a key changing access answered {}".format(got))
+        got = answer("key", "GET", "/collections/{}/access".format(name))
+        expect(got == (403, "KEY_NOT_ALLOWED"), "a key reading access answered {}".format(got))
+
+        def audited(action, **match):
+            query = "/audit?action={}&collection={}&limit=100".format(action, name)
+            status, raw, _ = code("GET", query, token=admin)
+            expect(status == 200, "GET /audit answered {}".format(status))
+            return [r for r in json.loads(raw)["records"] if all(r.get(k) == v for k, v in match.items())]
+        # The newest record is the key's refused change below; this is the Engineer's grant.
+        change = audited("collection.access", result="success")
+        expect(change and change[0]["details"].get("added") == {"users": [dev], "service_principals": [principal]},
+               "the change's audit record is {}".format(change[:1]))
+        refused = audited("query", actor=user)
+        expect(refused and refused[0]["result"] == "refused" and refused[0]["details"].get("reason") == "collection_access",
+               "the refused query's audit record is {}".format(refused[:1]))
+        expect(audited("collection.access.refused", actor=principal),
+               "no collection.access.refused record for the key's settings read")
+    finally:
+        if document:
+            code("DELETE", "/prepare/documents/" + document, token=document_owner)
+        code("DELETE", "/collections/{}?confirm=true".format(name), token=admin)
+        for username in users:
+            code("POST", "/auth/users/{}/disable".format(username), token=admin)
+        if principal:
+            code("POST", "/auth/service-principals/{}/disable".format(principal), token=admin)
+        request("POST", "/auth/logout", token=admin)
 
 
 CHECKS = {name[len("check_"):].replace("_", "-"): fn for name, fn in globals().items() if name.startswith("check_")}

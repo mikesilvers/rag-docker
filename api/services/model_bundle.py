@@ -11,7 +11,7 @@ The manifest names every blob the model needs, so bundling resolves blobs
 weights, and on a machine with other models pulled it would be far worse.
 
 In a package each model gets its own folder, `models/<name>/<tag>/`, so two
-tags of one name (an embedding model `foo:a` and an LLM `foo:b`) never share
+tags of one name (an embedding model `foo:a` and an answer LLM `foo:b`) never share
 files. Packages built before #487 used `models/<name>/`; such a folder is used
 only for the one tag the package manifest gives that name.
 
@@ -192,7 +192,7 @@ def _legacy_tag(name: str, package_manifest) -> str | None:
     """The tag a pre-#487 `models/<name>/` folder holds, or None if unknown.
 
     Those packages didn't record it. The package manifest names the embedding
-    model and the LLM; when exactly one tag of `name` is among them, the folder
+    model and the (answer) LLM; when exactly one tag of `name` is among them, the folder
     holds that tag. Two tags of one name shared the folder, the last copy
     overwriting the first's manifest, so the folder can't be trusted for either.
     """

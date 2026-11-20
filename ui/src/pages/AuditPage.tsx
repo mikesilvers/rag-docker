@@ -3,14 +3,16 @@ import { api, AuditFilters, AuditPage as AuditPageData, AuditRecord, auditCsvUrl
 
 // The names the API records (api/services/audit.py ALL_ACTIONS), for the filter.
 const ACTIONS = [
-  'admin.key.issue', 'admin.key.revoke', 'admin.principal.create', 'admin.principal.disable',
+  'admin.key.issue', 'admin.key.revoke', 'admin.mfa.policy', 'admin.principal.create', 'admin.principal.disable',
   'admin.principal.enable', 'admin.principal.set-role', 'admin.user.create', 'admin.user.disable',
-  'admin.user.enable', 'admin.user.reset-password', 'admin.user.set-role', 'audit.download', 'audit.view',
-  'auth.login', 'auth.logout', 'auth.password', 'collection.create', 'collection.delete', 'export',
+  'admin.user.enable', 'admin.user.reset-mfa', 'admin.user.reset-password', 'admin.user.set-role', 'audit.download',
+  'audit.view', 'auth.login', 'auth.logout', 'auth.mfa', 'auth.mfa.disable', 'auth.mfa.enroll',
+  'auth.mfa.recovery-codes', 'auth.password', 'collection.access', 'collection.access.refused', 'collection.create',
+  'collection.delete', 'export',
   'goldstandard.download', 'goldstandard.save', 'import', 'ingest', 'ingest.config', 'operator.bootstrap',
-  'operator.create-user', 'operator.disable', 'operator.enable', 'operator.reset-password', 'operator.set-role',
-  'prepare.cancel', 'prepare.delete', 'prepare.download', 'prepare.import', 'prepare.start', 'prepare.upload',
-  'query', 'retrieval.config', 'system.start', 'tune.rechunk', 'tune.reembed', 'tune.reindex',
+  'operator.create-user', 'operator.disable', 'operator.enable', 'operator.load', 'operator.reset-mfa', 'operator.reset-password',
+  'operator.set-role', 'package.delete', 'package.download', 'prepare.cancel', 'prepare.delete', 'prepare.download', 'prepare.import', 'prepare.start',
+  'prepare.upload', 'query', 'retrieval.config', 'system.start', 'tune.rechunk', 'tune.reembed', 'tune.reindex',
 ]
 const RESULTS = ['success', 'refused', 'error', 'accepted', 'succeeded', 'failed', 'interrupted']
 const EMPTY: AuditFilters = { from: '', to: '', actor: '', action: '', collection: '', result: '' }

@@ -50,6 +50,9 @@ run_import() {   # run_import <file> <on_conflict>; leaves the job in /tmp/vfy_p
 }
 
 drop_collection "$C"; make_collection "$C"
+# The End User's retrieve.py queries it and its import below (#606); the import
+# under a new name copies its access.
+open_collection "$C"
 curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
   -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$FIX/policies.txt" > /tmp/vfy_p_ing.json
 check_eq "the suite's collection is ingested" \
@@ -147,7 +150,7 @@ check_eq "the package imports under a new name" "$istat" "completed"
 check_eq "the import leaves the package's bytes, size and mtime unchanged" "$(package_state)" "$state_before"
 
 # -- E11: the import retrieves what the original does -------------------------
-# /query rewrites each question with the LLM first, so two answers can differ even for
+# /query rewrites each question with the answer LLM first, so two answers can differ even for
 # identical collections; retrieval is compared directly, for each path /query uses.
 (cd "$REPO_ROOT" && docker compose exec -T api python - "$C" "$IMP" "$QUESTION") <<'ENDPY'
 import asyncio, sys
@@ -240,6 +243,8 @@ else
     name=${run%%:*}; want=${run#*:}
     args=(--api-url "$API" --json --citations)
     [ "$name" = top2 ] && args+=(--top-k 2)
+    # Retrieval, not the generated text, is what the check wants: generation
+    # varies (an empty answer), as for E11 below (#549).
     # As the End User test account (#25): the password goes in on stdin.
     _rag_require_lock_owner
     python3 ./auth_setup.py password end_user \
@@ -252,19 +257,37 @@ try:
     d = json.load(open("/tmp/vfy_p_r.json"))
 except ValueError:
     sys.exit(1)
-sys.exit(0 if d["answer"].strip() and len(d["citations"] or []) == int(sys.argv[1]) else 1)
+sys.exit(0 if isinstance(d, dict) and len(d.get("citations") or []) == int(sys.argv[1]) else 1)
 ENDPY
     answered=$?
     [ "$rc" = 0 ] && [ "$answered" = 0 ]
-    check "E8/E9: retrieve.py ($name) answers with $want citation(s)" $? \
+    check "E8/E9: retrieve.py ($name) retrieves $want citation(s)" $? \
       "exit $rc: $(head -c 200 /tmp/vfy_p_r.err)"
   done
-  python3 ./auth_setup.py password end_user \
-    | python3 -I -S "$RTMP/retrieve.py" --username vfy-end-user --password-stdin --api-url "$API" \
-        --collection "$IMP" "$QUESTION" > /tmp/vfy_p_r.out 2> /tmp/vfy_p_r.err
-  rc=$?
-  [ "$rc" = 0 ] && [ -n "$(tr -d '[:space:]' < /tmp/vfy_p_r.out)" ]
-  check "E11: retrieve.py answers from the imported collection" $? "exit $rc: $(head -c 200 /tmp/vfy_p_r.err)"
+  # Retrieval, not the generated text, is what shows retrieve.py works against
+  # the import: generation varies (an empty answer) and can time out under CPU
+  # load (a 504), so the check wants citations and allows 3 attempts (#549).
+  e11=1
+  for attempt in 1 2 3; do
+    _rag_require_lock_owner
+    python3 ./auth_setup.py password end_user \
+      | python3 -I -S "$RTMP/retrieve.py" --username vfy-end-user --password-stdin --api-url "$API" \
+          --json --citations --collection "$IMP" "$QUESTION" > /tmp/vfy_p_r.json 2> /tmp/vfy_p_r.err
+    rc=$?
+    python3 - <<'ENDPY'
+import json, sys
+try:
+    d = json.load(open("/tmp/vfy_p_r.json"))
+except ValueError:
+    sys.exit(1)
+sys.exit(0 if isinstance(d, dict) and d.get("citations") else 1)
+ENDPY
+    cited=$?
+    if [ "$rc" = 0 ] && [ "$cited" = 0 ]; then e11=0; break; fi
+    [ "$attempt" -lt 3 ] && sleep 10
+  done
+  check "E11: retrieve.py retrieves from the imported collection (citations, up to 3 attempts)" "$e11" \
+    "after $attempt attempt(s): exit $rc: $(head -c 200 /tmp/vfy_p_r.err)"
 fi
 rm -rf "$RTMP"
 

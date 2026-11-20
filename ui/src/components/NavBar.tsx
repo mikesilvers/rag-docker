@@ -5,22 +5,23 @@ import type { Role } from '../api/client'
 
 // The pages grouped into menus (#616). Each role sees the pages it had before;
 // a menu with none of them isn't shown. Hiding a page is a convenience: the
-// router and the API refuse what the role can't do (#25).
-interface PageEntry { label: string; to: string; roles: Role[] }
+// router and the API refuse what the role can't do (#25). A page that changes
+// data (`writes`) is hidden in query-only mode, where the API refuses it (#670).
+interface PageEntry { label: string; to: string; roles: Role[]; writes?: true }
 interface MenuDef { key: string; label: string; entries: PageEntry[] }
 
 const STAFF: Role[] = ['engineer', 'developer']
 const ENGINEER: Role[] = ['engineer']
 const MENUS: MenuDef[] = [
   { key: 'data', label: 'Data', entries: [
-    { label: 'Import', to: '/import', roles: STAFF },
-    { label: 'Prepare', to: '/prepare', roles: STAFF },
+    { label: 'Import', to: '/import', roles: STAFF, writes: true },
+    { label: 'Prepare', to: '/prepare', roles: STAFF, writes: true },
     { label: 'Transfer', to: '/transfer', roles: STAFF },
   ] },
   { key: 'tune', label: 'Tune', entries: [
-    { label: 'Chunking', to: '/chunking', roles: STAFF },
-    { label: 'Retrieval', to: '/retrieval', roles: STAFF },
-    { label: 'Gold Standard', to: '/goldstandard', roles: STAFF },
+    { label: 'Chunking', to: '/chunking', roles: STAFF, writes: true },
+    { label: 'Retrieval', to: '/retrieval', roles: STAFF, writes: true },
+    { label: 'Gold Standard', to: '/goldstandard', roles: STAFF, writes: true },
   ] },
   { key: 'admin', label: 'Admin', entries: [
     { label: 'Collections', to: '/collections', roles: ENGINEER },
@@ -34,9 +35,9 @@ const MENUS: MenuDef[] = [
 type Item = { label: string; to: string; current: boolean } | { label: string; onSelect: () => void }
 type Focus = 'first' | 'last'
 
-const TOP = 'text-sm px-2 py-1 rounded hover:text-blue-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-600'
+const TOP = 'text-sm px-2 py-1 rounded hover:text-blue-600 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-blue-600'
 const CURRENT = 'text-blue-700 font-semibold bg-blue-50'
-const ENTRY = 'block w-full text-left whitespace-nowrap px-3 py-1.5 text-sm hover:bg-gray-100 focus:bg-gray-100 focus:outline-none'
+const ENTRY = 'block w-full text-left whitespace-nowrap px-3 py-1.5 text-sm hover:bg-gray-100 focus:bg-gray-100 focus:outline-hidden'
 
 // One menu button and its menu, after the WAI-ARIA menu button pattern: Enter,
 // Space or ArrowDown opens it on the first entry, ArrowUp on the last; the
@@ -96,7 +97,7 @@ function NavMenu({ menuKey, label, items, current, open, focus, align, onOpen, o
   }
 
   return (
-    <div ref={wrapper} className={`relative${align === 'right' ? ' ml-auto' : ''}`}>
+    <div ref={wrapper} className={align === 'right' ? 'relative ml-auto' : 'relative'}>
       <button
         ref={button}
         type="button"
@@ -157,6 +158,7 @@ export default function NavBar() {
   const navigate = useNavigate()
   const { pathname } = useLocation()
   const role = user?.role ?? null
+  const queryOnly = user?.query_only === true
   const [open, setOpen] = useState<{ key: string; focus: Focus } | null>(null)
 
   // A change of page closes any open menu.
@@ -178,13 +180,19 @@ export default function NavBar() {
   })
 
   const menus = MENUS
-    .map(m => ({ ...m, entries: m.entries.filter(e => role !== null && e.roles.includes(role)) }))
+    .map(m => ({ ...m, entries: m.entries.filter(e => role !== null && e.roles.includes(role)
+      && !(queryOnly && e.writes)) }))
     .filter(m => m.entries.length > 0)
-  const accountCurrent = pathname === '/account/password'
+  const accountCurrent = pathname === '/account' || pathname === '/account/password'
 
   return (
     <nav className="bg-white border-b border-gray-200 px-4 py-3 flex items-center gap-4">
       <span className="font-bold text-blue-700 text-lg mr-2">RAG Platform</span>
+      {queryOnly && (
+        <span data-testid="nav-query-only"
+              title="This instance is query-only: it answers questions on its collections and can't change them."
+              className="text-xs bg-amber-100 text-amber-800 px-2 py-1 rounded">Query-only</span>
+      )}
       <Link
         to="/qa"
         aria-current={pathname === '/qa' ? 'page' : undefined}
@@ -211,7 +219,9 @@ export default function NavBar() {
         align="right"
         current={accountCurrent}
         items={[
-          { label: 'Change password', to: '/account/password', current: accountCurrent },
+          // The account page holds two-step verification (#607).
+          { label: 'Account', to: '/account', current: pathname === '/account' },
+          { label: 'Change password', to: '/account/password', current: pathname === '/account/password' },
           { label: 'Log out', onSelect: logOut },
         ]}
       />

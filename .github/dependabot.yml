@@ -14,8 +14,8 @@ updates:
       ui-minor-and-patch:
         update-types: ["minor", "patch"]
     ignore:
-      # vite 8 needs a newer @vitejs/plugin-react; upgrade both together
-      # by hand (see closed PRs #3, #5, #17).
+      # vite and @vitejs/plugin-react majors must move together; upgrade
+      # both by hand (see closed PRs #3, #5, #17).
       - dependency-name: "vite"
         update-types: ["version-update:semver-major"]
 

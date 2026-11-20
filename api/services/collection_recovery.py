@@ -15,6 +15,8 @@ import shutil
 import uuid
 from pathlib import Path
 
+from auth import access
+from auth import store as auth_store
 from config import settings
 from services import sources
 
@@ -64,6 +66,13 @@ def begin(target: str, operation: str, client) -> dict:
     record = dict(version=1, operation_id=token, operation=operation,
                   target=target, staging=staging, state="scratch")
     _write(record)  # Ownership is persisted before collection creation.
+    # The copy will hold the target's data, so it gets the target's access as
+    # it is now, under its own name, before it exists (#606). A target that is
+    # itself a kept copy narrows it by every collection that one was made from:
+    # the narrowest state across the target's chain (#792). Later changes to
+    # them never change this state, but while any of them has a state a caller
+    # other than an Engineer needs every one (access.scope, #788, #792).
+    auth_store.copy_collection_access(target, staging, access.scope(target)[1:])
     return record
 
 
@@ -205,6 +214,7 @@ def discard(record: dict, client) -> None:
     name = record["staging"]
     if telemetry.call("weaviate.exists", client.collections.exists, name):
         telemetry.call("weaviate.delete", client.collections.delete, name)
+    auth_store.drop_collection_access(name)          # the copy's own access state (#606)
     sources.delete(name)
     if sources.collection_dir(name).exists():
         raise OSError(f"Could not remove recovery sources for {name}")

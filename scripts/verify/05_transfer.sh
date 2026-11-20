@@ -44,6 +44,9 @@ check "the package listing reads only up to each manifest (#383)" $?
 # import, listing and refusals, with no backend.
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_export_encryption.py)
 check "export encryption: age format, encrypted export and import, refusals (#27)" $?
+# Downloading a package deletes it; undownloaded exports expire (#677).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_package_download.py)
+check "package download and expiry: delete after a full download, busy, access, sweep (#677)" $?
 
 python3 "$REPO_ROOT/scripts/tests/test_batch_implementation.py"
 check "test_batch_implementation.py registered regression checks" $?
@@ -863,7 +866,7 @@ drop_collection "$iname"
 # ── models on import: damaged and namespaced (E26, E27) ──────────────────────
 # Runs the importer inside the API process with its settings patched. E26 copies
 # the embedding model into a temporary store and damages the copy; the live
-# model store is only read. E27 uses the live store and a namespaced LLM name.
+# model store is only read. E27 uses the live store and a namespaced answer LLM name.
 (cd "$REPO_ROOT" && docker compose exec -T api python - "$PKG") > /tmp/vfy_models.json 2>/tmp/vfy_models.err <<'ENDPY'
 import json, shutil, sys, tempfile, uuid
 from pathlib import Path
@@ -912,7 +915,7 @@ with tempfile.TemporaryDirectory(prefix="vfy-model-", dir=settings.upload_dir) a
         out["e26_untouched"] = (damaged.read_bytes() == b"ordinary damaged review bytes"
                                 and mp.read_bytes() == manifest_before)
 
-# E27: a namespaced LLM that Ollama doesn't report -> import completes with a note
+# E27: a namespaced answer LLM that Ollama doesn't report -> import completes with a note
 ns = "vfy-namespace/absent-llm"
 reports = getattr(importer, "_ollama_reports", None)
 if reports:                                              # real /api/tags; tag defaults to latest
@@ -1240,7 +1243,7 @@ ENDPY
   ) >/tmp/vfy_xrestart_prepare.log 2>&1
   check "a 30,000-chunk collection is built for the interrupted export" $? \
     "$(grep -E 'Error' /tmp/vfy_xrestart_prepare.log | tail -1)"
-  builds_before=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/exports/.build-* 2>/dev/null' | sort)
+  builds_before=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/uploads/export-* 2>/dev/null' | sort)
   api_post "/export" "{\"collection\":\"$XR\",\"include_models\":false}" > /tmp/vfy_xrestart_start.json
   xjob=$(jfield "['job_id']" < /tmp/vfy_xrestart_start.json)
   state=""
@@ -1256,9 +1259,10 @@ print(d['status'] + ('-writing' if d['chunks_written'] > 0 else ''))" 2>/dev/nul
     check "an export is running with chunks written before the restart" 1 "last status '$state'; nothing restarted"
   else
     sleep 2
-    # The build directory this export is writing; the restart kills it there.
-    builds_during=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/exports/.build-* 2>/dev/null' | sort)
-    killed=$(comm -13 <(printf '%s\n' "$builds_before") <(printf '%s\n' "$builds_during") | grep '^/app/exports/\.build-' || true)
+    # The staging directory this export is writing, in UPLOAD_DIR since #549;
+    # the restart kills it there.
+    builds_during=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/uploads/export-* 2>/dev/null' | sort)
+    killed=$(comm -13 <(printf '%s\n' "$builds_before") <(printf '%s\n' "$builds_during") | grep '^/app/uploads/export-' || true)
     _rag_require_lock_owner
     (cd "$REPO_ROOT" && docker compose restart --timeout 0 api) >/dev/null 2>&1
     for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
@@ -1281,16 +1285,16 @@ ENDPY
     check "an interrupted export reads back 200 'failed' with INTERRUPTED and its progress" $? \
       "$(head -c 300 /tmp/vfy_xrestart_after.json)"
     # The killed build's leftovers (root, mode 0700) are the startup sweep's to
-    # remove (#377): its build directory and any temporary archive must be gone,
+    # remove (#377): its staging directory and any temporary archive must be gone,
     # and the completed package from the top of this suite still there.
-    check "the interrupted export had a build directory for the restart to sweep" \
-      "$([ -n "$killed" ] && echo 0 || echo 1)" "no new /app/exports/.build-* while the export ran"
+    check "the interrupted export had a staging directory for the restart to sweep" \
+      "$([ -n "$killed" ] && echo 0 || echo 1)" "no new /app/uploads/export-* while the export ran"
     stem=$(printf '%s' "$XR" | tr '[:upper:]' '[:lower:]')
     left=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c '
       for p in "$@" /app/exports/.ragpkg-'"$stem"'-*.tar.gz.partial; do
         if [ -e "$p" ] || [ -L "$p" ]; then echo "$p"; fi
       done; echo checked' sh $killed)
-    check "the restart removes the interrupted export's build directory and temporary archive" \
+    check "the restart removes the interrupted export's staging directory and temporary archive" \
       "$([ "$left" = checked ] && echo 0 || echo 1)" "still there: $left"
     check "the restart sweep keeps completed packages" "$([ -f "$EXPORTS/$PKG" ] && echo 0 || echo 1)" \
       "$EXPORTS/$PKG is gone"
@@ -1392,6 +1396,68 @@ else
 fi
 [ -n "$sppkg" ] && rm -f "$EXPORTS/$sppkg"
 drop_collection "$SC"
+
+# ── downloading a package, and expiry (#677) ─────────────────────────────────
+# A full download through the proxy deletes a package exported here; an
+# interrupted one keeps it; a recorded package past EXPORT_RETENTION_HOURS (the
+# default, 24) is swept while one copied in is kept; an End User is refused.
+# Fixtures come from package_retention_stack.py inside the API container.
+retention() { (cd "$REPO_ROOT" && docker compose exec -T api python - "$@" < scripts/verify/package_retention_stack.py); }
+audit_has() {   # audit_has <action> <file> <python condition on r>: exit 0 when a record matches
+  api_get "/audit?action=$1&limit=1000" | python3 -c "
+import json, sys
+r = [r for r in json.load(sys.stdin)['records'] if r['details'].get('file') == sys.argv[1]]
+sys.exit(0 if r and eval(sys.argv[2], {'r': r[0]}) else 1)" "$2" "$3"
+}
+
+api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_dl_exp.json
+djob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_dl_exp.json'))['job_id'])")
+check_eq "#677: an export to download completes" "$(wait_for_job "/export/job/$djob" 1800)" "completed"
+DPKG=$(api_get "/export/job/$djob" | jfield "['filename']")
+read -r dsize dexp <<<"$(api_get "/packages" | python3 -c "
+import json, sys
+p = next(p for p in json.load(sys.stdin)['packages'] if p['filename'] == sys.argv[1])
+print(p['size_bytes'], p['expires_at'])" "$DPKG")"
+[ -n "$dexp" ] && [ "$dexp" != "None" ]
+check "#677: GET /packages says when the new export expires ($dexp)" $?
+dcode=$(curl -s -o /tmp/vfy_dl.bin -m 600 -w '%{http_code}' "$API/packages/$DPKG")
+check_eq "#677: GET /packages/{filename} downloads the package" "$dcode" "200"
+check_eq "#677: ... every byte of it" "$(wc -c < /tmp/vfy_dl.bin | tr -d ' ')" "$dsize"
+[ ! -e "$EXPORTS/$DPKG" ] && ! api_get "/packages" | grep -q "\"$DPKG\""
+check "#677: a full download deletes the package from ./exports and the listing" $?
+audit_has package.download "$DPKG" "r['details'].get('completed') is True and r['result'] == 'success'"
+check "#677: the download is audited as package.download, completed" $?
+audit_has package.delete "$DPKG" "r['details'].get('reason') == 'downloaded' and r['actor_kind'] == 'user'"
+check "#677: the deletion is audited as package.delete, reason downloaded, by the user" $?
+rm -f /tmp/vfy_dl.bin
+
+IPKG="ragpkg-vfy677-int-$$.tar.gz"
+retention junk "$IPKG" 64 0 >/dev/null
+command curl -s -o /dev/null -b "$RAG_AUTH_JAR" --limit-rate 1M --max-time 2 "$API/packages/$IPKG"
+sleep 3
+retention exists "$IPKG"
+check "#677: an interrupted download keeps the package" $?
+audit_has package.download "$IPKG" "r['details'].get('completed') is False"
+check "#677: ... and its package.download record says it was incomplete" $?
+retention remove "$IPKG"
+
+OPKG="ragpkg-vfy677-old-$$.tar.gz"; NPKG="ragpkg-vfy677-dropin-$$.tar.gz"
+retention junk "$OPKG" 1 25 >/dev/null
+retention junk "$NPKG" 1 none >/dev/null
+retention sweep > /tmp/vfy_sweep.txt
+! retention exists "$OPKG" && grep -qx "$OPKG" /tmp/vfy_sweep.txt
+check "#677: the sweep deletes a package recorded more than EXPORT_RETENTION_HOURS ago" $? "$(cat /tmp/vfy_sweep.txt)"
+retention exists "$NPKG"
+check "#677: ... and keeps a package copied in, which isn't recorded" $?
+audit_has package.delete "$OPKG" "r['details'].get('reason') == 'expired' and r['actor'] == 'system'"
+check "#677: the expiry is audited as package.delete, reason expired, by the system" $?
+
+EUJAR=$(auth_jar end_user) || EUJAR=""
+check_eq "#677: an End User is refused GET /packages/{filename}" \
+  "$(command curl -s -o /dev/null -m 60 -b "$EUJAR" -w '%{http_code}' "$API/packages/$NPKG")" "403"
+retention exists "$NPKG"
+check "#677: ... and the package stays" $?
+retention remove "$NPKG"
 
 # ── verified recovery across an API restart (#43, #44; opt-in: restarts the API) ──
 RP="${PREFIX}BatchRecovery"

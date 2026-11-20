@@ -22,8 +22,11 @@ const CITATIONS = [
   { source_file: 'beta.txt', chunk_index: 0, score: null, excerpt: 'Second excerpt.' },
 ];
 // Answers for the pages a case may pass through; a case adds or overrides routes.
+const OPEN = { restricted: false, users: [], service_principals: [] };
 const base = (extra = {}) => ({
   'GET /api/collections': json(200, { collections: COLS }),
+  // Each collection's access on the Collections page (#606): open unless a case says otherwise.
+  'GET /api/collections/*': json(200, OPEN),
   'GET /api/retrieval/config/*': call => json(200, retrievalConfig(call.path.split('/').pop())),
   'GET /api/packages': json(200, { packages: [] }),
   'GET /api/tune/*': call => json(200, { collection: call.path.split('/').pop(), fidelity: 'with-sources', source_document_count: 2, can_rechunk: true, can_reembed: true, can_reindex: true, note: '' }),
@@ -67,13 +70,158 @@ function collectionsCases() {
     { name: 'Collections table shows its columns, each collection and a dash for a null created date', open: open(), async run(s) {
       await waitText(s.page, A);
       const heads = await s.page.evaluate(() => [...document.querySelectorAll('thead th')].map(t => t.textContent.trim()));
-      assert.deepEqual(heads, ['Name', 'Objects', 'Index', 'Distance', 'Created', '']);
+      assert.deepEqual(heads, ['Name', 'Objects', 'Index', 'Distance', 'Created', 'Access', '']);
       const rows = await s.page.evaluate(() => [...document.querySelectorAll('tbody tr')].map(r => [...r.querySelectorAll('td')].map(c => c.textContent.trim())));
       const date = await s.page.evaluate(v => new Date(v).toLocaleDateString(), COLS[0].created_at);
       assert.deepEqual(rows[0].slice(0, 5), [A, '12', 'hnsw', 'cosine', date]);
       assert.notEqual(date, DASH);
       assert.deepEqual(rows[1].slice(0, 5), [B, '0', 'flat', 'dot', DASH]);
+      await waitFor(s.page, () => [...document.querySelectorAll('tbody tr')].every(r => r.cells[5].textContent.trim() !== '\u2014'), 'the access column');
+      const access = await s.page.evaluate(() => [...document.querySelectorAll('tbody tr')].map(r => r.cells[5].textContent.trim()));
+      assert.deepEqual(access, ['Open', 'Open']);
     } },
+    { name: 'Access (#606): a restricted collection shows its grant count; the dialog restricts to the ticked accounts and PUTs them; a refused save stays open with the message', open: (() => {
+      let saves = 0;
+      return open({
+        ['GET /api/collections/' + A + '/access']: json(200, { restricted: true, users: ['vfy-developer'], service_principals: [] }),
+        'GET /api/auth/users': json(200, { users: [{ username: 'vfy-developer', role: 'developer', enabled: true, must_change_password: false, created_at: '2026-01-02T12:00:00Z' }, { username: 'vfy-off', role: 'end_user', enabled: false, must_change_password: false, created_at: '2026-01-02T12:00:00Z' }] }),
+        'GET /api/auth/service-principals': json(200, { principals: [{ name: 'vfy-svc', role: 'end_user', enabled: true, created_at: '2026-01-02T12:00:00Z', keys: [] }] }),
+        'PUT /api/collections/*': call => (++saves === 1 ? apiError(422, 'INVALID_PARAMETER', 'no person is named \'x\'') : json(200, call.body)),
+      });
+    })(), async run(s) {
+      await waitText(s.page, 'Restricted (1)');
+      const accessButtons = () => s.page.$$('tbody button');
+      await (await accessButtons())[2].click();   // row B: Access, Delete; row A first
+      await waitText(s.page, 'Access to ' + B);
+      await waitText(s.page, 'Open: everyone whose role allows it');
+      await waitFor(s.page, () => [...document.querySelectorAll('.fixed button')].some(b => b.textContent.trim() === 'Save' && !b.disabled), 'Save to be enabled once the state is read');
+      await s.page.click('input[type=radio]:not(:checked)');
+      await waitText(s.page, 'vfy-off (disabled)');
+      await waitText(s.page, 'vfy-svc');
+      const boxes = await s.page.$$('input[type=checkbox]');
+      await boxes[0].click();   // vfy-developer
+      await boxes[2].click();   // vfy-svc
+      await press(s.page, 'Save');
+      await waitText(s.page, "no person is named 'x'");
+      assert.equal(await modalOpen(s.page), true);
+      await press(s.page, 'Save');
+      await waitFor(s.page, () => !document.querySelector('.fixed.inset-0'), 'the dialog to close');
+      const puts = callsTo(s, 'PUT', '/api/collections/' + B + '/access');
+      assert.equal(puts.length, 2);
+      assert.deepEqual(puts[1].body, { restricted: true, users: ['vfy-developer'], service_principals: ['vfy-svc'] });
+      await waitText(s.page, 'Restricted (2)');
+    } },
+    { name: 'Access (#606): when the dialog cannot read the state, the choice stays unknown and Save is disabled', open: open({
+      ['GET /api/collections/' + B + '/access']: apiError(500, 'INTERNAL_ERROR', 'Synthetic read failure.'),
+      'GET /api/auth/users': json(200, { users: [] }),
+      'GET /api/auth/service-principals': json(200, { principals: [] }),
+    }), async run(s) {
+      await waitText(s.page, A);
+      await (await s.page.$$('tbody button'))[2].click();
+      await waitText(s.page, 'Synthetic read failure.');
+      const state = await s.page.evaluate(() => ({
+        save: [...document.querySelectorAll('.fixed button')].find(b => b.textContent.trim() === 'Save').disabled,
+        checked: [...document.querySelectorAll('.fixed input[type=radio]')].filter(r => r.checked).length,
+      }));
+      assert.deepEqual(state, { save: true, checked: 0 });
+      assert.equal(callsTo(s, 'PUT', '/api/collections/' + B + '/access').length, 0);
+    } },
+    (() => {
+      // The page's own read of A answers at once; the dialog's read of A is held
+      // until B's dialog has read B (#788).
+      const late = hold();
+      let readsOfA = 0;
+      return { name: 'Access (#788): a late answer for an earlier opening does not fill another collection\'s dialog', open: open({
+        ['GET /api/collections/' + A + '/access']: () => (++readsOfA === 1 ? json(200, OPEN) : late),
+        ['GET /api/collections/' + B + '/access']: json(200, { restricted: true, users: ['vfy-developer'], service_principals: [] }),
+        'GET /api/auth/users': json(200, { users: [] }),
+        'GET /api/auth/service-principals': json(200, { principals: [] }),
+        'PUT /api/collections/*': call => json(200, call.body),
+      }), async run(s) {
+        await waitText(s.page, A);
+        await waitFor(s.page, () => [...document.querySelectorAll('tbody tr')].every(r => r.cells[5].textContent.trim() !== '\u2014'), 'the access column');
+        await (await s.page.$$('tbody button'))[0].click();   // row A: Access
+        await waitText(s.page, 'Access to ' + A);
+        await press(s.page, 'Cancel');
+        await waitFor(s.page, () => !document.querySelector('.fixed.inset-0'), 'the dialog to close');
+        await (await s.page.$$('tbody button'))[2].click();   // row B: Access
+        await waitText(s.page, 'Access to ' + B);
+        await waitFor(s.page, () => [...document.querySelectorAll('.fixed button')].some(b => b.textContent.trim() === 'Save' && !b.disabled), 'Save to be enabled once B is read');
+        late.release(json(200, { restricted: true, users: ['vfy-a-only'], service_principals: [] }));
+        await new Promise(r => setTimeout(r, 300));
+        await press(s.page, 'Save');
+        await waitFor(s.page, () => !document.querySelector('.fixed.inset-0'), 'the dialog to close');
+        const puts = s.calls.filter(call => call.method === 'PUT');
+        assert.equal(puts.length, 1);
+        assert.equal(puts[0].path, '/api/collections/' + B + '/access');
+        assert.deepEqual(puts[0].body, { restricted: true, users: ['vfy-developer'], service_principals: [] });
+      } };
+    })(),
+    (() => {
+      // As above, but the dialog's held read of A later fails: its error must
+      // not reach B's dialog (#792).
+      const late = hold();
+      let readsOfA = 0;
+      return { name: 'Access (#792): a failed read for an earlier opening does not show its error in another collection\'s dialog', open: open({
+        ['GET /api/collections/' + A + '/access']: () => (++readsOfA === 1 ? json(200, OPEN) : late),
+        ['GET /api/collections/' + B + '/access']: json(200, { restricted: true, users: ['vfy-developer'], service_principals: [] }),
+        'GET /api/auth/users': json(200, { users: [] }),
+        'GET /api/auth/service-principals': json(200, { principals: [] }),
+        'PUT /api/collections/*': call => json(200, call.body),
+      }), async run(s) {
+        await waitText(s.page, A);
+        await waitFor(s.page, () => [...document.querySelectorAll('tbody tr')].every(r => r.cells[5].textContent.trim() !== '\u2014'), 'the access column');
+        await (await s.page.$$('tbody button'))[0].click();   // row A: Access
+        await waitText(s.page, 'Access to ' + A);
+        await press(s.page, 'Cancel');
+        await waitFor(s.page, () => !document.querySelector('.fixed.inset-0'), 'the dialog to close');
+        await (await s.page.$$('tbody button'))[2].click();   // row B: Access
+        await waitText(s.page, 'Access to ' + B);
+        await waitFor(s.page, () => [...document.querySelectorAll('.fixed button')].some(b => b.textContent.trim() === 'Save' && !b.disabled), 'Save to be enabled once B is read');
+        late.release(apiError(500, 'INTERNAL_ERROR', 'Synthetic late failure.'));
+        await new Promise(r => setTimeout(r, 300));
+        const state = await s.page.evaluate(() => ({
+          error: document.body.textContent.includes('Synthetic late failure.'),
+          save: [...document.querySelectorAll('.fixed button')].find(b => b.textContent.trim() === 'Save').disabled,
+        }));
+        assert.deepEqual(state, { error: false, save: false });
+        assert.equal(s.calls.filter(call => call.method === 'PUT').length, 0);
+      } };
+    })(),
+    (() => {
+      // A's opening's lists of people and service principals are held until B's
+      // dialog has its own: the late people list and the late principals error
+      // must not reach B's dialog (#792).
+      const lateUsers = hold(), latePrincipals = hold();
+      let usersReads = 0, principalsReads = 0;
+      const user = name => ({ username: name, role: 'developer', enabled: true, must_change_password: false, created_at: '2026-01-02T12:00:00Z' });
+      return { name: 'Access (#792): an earlier opening\'s late lists of people and service principals do not reach another collection\'s dialog', open: open({
+        ['GET /api/collections/' + B + '/access']: json(200, { restricted: true, users: ['vfy-developer'], service_principals: [] }),
+        'GET /api/auth/users': () => (++usersReads === 1 ? lateUsers : json(200, { users: [user('vfy-developer')] })),
+        'GET /api/auth/service-principals': () => (++principalsReads === 1 ? latePrincipals : json(200, { principals: [] })),
+        'PUT /api/collections/*': call => json(200, call.body),
+      }), async run(s) {
+        await waitText(s.page, A);
+        await (await s.page.$$('tbody button'))[0].click();   // row A: Access
+        await waitText(s.page, 'Access to ' + A);
+        await press(s.page, 'Cancel');
+        await waitFor(s.page, () => !document.querySelector('.fixed.inset-0'), 'the dialog to close');
+        await (await s.page.$$('tbody button'))[2].click();   // row B: Access
+        await waitText(s.page, 'Access to ' + B);
+        await waitText(s.page, 'vfy-developer');
+        lateUsers.release(json(200, { users: [user('vfy-stale')] }));
+        latePrincipals.release(apiError(500, 'INTERNAL_ERROR', 'Synthetic late principals failure.'));
+        await new Promise(r => setTimeout(r, 300));
+        const state = await s.page.evaluate(() => ({
+          error: document.body.textContent.includes('Synthetic late principals failure.'),
+          people: [...document.querySelectorAll('.fixed fieldset')][0].textContent.trim(),
+          save: [...document.querySelectorAll('.fixed button')].find(b => b.textContent.trim() === 'Save').disabled,
+        }));
+        assert.deepEqual(state, { error: false, people: 'Peoplevfy-developer', save: false });
+        assert.equal(usersReads, 2);
+        assert.equal(principalsReads, 2);
+      } };
+    })(),
     { name: 'New Collection modal starts with HNSW, Cosine and the three HNSW sliders at their defaults and bounds', open: open(), async run(s) {
       await waitText(s.page, A);
       await press(s.page, '+ New Collection');
@@ -270,7 +418,7 @@ function navMenuCases() {
   const DATA = { key: 'data', label: 'Data', entries: ['Import', 'Prepare', 'Transfer'] };
   const TUNE = { key: 'tune', label: 'Tune', entries: ['Chunking', 'Retrieval', 'Gold Standard'] };
   const ADMIN = { key: 'admin', label: 'Admin', entries: ['Collections', 'Users', 'Service keys', 'Audit', 'Health'] };
-  const account = (username, badge) => ({ key: 'account', label: `${username} ${badge}`, entries: ['Change password', 'Log out'] });
+  const account = (username, badge) => ({ key: 'account', label: `${username} ${badge}`, entries: ['Account', 'Change password', 'Log out'] });
   const want = {
     end_user: [account('vfy-end-user', 'End User')],
     developer: [DATA, TUNE, account('vfy-developer', 'Developer')],
@@ -516,9 +664,19 @@ function usersCases() {
       ...extra,
     });
   };
-  const open = (extra = {}) => ({ role: 'engineer', path: '/users', routes: usersApi(extra) });
+  // Reset password, Disable and a role change ask first (#551): `dialog.answer`
+  // says whether a confirmation is accepted (yes by default), `dialog.seen` keeps
+  // what was asked.
+  const open = (extra = {}, dialog = { answer: () => true, seen: [] }) => ({ role: 'engineer', path: '/users', routes: usersApi(extra),
+    onDialog: async d => { dialog.seen.push(d.message()); if (dialog.answer(d.message())) await d.accept(); else await d.dismiss(); } });
+  const othersAccepted = { answer: m => !m.includes('your own'), seen: [] }, allCancelled = { answer: () => false, seen: [] };
   const rowTexts = page => page.evaluate(() => [...document.querySelectorAll('tbody tr')].map(r => [...r.querySelectorAll('td')].map(c => c.textContent.trim())));
+  // The row controls are disabled while a change is in flight, and a click on a
+  // disabled button does nothing. The one-time password shows before the list
+  // has reloaded and the controls are enabled again, so wait for that first.
+  const settled = page => waitFor(page, () => ![...document.querySelectorAll('tbody button, tbody select')].some(e => e.disabled), 'the row controls to be enabled');
   const rowPress = async (page, username, label) => {
+    await settled(page);
     const done = await page.evaluate((u, t) => {
       const b = [...document.querySelectorAll(`tr[data-username="${u}"] button`)].find(x => x.textContent.trim() === t);
       if (!b) return false; b.click(); return true;
@@ -546,10 +704,10 @@ function usersCases() {
     { name: 'The list shows each account; the own row has no Reset password', open: open(), async run(s) {
       await waitText(s.page, 'vfy-off');
       const heads = await s.page.evaluate(() => [...document.querySelectorAll('thead th')].map(t => t.textContent.trim()));
-      assert.deepEqual(heads, ['Username', 'Role', 'Status', 'Password', 'Created', '']);
+      assert.deepEqual(heads, ['Username', 'Role', 'Status', 'Password', 'Two-step', 'Created', '']);
       const date = await s.page.evaluate(v => new Date(v).toLocaleDateString(), '2026-10-01T12:00:00Z');
       const rows = await rowTexts(s.page);
-      assert.deepEqual(rows.map(r => [r[0], r[2], r[3], r[4]]), [['vfy-developer', 'Enabled', 'Set', date], [ME + ' (you)', 'Enabled', 'Set', date], ['vfy-off', 'Disabled', 'Change due', date]]);
+      assert.deepEqual(rows.map(r => [r[0], r[2], r[3], r[4], r[5]]), [['vfy-developer', 'Enabled', 'Set', 'Off', date], [ME + ' (you)', 'Enabled', 'Set', 'Off', date], ['vfy-off', 'Disabled', 'Change due', 'Off', date]]);
       assert.deepEqual(await s.page.evaluate(() => [...document.querySelectorAll('tbody select')].map(x => x.value)), ['developer', 'engineer', 'end_user']);
       assert.deepEqual(await rowButtons(s.page, 'vfy-developer'), ['Reset password', 'Disable']);
       assert.deepEqual(await rowButtons(s.page, ME), ['Disable']);
@@ -600,8 +758,235 @@ function usersCases() {
       assert.ok(callsTo(s, 'GET', '/api/auth/users').length > before, 'the list was reloaded');
       assert.equal(await s.page.evaluate(() => document.querySelector('tr[data-username="vfy-engineer"] td:nth-child(3)').textContent.trim()), 'Enabled');
     } },
+    { name: 'Reset password, Disable and a role change ask first, worded for the account; Enable asks nothing', open: open({}, othersAccepted), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      const status = (u, want) => waitFor(s.page, (n, w) => document.querySelector(`tr[data-username="${n}"] td:nth-child(3)`).textContent.trim() === w, `${u} ${want}`, u, want);
+      await fill(s.page, 'select[aria-label="Role of vfy-developer"]', 'end_user');
+      await waitFor(s.page, () => document.querySelector('select[aria-label="Role of vfy-developer"]').value === 'end_user', 'the new role');
+      await rowPress(s.page, 'vfy-developer', 'Disable');
+      await status('vfy-developer', 'Disabled');
+      await rowPress(s.page, 'vfy-off', 'Reset password');
+      await waitText(s.page, 'ResetOnce-0987654321ab');
+      await rowPress(s.page, 'vfy-off', 'Enable');
+      await status('vfy-off', 'Enabled');
+      await settled(s.page);
+      await fill(s.page, `select[aria-label="Role of ${ME}"]`, 'developer');
+      await rowPress(s.page, ME, 'Disable');
+      await settled(s.page);
+      assert.deepEqual(othersAccepted.seen, [
+        'Change the role of vfy-developer to End User?',
+        "Disable vfy-developer? Their sessions end and they can't log in until enabled.",
+        'Reset the password of vfy-off? Their sessions end and they must change the new password at their next login.',
+        'Change your own role to Developer? You will lose access to the Users page.',
+        "Disable your own account? You will be logged out and can't log in again until another AI Engineer enables you.",
+      ]);
+      for (const action of ['vfy-developer/role', 'vfy-developer/disable', 'vfy-off/reset-password', 'vfy-off/enable']) assert.equal(callsTo(s, 'POST', `/api/auth/users/${action}`).length, 1, action);
+      assert.equal(s.calls.filter(c => c.method === 'POST' && c.path.startsWith(`/api/auth/users/${ME}/`)).length, 0);
+      assert.equal(await s.page.evaluate(n => document.querySelector(`select[aria-label="Role of ${n}"]`).value, ME), 'engineer');
+    } },
+    { name: 'A cancelled role change, Disable or Reset password sends nothing', open: open({}, allCancelled), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      await fill(s.page, 'select[aria-label="Role of vfy-developer"]', 'end_user');
+      await rowPress(s.page, 'vfy-developer', 'Disable');
+      await rowPress(s.page, 'vfy-developer', 'Reset password');
+      // A dismissed confirmation is answered inside the click, so nothing can be
+      // in flight; the pause only gives a wrongly sent request time to be seen.
+      await new Promise(r => setTimeout(r, 300));
+      assert.equal(allCancelled.seen.length, 3);
+      assert.equal(s.calls.filter(c => c.method === 'POST' && c.path.startsWith('/api/auth/users/')).length, 0);
+      assert.equal(await s.page.evaluate(() => document.querySelector('select[aria-label="Role of vfy-developer"]').value), 'developer');
+      assert.equal(await s.page.evaluate(() => document.querySelector('tr[data-username="vfy-developer"] td:nth-child(3)').textContent.trim()), 'Enabled');
+    } },
     { name: 'A list that cannot be loaded says so', open: open({ 'GET /api/auth/users': apiError(500, 'INTERNAL_ERROR', 'Synthetic failure.') }), async run(s) {
       await waitText(s.page, 'Could not load the users: Synthetic failure.');
+    } },
+    // The page re-reads the session after a change to the Engineer's own account:
+    // a demoted Engineer leaves the page, a disabled one is logged out. The stub
+    // answers as the API would once the change applies (reviewer, PR #550).
+    ...[['demotes themselves', 'role', { role: 'developer' }, '/qa', 'Ask a Question'],
+        ['disables themselves', 'disable', null, '/login', 'Log in to continue']].map(([what, action, body, where, landmark]) => {
+      const me = { role: 'engineer', enabled: true };
+      const gone = () => !me.enabled ? apiError(401, 'AUTH_REQUIRED', 'Log in to use this.') : null;
+      const notEngineer = () => me.role !== 'engineer' ? apiError(403, 'FORBIDDEN', 'This needs the engineer role.') : null;
+      return { name: `An Engineer who ${what} on the Users page is sent to ${where}`, open: open({
+        'GET /api/auth/me': () => gone() || json(200, { username: ME, role: me.role, must_change_password: false }),
+        'GET /api/auth/users': () => gone() || notEngineer() || json(200, { users: [row('vfy-developer', 'developer'), row(ME, me.role, { enabled: me.enabled }), row('vfy-eng2', 'engineer')] }),
+        [`POST /api/auth/users/${ME}/${action}`]: call => {
+          if (action === 'role') me.role = call.body.role; else me.enabled = false;
+          return json(200, { user: row(ME, me.role, { enabled: me.enabled }) });
+        },
+      }), async run(s) {
+        await waitText(s.page, 'vfy-eng2');
+        if (action === 'role') await fill(s.page, `select[aria-label="Role of ${ME}"]`, body.role);
+        else await rowPress(s.page, ME, 'Disable');
+        await waitPath(s.page, where);
+        await waitText(s.page, landmark);
+        assert.equal(callsTo(s, 'POST', `/api/auth/users/${ME}/${action}`).length, 1);
+        if (action === 'role') assert.equal((await nav(s.page)).includes('Users'), false);
+      } };
+    }),
+  ];
+}
+
+// Two-step verification (#607): the Account page's set-up, recovery codes and
+// turn-off, the login's code step, a forced set-up, and the Users page's
+// column, reset and switch. The API is stubbed; the real routes are checked
+// in 17_auth.sh (auth_stack.py mfa) and test_auth.py.
+function mfaCases() {
+  const SECRET = 'JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP';
+  const CODES = Array.from({ length: 10 }, (_, i) => `aaaa-bbbb-cccc-dd${String(i).padStart(2, '2')}`.slice(0, 19));
+  const off = { enrolled: false, enrolled_at: null, required: false, recovery_codes_remaining: 0 };
+  const on = { enrolled: true, enrolled_at: '2026-11-16T12:00:00Z', required: false, recovery_codes_remaining: 10 };
+  const me = (role, over = {}) => ({ username: 'vfy-' + role.replace('_', '-'), role, must_change_password: false, ...over });
+  const row = (username, role, over = {}) => ({ username, role, enabled: true, must_change_password: false, created_at: '2026-10-01T12:00:00Z', mfa_enrolled: false, ...over });
+  // Reset two-step asks first (#779): each Users case below keeps what was asked.
+  const RESET2_ASK = 'Reset the two-step verification of vfy-developer? Their sessions end and they must log in again with their password alone.';
+  const resetAccepted = { seen: [] }, resetCancelled = { seen: [] };
+  const dialogTo = (d, accept) => async dlg => { d.seen.push(dlg.message()); if (accept) await dlg.accept(); else await dlg.dismiss(); };
+  return [
+    { name: 'The account menu has Account, which opens the two-step set-up: a QR code, the key as text, and the codes once', open: { role: 'developer', path: '/qa', routes: base({
+      'GET /api/auth/mfa': json(200, off),
+      'POST /api/auth/mfa/enroll': json(200, { secret: SECRET, otpauth_uri: `otpauth://totp/RAG%20Platform:vfy-developer?secret=${SECRET}&issuer=RAG%20Platform&algorithm=SHA1&digits=6&period=30` }),
+      'POST /api/auth/mfa/enroll/confirm': json(200, { recovery_codes: CODES, status: on }),
+    }) }, async run(s) {
+      await waitText(s.page, 'Ask a Question');
+      await chooseFromMenu(s.page, 'account', 'Account');
+      await waitPath(s.page, '/account');
+      await waitText(s.page, 'Two-step verification is off');
+      await press(s.page, 'Set up');
+      await waitFor(s.page, () => !!document.querySelector('[data-testid=mfa-setup] img[src^="data:image/"]'), 'the QR code drawn in the page');
+      assert.equal(await s.page.evaluate(() => document.querySelector('[data-testid=mfa-secret]').textContent.trim()), SECRET);
+      await fill(s.page, '#mfa-confirm-code', '123456');
+      await press(s.page, 'Confirm');
+      await waitFor(s.page, () => !!document.querySelector('[data-testid=recovery-codes]'), 'the recovery codes');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/mfa/enroll/confirm').map(c => c.body), [{ code: '123456' }]);
+      await waitText(s.page, CODES[9]);
+      await waitText(s.page, 'shown only once');
+      assert.deepEqual(await s.page.evaluate(() => [Object.keys(sessionStorage), Object.keys(localStorage)]), [[], []]);
+      await press(s.page, 'Done');
+      await waitText(s.page, CODES[0], true);
+      await waitText(s.page, '10 of 10 recovery codes left');
+    } },
+    { name: 'Enrolled: regenerate shows a new set once; Turn off sends the password and code', open: { role: 'developer', path: '/account', routes: base({
+      'GET /api/auth/mfa': json(200, on),
+      'POST /api/auth/mfa/recovery-codes': json(200, { recovery_codes: CODES, status: on }),
+      'POST /api/auth/mfa/disable': json(200, { status: off }),
+    }) }, async run(s) {
+      await waitText(s.page, '10 of 10 recovery codes left');
+      await press(s.page, 'Regenerate recovery codes');
+      await fill(s.page, '#mfa-regenerate-code', '654321');
+      await press(s.page, 'Get new recovery codes');
+      await waitText(s.page, CODES[3]);
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/mfa/recovery-codes').map(c => c.body), [{ code: '654321' }]);
+      await press(s.page, 'Done');
+      await press(s.page, 'Turn off');
+      await fill(s.page, '#mfa-disable-password', 'my password here');
+      await fill(s.page, '#mfa-disable-code', CODES[0]);
+      await press(s.page, 'Turn off', 'form button[type=submit]');
+      await waitText(s.page, 'Two-step verification is off');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/mfa/disable').map(c => c.body), [{ password: 'my password here', code: CODES[0] }]);
+    } },
+    { name: 'While two-step verification is required, Turn off isn\'t offered', open: { role: 'developer', path: '/account', routes: base({
+      'GET /api/auth/mfa': json(200, { ...on, required: true }),
+    }) }, async run(s) {
+      await waitText(s.page, 'Regenerate recovery codes');
+      assert.equal(await bodyHas(s.page, 'Turn off'), false);
+    } },
+    { name: 'A right password asks for a code; a wrong code shows the API\'s message; the right one opens /qa', open: { role: null, path: '/login', routes: base({
+      'POST /api/auth/login': json(200, { mfa_required: true }),
+      'POST /api/auth/login/mfa': call => call.body.code === '111111' ? json(200, me('developer', { mfa_enrolled: true })) : apiError(401, 'MFA_FAILED', 'The code is incorrect.'),
+    }) }, async run(s) {
+      await waitText(s.page, 'Log in to continue');
+      await fill(s.page, '#login-username', 'vfy-developer');
+      await fill(s.page, '#login-password', 'a password of twelve');
+      await press(s.page, 'Log in');
+      await waitFor(s.page, () => !!document.querySelector('#login-code'), 'the code step');
+      await fill(s.page, '#login-code', '000000');
+      await press(s.page, 'Verify');
+      await waitText(s.page, 'The code is incorrect.');
+      assert.equal(await s.page.evaluate(() => document.querySelector('#login-code').value), '');
+      await fill(s.page, '#login-code', '111111');
+      await press(s.page, 'Verify');
+      await waitPath(s.page, '/qa');
+      await waitText(s.page, 'Ask a Question');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/login/mfa').map(c => c.body), [{ code: '000000' }, { code: '111111' }]);
+    } },
+    // A login that opens a session carries the switch as mfa_required (#607 review):
+    // false, or true while required for everyone, it opens /qa, never the code step.
+    ...[false, true].map(required => ({ name: `A login answered with a user and mfa_required ${required} opens /qa without a code step`, open: { role: null, path: '/login', routes: base({
+      'POST /api/auth/login': json(200, me('developer', { mfa_enrolled: required, mfa_required: required, mfa_enrollment_required: false })),
+    }) }, async run(s) {
+      await waitText(s.page, 'Log in to continue');
+      await fill(s.page, '#login-username', 'vfy-developer');
+      await fill(s.page, '#login-password', 'a password of twelve');
+      await press(s.page, 'Log in');
+      await waitPath(s.page, '/qa');
+      await waitText(s.page, 'Ask a Question');
+      assert.equal(await s.page.evaluate(() => !!document.querySelector('#login-code')), false);
+      assert.equal(callsTo(s, 'POST', '/api/auth/login/mfa').length, 0);
+    } })),
+    { name: 'An expired challenge returns to the password step', open: { role: null, path: '/login', routes: base({
+      'POST /api/auth/login': json(200, { mfa_required: true }),
+      'POST /api/auth/login/mfa': apiError(401, 'MFA_CHALLENGE_INVALID', 'Your sign-in expired. Log in again.'),
+    }) }, async run(s) {
+      await waitText(s.page, 'Log in to continue');
+      await fill(s.page, '#login-username', 'vfy-developer');
+      await fill(s.page, '#login-password', 'a password of twelve');
+      await press(s.page, 'Log in');
+      await waitFor(s.page, () => !!document.querySelector('#login-code'), 'the code step');
+      await fill(s.page, '#login-code', '123456');
+      await press(s.page, 'Verify');
+      await waitText(s.page, 'Your sign-in expired');
+      await waitFor(s.page, () => !!document.querySelector('#login-password'), 'the password step again');
+    } },
+    { name: 'A required set-up shows only the account page, with Log out; an API answer MFA_ENROLLMENT_REQUIRED returns to it', open: { role: null, path: '/collections', routes: base({
+      'GET /api/auth/me': json(200, me('developer', { mfa_required: true, mfa_enrollment_required: true })),
+      'GET /api/auth/mfa': json(200, { ...off, required: true }),
+    }) }, async run(s) {
+      await waitPath(s.page, '/account');
+      await waitText(s.page, 'required for every account');
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('nav').length), 0);
+      await waitText(s.page, 'Log out');
+    } },
+    { name: 'An API answer 403 MFA_ENROLLMENT_REQUIRED on any page opens the account page', open: { role: 'engineer', path: '/collections', routes: base({
+      'GET /api/collections': apiError(403, 'MFA_ENROLLMENT_REQUIRED', 'Set up two-step verification before doing anything else.'),
+      'GET /api/auth/mfa': json(200, { ...off, required: true }),
+    }) }, async run(s) {
+      await waitPath(s.page, '/account');
+      await waitText(s.page, 'required for every account');
+    } },
+    { name: 'Users page: the Two-step column, Reset two-step on enrolled rows but the own, and the switch', open: { role: 'engineer', path: '/users', routes: (() => {
+      const list = [row('vfy-developer', 'developer', { mfa_enrolled: true }), row('vfy-engineer', 'engineer', { mfa_enrolled: true }), row('vfy-off', 'end_user')];
+      return base({
+        'GET /api/auth/users': () => json(200, { users: list.map(u => ({ ...u })) }),
+        'POST /api/auth/users/vfy-developer/reset-mfa': () => { list[0].mfa_enrolled = false; return json(200, { user: list[0] }); },
+        'POST /api/auth/mfa/policy': apiError(409, 'MFA_ENROLL_FIRST', 'Set up two-step verification for your own account first, on the Account page.'),
+      });
+    })(), onDialog: dialogTo(resetAccepted, true) }, async run(s) {
+      await waitText(s.page, 'vfy-off');
+      const buttons = u => s.page.evaluate(n => [...document.querySelectorAll(`tr[data-username="${n}"] button`)].map(b => b.textContent.trim()), u);
+      assert.deepEqual(await buttons('vfy-developer'), ['Reset password', 'Disable', 'Reset two-step']);
+      assert.deepEqual(await buttons('vfy-engineer'), ['Disable']);
+      assert.deepEqual(await buttons('vfy-off'), ['Reset password', 'Disable']);
+      await s.page.evaluate(() => [...document.querySelectorAll('tr[data-username="vfy-developer"] button')].find(b => b.textContent.trim() === 'Reset two-step').click());
+      await waitFor(s.page, () => document.querySelector('tr[data-username="vfy-developer"] td:nth-child(5)').textContent.trim() === 'Off', 'Off after the reset');
+      assert.equal(callsTo(s, 'POST', '/api/auth/users/vfy-developer/reset-mfa').length, 1);
+      assert.deepEqual(resetAccepted.seen, [RESET2_ASK]);
+      await s.page.click('#mfa-required');
+      await waitText(s.page, 'for your own account first');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/mfa/policy').map(c => c.body), [{ required: true }]);
+      assert.equal(await s.page.evaluate(() => document.querySelector('#mfa-required').checked), false);
+    } },
+    { name: 'A cancelled Reset two-step sends nothing', open: { role: 'engineer', path: '/users', routes: base({
+      'GET /api/auth/users': () => json(200, { users: [row('vfy-developer', 'developer', { mfa_enrolled: true }), row('vfy-engineer', 'engineer', { mfa_enrolled: true })] }),
+    }), onDialog: dialogTo(resetCancelled, false) }, async run(s) {
+      await waitText(s.page, 'vfy-developer');
+      await s.page.evaluate(() => [...document.querySelectorAll('tr[data-username="vfy-developer"] button')].find(b => b.textContent.trim() === 'Reset two-step').click());
+      // A dismissed confirmation is answered inside the click; the pause only gives a wrongly sent request time to be seen.
+      await new Promise(r => setTimeout(r, 300));
+      assert.deepEqual(resetCancelled.seen, [RESET2_ASK]);
+      assert.equal(s.calls.filter(c => c.method === 'POST' && c.path.startsWith('/api/auth/users/')).length, 0);
+      assert.equal(await s.page.evaluate(() => document.querySelector('tr[data-username="vfy-developer"] td:nth-child(5)').textContent.trim()), 'On');
     } },
   ];
 }
@@ -1159,10 +1544,12 @@ function prepareCases() {
       });
     })(), async run(s) {
       await waitText(s.page, 'minutes.txt');
+      await waitSelected(s.page, 0);
       await fillNth(s.page, 'select', 0, B);
       await press(s.page, 'Import all prepared');
       await waitFor(s.page, () => [...document.querySelectorAll('[role=alert]')].some(a => a.textContent.includes('total 600.0 MB; one import can be at most 512 MB') && a.textContent.includes('Import them in smaller selections.')), 'the IMPORT_TOO_LARGE alert');
       assert.equal(callsTo(s, 'POST', '/api/prepare/import').length, 1);
+      assert.equal(callsTo(s, 'POST', '/api/prepare/import')[0].body.collection, B);
       const input = await s.page.$('#prepare-file-input');
       await input.uploadFile(...tempFiles(['a.txt', 'b.zip']));
       await waitText(s.page, 'b.zip');
@@ -1183,6 +1570,75 @@ function prepareCases() {
   ];
 }
 
+// Query-only mode (#670): GET /api/auth/me says query_only, and the UI shows
+// the "Query-only" tag, hides the pages that change data from the nav and the
+// router, keeps Transfer's export and package list without its import
+// controls, and drops "+ New Collection" and Delete from the Collections page.
+// The API refuses those writes whatever the UI shows (24_query_only.sh).
+function queryOnlyCases() {
+  const me = (role, queryOnly) => json(200, { username: 'vfy-' + role.replace('_', '-'), role, must_change_password: false, query_only: queryOnly });
+  const qo = (role, path, routes = {}) => ({ role, path, routes: base({ 'GET /api/auth/me': me(role, true), ...routes }) });
+  const goto = async (page, p) => { await page.goto(S.BASE + p, { waitUntil: 'domcontentloaded' }); };
+  const tag = page => page.evaluate(() => document.querySelector('[data-testid=nav-query-only]')?.textContent.trim() ?? null);
+  const ready = page => waitFor(page, () => document.querySelectorAll('nav button[data-menu]').length > 0, 'the nav');
+  const WRITE_PAGES = ['/import', '/prepare', '/chunking', '/retrieval', '/goldstandard'];
+  return [
+    { name: 'Query-only Engineer: the nav shows the Query-only tag and Q&A, Transfer and the Admin pages, without Import, Prepare, Chunking, Retrieval or Gold Standard', open: qo('engineer', '/qa'), async run(s) {
+      await ready(s.page);
+      assert.equal(await tag(s.page), 'Query-only');
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Transfer', 'Collections', 'Users', 'Service keys', 'Audit', 'Health']);
+    } },
+    { name: 'Query-only Developer: the nav shows the tag, Q&A and Transfer, and no Tune menu', open: qo('developer', '/qa'), async run(s) {
+      await ready(s.page);
+      assert.equal(await tag(s.page), 'Query-only');
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Transfer']);
+      assert.equal(await s.page.evaluate(() => !!document.querySelector('nav button[data-menu="tune"]')), false);
+    } },
+    { name: 'Query-only: opening Import, Prepare, Chunking, Retrieval or Gold Standard directly is sent to Q&A, while Transfer and Collections still open', open: qo('engineer', '/qa'), async run(s) {
+      for (const p of WRITE_PAGES) {
+        await goto(s.page, p);
+        await waitText(s.page, 'Ask a Question');
+        await waitPath(s.page, '/qa');
+      }
+      await goto(s.page, '/transfer');
+      await waitText(s.page, 'Export a collection');
+      await waitPath(s.page, '/transfer');
+      await goto(s.page, '/collections');
+      await waitText(s.page, A);
+      await waitPath(s.page, '/collections');
+    } },
+    { name: 'Query-only Collections page: the list and Access stay, "+ New Collection" and Delete are gone', open: qo('engineer', '/collections'), async run(s) {
+      await waitText(s.page, A);
+      const buttons = await s.page.evaluate(() => [...document.querySelectorAll('main button')].map(b => b.textContent.trim()));
+      assert.equal(buttons.includes('+ New Collection'), false);
+      assert.equal(buttons.includes('Delete'), false);
+      assert.equal(buttons.filter(b => b === 'Access').length, COLS.length);
+    } },
+    { name: 'Query-only Transfer page: export, the package list, Download and Refresh stay; the import controls are gone and the loader is named', open: qo('developer', '/transfer', {
+        'GET /api/packages': json(200, { packages: [{ filename: 'ragpkg-vfyqo.tar.gz', readable: true, encrypted: false, collection: A, chunk_count: 3, fidelity: 'with-sources', size_bytes: 2048 }] }) }), async run(s) {
+      await waitText(s.page, 'Export a collection');
+      await waitText(s.page, 'Packages in ./exports');
+      await waitText(s.page, 'python -m loader');
+      await waitFor(s.page, () => document.querySelectorAll('select')[1]?.options.length > 1, 'the packages');
+      await fillNth(s.page, 'select', 1, 'ragpkg-vfyqo.tar.gz');
+      await waitFor(s.page, () => [...document.querySelectorAll('a')].some(a => a.textContent.trim() === 'Download'), 'the Download link');
+      const buttons = await s.page.evaluate(() => [...document.querySelectorAll('main button')].map(b => b.textContent.trim()));
+      assert.equal(buttons.includes('Refresh'), true);
+      assert.equal(buttons.includes('Import'), false);
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('input[name=conflict]').length), 0);
+      assert.equal(await s.page.evaluate(() => document.body.innerText.includes('Import a package')), false);
+      assert.equal(callsTo(s, 'POST', '/api/import').length, 0);
+    } },
+    { name: 'query_only false: no Query-only tag, the full Engineer nav, and "+ New Collection" on the Collections page', open: { role: 'engineer', path: '/collections', routes: base({ 'GET /api/auth/me': me('engineer', false) }) }, async run(s) {
+      await waitText(s.page, A);
+      await ready(s.page);
+      assert.equal(await tag(s.page), null);
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Prepare', 'Transfer', 'Chunking', 'Retrieval', 'Gold Standard', 'Collections', 'Users', 'Service keys', 'Audit', 'Health']);
+      assert.equal(await s.page.evaluate(() => [...document.querySelectorAll('main button')].some(b => b.textContent.trim() === '+ New Collection')), true);
+    } },
+  ];
+}
+
 async function runUiControlTests(browser, baseUrl, reporter) {
   S.BASE = baseUrl;
   const run = (section, cases) => S.runCases(browser, baseUrl, reporter, section, cases);
@@ -1191,12 +1647,14 @@ async function runUiControlTests(browser, baseUrl, reporter) {
   await run('Navigation, roles and redirects (#400); the API enforces the roles (#25)', navigationCases());
   await run('Login, logout, setup and password changes (#25)', authCases());
   await run('Users page: Engineers manage accounts (#25)', usersCases());
+  await run('Two-step verification: account page, login code, forced set-up, Users page (#607)', mfaCases());
   await run('Service keys page: Engineers manage service principals and keys (#25)', serviceKeysCases());
   await run('Audit page: Engineers read the audit log (#29)', auditCases());
   await run('Prepare page: list, preview, upload, jobs, deletes and import (#638)', prepareCases());
   await run('Q&A input, citations toggle, answer display and End User view (#400)', qaCases());
   await run('Retrieval page status text, alpha slider and save (#400)', retrievalCases());
   await run('Client handling of the proxy error pages (#400)', proxyCases());
+  await run('Query-only mode: the tag, the hidden pages and controls (#670)', queryOnlyCases());
 }
 
 module.exports = { runUiControlTests };

@@ -2,6 +2,14 @@ services:
   weaviate:
     # 1.27.0 is the minimum supported by weaviate-client 4.23.1 (pinned in
     # api/requirements.txt); 1.25.x fails at connect with WeaviateStartUpError.
+    # Use the plain X.Y.Z tag: it is the multi-arch image. The suffixed tags,
+    # such as 1.40.2-9858973.arm64, carry one platform only (#527, #530), so
+    # Dependabot ignores Weaviate (.github/dependabot.yml) and it is upgraded
+    # by hand. The main stack's images are pinned by tag, not digest (decided
+    # on #544): weaviate and ollama to exact versions, nginx to the 1.29-alpine
+    # tag, which moves with patch and Alpine rebuilds and which Dependabot
+    # updates. The opt-in telemetry collector (docker-compose.telemetry.yml) is
+    # the exception: it is pinned by digest.
     image: semitechnologies/weaviate:1.40.2
     environment:
       QUERY_DEFAULTS_LIMIT: 25
@@ -56,13 +64,26 @@ services:
     # Windows machine in the transfer path can all drop it), which would
     # otherwise fail with "permission denied" on a fresh install.
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    # The LLMs (#671), set once here; the api reads the same three through the
+    # llm-models anchor. BUILD_LLM_MODEL prepares documents and writes gold
+    # standard pairs; ANSWER_LLM_MODEL answers questions. Each falls back to
+    # LLM_MODEL when empty, and LLM_MODEL to llama3.1:8b. Ollama pulls each
+    # distinct model when it starts (ollama/models.sh). The embedding model is
+    # the api's EMBED_MODEL and stays one.
+    environment: &llm-models
+      LLM_MODEL: llama3.1:8b
+      BUILD_LLM_MODEL: ""
+      ANSWER_LLM_MODEL: ""
     volumes:
       - ollama_models:/root/.ollama
       - ./ollama/entrypoint.sh:/entrypoint.sh:ro
+      - ./ollama/models.sh:/models.sh:ro
     networks: [rag-internal]
     healthcheck:
       # The ollama image has no curl/wget; the CLI is the only probe available.
-      test: ["CMD-SHELL", "ollama list | grep -q llama3.1:8b && ollama list | grep -q nomic-embed-text"]
+      # Healthy once `ollama list` has every model ollama/models.sh resolves
+      # from the settings above, by exact name (#671).
+      test: ["CMD", "bash", "/models.sh", "present"]
       interval: 20s
       timeout: 15s
       retries: 20
@@ -90,11 +111,18 @@ services:
       WEAVIATE_PORT: 8080
       OLLAMA_HOST: ollama
       OLLAMA_PORT: 11434
-      LLM_MODEL: llama3.1:8b
+      # LLM_MODEL, BUILD_LLM_MODEL and ANSWER_LLM_MODEL, from the ollama
+      # service's environment above (#671).
+      <<: *llm-models
       EMBED_MODEL: nomic-embed-text
       UPLOAD_DIR: /app/uploads
       SOURCES_DIR: /app/sources
       EXPORTS_DIR: /app/exports
+      # A package exported here and never downloaded is deleted from ./exports
+      # this many hours after its export finished (#677), 1 to 720; a full
+      # download through the API deletes it at once. Packages copied into
+      # ./exports to be imported are never deleted.
+      EXPORT_RETENTION_HOURS: "24"
       OLLAMA_MODELS_DIR: /ollama
       # The sentence-transformers model is pre-cached in the api image at
       # build time (api/Dockerfile). Without these flags the Hugging Face
@@ -108,7 +136,7 @@ services:
       # when it is imported and on every partition call, so ingest never
       # dials out (issue #695). Also set as ENV in api/Dockerfile.
       DO_NOT_TRACK: "1"
-      # Shown by /health and compared against the memory Docker actually
+      # Shown by /health/details and compared against the memory Docker actually
       # provides. Raise this if you allocate more to Docker Desktop.
       RECOMMENDED_MEMORY_GB: 12
       # The most one upload's ZIPs may expand to in all, gzipped members'
@@ -129,6 +157,10 @@ services:
       # docker-compose.lan.yml serves TLS and sets it true (#26). Exactly true
       # or false.
       AUTH_COOKIE_SECURE: "false"
+      # Query-only mode (#670): an instance that serves questions on collections
+      # loaded with `python -m loader` and can't change them. Exactly true or
+      # false; the overlay docker-compose.query-only.yml sets it true.
+      RAG_QUERY_ONLY: "false"
       # The audit log (#29), in the ingest_uploads volume under audit/ and read
       # on the AI Engineer's Audit page. Whether a query's question text is
       # recorded: exactly true or false, off by default. audit.jsonl is rotated

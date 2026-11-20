@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Any, Optional, Annotated, Literal
-from pydantic import AfterValidator, BaseModel, Field, BeforeValidator, ValidationError, field_validator, model_validator, SecretStr, StrictInt
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, BeforeValidator, ValidationError, field_validator, model_validator, SecretStr, StrictInt
 
 from services.collection_writes import canonical
 
@@ -83,6 +83,28 @@ class CollectionInfo(BaseModel):
 
 class CollectionsResponse(BaseModel):
     collections: list[CollectionInfo]
+
+
+class CollectionAccessRequest(BaseModel):
+    """PUT /collections/{name}/access (#606): the whole state at once. Open
+    takes no names; restricted grants exactly the people and service
+    principals named (none: Engineers only)."""
+    model_config = ConfigDict(extra="forbid")
+    restricted: bool
+    users: list[Annotated[str, Field(max_length=64)]] = Field(default_factory=list, max_length=1000)
+    service_principals: list[Annotated[str, Field(max_length=64)]] = Field(default_factory=list, max_length=1000)
+
+    @model_validator(mode="after")
+    def _names_only_when_restricted(self):
+        if not self.restricted and (self.users or self.service_principals):
+            raise ValueError("an open collection takes no users or service principals")
+        return self
+
+
+class CollectionAccessResponse(BaseModel):
+    restricted: bool
+    users: list[str]
+    service_principals: list[str]
 
 
 # ── Ingest ────────────────────────────────────────────────────────────────────
@@ -243,6 +265,9 @@ class ExportJobStatusResponse(BaseModel):
 
     error_code: Optional[str] = None
     error_detail: Optional[dict] = None
+    # When the package expires (UTC, #677): set for a completed export whose
+    # package is still recorded, null once it is downloaded or swept.
+    expires_at: Optional[str] = None
 
 class ImportRequest(BaseModel):
     filename: str
@@ -313,6 +338,9 @@ class PackageSummary(BaseModel):
     # can't be read without the passphrase. `readable` then says whether its
     # age header is valid.
     encrypted: bool = False
+    # When a package this instance exported is deleted if nobody downloads it
+    # (UTC, #677); null for one copied in to be imported or from before #677.
+    expires_at: Optional[str] = None
 
 
 class PackageListResponse(BaseModel):
@@ -617,6 +645,19 @@ class PasswordChangeRequest(BaseModel):
     new_password: str = Field(max_length=1024)
 
 
+class MfaCodeRequest(BaseModel):
+    code: str = Field(max_length=64)   # a 6-digit TOTP code or a recovery code (#607)
+
+
+class MfaDisableRequest(BaseModel):
+    password: str = Field(max_length=1024)
+    code: str = Field(max_length=64)
+
+
+class MfaPolicyRequest(BaseModel):
+    required: bool
+
+
 class AuthStatus(BaseModel):
     setup_required: bool
 
@@ -626,6 +667,12 @@ class AuthUser(BaseModel):
     role: Literal["end_user", "developer", "engineer"]
     must_change_password: bool
     kind: Optional[Literal["user", "service"]] = None   # GET /auth/me: a session's user or a key's principal
+    # Two-step verification (#607): enrolled, the switch, and a set-up due because of it.
+    mfa_enrolled: Optional[bool] = None
+    mfa_required: Optional[bool] = None
+    mfa_enrollment_required: Optional[bool] = None
+    # Query-only mode (#670): the UI hides the pages that change data.
+    query_only: Optional[bool] = None
 
 
 class AdminUser(BaseModel):
@@ -634,6 +681,7 @@ class AdminUser(BaseModel):
     enabled: bool
     must_change_password: bool
     created_at: str
+    mfa_enrolled: bool = False
 
 
 class AdminUserList(BaseModel):
@@ -646,7 +694,7 @@ class AdminUserResult(BaseModel):
 
 
 class UserCreateRequest(BaseModel):
-    username: str = Field(max_length=256)
+    username: str   # no length cap: the route refuses any name breaking the rule as INVALID_USERNAME (#551)
     role: Literal["end_user", "developer", "engineer"]
 
 
@@ -683,7 +731,7 @@ class ServicePrincipalResult(BaseModel):
 
 
 class PrincipalCreateRequest(BaseModel):
-    name: str = Field(max_length=256)
+    name: str   # no length cap: the route refuses any name breaking the rule as INVALID_USERNAME (#551)
     role: Literal["end_user", "developer", "engineer"]
 
 

@@ -12,8 +12,9 @@ import asyncio
 import logging
 import threading
 import uuid
+from datetime import datetime, timezone
 
-from services import collection_writes, jobstore, packager
+from services import collection_writes, jobstore, package_retention, packager
 
 _log = logging.getLogger(__name__)
 
@@ -104,6 +105,17 @@ def _run(job_id: str, collection: str, include_models: bool,
                "cancelled before it finished. Start the export again.")
         raise
     else:
+        # Recorded before the status turns completed, so a client that sees the
+        # export finish also sees when its package expires (#677). A failure
+        # leaves the package unrecorded, never expired: the job says so. The
+        # collection is recorded too: an encrypted package follows its access (#794).
+        warnings = list(result["warnings"])
+        try:
+            package_retention.record_export(result["filename"], datetime.now(timezone.utc), collection)
+        except Exception:                          # noqa: BLE001 - reported in the warnings
+            _log.exception("Could not record the expiry of package %s", result["filename"])
+            warnings.append("The package's expiry could not be recorded, so it won't be deleted "
+                            "automatically. Delete it from ./exports by hand once it has been copied.")
         finish(
             status="completed",
             filename=result["filename"],
@@ -113,7 +125,7 @@ def _run(job_id: str, collection: str, include_models: bool,
             fidelity=result["fidelity"],
             models_bundled=result["models_bundled"],
             retrieve_script=result["retrieve_script"],
-            warnings=result["warnings"],
+            warnings=warnings,
         )
     finally:
         collection_writes.end_job("export", job_id)

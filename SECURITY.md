@@ -31,9 +31,18 @@ request but `/health` and the login (#25).
   request. The first AI Engineer is created with the operator command
   `python -m auth` inside the api container, which also recovers lockouts;
   after that AI Engineers manage accounts on the Users page. Accounts are
-  disabled, never deleted. There is no self-registration, email recovery, SSO
-  or MFA. Passwords are stored as scrypt hashes, generated
+  disabled, never deleted. There is no self-registration, email recovery or
+  SSO. Passwords are stored as scrypt hashes, generated
   passwords must be changed at first login, and failed logins are throttled.
+- **Two-step verification (#607).** Users can turn on TOTP codes from an
+  authenticator app (no SMS or outside service), with 10 one-time recovery
+  codes; an AI Engineer can require it for everyone and reset a user's set-up,
+  and the operator command's `reset-mfa` is the last-resort recovery. Codes
+  are accepted one step either side and never twice, and count against the
+  login throttle. TOTP secrets are stored sealed with AES-256-GCM under a key
+  in the `auth_data` volume (`mfa.key`), so a copy of `auth.db` alone reveals
+  none, though a copy of the whole volume does; recovery codes are stored
+  only as SHA-256. Service keys have no second factor.
   See README "Accounts and roles".
 - **Sessions.** The browser holds an HttpOnly, `SameSite=Strict` cookie; the
   server keeps only a hash of it, ends it after 12 hours idle or 7 days, and
@@ -102,9 +111,11 @@ request but `/health` and the login (#25).
   only route that reads a request body before authentication, so the proxy
   accepts a body of at most 16k there; nginx refuses a larger one with `413`
   before the API reads it.
-- **Not covered yet.** The MCP server's use of keys is #39. `GET /health` is
-  open, for container healthchecks, and reports service status and host
-  resources.
+- **Health (#750).** `GET /health` stays open, for container healthchecks,
+  and answers only `ok` or `degraded`. Which service is down, the model
+  names, latencies and the host's memory are at `GET /health/details`, for
+  Developers and AI Engineers (a session or a key).
+- **Not covered yet.** The MCP server's use of keys is #39.
 
 Exposing the workbench to an untrusted network is outside the supported
 configuration, but reports of issues that make that riskier than expected are

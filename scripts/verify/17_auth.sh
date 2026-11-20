@@ -19,6 +19,8 @@ stack() { _rag_require_lock_owner; python3 ./auth_stack.py "$@" $operator; }
 section "Auth units: passwords, store, policy, middleware, routes, operator command"
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_auth.py)
 check "test_auth.py registered regression checks" $?
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_collection_access.py)
+check "test_collection_access.py: per-collection access (#606) in the store, the routes and the audit log" $?
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_auth_enforcement.py)
 check "test_auth_enforcement.py: every protected route refuses a request without a session" $?
 python3 "$REPO_ROOT/scripts/tests/test_verify_auth.py"
@@ -56,6 +58,14 @@ section "Account administration by Engineers (PR 2)"
 stack admin-accounts
 check "an Engineer creates, resets, re-roles, disables and enables an account through the API; own reset refused; no password logged" $?
 
+section "Two-step verification (#607)"
+stack mfa
+check "set-up, password then code, no code twice, a recovery code once, an Engineer's reset; nothing secret logged" $?
+stack mfa-required
+check "the switch needs an enrolled Engineer and gates an unenrolled session to its own routes; reset-mfa ends the sessions; audit records hold no code" $?
+stack mfa-rate-limit
+check "nginx gives POST /auth/login/mfa the login's 16k body limit and its rate zone (429 LOGIN_RATE_LIMITED)" $?
+
 section "Service principals and API keys (PR 3, H3)"
 stack key-matrix end_user
 check "End User key, no Origin: 403 above its role and on account/key administration, logout and password change" $?
@@ -65,6 +75,10 @@ stack key-matrix engineer
 check "Engineer key, no Origin: no 401 or 403 on data routes; 403 KEY_NOT_ALLOWED on account/key administration" $?
 stack service-keys
 check "keys: no principal login, rotation, role change, disable, revoke and expiry; bad keys 401; no key in listings or the log" $?
+
+section "Per-collection access (#606)"
+stack collection-access
+check "a new collection is restricted to its creator: hidden from and refused to others until granted; a key can't change access; audited" $?
 
 section "Request protection and login throttling (H4)"
 stack control-path

@@ -4,7 +4,7 @@
 # A real browser (browser/ui_ingest.js), logged in as the harness Engineer, with
 # nothing stubbed, ingests on the Import page every supported type into a new
 # collection each, a ZIP of mixed types with a .jsonl.gz, and a file over the
-# part limit; prepares two files on the Prepare page with the local LLM and
+# part limit; prepares two files on the Prepare page with the build LLM and
 # imports them into a new collection (full runs only); and sends a broken PDF,
 # an unsupported type and an over-limit ZIP, each into a new collection. Then
 # ui_ingest_check.py checks each collection: the job ended with no error and the

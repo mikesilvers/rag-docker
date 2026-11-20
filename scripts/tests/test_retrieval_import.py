@@ -288,7 +288,7 @@ class RetrievalImportTests(unittest.TestCase):
 
     def build_with_models(self, failing, llm_model='chat:v2', include_models=True,
                           store_available=True, broken_copy=(), fail_mid_write=(),
-                          embed_model='embed:v1'):
+                          embed_model='embed:v1', build_model=''):
         """Export with both models requested; models named in `failing` cannot bundle.
 
         Models named in `broken_copy` resolve, but their second file's copy fails.
@@ -323,6 +323,8 @@ class RetrievalImportTests(unittest.TestCase):
         with ExitStack() as mocks:
             mocks.enter_context(patch.object(settings, 'embed_model', embed_model))
             mocks.enter_context(patch.object(settings, 'llm_model', llm_model))
+            mocks.enter_context(patch.object(settings, 'build_llm_model', build_model))
+            mocks.enter_context(patch.object(settings, 'answer_llm_model', ''))
             mocks.enter_context(patch.object(packager, 'read_chunks', return_value=[]))
             mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': embed_model}))
             mocks.enter_context(patch.object(packager, '_ingest_config', return_value=None))
@@ -433,6 +435,17 @@ class RetrievalImportTests(unittest.TestCase):
         result, manifest = self.build_with_models(set(), llm_model='embed:v1')
         self.assertEqual(manifest['bundled_models'], ['embed:v1'])
         self.assertIs(manifest['models_bundled'], True)
+
+    def test_manifest_records_both_llms_and_keeps_llm_as_the_answer_model(self):
+        # #671: package_format stays 1.
+        result, manifest = self.build_with_models(set(), build_model='small:v1')
+        self.assertEqual(manifest['package_format'], 1)
+        self.assertEqual(manifest['llm'], {'model': 'chat:v2'})
+        self.assertEqual(manifest['answer_llm'], {'model': 'chat:v2'})
+        self.assertEqual(manifest['build_llm'], {'model': 'small:v1'})
+        # Only the embedding and answer models are bundled.
+        self.assertEqual(self.exported, ['embed:v1', 'chat:v2'])
+        self.assertEqual(manifest['bundled_models'], ['chat:v2', 'embed:v1'])
 
     def test_manifest_leaves_out_a_model_whose_file_copy_failed(self):
         result, manifest = self.build_with_models(set(), broken_copy={'chat:v2'})
@@ -588,9 +601,10 @@ class ModelTagFolderTests(unittest.TestCase):
         path.write_bytes(manifest)
         return manifest
 
-    def export(self, embed, llm):
+    def export(self, embed, llm, build=''):
         with ExitStack() as mocks:
-            for key, value in [('ollama_models_dir', self.store), ('embed_model', embed), ('llm_model', llm)]:
+            for key, value in [('ollama_models_dir', self.store), ('embed_model', embed), ('llm_model', llm),
+                               ('build_llm_model', build), ('answer_llm_model', '')]:
                 mocks.enter_context(patch.object(settings, key, str(value)))
             mocks.enter_context(patch.object(packager, 'read_chunks', return_value=[]))
             mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': embed}))
@@ -601,9 +615,10 @@ class ModelTagFolderTests(unittest.TestCase):
             result = packager.build('Corpus', include_models=True)
         return packager.open_package(self.exports / result['filename'], Path(tempfile.mkdtemp(dir=self.root)))
 
-    def ensure(self, pkg, manifest, embed, llm):
+    def ensure(self, pkg, manifest, embed, llm, build=''):
         with patch.object(settings, 'ollama_models_dir', str(self.target)), \
              patch.object(settings, 'embed_model', embed), patch.object(settings, 'llm_model', llm), \
+             patch.object(settings, 'build_llm_model', build), patch.object(settings, 'answer_llm_model', ''), \
              patch.object(importer, '_ollama_reports', lambda model: True):
             return importer._ensure_models(pkg, manifest)
 
@@ -639,6 +654,26 @@ class ModelTagFolderTests(unittest.TestCase):
             self.assertEqual((pkg / folder / 'manifest.json').read_bytes(), self.manifests[model])
         self.assertEqual(manifest['bundled_models'], ['foo:a', 'foo:b'])
         self.assertEqual(model_bundle.bundled_models(pkg, manifest), ['foo:a', 'foo:b'])
+
+    def test_a_different_build_model_is_recorded_but_never_bundled_or_installed(self):
+        # #671: the package carries the answer model only; the build model is
+        # recorded for information, and import neither checks nor installs it.
+        pkg, manifest = self.export('foo:a', 'foo:b', build='bar:x')
+        self.assertEqual(manifest['bundled_models'], ['foo:a', 'foo:b'])
+        self.assertFalse(any(k.startswith('models/bar/') for k in manifest['files']))
+        self.assertEqual(manifest['llm'], {'model': 'foo:b'})
+        self.assertEqual(manifest['answer_llm'], {'model': 'foo:b'})
+        self.assertEqual(manifest['build_llm'], {'model': 'bar:x'})
+        notes = self.ensure(pkg, manifest, 'foo:a', 'foo:b', build='bar:x')
+        self.assertEqual(self.installed('foo:b'), self.manifests['foo:b'])
+        self.assertIsNone(self.installed('bar:x'))
+        self.assertFalse(any('bar' in note for note in notes), notes)
+
+    def test_an_absent_build_model_is_not_checked_at_import(self):
+        pkg, manifest = self.export('foo:a', 'foo:b')
+        notes = self.ensure(pkg, manifest, 'foo:a', 'foo:b', build='bar:y')
+        self.assertIsNone(self.installed('bar:y'))
+        self.assertFalse(any('bar' in note for note in notes), notes)
 
     def test_a_bundled_tag_is_never_installed_under_another_tag(self):
         pkg, manifest = self.export('foo:a', 'bar:x')
@@ -724,8 +759,14 @@ class IngestImportTests(unittest.TestCase):
 
     def served(self, collection):
         from routers import ingest as ingest_router
+        from services import weaviate_client
         import asyncio
-        return asyncio.run(ingest_router.get_ingest_config(collection)).model_dump()
+
+        # The route answers 404 for a collection that doesn't exist (#606); these exist.
+        async def exists(name):
+            return True
+        with patch.object(weaviate_client, 'collection_exists', exists):
+            return asyncio.run(ingest_router.get_ingest_config(collection)).model_dump()
 
     def assert_refused_before_mutation(self):
         saved = ingest_config._path('Corpus')
