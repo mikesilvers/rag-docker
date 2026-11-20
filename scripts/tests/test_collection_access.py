@@ -1280,5 +1280,55 @@ class GroupCopyTests(GroupTestCase):
         self.assertEqual(store.collection_access("Brandnew"), store.CollectionAccess(True, ("dev2",), (), ()))
 
 
+class GroupRecoveryTests(GroupTestCase):
+    """A staging or recovery copy made by collection_recovery carries its
+    target's group grants as its own state, and discarding the copy drops
+    them (#784 with #606, #788, #792)."""
+
+    class Client:
+        class collections:
+            @staticmethod
+            def exists(name):
+                return False
+
+            @staticmethod
+            def delete(name):
+                pass
+
+    def test_begin_copies_group_grants_and_discard_drops_them(self):
+        from services import collection_recovery
+        self.put(SECRET, {"restricted": True, "users": ["dev"], "groups": ["team"]})
+        record = collection_recovery.begin(SECRET, "import", self.Client)
+        copy = record["staging"]
+        self.assertEqual(store.collection_access(copy), store.CollectionAccess(True, ("dev",), (), ("team",)))
+        self.assertTrue(store.has_access(store.get_user("dev2").id, "developer", copy))    # through the group
+        kept = collection_recovery.begin(SECRET, "tune", self.Client)["staging"]
+        collection_recovery.discard(record, self.Client)
+        conn = sqlite3.connect(store.db_path())
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM collection_group_grants WHERE collection = ?",
+                                      (copy,)).fetchone()[0], 0)
+        conn.close()
+        self.assertFalse(store.collection_access(copy).restricted)
+        # Deleting the group removes its grant on the kept copy too, which stays restricted.
+        self.assertEqual(store.delete_group("team"), sorted([SECRET, kept]))
+        self.assertEqual(store.collection_access(kept), store.CollectionAccess(True, ("dev",), (), ()))
+        self.assertFalse(store.has_access(store.get_user("dev2").id, "developer", kept))
+
+    def test_begin_on_a_copy_intersects_the_group_grants_of_its_chain(self):
+        from services import collection_recovery
+        store.create_group("crew")
+        store.set_group_members("crew", ["dev2"], [])
+        self.put(SECRET, {"restricted": True, "groups": ["team", "crew"]})
+        self.put(STAGING, {"restricted": True, "groups": ["team"]})
+        record = collection_recovery.begin(STAGING, "tune", self.Client)
+        self.assertEqual(store.collection_access(record["staging"]), store.CollectionAccess(True, (), (), ("team",)))
+        self.put(STAGING, {"restricted": False})                   # the copy open: the original decides
+        record = collection_recovery.begin(STAGING, "tune", self.Client)
+        self.assertEqual(store.collection_access(record["staging"]).groups, ("crew", "team"))
+        self.assertTrue(access.allowed(store.authenticate_key(self.key2), record["staging"]))
+        store.set_group_members("team", ["dev2"], [])               # svc2 leaves: the chain refuses its key
+        self.assertFalse(access.allowed(store.authenticate_key(self.key2), record["staging"]))
+
+
 if __name__ == "__main__":
     unittest.main()
