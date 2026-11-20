@@ -130,14 +130,20 @@ def run_container(options, image, command, cwd, timeout):
     try:
         result = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        # A timeout kills only the docker CLI; the container would keep building, so remove it.
+        # A timeout kills only the docker CLI; the container would keep building, so remove it. The
+        # timeout can also fire while the image is still being pulled, before any container exists.
         try:
-            removed = subprocess.run(['docker', 'rm', '-f', name], capture_output=True, text=True,
-                                     timeout=60).returncode == 0
+            removal = subprocess.run(['docker', 'rm', '-f', name], capture_output=True, text=True, timeout=60)
+            if removal.returncode == 0:
+                outcome = 'removed the container'
+            elif 'no such container' in (removal.stderr or '').lower():
+                outcome = 'found no container to remove'
+            else:
+                outcome = 'failed'
         except (OSError, subprocess.SubprocessError):
-            removed = False
+            outcome = 'failed'
         raise AssertionError('{} timed out after {} s; docker rm -f {} {}'.format(
-            ' '.join(command), timeout, name, 'removed the container' if removed else 'failed')) from None
+            ' '.join(command), timeout, name, outcome)) from None
     if result.returncode != 0:
         raise AssertionError('{} exited {}:\n{}'.format(' '.join(argv), result.returncode,
                                                        (result.stdout + result.stderr)[-3000:]))
@@ -159,6 +165,31 @@ class ContainerRunTests(unittest.TestCase):
         name = calls[0][calls[0].index('--name') + 1]
         self.assertTrue(name.startswith('rag-tailwind-'), name)
         self.assertEqual(calls[1], ['docker', 'rm', '-f', name])
+
+    def _timed_out_message(self, removal):
+        calls = []
+
+        def fake(args, **kwargs):
+            calls.append(args)
+            if len(calls) == 1:
+                raise subprocess.TimeoutExpired(args, kwargs['timeout'])
+            return removal(args)
+
+        with mock.patch.object(subprocess, 'run', side_effect=fake):
+            with self.assertRaisesRegex(AssertionError, 'timed out') as caught:
+                run_container([], 'node:26-alpine', ['npm', 'ci'], '.', 300)
+        return str(caught.exception)
+
+    def test_a_timeout_before_the_container_exists_says_there_is_nothing_to_remove(self):
+        message = self._timed_out_message(lambda args: subprocess.CompletedProcess(
+            args, 1, '', 'Error response from daemon: No such container: ' + args[-1]))
+        self.assertIn('no container to remove', message)
+        self.assertNotIn('failed', message)
+
+    def test_a_failed_removal_still_says_failed(self):
+        message = self._timed_out_message(lambda args: subprocess.CompletedProcess(
+            args, 1, '', 'Error response from daemon: permission denied'))
+        self.assertTrue(message.endswith('failed'), message)
 
     def test_each_run_gets_its_own_name(self):
         calls = []
