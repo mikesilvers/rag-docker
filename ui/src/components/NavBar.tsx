@@ -27,6 +27,7 @@ const MENUS: MenuDef[] = [
     { label: 'Collections', to: '/collections', roles: ENGINEER },
     { label: 'Users', to: '/users', roles: ENGINEER },
     { label: 'Service keys', to: '/service-keys', roles: ENGINEER },
+    { label: 'Groups', to: '/groups', roles: ENGINEER },
     { label: 'Audit', to: '/audit', roles: ENGINEER },
     { label: 'Health', to: '/health', roles: ENGINEER },
   ] },

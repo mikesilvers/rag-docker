@@ -281,7 +281,7 @@ async def delete_collection(name: CollectionName, confirm: str | None = None):
 
 def _access_body(state: store.CollectionAccess) -> CollectionAccessResponse:
     return CollectionAccessResponse(restricted=state.restricted, users=list(state.users),
-                                    service_principals=list(state.service_principals))
+                                    service_principals=list(state.service_principals), groups=list(state.groups))
 
 
 async def _missing(name: str, outcome: str):
@@ -311,23 +311,24 @@ def _names(before: tuple, after: tuple) -> tuple[list, list]:
 
 @router.put("/{name}/access", response_model=CollectionAccessResponse)
 async def set_collection_access(name: CollectionName, body: CollectionAccessRequest, request: Request = None):
-    """Set who may use the collection, the whole state at once (#606)."""
+    """Set who may use the collection, the whole state at once (#606), groups included (#784)."""
     audit.note(collection=name)
     missing = await _missing(name, "Nothing was changed")
     if missing is not None:
         return missing
     try:
         before, after = await asyncio.to_thread(store.set_collection_access, name, body.restricted,
-                                                body.users, body.service_principals)
+                                                body.users, body.service_principals, body.groups)
     except store.Refused as exc:
         return api_error(422, "INVALID_PARAMETER", str(exc))
     added_users, removed_users = _names(before.users, after.users)
     added_svc, removed_svc = _names(before.service_principals, after.service_principals)
+    added_groups, removed_groups = _names(before.groups, after.groups)
     audit.note(restricted_before=before.restricted, restricted_after=after.restricted,
-               added={"users": added_users, "service_principals": added_svc},
-               removed={"users": removed_users, "service_principals": removed_svc})
+               added={"users": added_users, "service_principals": added_svc, "groups": added_groups},
+               removed={"users": removed_users, "service_principals": removed_svc, "groups": removed_groups})
     actor = getattr(access.principal_of(request), "username", "?")
-    _log.warning("Admin %r set the access of collection %r: %s, %d people and %d service principals granted",
-                 actor, name, "restricted" if after.restricted else "open", len(after.users),
-                 len(after.service_principals))
+    _log.warning("Admin %r set the access of collection %r: %s, %d people, %d service principals and %d groups "
+                 "granted", actor, name, "restricted" if after.restricted else "open", len(after.users),
+                 len(after.service_principals), len(after.groups))
     return _access_body(after)

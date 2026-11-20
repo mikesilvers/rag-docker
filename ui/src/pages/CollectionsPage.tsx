@@ -1,13 +1,16 @@
 import { useState, useEffect, useRef } from 'react'
-import { api, AdminUser, CollectionAccess, CollectionInfo, ServicePrincipal } from '../api/client'
+import { api, AdminUser, CollectionAccess, CollectionInfo, Group, ServicePrincipal } from '../api/client'
 import { useAuth } from '../context/AuthContext'
 
-// Who may use each collection (#606): "Open", "Restricted (n)" with n grants,
-// or a dash when the state couldn't be read.
+// Who may use each collection (#606): "Open", "Restricted (n)" with n grants
+// (people, service principals and groups, #784), or a dash when the state
+// couldn't be read.
 function accessLabel(a: CollectionAccess | null | undefined): string {
   if (!a) return '—'
-  return a.restricted ? `Restricted (${a.users.length + a.service_principals.length})` : 'Open'
+  return a.restricted ? `Restricted (${a.users.length + a.service_principals.length + (a.groups?.length ?? 0)})` : 'Open'
 }
+
+const CLOSED: CollectionAccess = { restricted: false, users: [], service_principals: [], groups: [] }
 
 export default function CollectionsPage() {
   // Query-only mode (#670): no create or delete; the list and access stay.
@@ -32,9 +35,10 @@ export default function CollectionsPage() {
   // Per-collection access (#606): each row's state, and the Access dialog.
   const [access, setAccess] = useState<Record<string, CollectionAccess | null>>({})
   const [accessTarget, setAccessTarget] = useState('')
-  const [draft, setDraft] = useState<CollectionAccess>({ restricted: false, users: [], service_principals: [] })
+  const [draft, setDraft] = useState<CollectionAccess>(CLOSED)
   const [people, setPeople] = useState<AdminUser[]>([])
   const [principals, setPrincipals] = useState<ServicePrincipal[]>([])
+  const [groups, setGroups] = useState<Group[]>([])
   const [accessError, setAccessError] = useState('')
   // The dialog's own read of the state: until it succeeds the choice is
   // unknown and Save stays disabled; once the Engineer changes something, a
@@ -43,7 +47,7 @@ export default function CollectionsPage() {
   // since) is ignored, so it can't become this dialog's draft (#788). The
   // opening's lists of people and service principals are numbered the same
   // way, so an earlier opening's late answer or error never reaches this one
-  // (#792).
+  // (#792), and so are its groups (#784).
   const [accessLoaded, setAccessLoaded] = useState(false)
   const touched = useRef(false)
   const accessRead = useRef(0)
@@ -66,10 +70,10 @@ export default function CollectionsPage() {
     setAccessTarget(name)
     setAccessLoaded(false)
     touched.current = false
-    setDraft({ restricted: false, users: [], service_principals: [] })
+    setDraft(CLOSED)
     api.getCollectionAccess(name).then(a => {
       if (ticket !== accessRead.current) return
-      if (!touched.current) setDraft({ ...a })
+      if (!touched.current) setDraft({ ...a, groups: a.groups ?? [] })
       setAccessLoaded(true)
     }).catch((e: unknown) => {
       if (ticket !== accessRead.current) return
@@ -89,6 +93,13 @@ export default function CollectionsPage() {
       if (ticket !== accessRead.current) return
       setAccessError(`Could not load the service principals: ${e instanceof Error ? e.message : String(e)}`)
     })
+    api.listGroups().then(r => {
+      if (ticket !== accessRead.current) return
+      setGroups(r.groups)
+    }).catch((e: unknown) => {
+      if (ticket !== accessRead.current) return
+      setAccessError(`Could not load the groups: ${e instanceof Error ? e.message : String(e)}`)
+    })
   }
 
   function closeAccess() {
@@ -97,14 +108,14 @@ export default function CollectionsPage() {
     setAccessError('')
   }
 
-  function toggle(list: 'users' | 'service_principals', name: string) {
+  function toggle(list: 'users' | 'service_principals' | 'groups', name: string) {
     touched.current = true
     setDraft(d => ({ ...d, [list]: d[list].includes(name) ? d[list].filter(n => n !== name) : [...d[list], name] }))
   }
 
   async function saveAccess() {
     if (!accessLoaded) return
-    const body = draft.restricted ? draft : { restricted: false, users: [], service_principals: [] }
+    const body = draft.restricted ? draft : CLOSED
     try {
       const saved = await api.setCollectionAccess(accessTarget, body)
       setAccess(prev => ({ ...prev, [accessTarget]: saved }))
@@ -255,7 +266,7 @@ export default function CollectionsPage() {
             </label>
             <label className="flex items-center gap-2 text-sm mb-3">
               <input type="radio" name="access-mode" checked={accessLoaded && draft.restricted} disabled={!accessLoaded} onChange={() => { touched.current = true; setDraft(d => ({ ...d, restricted: true })) }} />
-              Restricted: only the accounts ticked below (and AI Engineers)
+              Restricted: only the accounts and groups ticked below (and AI Engineers)
             </label>
             {accessLoaded && draft.restricted && (
               <div className="space-y-3 mb-4">
@@ -275,6 +286,16 @@ export default function CollectionsPage() {
                     <label key={p.name} className="flex items-center gap-2 text-sm">
                       <input type="checkbox" checked={draft.service_principals.includes(p.name)} onChange={() => toggle('service_principals', p.name)} />
                       {p.name}{p.enabled ? '' : ' (disabled)'}
+                    </label>
+                  ))}
+                </fieldset>
+                <fieldset>
+                  <legend className="text-xs text-gray-500 mb-1">Groups</legend>
+                  {groups.length === 0 && <p className="text-xs text-gray-400">None</p>}
+                  {groups.map(g => (
+                    <label key={g.name} className="flex items-center gap-2 text-sm">
+                      <input type="checkbox" checked={draft.groups.includes(g.name)} onChange={() => toggle('groups', g.name)} />
+                      {g.name} ({g.users.length + g.service_principals.length} {g.users.length + g.service_principals.length === 1 ? 'member' : 'members'})
                     </label>
                   ))}
                 </fieldset>

@@ -118,12 +118,15 @@ class StoreTests(AccessTestCase):
     def test_a_version_3_store_gains_the_tables_and_every_collection_stays_open(self):
         path = store.db_path()
         conn = sqlite3.connect(path)
-        conn.executescript("DROP TABLE collection_grants; DROP TABLE restricted_collections; PRAGMA user_version = 3;")
+        conn.executescript("DROP TABLE collection_grants; DROP TABLE restricted_collections; "
+                           "DROP TABLE collection_group_grants; DROP TABLE group_members; DROP TABLE groups; "
+                           "PRAGMA user_version = 3;")
         conn.close()
         store._ready.clear()
         self.assertTrue(store.has_access(store.get_user("user").id, "end_user", SECRET))
         version = sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0]
-        self.assertEqual(version, 4)
+        self.assertEqual(version, 5)
+        self.assertEqual(store.list_groups(), [])
         self.assertEqual(store.get_user("dev").role, "developer")       # rows kept
 
     def test_the_rule(self):
@@ -215,16 +218,18 @@ class AccessRouteTests(AccessTestCase):
 
     def test_read_and_set(self):
         answer = self.client.get(f"/collections/{SECRET.lower()}/access", headers=self.as_("eng"))
-        self.assertEqual(answer.json(), {"restricted": True, "users": ["dev"], "service_principals": ["svc"]})
+        self.assertEqual(answer.json(), {"restricted": True, "users": ["dev"], "service_principals": ["svc"],
+                                         "groups": []})
         self.assertEqual(self.client.get(f"/collections/{OPEN}/access", headers=self.as_("eng")).json(),
-                         {"restricted": False, "users": [], "service_principals": []})
+                         {"restricted": False, "users": [], "service_principals": [], "groups": []})
         self.refused(self.client.get("/collections/Nowhere/access", headers=self.as_("eng")))
         answer = self.put(SECRET, {"restricted": True, "users": ["DEV2", "user"], "service_principals": []})
-        self.assertEqual(answer.json(), {"restricted": True, "users": ["dev2", "user"], "service_principals": []})
+        self.assertEqual(answer.json(), {"restricted": True, "users": ["dev2", "user"], "service_principals": [],
+                                         "groups": []})
         item = self.records("collection.access")[-1]
         self.assertEqual((item["actor"], item["collection"], item["result"]), ("eng", SECRET, "success"))
-        self.assertEqual(item["details"]["added"], {"users": ["dev2", "user"], "service_principals": []})
-        self.assertEqual(item["details"]["removed"], {"users": ["dev"], "service_principals": ["svc"]})
+        self.assertEqual(item["details"]["added"], {"users": ["dev2", "user"], "service_principals": [], "groups": []})
+        self.assertEqual(item["details"]["removed"], {"users": ["dev"], "service_principals": ["svc"], "groups": []})
         self.assertEqual((item["details"]["restricted_before"], item["details"]["restricted_after"]), (True, True))
 
     def test_refused_changes_change_nothing(self):
@@ -984,6 +989,295 @@ class PrepareAreaTests(AccessTestCase):
                 item = [r for r in self.records(action) if r["actor"] == "dev2"][-1]
                 self.assertEqual((item["result"], item["collection"], item["details"].get("reason")),
                                  ("refused", SECRET, "collection_access"), item)
+
+
+class GroupTestCase(AccessTestCase):
+    """Groups for collection access (#784): AccessTestCase, plus a group
+    `team` holding `dev2` and the principal `svc2`, neither granted SECRET
+    directly."""
+
+    def setUp(self):
+        super().setUp()
+        store.create_group("team")
+        store.set_group_members("team", ["dev2"], ["svc2"])
+
+    def group_call(self, method, path, body=None, who="eng"):
+        return self.client.request(method, "/auth/groups" + path, json=body, headers=self.as_(who))
+
+    def error(self, answer):
+        return answer.status_code, answer.json()["error"]["code"]
+
+
+class GroupRuleTests(GroupTestCase):
+    def test_a_version_4_store_gains_the_group_tables_and_keeps_its_grants(self):
+        path = store.db_path()
+        conn = sqlite3.connect(path)
+        conn.executescript("DROP TABLE collection_group_grants; DROP TABLE group_members; DROP TABLE groups; "
+                           "PRAGMA user_version = 4;")
+        conn.close()
+        store._ready.clear()
+        self.assertEqual(store.collection_access(SECRET), store.CollectionAccess(True, ("dev",), ("svc",)))
+        self.assertEqual(sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0], 5)
+        self.assertEqual(store.list_groups(), [])
+        self.assertFalse(store.has_access(store.get_user("dev2").id, "developer", SECRET))
+
+    def test_a_member_reaches_a_collection_granted_to_the_group(self):
+        dev2 = store.get_user("dev2")
+        self.assertFalse(store.has_access(dev2.id, "developer", SECRET))
+        self.put(SECRET, {"restricted": True, "users": ["dev"], "groups": ["TEAM"]})
+        self.assertEqual(store.collection_access(SECRET), store.CollectionAccess(True, ("dev",), (), ("team",)))
+        self.assertTrue(store.has_access(dev2.id, "developer", SECRET))
+        self.assertTrue(store.has_access(store.get_user("dev").id, "developer", SECRET))     # direct grant
+        self.assertFalse(store.has_access(store.get_user("user").id, "end_user", SECRET))     # not a member
+        self.assertIn(SECRET, self.names("dev2"))
+        self.assertIn(SECRET, self.names("svc2"))                                            # a key, as its principal
+        self.assertNotIn(SECRET, self.names("user"))
+        answer = self.client.post("/query", json={"question": "What?", "collection": SECRET},
+                                  headers=self.as_("user"))
+        self.refused(answer)
+
+    def test_the_restricted_listing_counts_members(self):
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        ids = store.restricted_collections()[SECRET]
+        self.assertEqual(ids, frozenset({store.get_user("dev2").id, store.get_principal("svc2").id}))
+
+    def test_a_membership_or_grant_change_applies_to_the_next_request(self):
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        headers = self.as_("dev2")                                   # one session throughout
+        listed = lambda: [c["name"] for c in self.client.get("/collections", headers=headers).json()["collections"]]
+        self.assertIn(SECRET, listed())
+        store.set_group_members("team", [], ["svc2"])
+        self.assertNotIn(SECRET, listed())
+        store.set_group_members("team", ["dev2"], [])
+        self.assertIn(SECRET, listed())
+        self.put(SECRET, {"restricted": True, "users": ["dev"]})        # the group's grant removed
+        self.assertNotIn(SECRET, listed())
+
+    def test_deleting_the_group_keeps_the_collection_restricted(self):
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        self.assertEqual(store.delete_group("team"), [SECRET])
+        self.assertEqual(store.collection_access(SECRET), store.CollectionAccess(True, (), (), ()))
+        self.assertFalse(store.has_access(store.get_user("dev2").id, "developer", SECRET))
+        self.assertEqual(self.names("user"), [OPEN])
+        store.create_group("team")                                   # a new group of the same name gets nothing
+        self.assertEqual(store.collection_access(SECRET).groups, ())
+
+    def test_a_disabled_member_stays_and_a_demoted_engineer_is_bound(self):
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        store.set_enabled("dev2", False)
+        store.set_enabled("dev2", True)
+        self.assertEqual(store.get_group("team").users, ("dev2",))
+        self.assertTrue(store.has_access(store.get_user("dev2").id, "developer", SECRET))
+        store.create_user("boss", "engineer", passwords.generate_password(), must_change_password=False)
+        boss = store.get_user("boss")
+        self.assertTrue(store.has_access(boss.id, "engineer", SECRET))
+        store.set_role("boss", "developer")
+        self.assertFalse(store.has_access(boss.id, "developer", SECRET))
+        store.set_group_members("team", ["boss"], [])
+        self.assertTrue(store.has_access(boss.id, "developer", SECRET))
+
+    def test_a_rename_keeps_members_and_grants(self):
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        group = store.rename_group("team", "crew")
+        self.assertEqual((group.name, group.users, group.service_principals), ("crew", ("dev2",), ("svc2",)))
+        self.assertEqual(store.collection_access(SECRET).groups, ("crew",))
+        self.assertTrue(store.has_access(store.get_user("dev2").id, "developer", SECRET))
+        self.assertEqual(store.rename_group("crew", "crew").name, "crew")       # its own name: no change
+
+    def test_a_collection_delete_drops_its_group_grants(self):
+        async def delete(name):
+            self.collections.discard(name)
+            return 1
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        with patch.object(wc, "delete_collection_when_idle", delete):
+            self.assertEqual(self.client.delete(f"/collections/{SECRET}?confirm=true",
+                                                headers=self.as_("eng")).status_code, 200)
+        conn = sqlite3.connect(store.db_path())
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM collection_group_grants WHERE collection = ?",
+                                      (SECRET,)).fetchone()[0], 0)
+        conn.close()
+        self.assertEqual(store.collection_access(SECRET), store.CollectionAccess(False))
+        self.assertEqual(store.get_group("team").users, ("dev2",))              # the group itself stays
+
+    def test_opening_drops_the_group_grants(self):
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        self.put(SECRET, {"restricted": False})
+        self.put(SECRET, {"restricted": True})
+        self.assertEqual(store.collection_access(SECRET).groups, ())
+
+    def test_a_job_owner_reaches_through_a_group(self):
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        self.assertTrue(store.owner_has_access({"name": "dev2", "kind": "user"}, SECRET))
+        self.assertTrue(store.owner_has_access({"name": "svc2", "kind": "service"}, SECRET))
+        self.assertFalse(store.owner_has_access({"name": "user", "kind": "user"}, SECRET))
+        self.assertFalse(importer._refused({"name": "dev2", "kind": "user"}, SECRET))
+        self.assertTrue(importer._refused({"name": "user", "kind": "user"}, SECRET))
+
+
+class GroupAccessRouteTests(GroupTestCase):
+    def test_read_and_set_with_groups(self):
+        answer = self.put(SECRET, {"restricted": True, "users": ["dev"], "groups": ["team"]})
+        self.assertEqual(answer.json(), {"restricted": True, "users": ["dev"], "service_principals": [],
+                                         "groups": ["team"]})
+        self.assertEqual(self.client.get(f"/collections/{SECRET}/access", headers=self.as_("eng")).json(),
+                         answer.json())
+        item = self.records("collection.access")[-1]
+        self.assertEqual(item["details"]["added"], {"users": [], "service_principals": [], "groups": ["team"]})
+        self.assertEqual(item["details"]["removed"], {"users": [], "service_principals": ["svc"], "groups": []})
+        self.put(SECRET, {"restricted": True, "users": ["dev"]})            # a v1.3.0 body: no group
+        item = self.records("collection.access")[-1]
+        self.assertEqual(item["details"]["removed"], {"users": [], "service_principals": [], "groups": ["team"]})
+        self.assertEqual(store.collection_access(SECRET).groups, ())
+
+    def test_an_unknown_group_or_groups_on_an_open_collection_change_nothing(self):
+        before = store.collection_access(SECRET)
+        for body in ({"restricted": True, "groups": ["nobody"]}, {"restricted": True, "groups": ["dev"]},
+                     {"restricted": False, "groups": ["team"]}, {"restricted": True, "groups": ["x" * 65]}):
+            with self.subTest(body=body):
+                self.assertEqual(self.error(self.put(SECRET, body)), (422, "INVALID_PARAMETER"))
+        self.assertEqual(store.collection_access(SECRET), before)
+
+
+class GroupRouteTests(GroupTestCase):
+    def test_engineers_in_a_session_only(self):
+        store.create_principal("boss", "engineer")
+        key = store.issue_key("boss")[1]
+        for method, path, body in (("GET", "", None), ("POST", "", {"name": "new"}),
+                                   ("POST", "/team/rename", {"name": "crew"}),
+                                   ("PUT", "/team/members", {"users": []}), ("POST", "/team/delete", None)):
+            with self.subTest(route=f"{method} {path}"):
+                self.assertEqual(self.error(self.group_call(method, path, body, who="dev")), (403, "FORBIDDEN"))
+                answer = self.client.request(method, "/auth/groups" + path, json=body,
+                                             headers={"Authorization": "Bearer " + key})
+                self.assertEqual(self.error(answer), (403, "KEY_NOT_ALLOWED"))
+        self.assertEqual(store.get_group("team").users, ("dev2",))
+
+    def test_create_list_rename_members_delete(self):
+        answer = self.group_call("POST", "", {"name": "Legal.Team"})
+        self.assertEqual(answer.status_code, 201, answer.text)
+        self.assertEqual({k: v for k, v in answer.json()["group"].items() if k != "created_at"},
+                         {"name": "legal.team", "users": [], "service_principals": []})
+        self.assertRegex(answer.json()["group"]["created_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        listed = self.group_call("GET", "").json()["groups"]
+        self.assertEqual([g["name"] for g in listed], ["legal.team", "team"])
+        self.assertEqual((listed[1]["users"], listed[1]["service_principals"]), (["dev2"], ["svc2"]))
+        answer = self.group_call("PUT", "/legal.team/members", {"users": ["DEV", "user"], "service_principals": ["svc"]})
+        self.assertEqual((answer.json()["group"]["users"], answer.json()["group"]["service_principals"]),
+                         (["dev", "user"], ["svc"]))
+        answer = self.group_call("PUT", "/legal.team/members", {"users": ["dev"]})
+        self.assertEqual((answer.json()["group"]["users"], answer.json()["group"]["service_principals"]),
+                         (["dev"], []))
+        answer = self.group_call("POST", "/legal.team/rename", {"name": "Legal"})
+        self.assertEqual(answer.json()["group"]["name"], "legal")
+        self.put(SECRET, {"restricted": True, "groups": ["legal", "team"]})
+        self.put(OPEN, {"restricted": True, "groups": ["legal"]})
+        answer = self.group_call("POST", "/legal/delete")
+        self.assertEqual(answer.json(), {"name": "legal", "collections": [OPEN, SECRET]})
+        self.assertEqual(store.collection_access(SECRET).groups, ("team",))
+        self.assertEqual(store.collection_access(OPEN), store.CollectionAccess(True, (), (), ()))
+        self.assertEqual([g["name"] for g in self.group_call("GET", "").json()["groups"]], ["team"])
+
+    def test_refusals(self):
+        cases = [
+            ("POST", "", {"name": "x"}, (422, "INVALID_GROUP_NAME")),
+            ("POST", "", {"name": "a" * 300}, (422, "INVALID_GROUP_NAME")),
+            ("POST", "", {"name": "TEAM"}, (409, "GROUP_EXISTS")),
+            ("POST", "", {}, (422, "INVALID_PARAMETER")),
+            ("POST", "/nobody/rename", {"name": "crew"}, (404, "GROUP_NOT_FOUND")),
+            ("POST", "/no%20such/rename", {"name": "crew"}, (404, "GROUP_NOT_FOUND")),
+            ("POST", "/team/rename", {"name": "!!"}, (422, "INVALID_GROUP_NAME")),
+            ("PUT", "/nobody/members", {"users": []}, (404, "GROUP_NOT_FOUND")),
+            ("PUT", "/team/members", {"users": ["nobody"]}, (422, "INVALID_PARAMETER")),
+            ("PUT", "/team/members", {"users": ["svc"]}, (422, "INVALID_PARAMETER")),
+            ("PUT", "/team/members", {"service_principals": ["dev"]}, (422, "INVALID_PARAMETER")),
+            ("PUT", "/team/members", {"groups": ["team"]}, (422, "INVALID_PARAMETER")),
+            ("POST", "/nobody/delete", None, (404, "GROUP_NOT_FOUND")),
+        ]
+        store.create_group("crew")
+        cases.append(("POST", "/team/rename", {"name": "crew"}, (409, "GROUP_EXISTS")))
+        for method, path, body, expected in cases:
+            with self.subTest(route=f"{method} {path}", body=body):
+                self.assertEqual(self.error(self.group_call(method, path, body)), expected)
+        group = store.get_group("team")
+        self.assertEqual((group.name, group.users, group.service_principals), ("team", ("dev2",), ("svc2",)))
+
+    def test_the_audit_records(self):
+        self.group_call("POST", "", {"name": "crew"})
+        self.group_call("PUT", "/crew/members", {"users": ["dev", "user"], "service_principals": ["svc"]})
+        self.group_call("PUT", "/crew/members", {"users": ["dev2"]})
+        self.group_call("POST", "/crew/rename", {"name": "squad"})
+        self.put(SECRET, {"restricted": True, "groups": ["squad"]})
+        self.group_call("POST", "/squad/delete")
+        self.group_call("POST", "", {"name": "team"})                      # refused: exists
+        records = [r for r in self.records() if r["action"].startswith("admin.group.")]
+        self.assertEqual([(r["action"], r["target"], r["result"]) for r in records], [
+            ("admin.group.create", "crew", "success"), ("admin.group.members", "crew", "success"),
+            ("admin.group.members", "crew", "success"), ("admin.group.rename", "crew", "success"),
+            ("admin.group.delete", "squad", "success"), ("admin.group.create", "team", "refused")])
+        self.assertEqual(records[1]["details"]["added"], {"users": ["dev", "user"], "service_principals": ["svc"]})
+        self.assertEqual(records[2]["details"]["added"], {"users": ["dev2"], "service_principals": []})
+        self.assertEqual(records[2]["details"]["removed"], {"users": ["dev", "user"], "service_principals": ["svc"]})
+        self.assertEqual(records[3]["details"]["name"], "squad")
+        self.assertEqual(records[4]["details"]["collections"], [SECRET])
+        self.assertEqual(records[5]["details"]["code"], "GROUP_EXISTS")
+        self.assertEqual(self.records("admin.group.list"), [])
+        self.assertIn("admin.group.delete", audit.ALL_ACTIONS)
+
+
+class GroupCopyTests(GroupTestCase):
+    """Copies and imports carry group grants under the same rules as account
+    grants (#788, #792)."""
+
+    def test_a_copy_takes_the_group_grants(self):
+        self.put(SECRET, {"restricted": True, "users": ["dev"], "groups": ["team"]})
+        store.copy_collection_access(SECRET, "Secret_ab12cd34")
+        self.assertEqual(store.collection_access("Secret_ab12cd34"),
+                         store.CollectionAccess(True, ("dev",), (), ("team",)))
+        importer._start_access({"name": "dev", "kind": "user"}, SECRET, "Secret_cd34ef56")
+        self.assertEqual(store.collection_access("Secret_cd34ef56").groups, ("team",))
+        store.set_group_members("team", [], [])                    # a membership change reaches the copy
+        self.assertFalse(store.has_access(store.get_user("dev2").id, "developer", "Secret_ab12cd34"))
+
+    def test_narrowing_intersects_accounts_and_groups_on_their_own(self):
+        store.create_group("crew")
+        store.set_group_members("crew", ["dev2"], [])
+        self.put(SECRET, {"restricted": True, "users": ["dev", "dev2"], "groups": ["team", "crew"]})
+        self.put(STAGING, {"restricted": True, "users": ["dev"], "groups": ["team"]})
+        store.copy_collection_access(STAGING, NESTED, access.scope(STAGING)[1:])
+        self.assertEqual(store.collection_access(NESTED), store.CollectionAccess(True, ("dev",), (), ("team",)))
+        # dev2 is granted directly in SECRET but only through a group in STAGING: never wider, so no own grant.
+        self.put(STAGING, {"restricted": True, "groups": ["crew"]})
+        store.copy_collection_access(STAGING, NESTED, access.scope(STAGING)[1:])
+        self.assertEqual(store.collection_access(NESTED), store.CollectionAccess(True, (), (), ("crew",)))
+
+    def test_a_copy_needs_the_group_grant_of_every_collection_in_its_chain(self):
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        self.assertTrue(access.allowed(store.authenticate_key(self.key2), STAGING) is False)   # the copy's own state
+        self.put(STAGING, {"restricted": True, "groups": ["team"]})
+        self.assertTrue(access.allowed(store.authenticate_key(self.key2), STAGING))
+        self.put(SECRET, {"restricted": True})                     # narrowing the target reaches the copy
+        self.assertFalse(access.allowed(store.authenticate_key(self.key2), STAGING))
+        self.assertNotIn(STAGING, self.names("svc2"))
+
+    def test_put_back_restores_group_grants_and_leaves_out_a_deleted_group(self):
+        self.put(SECRET, {"restricted": True, "users": ["dev"], "groups": ["team"]})
+        previous, written = store.restrict_to(SECRET, store.get_user("dev2").id)
+        self.assertEqual(written, store.CollectionAccess(True, ("dev2",), (), ()))
+        self.assertTrue(store.put_back(SECRET, written, previous))
+        self.assertEqual(store.collection_access(SECRET), previous)
+        previous, written = store.restrict_to(SECRET, None)
+        store.delete_group("team")
+        self.assertTrue(store.put_back(SECRET, written, previous))
+        self.assertEqual(store.collection_access(SECRET), store.CollectionAccess(True, ("dev",), (), ()))
+        store.create_group("crew")
+        self.put(SECRET, {"restricted": True, "groups": ["crew"]})
+        self.assertFalse(store.put_back(SECRET, written, previous))          # not the state it wrote: kept
+        self.assertEqual(store.collection_access(SECRET).groups, ("crew",))
+
+    def test_a_new_collection_starts_with_no_group(self):
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        store.restrict_to("Brandnew", store.get_user("dev2").id)
+        self.assertEqual(store.collection_access("Brandnew"), store.CollectionAccess(True, ("dev2",), (), ()))
 
 
 if __name__ == "__main__":
