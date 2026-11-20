@@ -814,10 +814,11 @@ async def delete_group(name: str, request: Request):
     if target is None:
         return _group_not_found(actor, "delete", _shown(name))
     try:
-        collections = await asyncio.to_thread(store.delete_group, target)
+        collections, group = await asyncio.to_thread(store.delete_group, target)
     except store.Refused as exc:
         return _group_refused(actor, "delete", target, exc)
-    audit.note(collections=collections)
+    audit.note(collections=collections,
+               removed={"users": list(group.users), "service_principals": list(group.service_principals)})
     _log.warning("Admin %r deleted group %r; its grants on %d collections were removed", actor, target,
                  len(collections))
     return {"name": target, "collections": collections}
