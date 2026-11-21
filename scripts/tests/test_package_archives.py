@@ -72,6 +72,9 @@ class PackageArchiveTests(unittest.TestCase):
         for name in ('entrypoint.sh', 'models.sh', 'compose-models.sh'):
             write(self.repo / 'ollama' / name, (ROOT / 'ollama' / name).read_text())
         write(self.repo / 'install-offline.sh', '#!/usr/bin/env bash\necho install\n', 0o755)
+        # package-offline.sh tags and saves the age image of the backup scripts (#852).
+        for name in ('scripts/backup-common.sh', 'scripts/age/Dockerfile'):
+            write(self.repo / name, (ROOT / name).read_text())
         write(self.repo / 'README.md', COMMITTED_README)
         write(self.repo / 'ingest-inbox' / '.gitkeep', '')
         write(self.repo / 'exports' / '.gitkeep', '')

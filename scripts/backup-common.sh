@@ -9,7 +9,9 @@
 # ollama_models, which holds only downloadable models.
 RB_VOLUMES="weaviate_data ingest_uploads rag_sources rag_preparation auth_data lan_certs"
 RB_NAME=$(basename "$0")
-RB_ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
+# The checkout, found from this file's own path, so another script can source
+# it (package-offline.sh does, for rb_image).
+RB_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 RB_YES=no
 RB_PREFIX=
 
@@ -22,12 +24,17 @@ rb_need_docker() {
   command -v docker >/dev/null 2>&1 || rb_die "docker is not on PATH"
 }
 
-# Sets RB_IMAGE, building the image if this machine doesn't have it.
+# Sets RB_IMAGE, building the image if this machine doesn't have it. The tag
+# holds both pins of scripts/age/Dockerfile, the age package version and the
+# first 12 hex digits of the alpine digest, so a change of either builds a new
+# image instead of reusing the old one.
 rb_image() {
-  local version
+  local version digest
   version=$(sed -n 's/^RUN apk add --no-cache age=\([0-9A-Za-z._-]*\)$/\1/p' "$RB_ROOT/scripts/age/Dockerfile")
   [ -n "$version" ] || rb_die "scripts/age/Dockerfile names no age version"
-  RB_IMAGE="rag-docker-age:$version"
+  digest=$(sed -n 's/^FROM [^@ ]*@sha256:\([0-9a-f]\{12\}\)[0-9a-f]\{52\}$/\1/p' "$RB_ROOT/scripts/age/Dockerfile")
+  [ -n "$digest" ] || rb_die "scripts/age/Dockerfile names no alpine digest"
+  RB_IMAGE="rag-docker-age:$version-$digest"
   if ! docker image inspect "$RB_IMAGE" >/dev/null 2>&1; then
     echo "Building the age image $RB_IMAGE from scripts/age (once; this needs the network)..."
     docker build -q -t "$RB_IMAGE" "$RB_ROOT/scripts/age" >/dev/null ||
@@ -37,6 +44,14 @@ rb_image() {
 
 rb_run() {
   docker run --rm --network none --log-driver none "$@"
+}
+
+# Prints what age or Docker said ($1, captured stderr) to stderr, indented. A
+# line holding a secret key is never printed (age doesn't print one; this is a
+# second guard).
+rb_show_error() {
+  printf '%s\n' "$1" | grep -v -e 'AGE-SECRET-KEY-' -e '^[[:space:]]*$' | sed 's/^/  /' >&2
+  return 0
 }
 
 # Sets RB_PREFIX: --prefix, else COMPOSE_PROJECT_NAME, else the checkout

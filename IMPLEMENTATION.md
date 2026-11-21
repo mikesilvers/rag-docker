@@ -29498,7 +29498,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
 | `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530); the nginx tag in SPECIFICATIONS.md's compose copy and 11.3 image list matches docker-compose.yml (#665), registered by infrastructure |
 | `../tests/test_upgrade_backup.py` | host-only: the README's 1.1.0 → 1.2.0 upgrade blocks, run as written under bash, `zsh -c` and interactive zsh with comments off, against stub `docker`, `git` and `curl`; the stub docker accepts only mounts inside its temp directory and only the README's two container commands: no block holds a `#` comment line; the backup skips a missing volume (a wrong prefix) and counts only existing volumes' archives, and writes each copy to a `.tmp` file that replaces the archive only once `gzip -t` passes, so a failed or corrupt copy prints `backup FAILED` and keeps an earlier archive; the rollback is gated on `git checkout v1.1.0` and checks every archive (`gzip -t`, `tar tzf`) and volume before it empties any, and a failed restore stops before `compose up`; alpine is pinned by version and digest; git ignores `backups/` (#679, #693), registered by infrastructure |
-| `../tests/test_backup_scripts.py` | runs from the host, standard library plus the docker CLI: `scripts/backup.sh` and `scripts/restore.sh` (#848) on throwaway volumes of a random project of their own (`rd848t<hex>`, with compose's labels, removed afterwards), run from a scratch git checkout with their own `HOME`: a backup then a restore gives back every file, folder, link, mode and owner; every volume gets its own key, and no two keys match over two runs; the backup folder (0700) holds only `.tgz.age` archives and `.key` files (0600), with no unencrypted archive and no key in the output; a missing volume is skipped and a running container of the project is stopped, not removed; a wrong key, a missing key file and a damaged or cut archive change nothing and stop nothing; the prefix and location refusals; the age image pins (the README's alpine, an exact `age` package) and `*.key` in `.gitignore`. Skipped, with a message, only when the docker CLI is missing; it builds the age image (`scripts/age`) if this machine doesn't have it, which needs the network. Registered by infrastructure |
+| `../tests/test_backup_scripts.py` | runs from the host, standard library plus the docker CLI: `scripts/backup.sh` and `scripts/restore.sh` (#848) on throwaway volumes of a random project of their own (`rd848t<hex>`, with compose's labels, removed afterwards), run from a scratch git checkout with their own `HOME`: a backup then a restore gives back every file, folder, link, mode and owner; every volume gets its own key, and no two keys match over two runs; the backup folder (0700) holds only `.tgz.age` archives and `.key` files (0600), with no unencrypted archive and no key in the output; a missing volume is skipped and a running container of the project is stopped, not removed; a wrong key, a missing key file and a damaged or cut archive change nothing and stop nothing, and a wrong key or a Docker error in the check shows what age or Docker said; an extraction that fails after the check (a damaged copy fed by a docker wrapper) leaves the volume unchanged, its root's mode and owner included; a Docker error in the key step is shown, with no line holding a secret key; the prefix and location refusals, and the checkout named in another case refused where the filesystem ignores case; the age image pins (the README's alpine, an exact `age` package), its tag following both pins (a stub docker, #852), and `*.key` in `.gitignore`. Skipped, with a message, only when the docker CLI is missing; it builds the age image (`scripts/age`) if this machine doesn't have it, which needs the network. Registered by infrastructure |
 | `../tests/test_version_agreement.py` | host-only: the first-party version strings agree with each other, not with a fixed version: `ui/package.json`, the root versions in `ui/package-lock.json`, `mcp/mcpapp.py`, the two `service.version` defaults in `api/services/telemetry.py` and `RAG_OTEL_SERVICE_VERSION` in `docker-compose.telemetry.yml` and `docker-compose.telemetry.verify.yml` (#605, #656), registered by infrastructure |
 | `../tests/test_ui_dependencies.py` | host-only: the copy of `ui/package.json` embedded in `IMPLEMENTATION.md` (`### ui/package.json`) is the file, exactly, so a UI dependency bump that misses the copy fails (#532), registered by infrastructure |
 | `../tests/test_tailwind_output.py` | runs from the host, standard library plus the docker CLI: the built UI CSS keeps what the Tailwind 4 migration relies on (RD-157, #773): the `prose` and `prose-sm` rules, `relative`, `hover` on every device with no `@media (hover: hover)`, and the `@source` globs with automatic detection off (a sentinel `.jsx` file under `ui/src/` is scanned, a sentinel `.md` file is not). It builds a scratch copy of `ui/` with `npm ci --ignore-scripts` from the lock file and `vite build` in a throwaway container of the image `ui/Dockerfile` builds with (its `builder` stage), not on the host (#826), so it needs the network unless the image and the npm cache are present, and is skipped, with a message, only when the docker CLI is missing (a docker or build failure fails it); a second class reads `ui/src/index.css`, `NavBar.tsx` and `ui/Dockerfile` directly, and checks that the builder image is an image reference with a tag or a digest (a `--platform` flag, a digest pin and a registry with a port are accepted; a token starting with `-` is refused before it reaches `docker run`); a third checks, with a stub in place of docker, that a build step that times out has its named container removed (#841). Registered by infrastructure |
@@ -29507,7 +29507,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_package_refusals.py` | controlled import checks 1 and 2, collection-name and `chunks.jsonl` record refusals, registered by suite 15 |
 | `../tests/test_transfer_paths.py` | controlled transfer and tuning route regressions through the app, registered by suite 15 |
 | `../tests/test_retrieve_script.py` | controlled `retrieve.py` defaults, flags and exit codes against a stub API, registered by suite 15 |
-| `../tests/test_distribution.py` | `package.sh`, `package-offline.sh` and `install-offline.sh` with stubbed `docker`, and the image list, on the host, registered by suite 15 |
+| `../tests/test_distribution.py` | `package.sh`, `package-offline.sh` and `install-offline.sh` with stubbed `docker`, and the image list, on the host, registered by suite 15; the offline bundle also saves the backup scripts' age image, built from the bundle's own `scripts/age` when missing, and a failed build saves nothing (#852) |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types, the Import page's corpus preparation rules download (#615), the page controls of #400 (see "UI control browser checks") and, last, the login page against nginx's real login rate limit (#577) |
 | `14_reindex.sh` | exact-record reindex: a host check that the embedded sources match the real files (`../tests/test_reindex_preservation.py`), 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
 | `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures, canonical local session IDs and exact successful-creation ownership. Verifier collection names deliberately lie outside the parent prefix-sweep namespace. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves a durable exact-name fixture receipt/directory before standalone exit; inspection must confirm terminal writer state before exact-name cleanup |
@@ -53488,7 +53488,8 @@ echo "No internet on the target? Use: bash package-offline.sh"
 ### package-offline.sh
 
 Self-contained bundle (~4.6 GB) for an air-gapped target: source plus
-`docker save` of all five images plus the Ollama model weights.
+`docker save` of all five images and the backup scripts' age image (#852) plus
+the Ollama model weights.
 
 ```bash
 #!/usr/bin/env bash
@@ -53503,7 +53504,9 @@ Self-contained bundle (~4.6 GB) for an air-gapped target: source plus
 #   * the source tree: the files git tracks in the current commit (HEAD),
 #     built with `git archive`, exactly as package.sh does. Untracked and
 #     ignored files and uncommitted changes are left out (#384).
-#   * all five Docker images, pre-built (docker save)
+#   * all five Docker images, pre-built (docker save), and the age image that
+#     scripts/backup.sh and scripts/restore.sh run in (#852), so backups work
+#     on the target with no network
 #   * the Ollama model weights (by default llama3.1:8b + nomic-embed-text; a
 #     different build or answer LLM too, #671), the whole model volume: a model
 #     left in it, such as phi3.5 from before 1.2.1, is carried too
@@ -53599,8 +53602,15 @@ echo "==> Copying source (tracked files of the current commit)"
 # root and the user cannot drop files into ./ingest-inbox.
 git archive --format=tar HEAD | ( cd "$STAGE/rag-docker" && tar xf - )
 
+# The age image, tagged from the bundle's own scripts/age/Dockerfile (the copy
+# just archived), so the backup scripts on the target find it and never build.
+# It is built here if this machine doesn't have it (this needs the network).
+echo "==> Checking the age image for scripts/backup.sh and scripts/restore.sh"
+. "$STAGE/rag-docker/scripts/backup-common.sh"
+rb_image
+
 echo "==> Saving images (this is the slow part)"
-docker save "${IMAGES[@]}" | gzip > "$STAGE/rag-docker/offline/images.tar.gz"
+docker save "${IMAGES[@]}" "$RB_IMAGE" | gzip > "$STAGE/rag-docker/offline/images.tar.gz"
 
 if [ "$TELEMETRY" = 1 ]; then
   echo "==> Saving optional pinned collector (Python 3.11+ required)"
@@ -53788,6 +53798,9 @@ class PackageArchiveTests(unittest.TestCase):
         for name in ('entrypoint.sh', 'models.sh', 'compose-models.sh'):
             write(self.repo / 'ollama' / name, (ROOT / 'ollama' / name).read_text())
         write(self.repo / 'install-offline.sh', '#!/usr/bin/env bash\necho install\n', 0o755)
+        # package-offline.sh tags and saves the age image of the backup scripts (#852).
+        for name in ('scripts/backup-common.sh', 'scripts/age/Dockerfile'):
+            write(self.repo / name, (ROOT / name).read_text())
         write(self.repo / 'README.md', COMMITTED_README)
         write(self.repo / 'ingest-inbox' / '.gitkeep', '')
         write(self.repo / 'exports' / '.gitkeep', '')
@@ -67206,6 +67219,9 @@ class Packager(unittest.TestCase):
                 # resolved from the compose settings by models.sh and compose-models.sh (#671).
                 (root/'ollama').mkdir()
                 for name in ('entrypoint.sh','models.sh','compose-models.sh'):shutil.copy(ROOT/'ollama'/name,root/'ollama'/name)
+                # It also tags and saves the backup scripts' age image (#852).
+                (root/'scripts/age').mkdir()
+                for name in ('backup-common.sh','age/Dockerfile'):shutil.copy(ROOT/'scripts'/name,root/'scripts'/name)
                 (root/'scripts/collector_offline.py').write_text("from pathlib import Path\nimport sys\nPath(sys.argv[2],'collector.tar').touch()\n")
                 stub=root/'bin/docker'
                 stub.write_text("""#!/usr/bin/env python3
@@ -67658,7 +67674,9 @@ volumes:
 #   * the source tree: the files git tracks in the current commit (HEAD),
 #     built with `git archive`, exactly as package.sh does. Untracked and
 #     ignored files and uncommitted changes are left out (#384).
-#   * all five Docker images, pre-built (docker save)
+#   * all five Docker images, pre-built (docker save), and the age image that
+#     scripts/backup.sh and scripts/restore.sh run in (#852), so backups work
+#     on the target with no network
 #   * the Ollama model weights (by default llama3.1:8b + nomic-embed-text; a
 #     different build or answer LLM too, #671), the whole model volume: a model
 #     left in it, such as phi3.5 from before 1.2.1, is carried too
@@ -67754,8 +67772,15 @@ echo "==> Copying source (tracked files of the current commit)"
 # root and the user cannot drop files into ./ingest-inbox.
 git archive --format=tar HEAD | ( cd "$STAGE/rag-docker" && tar xf - )
 
+# The age image, tagged from the bundle's own scripts/age/Dockerfile (the copy
+# just archived), so the backup scripts on the target find it and never build.
+# It is built here if this machine doesn't have it (this needs the network).
+echo "==> Checking the age image for scripts/backup.sh and scripts/restore.sh"
+. "$STAGE/rag-docker/scripts/backup-common.sh"
+rb_image
+
 echo "==> Saving images (this is the slow part)"
-docker save "${IMAGES[@]}" | gzip > "$STAGE/rag-docker/offline/images.tar.gz"
+docker save "${IMAGES[@]}" "$RB_IMAGE" | gzip > "$STAGE/rag-docker/offline/images.tar.gz"
 
 if [ "$TELEMETRY" = 1 ]; then
   echo "==> Saving optional pinned collector (Python 3.11+ required)"

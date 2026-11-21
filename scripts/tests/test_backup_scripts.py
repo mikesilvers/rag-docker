@@ -39,12 +39,14 @@ PIN = re.compile(r'\balpine:(\d+\.\d+\.\d+)@sha256:[0-9a-f]{64}(?![0-9a-f])')
 SECRET = 'AGE-SECRET-KEY-'
 NOTHING = 'Nothing was stopped, emptied or restored.'
 DOCKER = shutil.which('docker')
-# A listing of a volume: every entry's path, mode, owner, size and type, link
-# targets and file digests, made in a container so the host's tools don't matter.
-LISTING = ('cd /data && find . -mindepth 1 | sort | while read -r f; do '
+# A listing of a volume: the root's mode and owner, every entry's path, mode,
+# owner, size and type, link targets and file digests, made in a container so
+# the host's tools don't matter.
+LISTING = ('stat -c "root %a %u %g" /data; cd /data && find . -mindepth 1 | sort | while read -r f; do '
            'stat -c "%n %a %u %g %s %F" "$f"; [ -L "$f" ] && echo "-> $(readlink "$f")"; done; '
            'find . -type f | sort | xargs -r sha256sum')
-FILL = ('mkdir -p /data/docs/sub /data/empty && echo "note of $1" > /data/docs/sub/note.txt && '
+FILL = ('chmod 750 /data && chown 4321:4321 /data && '
+        'mkdir -p /data/docs/sub /data/empty && echo "note of $1" > /data/docs/sub/note.txt && '
         'echo "hidden of $1" > /data/.hidden && chmod 640 /data/.hidden && chown 1234:1234 /data/.hidden && '
         'head -c 200000 /dev/urandom > /data/docs/random.bin && ln -s docs/sub/note.txt /data/link')
 
@@ -58,9 +60,23 @@ def dockerfile():
     return (ROOT / 'scripts/age/Dockerfile').read_text()
 
 
-def age_image():
-    version = re.search(r'^RUN apk add --no-cache age=(\S+)$', dockerfile(), re.M).group(1)
-    return 'rag-docker-age:' + version
+def age_image(text=None):
+    """The tag rb_image gives the age image: the age version and the alpine digest's first 12 hex digits."""
+    text = dockerfile() if text is None else text
+    version = re.search(r'^RUN apk add --no-cache age=(\S+)$', text, re.M).group(1)
+    digest = re.search(r'^FROM \S+@sha256:([0-9a-f]{64})$', text, re.M).group(1)
+    return 'rag-docker-age:' + version + '-' + digest[:12]
+
+
+# A docker for StaticTests: logs each call; no image exists; a build succeeds.
+STUB_DOCKER = """#!/bin/bash
+printf '%s\\n' "$*" >> "$STUB_LOG"
+case "$1 $2" in
+  "image inspect") exit 1 ;;
+esac
+[ "$1" = build ] && exit 0
+exit 99
+"""
 
 
 class StaticTests(unittest.TestCase):
@@ -73,6 +89,44 @@ class StaticTests(unittest.TestCase):
 
     def test_age_is_pinned_to_an_exact_package_version(self):
         self.assertRegex(dockerfile(), r'(?m)^RUN apk add --no-cache age=\d+\.\d+\.\d+-r\d+$')
+
+    def test_the_tag_follows_both_pins(self):
+        # A new alpine digest with the same age version gives a new tag, so the
+        # image is built again rather than reused (#852).
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder).resolve()
+            (folder / 'scripts' / 'age').mkdir(parents=True)
+            shutil.copy2(str(ROOT / 'scripts/backup-common.sh'), str(folder / 'scripts'))
+            stub = folder / 'bin' / 'docker'
+            stub.parent.mkdir()
+            stub.write_text(STUB_DOCKER)
+            stub.chmod(0o755)
+            log = folder / 'docker.log'
+            env = dict(os.environ, PATH=str(stub.parent) + os.pathsep + os.environ['PATH'], STUB_LOG=str(log))
+            today = dockerfile()
+            other = re.sub(r'@sha256:[0-9a-f]{64}', '@sha256:' + 'ab12' * 16, today)
+            self.assertNotEqual(other, today)
+            tags = []
+            for text in (today, other):
+                (folder / 'scripts/age/Dockerfile').write_text(text)
+                log.write_text('')
+                run = subprocess.run(['bash', '-c', '. scripts/backup-common.sh; rb_image; echo "tag=$RB_IMAGE"'],
+                                     cwd=str(folder), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     universal_newlines=True)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                tag = re.search(r'^tag=(\S+)$', run.stdout, re.M).group(1)
+                self.assertEqual(tag, age_image(text))
+                self.assertIn('build -q -t {} {}/scripts/age'.format(tag, folder), log.read_text().splitlines())
+                tags.append(tag)
+            self.assertEqual(tags[0], age_image())
+            self.assertNotEqual(tags[0], tags[1])
+            (folder / 'scripts/age/Dockerfile').write_text(re.sub(r'@sha256:[0-9a-f]{64}', '', today))
+            log.write_text('')
+            run = subprocess.run(['bash', '-c', '. scripts/backup-common.sh; rb_image'], cwd=str(folder), env=env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+            self.assertEqual(run.returncode, 1)
+            self.assertIn('scripts/age/Dockerfile names no alpine digest', run.stderr)
+            self.assertNotIn('build', log.read_text())
 
     def test_gitignore_lists_key_files(self):
         self.assertIn('*.key', (ROOT / '.gitignore').read_text().splitlines())
@@ -167,6 +221,16 @@ class ScriptTests(unittest.TestCase):
         self.outputs.append(result.stdout + result.stderr)
         self.assertNotIn(SECRET, result.stdout + result.stderr, 'a script printed a secret key')
         return result
+
+    def wrapped(self, body):
+        """The environment for a script whose docker is a wrapper: body (bash) runs
+        first, with the arguments in "$@", then the real docker CLI takes the call."""
+        folder = self.tmp / 'wrapper'
+        folder.mkdir()
+        wrapper = folder / 'docker'
+        wrapper.write_text('#!/bin/bash\n' + body + '\nexec "$REAL_DOCKER" "$@"\n')
+        wrapper.chmod(0o755)
+        return {'PATH': str(folder) + os.pathsep + os.environ['PATH'], 'REAL_DOCKER': DOCKER}
 
     def backup(self, *args):
         result = self.script('backup.sh', '--prefix', self.prefix, '--yes', *args)
@@ -276,7 +340,63 @@ class ScriptTests(unittest.TestCase):
         }
         for case, paths in cases.items():
             with self.subTest(case=case):
-                self.assert_refused_untouched(self.restore(*paths), 'weaviate_data', before, container)
+                result = self.restore(*paths)
+                self.assert_refused_untouched(result, 'weaviate_data', before, container)
+                if case == 'wrong key':
+                    # What age said is shown, not hidden (#852).
+                    self.assertIn('failed its check with', result.stderr)
+                    self.assertIn('no identity matched any of the recipients', result.stderr)
+
+    def test_a_docker_error_in_the_restore_check_is_shown(self):
+        self.create_volume('weaviate_data')
+        _, run = self.backup()
+        container = self.start_container()
+        before = self.listing('weaviate_data')
+        env = self.wrapped('case "$*" in *age.key*tzf*) echo "wrapper: mount refused" >&2; exit 125 ;; esac')
+        result = self.script('restore.sh', '--prefix', self.prefix, '--yes',
+                             *self.pairs(run, ('weaviate_data',)), env=env)
+        self.assert_refused_untouched(result, 'weaviate_data', before, container)
+        self.assertIn('a wrong key, a damaged or incomplete archive, or a Docker error.', result.stderr)
+        self.assertIn('  wrapper: mount refused', result.stderr)
+
+    def test_a_docker_error_in_the_key_step_is_shown_and_no_secret_is(self):
+        # A failed age-keygen run used to end in a bare "backup FAILED" (#852).
+        # The wrapper also prints a secret-looking line, which must not be shown.
+        self.create_volume('weaviate_data')
+        env = self.wrapped('case "$*" in *age-keygen*) case "$*" in *-y*) ;; *) '
+                           'echo "wrapper: daemon error" >&2; echo "AGE-SECRET-KEY-1WRAPPERTEST" >&2; '
+                           'exit 125 ;; esac ;; esac')
+        result = self.script('backup.sh', '--prefix', self.prefix, '--yes', env=env)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn('weaviate_data: backup FAILED', result.stdout)
+        self.assertIn('  wrapper: daemon error', result.stderr)
+        run = Path(re.search(r'^Backup folder: (.+)$', result.stdout, re.M).group(1))
+        self.assertEqual(list(run.iterdir()), [])
+
+    # A failed restore
+
+    def test_an_extraction_that_fails_after_the_check_leaves_the_volume_unchanged(self):
+        # Stands in for an archive that changed between the check and the
+        # restore: the wrapper feeds a damaged copy to the extraction only (#852).
+        self.create_volume('weaviate_data')
+        _, run = self.backup()
+        archive, key = self.pairs(run, ('weaviate_data',))
+        self.in_volume('weaviate_data', 'echo changed > /data/added-later')
+        before = self.listing('weaviate_data')
+        damaged = self.tmp / 'damaged.tgz.age'
+        data = bytearray(Path(archive).read_bytes())
+        data[len(data) // 2] ^= 0xff
+        damaged.write_bytes(bytes(data))
+        volume = self.prefix + '_weaviate_data:/data'
+        env = self.wrapped('for a in "$@"; do [ "$a" = "{}" ] && exec "$REAL_DOCKER" "$@" <"{}"; done'
+                           .format(volume, damaged))
+        result = self.script('restore.sh', '--prefix', self.prefix, '--yes', archive, key, env=env)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('weaviate_data: OK', result.stdout)
+        self.assertIn('weaviate_data: restore FAILED: the archive could not be extracted; this volume is unchanged.',
+                      result.stderr)
+        self.assertNotIn('weaviate_data: restored', result.stdout)
+        self.assertEqual(self.listing('weaviate_data'), before, 'a failed extraction changed the volume')
 
     def test_a_missing_key_argument_is_refused(self):
         self.create_volume('weaviate_data')
@@ -353,6 +473,23 @@ class ScriptTests(unittest.TestCase):
         _, run = self.backup('--dir', str(self.checkout / 'backups' / 'mine'))
         self.assertEqual(run.parent, self.checkout / 'backups' / 'mine')
         self.assertEqual(run.parent.stat().st_mode & 0o777, 0o700)
+
+    def test_the_checkout_named_in_another_case_is_refused(self):
+        # macOS's default filesystem ignores case, so ~/repo/RAG-Docker is the
+        # checkout ~/repo/rag-docker (#852).
+        other = self.checkout.parent / self.checkout.name.upper()
+        if not other.is_dir():
+            self.skipTest('this filesystem is case-sensitive: {} is not the checkout'.format(other))
+        self.create_volume('weaviate_data', fill=False)
+        for inside in (other, other / 'scripts', other / 'new' / 'folder', other / 'BACKUPS' / '..' / 'x'):
+            with self.subTest(folder=str(inside)):
+                result = self.script('backup.sh', '--prefix', self.prefix, '--yes', '--dir', str(inside))
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn('inside the git checkout', result.stderr)
+        self.assertFalse((self.checkout / 'new').exists())
+        self.assertFalse((self.checkout / 'x').exists())
+        _, run = self.backup('--dir', str(other / 'BACKUPS' / 'mine'))
+        self.assertTrue((self.checkout / 'backups' / 'mine').is_dir())
 
 
 if __name__ == '__main__':
