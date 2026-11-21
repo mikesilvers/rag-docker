@@ -113,13 +113,13 @@ def _run(job_id: str, collection: str, include_models: bool,
         # collection is recorded too: an encrypted package follows its access (#794).
         # A key export's key file is recorded too, with the same finish time:
         # each is deleted by its own full download, and expiry deletes both (#676).
+        # Both in one write, so the package is never recorded without its key (#860).
         warnings = list(result["warnings"])
         key_filename = result.get("key_filename")
         finished = datetime.now(timezone.utc)
         try:
-            package_retention.record_export(result["filename"], finished, collection)
-            if key_filename:
-                package_retention.record_export(key_filename, finished, collection)
+            package_retention.record_export(result["filename"], finished, collection,
+                                            key_filename=key_filename)
         except Exception:                          # noqa: BLE001 - reported in the warnings
             _log.exception("Could not record the expiry of package %s", result["filename"])
             if key_filename:

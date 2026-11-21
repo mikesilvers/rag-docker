@@ -1467,18 +1467,8 @@ key_export() {   # key_export <outfile>: start a default export, print its job i
   api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > "$1"
   python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['job_id'])" "$1"
 }
-plain_before=$(ls -A "$EXPORTS" | grep -E '\.tar\.gz$' | sort)
 kjob=$(key_export /tmp/vfy_key_exp.json)
-plain_during=""
-for _ in $(seq 1 3000); do
-  plain_during="$plain_during $(comm -13 <(printf '%s\n' "$plain_before") <(ls -A "$EXPORTS" | grep -E '\.tar\.gz$' | sort) | tr '\n' ' ')"
-  st=$(api_get "/export/job/$kjob" | jfield "['status']")
-  [ "$st" = "completed" ] || [ "$st" = "failed" ] && break
-  sleep 0.2
-done
-check_eq "#676: a default export completes" "$st" "completed"
-[ -z "$(echo "$plain_during" | tr -d ' ')" ]
-check "#676: no unencrypted archive appears in ./exports while it runs" $? "$plain_during"
+check_eq "#676: a default export completes" "$(wait_for_job "/export/job/$kjob" 1800)" "completed"
 api_get "/export/job/$kjob" > /tmp/vfy_key_job.json
 KPKG=$(jfield "['filename']" < /tmp/vfy_key_job.json)
 KKEY=$(jfield "['key_filename']" < /tmp/vfy_key_job.json)
@@ -1490,11 +1480,80 @@ check_eq "#676: the key file's mode is 600" \
   "$(cd "$REPO_ROOT" && docker compose exec -T api stat -c %a "/app/exports/$KKEY" | tr -d '\r')" "600"
 kpub=$(cd "$REPO_ROOT" && docker compose exec -T api grep '^# public key: ' "/app/exports/$KKEY" | tr -d '\r')
 
-# A package's name carries its export's second (RAG_EXPORT_SPECIFICATIONS.md §4.1):
-# two exports of one collection that start in the same second get the same name,
-# and the second replaces the first package and its key file. Start the second
-# export in a later second so the checks below use two different packages.
-sleep 1.1
+# Two key builds of one collection in the same second (#860), run in the API
+# container with the build's clock fixed to a past second no export uses: the
+# second gets `-2` (RAG_EXPORT_SPECIFICATIONS.md §4.1) and all four files are
+# kept. Every file the builds open for writing in ./exports is recorded through
+# Python's `open` audit event, so "no unencrypted archive" is checked on each
+# write instead of by sampling the folder (#860): only the encrypted package's
+# and the key's temporaries are written, and each package is an age file.
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$C") > /tmp/vfy_same_second.txt 2>&1 <<'ENDPY'
+import os, sys
+sys.path.insert(0, "/app")
+from datetime import datetime, timezone
+from unittest.mock import patch
+from services import age_stream, packager
+
+exports = packager.exports_dir()
+root = os.path.abspath(exports)
+writes, recording = [], [False]
+WRITE = os.O_WRONLY | os.O_RDWR | os.O_CREAT
+
+
+def hook(event, args):
+    if recording[0] and event == "open" and isinstance(args[0], str) and isinstance(args[2], int) \
+            and args[2] & WRITE and os.path.dirname(os.path.abspath(args[0])) == root:
+        writes.append(os.path.basename(args[0]))
+
+
+def check(ok, name, detail=""):
+    print(f"{0 if ok else 1}|{name}|{detail}".replace("\n", " "))
+
+
+sys.addaudithook(hook)
+built = []
+try:
+    with patch.object(packager, "_now", return_value=datetime(2001, 1, 1, tzinfo=timezone.utc)):
+        recording[0] = True
+        for _ in range(2):
+            built.append(packager.build(sys.argv[1], key=True))
+        recording[0] = False
+    first, second = built
+    stem = first["filename"][:-len(age_stream.ENCRYPTED_SUFFIX)]
+    check(second["filename"] == stem + "-2" + age_stream.ENCRYPTED_SUFFIX,
+          "#860: two exports of one collection in the same second get distinct names, the second -2",
+          f'{first["filename"]} / {second["filename"]}')
+    names = [r[k] for r in built for k in ("filename", "key_filename")]
+    check(all((exports / n).is_file() for n in names),
+          "#860: ... and both packages and both key files are kept", " ".join(names))
+    texts = [(exports / r["key_filename"]).read_text() for r in built]
+    publics = [next(l for l in t.splitlines() if l.startswith("# public key: ")) for t in texts]
+    check(publics[0] != publics[1] and all(r["filename"] in t for r, t in zip(built, texts)),
+          "#860: ... each key file holds its own key and names its own package", " / ".join(publics))
+    temps = {f".{n}.partial" for n in names}
+    check(bool(writes) and set(writes) <= temps,
+          "#676: a key build writes only the package's and the key's temporaries in ./exports",
+          " ".join(writes))
+    check(not any(w.endswith(".tar.gz") or w.endswith(".tar.gz.partial") for w in writes),
+          "#676: ... and never an unencrypted archive", " ".join(writes))
+    heads = []
+    for r in built:
+        with (exports / r["filename"]).open("rb") as fh:
+            heads.append(fh.read(len(age_stream.VERSION_LINE)))
+    check(all(h == age_stream.VERSION_LINE for h in heads),
+          "#676: ... and each placed package is an age file", repr(heads))
+finally:
+    for r in built:
+        for k in ("filename", "key_filename"):
+            if r.get(k):
+                (exports / r[k]).unlink(missing_ok=True)
+ENDPY
+[ "$(grep -c '^[01]|' /tmp/vfy_same_second.txt)" = "6" ]
+check "#860: the same-second check ran all six of its checks" $? "$(tail -5 /tmp/vfy_same_second.txt | tr '\n' ' ')"
+while IFS='|' read -r rc name detail; do
+  check "$name" "$rc" "$detail"
+done < <(grep '^[01]|' /tmp/vfy_same_second.txt)
+
 kjob2=$(key_export /tmp/vfy_key_exp2.json)
 check_eq "#676: a second default export completes" "$(wait_for_job "/export/job/$kjob2" 1800)" "completed"
 api_get "/export/job/$kjob2" > /tmp/vfy_key_job2.json
