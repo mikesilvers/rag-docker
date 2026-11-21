@@ -11132,6 +11132,7 @@ Format reference: RAG_EXPORT_SPECIFICATIONS.md §4.
 from __future__ import annotations
 from services import telemetry
 
+import errno
 import fnmatch
 import hashlib
 import json
@@ -11142,6 +11143,7 @@ import shutil
 import stat
 import tarfile
 import tempfile
+import threading
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterator
@@ -11253,6 +11255,72 @@ def timestamp(when: datetime) -> str:
 
 def package_stem(collection: str, when: datetime, id8: str) -> str:
     return f"ragpkg-{slug(collection)}-{timestamp(when)}-{id8}"
+
+
+def _now() -> datetime:
+    """The build's clock: the one place it is read, so a test can fix it."""
+    return datetime.now(timezone.utc)
+
+
+# Two exports of one collection with the same content that start in the same
+# second have the same plain stem. The second gets `-2` (then `-3`, ...), so
+# both packages and both key files are kept (#860, spec §4.1).
+MAX_NAME_SUFFIX = 1000
+_names_lock = threading.Lock()
+# Stems this process has given to an export: never given twice, even once the
+# files are downloaded and deleted.
+_given: set[str] = set()
+_DELIVERED = (".tar.gz", age_stream.ENCRYPTED_SUFFIX, age_stream.ENCRYPTED_SUFFIX + ".key")
+# No hard links in the folder: placement checks and renames under the lock.
+_NO_LINKS = {errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EMLINK, errno.ENOSYS, errno.EXDEV}
+
+
+def _stem_taken(out_dir: Path, stem: str) -> bool:
+    """Whether any file of `stem`, or its temporary, is in the folder (a link counts)."""
+    return any(os.path.lexists(out_dir / name)
+               for suffix in _DELIVERED
+               for name in (stem + suffix, f".{stem}{suffix}.partial"))
+
+
+def reserve_stem(out_dir: Path, collection: str, when: datetime, id8: str) -> str:
+    """The package's stem: the plain one when it is free, else the first free
+    `-<n>` from 2 (#860). Chosen and reserved under one lock."""
+    base = package_stem(collection, when, id8)
+    with _names_lock:
+        for n in range(1, MAX_NAME_SUFFIX + 1):
+            stem = base if n == 1 else f"{base}-{n}"
+            if stem not in _given and not _stem_taken(out_dir, stem):
+                _given.add(stem)
+                return stem
+    raise RuntimeError(f"No free package name for {base} up to -{MAX_NAME_SUFFIX}: "
+                       "delete old packages from ./exports and export again.")
+
+
+def _taken(final: Path) -> FileExistsError:
+    return FileExistsError(errno.EEXIST, f"{final.name} is already in the exports folder; it was "
+                           "left as it is and this export wasn't put in place", str(final))
+
+
+def _place(tmp: Path, final: Path) -> None:
+    """Move `tmp` to `final`, never replacing an existing entry (#860)."""
+    try:
+        os.link(tmp, final)
+    except FileExistsError:
+        raise _taken(final) from None
+    except OSError as exc:
+        if exc.errno not in _NO_LINKS:
+            raise
+        # Every export chooses and places names under this lock.
+        with _names_lock:
+            if os.path.lexists(final):
+                raise _taken(final) from None
+            os.rename(tmp, final)
+        return
+    try:
+        os.unlink(tmp)
+    except BaseException:
+        final.unlink(missing_ok=True)
+        raise
 
 
 # ── Digests ───────────────────────────────────────────────────────────────────
@@ -11547,7 +11615,7 @@ def build(
     if key and passphrase is not None:
         raise ValueError("a package takes a passphrase or a key, not both")
     encryption = "key" if key else "passphrase" if passphrase is not None else "none"
-    created = datetime.now(timezone.utc)
+    created = _now()
     created_at = created.strftime("%Y-%m-%dT%H:%M:%SZ")
     out_dir = exports_dir()
     warnings: list[str] = []
@@ -11741,7 +11809,8 @@ def build(
         id8 = sha256_file(manifest_path)[:8]
 
         # 7. the generated pair, which embed <id8>
-        stem = package_stem(collection, created, id8)
+        # A name no other export has, never replacing a file (#860).
+        stem = reserve_stem(out_dir, collection, created, id8)
         # The README and retrieve.py name the file as delivered (#27).
         filename = f"{stem}{age_stream.ENCRYPTED_SUFFIX if encryption != 'none' else '.tar.gz'}"
 
@@ -11781,16 +11850,17 @@ def build(
         key_filename = None
         if identity is not None:
             # The key file first, 0600 from its creation (#676); the package is
-            # put in place only once its key is.
+            # put in place only once its key is. Neither replaces a file (#860):
+            # `placed_key` is set only once this build has placed it.
             key_filename = filename + ".key"
             tmp_key = out_dir / f".{key_filename}.partial"
             _write_key_file(tmp_key, age_stream.identity_file(identity, created, filename))
             identity = None
+            _place(tmp_key, out_dir / key_filename)
             placed_key = out_dir / key_filename
-            tmp_key.replace(placed_key)
             tmp_key = None
         final = out_dir / filename
-        tmp_archive.replace(final)
+        _place(tmp_archive, final)
         tmp_archive = None
         placed_key = None
 
@@ -13625,13 +13695,13 @@ def _run(job_id: str, collection: str, include_models: bool,
         # collection is recorded too: an encrypted package follows its access (#794).
         # A key export's key file is recorded too, with the same finish time:
         # each is deleted by its own full download, and expiry deletes both (#676).
+        # Both in one write, so the package is never recorded without its key (#860).
         warnings = list(result["warnings"])
         key_filename = result.get("key_filename")
         finished = datetime.now(timezone.utc)
         try:
-            package_retention.record_export(result["filename"], finished, collection)
-            if key_filename:
-                package_retention.record_export(key_filename, finished, collection)
+            package_retention.record_export(result["filename"], finished, collection,
+                                            key_filename=key_filename)
         except Exception:                          # noqa: BLE001 - reported in the warnings
             _log.exception("Could not record the expiry of package %s", result["filename"])
             if key_filename:
@@ -13793,7 +13863,8 @@ changes only that function.
 its own, with the package's finish time and collection. It follows the same
 rules by its own name: a full download of it deletes it and only it, a full
 download of the package leaves it, and expiry deletes whichever of the two is
-still there. So it is not a companion: deleting it with the package would lose
+still there. It is recorded in the same write as its package (#860), so one is
+never recorded without the other. So it is not a companion: deleting it with the package would lose
 the key of a package downloaded first.
 
 **The record.** Each entry is `{"finished_at": ..., "collection": ...}`: the
@@ -13952,13 +14023,18 @@ def _write(entries: dict[str, dict]) -> None:
         raise
 
 
-def record_export(filename: str, finished: datetime, collection: str | None = None) -> None:
+def record_export(filename: str, finished: datetime, collection: str | None = None,
+                  key_filename: str | None = None) -> None:
     """Record a package this instance exported, with the collection it holds
-    (#794). Raises when it can't be written."""
+    (#794), and a key export's key file with the same entry, in one write
+    (#860). Raises when it can't be written; then neither is recorded."""
     with _lock:
         entries = _read()
-        entries[filename] = {"finished_at": finished.astimezone(timezone.utc).strftime(_TIME),
-                             "collection": collection}
+        entry = {"finished_at": finished.astimezone(timezone.utc).strftime(_TIME),
+                 "collection": collection}
+        entries[filename] = entry
+        if key_filename:
+            entries[key_filename] = dict(entry)
         _write(entries)
 
 
@@ -18617,14 +18693,19 @@ Check any machine with `docker compose exec ollama ollama list`.
 
 ````markdown
 ```
-ragpkg-<collection>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz          (not encrypted)
-ragpkg-<collection>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz.age      (encrypted with a new key, the default, or a passphrase)
-ragpkg-<collection>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz.age.key  (the key file of a package encrypted with a key)
+ragpkg-<collection>-<YYYYMMDDTHHMMSSZ>-<id8>[-<n>].tar.gz          (not encrypted)
+ragpkg-<collection>-<YYYYMMDDTHHMMSSZ>-<id8>[-<n>].tar.gz.age      (encrypted with a new key, the default, or a passphrase)
+ragpkg-<collection>-<YYYYMMDDTHHMMSSZ>-<id8>[-<n>].tar.gz.age.key  (the key file of a package encrypted with a key)
 ```
 
 The collection name in the filename is lowercased and stripped of punctuation,
 so it is lossy, and two different collections can produce the same label. `<id8>`
 is the first eight hex characters of the manifest's own digest.
+
+`-<n>` is added only when that name is already taken: two exports of the same
+collection that start in the same second would otherwise get the same name, so
+the later one is `-2` (then `-3`, and so on). Both packages and their key files
+are kept; an export never replaces a file in `./exports`.
 
 **`manifest.json` is authoritative.** Import reads the collection name from there
 and never parses the filename. Renaming a package file changes nothing about what
@@ -27285,6 +27366,8 @@ export default function TransferPage() {
   const [importKey, setImportKey] = useState('')
   const [importKeyName, setImportKeyName] = useState('')
   const keyInput = useRef<HTMLInputElement | null>(null)
+  // The package selected now, for a key file read that ends later (#860).
+  const selectedPackage = useRef(filename)
   const [importJob, setImportJob] = useState<ImportJob | null>(null)
   const [importError, setImportError] = useState('')
   const [importWatching, setImportWatching] = useState(false)
@@ -27387,6 +27470,7 @@ export default function TransferPage() {
 
   // A key file chosen for one package is never sent with another.
   useEffect(() => {
+    selectedPackage.current = filename
     setImportKey(''); setImportKeyName('')
     if (keyInput.current) keyInput.current.value = ''
   }, [filename])
@@ -27394,11 +27478,14 @@ export default function TransferPage() {
   async function chooseKeyFile(file: File | undefined) {
     setImportKey(''); setImportKeyName('')
     if (!file) return
+    // A read that ends after another package was chosen is dropped (#860).
+    const forPackage = filename
     try {
       const text = await file.text()
-      if (!alive.current) return
+      if (!alive.current || selectedPackage.current !== forPackage) return
       setImportKey(text); setImportKeyName(file.name)
     } catch (e: unknown) {
+      if (!alive.current || selectedPackage.current !== forPackage) return
       setImportError(`Could not read the key file: ${message(e)}`)
     }
   }
@@ -43841,10 +43928,10 @@ class RecordTests(DownloadTestCase):
                 package_retention.record_export("ragpkg-new.tar.gz", NOW)
         self.assertEqual(record.read_text(), '{"packages": "wrong shape"}')
 
-    def run_export(self, record=None):
+    def run_export(self, record=None, key_filename=None):
         result = {"filename": "ragpkg-open1-x.tar.gz", "size_bytes": 1, "chunk_count": 1,
                   "source_document_count": 0, "fidelity": "chunks-only", "models_bundled": False,
-                  "retrieve_script": True, "warnings": []}
+                  "retrieve_script": True, "warnings": [], "key_filename": key_filename}
         exporter._jobs["j677"] = {"job_id": "j677", "status": "queued", "collection": "Open1",
                                   "chunks_written": 0, "filename": None, "warnings": [], "error": None}
         self.addCleanup(exporter._jobs.pop, "j677", None)
@@ -43950,7 +44037,7 @@ class RecordTests(DownloadTestCase):
         self.assertIn("'ragpkg-x/../y.tar.gz'", logs.output[0])
 
     def test_an_export_whose_record_fails_still_completes_and_says_so(self):
-        def broken(*_):
+        def broken(*_args, **_kwargs):
             raise OSError("disk full")
         with self.assertLogs("services.exporter", "ERROR"):
             job = self.run_export(record=broken)
@@ -43958,6 +44045,35 @@ class RecordTests(DownloadTestCase):
         self.assertTrue(any("expiry could not be recorded" in w for w in job["warnings"]))
         answer = self.client.get("/export/job/j677", headers=self.as_("eng"))
         self.assertIsNone(answer.json()["expires_at"])
+
+    # #860: a key export's package and key file are recorded in one write.
+    def test_a_key_export_is_recorded_in_one_write(self):
+        key = "ragpkg-open1-x.tar.gz.age.key"
+        with patch.object(package_retention, "_write", wraps=package_retention._write) as write:
+            package_retention.record_export("ragpkg-open1-x.tar.gz.age", NOW, "Open1", key_filename=key)
+        self.assertEqual(write.call_count, 1)
+        entries = json.loads((self.root / "uploads" / "exported_packages.json").read_text())["packages"]
+        self.assertEqual(entries["ragpkg-open1-x.tar.gz.age"], entries[key])
+        self.assertEqual(entries[key]["collection"], "Open1")
+
+    def test_a_failed_write_records_neither_the_package_nor_its_key(self):
+        with patch.object(package_retention, "_write", side_effect=OSError("disk full")), \
+                self.assertRaises(OSError):
+            package_retention.record_export("ragpkg-open1-x.tar.gz.age", NOW, "Open1",
+                                            key_filename="ragpkg-open1-x.tar.gz.age.key")
+        self.assertFalse(package_retention.recorded("ragpkg-open1-x.tar.gz.age"))
+        self.assertFalse(package_retention.recorded("ragpkg-open1-x.tar.gz.age.key"))
+
+    def test_a_key_export_job_records_both_in_one_call(self):
+        calls = []
+
+        def record(*args, **kwargs):
+            calls.append((args, kwargs))
+        job = self.run_export(record=record, key_filename="ragpkg-open1-x.tar.gz.age.key")
+        self.assertEqual(job["status"], "completed")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0][0], "ragpkg-open1-x.tar.gz")
+        self.assertEqual(calls[0][1], {"key_filename": "ragpkg-open1-x.tar.gz.age.key"})
 
 
 class ListingTests(DownloadTestCase):
@@ -45701,12 +45817,12 @@ def check(name, ok, detail=""):
     if not ok: fails.append(name)
 
 # E5 — filename (§4.1)
-NAME_RE = re.compile(r"^ragpkg-([a-z0-9]+(?:-[a-z0-9]+)*)-(\d{8}T\d{6}Z)-([0-9a-f]{8})\.tar\.gz(?:\.age)?$")
+NAME_RE = re.compile(r"^ragpkg-([a-z0-9]+(?:-[a-z0-9]+)*)-(\d{8}T\d{6}Z)-([0-9a-f]{8})(?:-([1-9][0-9]*))?\.tar\.gz(?:\.age)?$")
 m = NAME_RE.match(archive.name)
 check("E5 filename matches the §4.1 pattern", m is not None, archive.name)
 if not m:
     sys.exit(1)
-slug, ts, id8 = m.groups()
+slug, ts, id8, _n = m.groups()   # -<n>: a same-second export (#860)
 
 with tempfile.TemporaryDirectory() as td:
     source = archive
@@ -50440,18 +50556,8 @@ key_export() {   # key_export <outfile>: start a default export, print its job i
   api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > "$1"
   python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['job_id'])" "$1"
 }
-plain_before=$(ls -A "$EXPORTS" | grep -E '\.tar\.gz$' | sort)
 kjob=$(key_export /tmp/vfy_key_exp.json)
-plain_during=""
-for _ in $(seq 1 3000); do
-  plain_during="$plain_during $(comm -13 <(printf '%s\n' "$plain_before") <(ls -A "$EXPORTS" | grep -E '\.tar\.gz$' | sort) | tr '\n' ' ')"
-  st=$(api_get "/export/job/$kjob" | jfield "['status']")
-  [ "$st" = "completed" ] || [ "$st" = "failed" ] && break
-  sleep 0.2
-done
-check_eq "#676: a default export completes" "$st" "completed"
-[ -z "$(echo "$plain_during" | tr -d ' ')" ]
-check "#676: no unencrypted archive appears in ./exports while it runs" $? "$plain_during"
+check_eq "#676: a default export completes" "$(wait_for_job "/export/job/$kjob" 1800)" "completed"
 api_get "/export/job/$kjob" > /tmp/vfy_key_job.json
 KPKG=$(jfield "['filename']" < /tmp/vfy_key_job.json)
 KKEY=$(jfield "['key_filename']" < /tmp/vfy_key_job.json)
@@ -50463,11 +50569,80 @@ check_eq "#676: the key file's mode is 600" \
   "$(cd "$REPO_ROOT" && docker compose exec -T api stat -c %a "/app/exports/$KKEY" | tr -d '\r')" "600"
 kpub=$(cd "$REPO_ROOT" && docker compose exec -T api grep '^# public key: ' "/app/exports/$KKEY" | tr -d '\r')
 
-# A package's name carries its export's second (RAG_EXPORT_SPECIFICATIONS.md §4.1):
-# two exports of one collection that start in the same second get the same name,
-# and the second replaces the first package and its key file. Start the second
-# export in a later second so the checks below use two different packages.
-sleep 1.1
+# Two key builds of one collection in the same second (#860), run in the API
+# container with the build's clock fixed to a past second no export uses: the
+# second gets `-2` (RAG_EXPORT_SPECIFICATIONS.md §4.1) and all four files are
+# kept. Every file the builds open for writing in ./exports is recorded through
+# Python's `open` audit event, so "no unencrypted archive" is checked on each
+# write instead of by sampling the folder (#860): only the encrypted package's
+# and the key's temporaries are written, and each package is an age file.
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$C") > /tmp/vfy_same_second.txt 2>&1 <<'ENDPY'
+import os, sys
+sys.path.insert(0, "/app")
+from datetime import datetime, timezone
+from unittest.mock import patch
+from services import age_stream, packager
+
+exports = packager.exports_dir()
+root = os.path.abspath(exports)
+writes, recording = [], [False]
+WRITE = os.O_WRONLY | os.O_RDWR | os.O_CREAT
+
+
+def hook(event, args):
+    if recording[0] and event == "open" and isinstance(args[0], str) and isinstance(args[2], int) \
+            and args[2] & WRITE and os.path.dirname(os.path.abspath(args[0])) == root:
+        writes.append(os.path.basename(args[0]))
+
+
+def check(ok, name, detail=""):
+    print(f"{0 if ok else 1}|{name}|{detail}".replace("\n", " "))
+
+
+sys.addaudithook(hook)
+built = []
+try:
+    with patch.object(packager, "_now", return_value=datetime(2001, 1, 1, tzinfo=timezone.utc)):
+        recording[0] = True
+        for _ in range(2):
+            built.append(packager.build(sys.argv[1], key=True))
+        recording[0] = False
+    first, second = built
+    stem = first["filename"][:-len(age_stream.ENCRYPTED_SUFFIX)]
+    check(second["filename"] == stem + "-2" + age_stream.ENCRYPTED_SUFFIX,
+          "#860: two exports of one collection in the same second get distinct names, the second -2",
+          f'{first["filename"]} / {second["filename"]}')
+    names = [r[k] for r in built for k in ("filename", "key_filename")]
+    check(all((exports / n).is_file() for n in names),
+          "#860: ... and both packages and both key files are kept", " ".join(names))
+    texts = [(exports / r["key_filename"]).read_text() for r in built]
+    publics = [next(l for l in t.splitlines() if l.startswith("# public key: ")) for t in texts]
+    check(publics[0] != publics[1] and all(r["filename"] in t for r, t in zip(built, texts)),
+          "#860: ... each key file holds its own key and names its own package", " / ".join(publics))
+    temps = {f".{n}.partial" for n in names}
+    check(bool(writes) and set(writes) <= temps,
+          "#676: a key build writes only the package's and the key's temporaries in ./exports",
+          " ".join(writes))
+    check(not any(w.endswith(".tar.gz") or w.endswith(".tar.gz.partial") for w in writes),
+          "#676: ... and never an unencrypted archive", " ".join(writes))
+    heads = []
+    for r in built:
+        with (exports / r["filename"]).open("rb") as fh:
+            heads.append(fh.read(len(age_stream.VERSION_LINE)))
+    check(all(h == age_stream.VERSION_LINE for h in heads),
+          "#676: ... and each placed package is an age file", repr(heads))
+finally:
+    for r in built:
+        for k in ("filename", "key_filename"):
+            if r.get(k):
+                (exports / r[k]).unlink(missing_ok=True)
+ENDPY
+[ "$(grep -c '^[01]|' /tmp/vfy_same_second.txt)" = "6" ]
+check "#860: the same-second check ran all six of its checks" $? "$(tail -5 /tmp/vfy_same_second.txt | tr '\n' ' ')"
+while IFS='|' read -r rc name detail; do
+  check "$name" "$rc" "$detail"
+done < <(grep '^[01]|' /tmp/vfy_same_second.txt)
+
 kjob2=$(key_export /tmp/vfy_key_exp2.json)
 check_eq "#676: a second default export completes" "$(wait_for_job "/export/job/$kjob2" 1800)" "completed"
 api_get "/export/job/$kjob2" > /tmp/vfy_key_job2.json
