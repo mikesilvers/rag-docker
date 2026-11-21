@@ -30475,7 +30475,11 @@ package; import and the query-only loader choose the secret by the header (`KEY_
 `KEY_FILE_INVALID`, `KEY_FILE_NOT_EXPECTED`). `test_export_encryption.py` runs the 68 testkit vectors that
 carry an X25519 key and an independent X25519 decryption, and checks the key build, the key
 file, the export choices (LAN mode's `ENCRYPTION_REQUIRED`), the import refusals and that no key
-reaches a job record, log or response.
+reaches a job record, log or response. Since #860 its `SameSecondNames` tests check that exports
+of one collection whose names would be the same get distinct names (`-2`, `-3`) and keep every
+file, that a name still taken by a key file or given earlier in the process isn't given again,
+that a name taken during the build fails the export and leaves that file, the fallback where
+hard links aren't supported, and that the build fails when no name is free.
 
 `scripts/tests/test_export_encryption.py`, run by `05_transfer.sh` in the API image with no
 network, checks the module against the vendored C2SP CCTV vectors
