@@ -50421,10 +50421,16 @@ check_eq "#676: the key file's mode is 600" \
   "$(cd "$REPO_ROOT" && docker compose exec -T api stat -c %a "/app/exports/$KKEY" | tr -d '\r')" "600"
 kpub=$(cd "$REPO_ROOT" && docker compose exec -T api grep '^# public key: ' "/app/exports/$KKEY" | tr -d '\r')
 
+# A package's name carries its export's second (RAG_EXPORT_SPECIFICATIONS.md §4.1):
+# two exports of one collection that start in the same second get the same name,
+# and the second replaces the first package and its key file. Start the second
+# export in a later second so the checks below use two different packages.
+sleep 1.1
 kjob2=$(key_export /tmp/vfy_key_exp2.json)
 check_eq "#676: a second default export completes" "$(wait_for_job "/export/job/$kjob2" 1800)" "completed"
 api_get "/export/job/$kjob2" > /tmp/vfy_key_job2.json
 KPKG2=$(jfield "['filename']" < /tmp/vfy_key_job2.json); KKEY2=$(jfield "['key_filename']" < /tmp/vfy_key_job2.json)
+check_eq "#676: the two exports are two packages (different names)" "$([ "$KPKG2" != "$KPKG" ] && echo different || echo "same: $KPKG")" "different"
 kpub2=$(cd "$REPO_ROOT" && docker compose exec -T api grep '^# public key: ' "/app/exports/$KKEY2" | tr -d '\r')
 [ -n "$kpub" ] && [ -n "$kpub2" ] && [ "$kpub" != "$kpub2" ]
 check "#676: each export has its own key" $? "$kpub / $kpub2"
