@@ -78,7 +78,7 @@ curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixe
   -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$FIX/policies.txt" > /tmp/vfy_qo.json
 job=$(python3 -c "import json;print(json.load(open('/tmp/vfy_qo.json'))['job_id'])" 2>/dev/null)
 check_eq "the collection is ingested" "$(wait_for_job "/ingest/job/$job" 900)" "completed"
-api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_qo.json
+api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_qo.json
 ejob=$(jfield "['job_id']" < /tmp/vfy_qo.json)
 check_eq "the collection is exported" "$(wait_for_job "/export/job/$ejob" 1800)" "completed"
 pkg=$(api_get "/export/job/$ejob" | jfield "['filename']")
@@ -178,9 +178,31 @@ sys.exit(0 if r.get('answer', '').strip() and r.get('citations') else 1)"
   check "an End User asks a question on the loaded collection and gets an answer with citations" $? "$(head -c 300 /tmp/vfy_qo.json)"
 fi
 
+# The default export, encrypted to a new key (#676).
 api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_qo.json
 ejob=$(jfield "['job_id']" < /tmp/vfy_qo.json)
 check_eq "export keeps working in query-only mode" "$(wait_for_job "/export/job/$ejob" 1800)" "completed"
 check_eq "the package list keeps working" "$(api_code "$API/packages")" "200"
+
+section "Load a key package with its key file (#676)"
+kpkg=$(api_get "/export/job/$ejob" | jfield "['filename']")
+kkey=$(api_get "/export/job/$ejob" | jfield "['key_filename']")
+check_eq "the default export is encrypted with a new key" "$(api_get "/export/job/$ejob" | jfield "['encryption']")" "key"
+loader -- "$kpkg"
+rc=$?
+[ "$rc" = 1 ] && grep -q "KEY_FILE_REQUIRED" "$OUT"
+check "the loader refuses a key package with no key on standard input (exit 1, KEY_FILE_REQUIRED)" $? "exit $rc: $(tail -2 "$OUT")"
+check_eq "the refusal is an operator.load audit record" "$(last_load)" "refused KEY_FILE_REQUIRED $kpkg"
+check_eq "the key file downloads" "$(curl -s -o /tmp/vfy_qo_key.txt -m 120 -w '%{http_code}' "$API/packages/$kkey")" "200"
+_rag_require_lock_owner
+(cd "$REPO_ROOT" && docker compose exec -T api python -m loader "$kpkg" --on-conflict rename) \
+  </tmp/vfy_qo_key.txt >"$OUT" 2>&1
+rc=$?
+check_eq "the loader loads the key package with its key file on standard input (exit 0)" "$rc" "0"
+grep -q "AGE-SECRET-KEY" "$OUT"
+[ "$?" = 1 ]
+check "the loader never prints the key" $?
+rm -f /tmp/vfy_qo_key.txt
+curl -s -o /dev/null -m 600 "$API/packages/$kpkg"
 
 summary

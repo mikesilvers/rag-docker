@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import Any, Optional, Annotated, Literal
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, BeforeValidator, ValidationError, field_validator, model_validator, SecretStr, StrictInt
 
+from services.age_stream import KEY_FILE_MAX
 from services.collection_writes import canonical
 
 
@@ -228,10 +229,23 @@ def _utf8_passphrase(v: Optional[SecretStr]) -> Optional[SecretStr]:
 class ExportRequest(BaseModel):
     collection: CollectionName
     include_models: bool = False
-    # Optional: given, the package is written encrypted as `.tar.gz.age` (#27).
+    # How the package is encrypted (#676): a new X25519 key, written to a key
+    # file beside it (the default); a passphrase (#27); or not at all, an
+    # explicit opt-out refused in LAN mode. Left out, a request with a
+    # passphrase is a passphrase export and one without is a key export.
+    encryption: Optional[Literal["key", "passphrase", "none"]] = None
+    # Given, the package is written encrypted as `.tar.gz.age` (#27).
     # SecretStr keeps it out of any repr or log line, and the 422 handler drops
     # `input`, so a refused passphrase is never echoed.
     passphrase: Optional[SecretStr] = None
+
+    @model_validator(mode="after")
+    def _encryption(self):
+        if self.encryption is None:
+            self.encryption = "passphrase" if self.passphrase is not None else "key"
+        elif (self.encryption == "passphrase") != (self.passphrase is not None):
+            raise ValueError("a passphrase goes with encryption 'passphrase', and that needs one")
+        return self
 
     @field_validator("passphrase")
     @classmethod
@@ -262,9 +276,16 @@ class ExportJobStatusResponse(BaseModel):
     retrieve_script: Optional[bool]
     warnings: list[str]
     error: Optional[str]
-    # Whether the export was requested with a passphrase (#27). Records from
-    # before #27 have no such key.
+    # Whether the package is encrypted (#27). Records from before #27 have no
+    # such key.
     encrypted: bool = False
+    # "key", "passphrase" or "none" (#676); records from before #676 read as
+    # "passphrase" when encrypted, else "none".
+    encryption: Optional[str] = None
+    # A key export's key file (#676): its name, never its contents, and whether
+    # it is still in ./exports (it is deleted by its own full download).
+    key_filename: Optional[str] = None
+    key_on_server: bool = False
 
     error_code: Optional[str] = None
     error_detail: Optional[dict] = None
@@ -277,14 +298,30 @@ class ImportRequest(BaseModel):
     # Required, no default (spec §6.4): silently picking a conflict policy could
     # delete a collection the caller did not mean to touch.
     on_conflict: str
-    # Required for a `.tar.gz.age` package and refused for any other (#27).
-    # Its length is checked on export only; any encodable value is tried here.
+    # Required for a passphrase `.tar.gz.age` package and refused for any other
+    # (#27). Its length is checked on export only; any encodable value is tried here.
     passphrase: Optional[SecretStr] = None
+    # The text of the key file of a key-encrypted package (#676): required for
+    # one and refused for any other. Never stored, logged or returned.
+    key: Optional[SecretStr] = None
 
     @field_validator("passphrase")
     @classmethod
     def _passphrase(cls, v: Optional[SecretStr]) -> Optional[SecretStr]:
         return _utf8_passphrase(v)
+
+    @field_validator("key")
+    @classmethod
+    def _key(cls, v: Optional[SecretStr]) -> Optional[SecretStr]:
+        if v is not None and len(v.get_secret_value()) > KEY_FILE_MAX:
+            raise ValueError(f"key must be at most {KEY_FILE_MAX} characters: the text of the key file")
+        return _utf8_passphrase(v)
+
+    @model_validator(mode="after")
+    def _one_secret(self):
+        if self.passphrase is not None and self.key is not None:
+            raise ValueError("send a passphrase or a key, not both")
+        return self
 
     @field_validator("on_conflict")
     @classmethod
@@ -325,6 +362,8 @@ class ImportJobStatusResponse(BaseModel):
     error_code: Optional[str]
     error_detail: Optional[dict]
     encrypted: bool = False
+    # "key", "passphrase" or "none", by the secret the import was sent (#676).
+    encryption: Optional[str] = None
 
 
 class PackageSummary(BaseModel):
@@ -341,6 +380,11 @@ class PackageSummary(BaseModel):
     # can't be read without the passphrase. `readable` then says whether its
     # age header is valid.
     encrypted: bool = False
+    # "none" for a `.tar.gz`; "key" or "passphrase" from a `.tar.gz.age` header,
+    # null when that header can't be read (#676). `key_on_server`: the package's
+    # key file is still in ./exports.
+    encryption: Optional[str] = None
+    key_on_server: bool = False
     # When a package this instance exported is deleted if nobody downloads it
     # (UTC, #677); null for one copied in to be imported or from before #677.
     expires_at: Optional[str] = None
@@ -676,6 +720,8 @@ class AuthUser(BaseModel):
     mfa_enrollment_required: Optional[bool] = None
     # Query-only mode (#670): the UI hides the pages that change data.
     query_only: Optional[bool] = None
+    # LAN mode (#26): the Transfer page hides the unencrypted export (#676).
+    lan_mode: Optional[bool] = None
 
 
 class AdminUser(BaseModel):

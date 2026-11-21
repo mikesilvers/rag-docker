@@ -1496,10 +1496,13 @@ restricted with no grants, so only AI Engineers can use it until one opens it
 or grants it on the Collections page; it never copies another collection's
 access. Only a replace keeps the collection's access.
 
-The passphrase of an encrypted package is asked for without echo when standard
-input is a terminal, and otherwise read as the first line of standard input
-(`docker compose exec -T api python -m loader NAME < file`). It is never an
-argument, never printed and never recorded.
+An encrypted package is opened by its key file (a key export, the default since
+#676) or its passphrase (#27); its age header says which. The key is asked for
+without echo when standard input is a terminal (paste the AGE-SECRET-KEY-1...
+line), and otherwise read as the whole of standard input, the key file itself
+(`docker compose exec -T api python -m loader NAME < NAME.key`). A passphrase is
+asked for the same way, or read as the first line of standard input
+(`... < passphrase-file`). Neither is ever an argument, printed or recorded.
 
 Each step is one line on standard error, prefixed "loader: ". Exit status: 0
 loaded, 1 refused or failed, 2 usage error. Every run past the arguments writes
@@ -1556,6 +1559,8 @@ def _audit(package: str, on_conflict: str, encrypted: bool, collection: str | No
            result: str = "success", code: str | None = None, chunks: int | None = None) -> None:
     from services import audit
     details: dict = {"on_conflict": on_conflict, "encrypted": encrypted}
+    if _state.get("encryption"):
+        details["encryption"] = _state["encryption"]    # "key" or "passphrase", never the secret (#676)
     if chunks is not None:
         details["chunks"] = chunks
     if code:
@@ -1596,6 +1601,18 @@ def _passphrase() -> str:
     return sys.stdin.readline().rstrip("\r\n")
 
 
+def _key(limit: int) -> str:
+    """The key file's text (#676): a hidden prompt on a terminal, otherwise the
+    whole of standard input, refused past `limit` characters."""
+    if sys.stdin.isatty():
+        return getpass.getpass("Key (the AGE-SECRET-KEY-1... line): ")
+    text = sys.stdin.read(limit + 1)
+    if len(text) > limit:
+        raise _Refused("KEY_FILE_INVALID", f"the key on standard input is longer than {limit} characters; "
+                                      "give the package's key file")
+    return text
+
+
 def _lock(upload_dir: str):
     """The one-load-at-a-time lock, held until the returned file is closed."""
     Path(upload_dir).mkdir(parents=True, exist_ok=True)
@@ -1618,7 +1635,7 @@ def _progress(job: dict, done: threading.Event) -> None:
             _say(f"chunks written: {count}")
 
 
-def _load(package: str, on_conflict: str, passphrase: str | None) -> dict:
+def _load(package: str, on_conflict: str, passphrase: str | None, identity=None) -> dict:
     """Run the import code on the package and return its finished job record."""
     from services import importer
     job_id = "load-" + uuid.uuid4().hex[:8]
@@ -1628,7 +1645,8 @@ def _load(package: str, on_conflict: str, passphrase: str | None) -> dict:
         "job_id": job_id, "status": "queued", "filename": package, "on_conflict": on_conflict,
         "collection": None, "original_collection": None, "chunks_written": 0, "fidelity": None,
         "renamed": False, "notes": [], "restored_sessions": [], "error": None, "error_code": None,
-        "error_detail": None, "encrypted": passphrase is not None,
+        "error_detail": None, "encrypted": passphrase is not None or identity is not None,
+        "encryption": "key" if identity is not None else "passphrase" if passphrase is not None else "none",
         "owner": None, "operator": True,        # access: restricted, no grants (#670)
     }
     job = importer._jobs[job_id]
@@ -1637,7 +1655,10 @@ def _load(package: str, on_conflict: str, passphrase: str | None) -> dict:
     ticker = threading.Thread(target=_progress, args=(job, done), daemon=True)
     ticker.start()
     try:
-        importer._run(job_id, package, on_conflict, passphrase)
+        if identity is not None:
+            importer._run(job_id, package, on_conflict, passphrase, identity=identity)
+        else:
+            importer._run(job_id, package, on_conflict, passphrase)
     finally:
         done.set()
     return job
@@ -1680,8 +1701,22 @@ def main(argv=None) -> int:
             regular = False
         if not regular:
             raise _Refused("PACKAGE_NOT_FOUND", f"no package named '{package}' in ./exports; copy it there first")
-        passphrase = None
-        if encrypted:
+        passphrase = identity = None
+        if encrypted and importer.package_kind(package) == "key":
+            # A key export (#676): its header says so.
+            _state["encryption"] = "key"
+            text = _key(age_stream.KEY_FILE_MAX)
+            if not text.strip():
+                raise _Refused("KEY_FILE_REQUIRED", f"'{package}' is encrypted with a key; give its key file "
+                                               "on standard input")
+            try:
+                identity = age_stream.parse_identity(text)
+            except age_stream.AgeError:
+                raise _Refused("KEY_FILE_INVALID", "that isn't the package's key file (one AGE-SECRET-KEY-1... "
+                                              "line)") from None
+            text = None
+        elif encrypted:
+            _state["encryption"] = "passphrase"
             passphrase = _passphrase()
             if not passphrase:
                 raise _Refused("PASSPHRASE_REQUIRED", f"'{package}' is encrypted; give its passphrase")
@@ -1689,7 +1724,7 @@ def main(argv=None) -> int:
         # API runs at its start. Under the lock, and nothing else imports here.
         for removed in importer.sweep_interrupted_imports():
             _say(f"removed a collection an interrupted load left half-built: {removed}")
-        job = _load(package, on_conflict, passphrase)
+        job = _load(package, on_conflict, passphrase, identity)
     except _Refused as refused:
         _state["done"] = True
         _say(f"load refused: {refused.code}: {refused}")
@@ -2037,6 +2072,7 @@ from __future__ import annotations
 from typing import Any, Optional, Annotated, Literal
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, BeforeValidator, ValidationError, field_validator, model_validator, SecretStr, StrictInt
 
+from services.age_stream import KEY_FILE_MAX
 from services.collection_writes import canonical
 
 
@@ -2263,10 +2299,23 @@ def _utf8_passphrase(v: Optional[SecretStr]) -> Optional[SecretStr]:
 class ExportRequest(BaseModel):
     collection: CollectionName
     include_models: bool = False
-    # Optional: given, the package is written encrypted as `.tar.gz.age` (#27).
+    # How the package is encrypted (#676): a new X25519 key, written to a key
+    # file beside it (the default); a passphrase (#27); or not at all, an
+    # explicit opt-out refused in LAN mode. Left out, a request with a
+    # passphrase is a passphrase export and one without is a key export.
+    encryption: Optional[Literal["key", "passphrase", "none"]] = None
+    # Given, the package is written encrypted as `.tar.gz.age` (#27).
     # SecretStr keeps it out of any repr or log line, and the 422 handler drops
     # `input`, so a refused passphrase is never echoed.
     passphrase: Optional[SecretStr] = None
+
+    @model_validator(mode="after")
+    def _encryption(self):
+        if self.encryption is None:
+            self.encryption = "passphrase" if self.passphrase is not None else "key"
+        elif (self.encryption == "passphrase") != (self.passphrase is not None):
+            raise ValueError("a passphrase goes with encryption 'passphrase', and that needs one")
+        return self
 
     @field_validator("passphrase")
     @classmethod
@@ -2297,9 +2346,16 @@ class ExportJobStatusResponse(BaseModel):
     retrieve_script: Optional[bool]
     warnings: list[str]
     error: Optional[str]
-    # Whether the export was requested with a passphrase (#27). Records from
-    # before #27 have no such key.
+    # Whether the package is encrypted (#27). Records from before #27 have no
+    # such key.
     encrypted: bool = False
+    # "key", "passphrase" or "none" (#676); records from before #676 read as
+    # "passphrase" when encrypted, else "none".
+    encryption: Optional[str] = None
+    # A key export's key file (#676): its name, never its contents, and whether
+    # it is still in ./exports (it is deleted by its own full download).
+    key_filename: Optional[str] = None
+    key_on_server: bool = False
 
     error_code: Optional[str] = None
     error_detail: Optional[dict] = None
@@ -2312,14 +2368,30 @@ class ImportRequest(BaseModel):
     # Required, no default (spec §6.4): silently picking a conflict policy could
     # delete a collection the caller did not mean to touch.
     on_conflict: str
-    # Required for a `.tar.gz.age` package and refused for any other (#27).
-    # Its length is checked on export only; any encodable value is tried here.
+    # Required for a passphrase `.tar.gz.age` package and refused for any other
+    # (#27). Its length is checked on export only; any encodable value is tried here.
     passphrase: Optional[SecretStr] = None
+    # The text of the key file of a key-encrypted package (#676): required for
+    # one and refused for any other. Never stored, logged or returned.
+    key: Optional[SecretStr] = None
 
     @field_validator("passphrase")
     @classmethod
     def _passphrase(cls, v: Optional[SecretStr]) -> Optional[SecretStr]:
         return _utf8_passphrase(v)
+
+    @field_validator("key")
+    @classmethod
+    def _key(cls, v: Optional[SecretStr]) -> Optional[SecretStr]:
+        if v is not None and len(v.get_secret_value()) > KEY_FILE_MAX:
+            raise ValueError(f"key must be at most {KEY_FILE_MAX} characters: the text of the key file")
+        return _utf8_passphrase(v)
+
+    @model_validator(mode="after")
+    def _one_secret(self):
+        if self.passphrase is not None and self.key is not None:
+            raise ValueError("send a passphrase or a key, not both")
+        return self
 
     @field_validator("on_conflict")
     @classmethod
@@ -2360,6 +2432,8 @@ class ImportJobStatusResponse(BaseModel):
     error_code: Optional[str]
     error_detail: Optional[dict]
     encrypted: bool = False
+    # "key", "passphrase" or "none", by the secret the import was sent (#676).
+    encryption: Optional[str] = None
 
 
 class PackageSummary(BaseModel):
@@ -2376,6 +2450,11 @@ class PackageSummary(BaseModel):
     # can't be read without the passphrase. `readable` then says whether its
     # age header is valid.
     encrypted: bool = False
+    # "none" for a `.tar.gz`; "key" or "passphrase" from a `.tar.gz.age` header,
+    # null when that header can't be read (#676). `key_on_server`: the package's
+    # key file is still in ./exports.
+    encryption: Optional[str] = None
+    key_on_server: bool = False
     # When a package this instance exported is deleted if nobody downloads it
     # (UTC, #677); null for one copied in to be imported or from before #677.
     expires_at: Optional[str] = None
@@ -2711,6 +2790,8 @@ class AuthUser(BaseModel):
     mfa_enrollment_required: Optional[bool] = None
     # Query-only mode (#670): the UI hides the pages that change data.
     query_only: Optional[bool] = None
+    # LAN mode (#26): the Transfer page hides the unencrypted export (#676).
+    lan_mode: Optional[bool] = None
 
 
 class AdminUser(BaseModel):
@@ -11103,8 +11184,9 @@ def exports_dir() -> Path:
 # Staging is now `{UPLOAD_DIR}/export-*`, swept with the other work directories
 # there (#549); `.build-*` is staging left here by earlier versions.
 _BUILD_DIR = ".build-*"
-# An encrypted export is written as `.<stem>.tar.gz.age.partial` (#27).
-_PARTIAL_ARCHIVES = (".*.tar.gz.partial", ".*.tar.gz.age.partial")
+# An encrypted export is written as `.<stem>.tar.gz.age.partial` (#27), and a
+# key export's key file as `.<stem>.tar.gz.age.key.partial` (#676).
+_PARTIAL_ARCHIVES = (".*.tar.gz.partial", ".*.tar.gz.age.partial", ".*.tar.gz.age.key.partial")
 
 
 def remove_leftover(entry: Path, *, directory: bool = False,
@@ -11378,6 +11460,21 @@ def _fidelity_note(fidelity: str) -> str:
             "work; re-chunking does not.")
 
 
+def _encryption_note(encryption: str, filename: str) -> str:
+    """The package README's line on how this package opens (#27, #676)."""
+    if encryption == "key":
+        return (f"This package is encrypted with its own key, in `{filename}.key`, written "
+                "beside it when it was exported. Open it with "
+                f"`age -d -i {filename}.key {filename}`, or import it with the key file (the "
+                "Transfer page, or the key file's text sent as `key`, for example built with "
+                f"`jq -n --rawfile key {filename}.key`). Store the key apart from the package: "
+                "anyone with both can read it.")
+    if encryption == "passphrase":
+        return ("This package is encrypted with the passphrase it was exported with; import "
+                "it with that passphrase, or open it with `age -d`.")
+    return "This package is not encrypted."
+
+
 def _retrieve_section(has_script: bool, cfg: dict, collection: str) -> str:
     if not has_script:
         return ("`retrieve.py` is **not** included in this package, because the "
@@ -11402,23 +11499,25 @@ def _add_members(tar: tarfile.TarFile, stage: Path, stem: str) -> None:
             tar.add(stage / entry, arcname=f"{stem}/{entry}")
 
 
-def _write_archive(stage: Path, stem: str, dest: Path, passphrase: str | None = None) -> None:
+def _write_archive(stage: Path, stem: str, dest: Path, passphrase: str | None = None,
+                   recipient: bytes | None = None) -> None:
     """Archive the staged package as `<stem>/`, with manifest.json first (#383).
 
     The directory entry, then the manifest, then everything else in the sorted
     order `tar.add(stage, arcname=stem)` gives, so the listing can stop reading
     at the manifest instead of decompressing chunks.jsonl to reach it.
 
-    With a passphrase the same tar.gz stream goes through the age encryptor on
-    its way to `dest` (#27): no plaintext archive is written, and only one
-    64 KiB chunk is held at a time, so a package of several GB streams.
+    With a passphrase (#27) or an X25519 recipient (#676) the same tar.gz stream
+    goes through the age encryptor on its way to `dest`: no plaintext archive is
+    written, and only one 64 KiB chunk is held at a time, so a package of
+    several GB streams.
     """
-    if passphrase is None:
+    if passphrase is None and recipient is None:
         with tarfile.open(dest, "w:gz") as tar:
             _add_members(tar, stage, stem)
         return
     with dest.open("wb") as fh:
-        encryptor = age_stream.Encryptor(fh, passphrase)
+        encryptor = age_stream.Encryptor(fh, passphrase, recipient=recipient)
         with tarfile.open(fileobj=encryptor, mode="w|gz") as tar:
             _add_members(tar, stage, stem)
         # Writes the final chunk; an exception above skips it, and build()
@@ -11432,6 +11531,7 @@ def build(
     include_models: bool = False,
     progress: Callable[[int], None] | None = None,
     passphrase: str | None = None,
+    key: bool = False,
 ) -> dict:
     """Write one package and return a summary. Blocking; run it in a thread.
 
@@ -11440,8 +11540,13 @@ def build(
     the manifest digest. Manifest last is what makes <id8> derivable.
 
     With a passphrase the package is written encrypted, as `<stem>.tar.gz.age`
-    (#27). The passphrase is used, never stored or logged.
+    (#27). The passphrase is used, never stored or logged. With `key` it is
+    encrypted to a new X25519 key instead (#676), whose secret goes only to the
+    key file `<filename>.key` (0600) beside it.
     """
+    if key and passphrase is not None:
+        raise ValueError("a package takes a passphrase or a key, not both")
+    encryption = "key" if key else "passphrase" if passphrase is not None else "none"
     created = datetime.now(timezone.utc)
     created_at = created.strftime("%Y-%m-%dT%H:%M:%SZ")
     out_dir = exports_dir()
@@ -11455,6 +11560,8 @@ def build(
     upload.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(dir=upload, prefix="export-"))
     tmp_archive: Path | None = None
+    tmp_key: Path | None = None
+    placed_key: Path | None = None
     try:
         b = _Builder(stage)
 
@@ -11636,7 +11743,7 @@ def build(
         # 7. the generated pair, which embed <id8>
         stem = package_stem(collection, created, id8)
         # The README and retrieve.py name the file as delivered (#27).
-        filename = f"{stem}{age_stream.ENCRYPTED_SUFFIX if passphrase is not None else '.tar.gz'}"
+        filename = f"{stem}{age_stream.ENCRYPTED_SUFFIX if encryption != 'none' else '.tar.gz'}"
 
         if has_saved_retrieval:
             (stage / "retrieve.py").write_text(_render_retrieve(collection, retrieval_cfg, {
@@ -11659,18 +11766,33 @@ def build(
             "CREATED_AT": created_at,
             "ID8": id8,
             "PACKAGE_FILENAME": filename,
-            "IMPORT_PASSPHRASE": (', "passphrase": "<the passphrase>"'
-                                  if passphrase is not None else ""),
+            "IMPORT_SECRET": {"passphrase": ', "passphrase": "<the passphrase>"',
+                              "key": ', "key": "<the key file\'s text>"'}.get(encryption, ""),
+            "ENCRYPTION_NOTE": _encryption_note(encryption, filename),
             "RETRIEVE_SECTION": _retrieve_section(has_saved_retrieval, retrieval_cfg, collection),
         }))
 
         # 8. archive under a temporary name, then rename, so a partial file is
         #    never mistaken for a package.
         tmp_archive = out_dir / f".{filename}.partial"
-        _write_archive(stage, stem, tmp_archive, passphrase)
+        identity = age_stream.generate_identity() if encryption == "key" else None
+        _write_archive(stage, stem, tmp_archive, passphrase,
+                       identity.public_bytes if identity is not None else None)
+        key_filename = None
+        if identity is not None:
+            # The key file first, 0600 from its creation (#676); the package is
+            # put in place only once its key is.
+            key_filename = filename + ".key"
+            tmp_key = out_dir / f".{key_filename}.partial"
+            _write_key_file(tmp_key, age_stream.identity_file(identity, created, filename))
+            identity = None
+            placed_key = out_dir / key_filename
+            tmp_key.replace(placed_key)
+            tmp_key = None
         final = out_dir / filename
         tmp_archive.replace(final)
         tmp_archive = None
+        placed_key = None
 
         return {
             "filename": filename,
@@ -11681,13 +11803,27 @@ def build(
             "models_bundled": models_bundled,
             "retrieve_script": has_saved_retrieval,
             "id8": id8,
-            "encrypted": passphrase is not None,
+            "encrypted": encryption != "none",
+            "encryption": encryption,
+            "key_filename": key_filename,
             "warnings": warnings,
         }
     finally:
         shutil.rmtree(stage, ignore_errors=True)
-        if tmp_archive is not None:
-            tmp_archive.unlink(missing_ok=True)
+        # A failed build leaves neither the package nor its key (#676).
+        for leftover in (tmp_archive, tmp_key, placed_key):
+            if leftover is not None:
+                leftover.unlink(missing_ok=True)
+
+
+def _write_key_file(path: Path, text: str) -> None:
+    """Create `path` with mode 0600 (the umask can only narrow it), never
+    following a link and never over an existing file, and write `text` (#676)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(fd, "w", encoding="ascii") as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
 
 
 # ── Reading a package back ────────────────────────────────────────────────────
@@ -11933,11 +12069,12 @@ def _safe_extract_stream(tar: tarfile.TarFile, dest: Path, name: str) -> None:
 
 
 # Why an encrypted package could not be decrypted, for `error_detail.reason`.
-_DECRYPT_REASONS = {"work_factor": "work_factor", "passphrase": "passphrase",
+_DECRYPT_REASONS = {"work_factor": "work_factor", "passphrase": "passphrase", "key": "key",
                     "hmac": "header", "payload": "payload", "nonce": "payload"}
 
 
-def _extract_encrypted(archive: Path, dest: Path, passphrase: str) -> None:
+def _extract_encrypted(archive: Path, dest: Path, passphrase: str | None,
+                       identity: "age_stream.Identity | None" = None) -> None:
     """Check 1 for a `.tar.gz.age` package: decrypt it as a stream into the tar
     reader, then authenticate the rest of the file to its end (#27).
 
@@ -11946,31 +12083,36 @@ def _extract_encrypted(archive: Path, dest: Path, passphrase: str) -> None:
     """
     try:
         with archive.open("rb") as fh:
-            decryptor = age_stream.open_decrypt(fh, passphrase)
+            if identity is not None:
+                decryptor = age_stream.open_decrypt(fh, identity=identity)
+            else:
+                decryptor = age_stream.open_decrypt(fh, passphrase)
             with tarfile.open(fileobj=decryptor, mode="r|gz") as tar:
                 _safe_extract_stream(tar, dest, archive.name)
             # tarfile stops at the end-of-archive blocks; the final chunk, and
             # anything after it, still has to be authenticated.
             decryptor.drain()
     except age_stream.AgeError as exc:
-        if exc.kind in ("header", "recipient"):
+        if exc.kind in ("header", "recipient", "identity"):
             raise PackageError(
                 "PACKAGE_UNREADABLE",
-                f"'{archive.name}' is not a passphrase-encrypted age file.",
+                f"'{archive.name}' is not "
+                f"{'a key-encrypted' if identity is not None else 'a passphrase-encrypted'} age file.",
                 {"reason": str(exc)}) from None
         raise PackageError(
             "DECRYPT_FAILED",
-            f"'{archive.name}' could not be decrypted: the passphrase is wrong or "
-            "the file is damaged.",
+            f"'{archive.name}' could not be decrypted: the "
+            f"{'key' if identity is not None else 'passphrase'} is wrong or the file is damaged.",
             {"reason": _DECRYPT_REASONS[exc.kind]}) from None
 
 
 @telemetry.traced("rag.package")
-def open_package(archive: Path, dest: Path, passphrase: str | None = None) -> tuple[Path, dict]:
+def open_package(archive: Path, dest: Path, passphrase: str | None = None,
+                 identity: "age_stream.Identity | None" = None) -> tuple[Path, dict]:
     """Checks 1 and 2 of spec §6.2: readable archive, understood format.
 
-    A `.tar.gz.age` package is decrypted with `passphrase` as it is unpacked
-    (#27); everything from check 2 on reads the decrypted files, as for an
+    A `.tar.gz.age` package is decrypted with `passphrase` (#27), or with the
+    X25519 `identity` of its key file (#676), as it is unpacked; everything from check 2 on reads the decrypted files, as for an
     unencrypted package. Returns (package root directory, manifest).
     """
     if not archive.is_file():
@@ -11979,7 +12121,8 @@ def open_package(archive: Path, dest: Path, passphrase: str | None = None) -> tu
     encrypted = age_stream.is_encrypted_name(archive.name)
     try:
         if encrypted:
-            _extract_encrypted(archive, dest, passphrase or "")
+            _extract_encrypted(archive, dest, None if identity is not None else passphrase or "",
+                               identity)
         else:
             with tarfile.open(archive, "r:gz") as tar:
                 _safe_extract(tar, dest, archive.name)
@@ -12086,18 +12229,32 @@ def iter_chunks_file(pkg: Path) -> Iterator[dict]:
 ### api/services/age_stream.py
 
 ```python
-"""Passphrase encryption of export packages in the age v1 format (#27).
+"""Encryption of export packages in the age v1 format (#27, #676).
 
-An encrypted package is an ordinary age file with one `scrypt` (passphrase)
-recipient, so `age -d` opens it as well as import does. The format is the C2SP
-age specification (https://c2sp.org/age); this module implements only the parts
-a passphrase file uses, on the `cryptography` package the API already locks:
+An encrypted package is an ordinary age file, so `age -d` opens it as well as
+import does. It has one recipient, of one of two kinds:
+
+- a new X25519 key per package (#676, the default): one `X25519` stanza. The
+  secret key is written once, to the package's key file, in age's own identity
+  file layout (`# created:`, `# public key: age1...`, `AGE-SECRET-KEY-1...`),
+  so `age -d -i <package>.key` opens it too;
+- a passphrase (#27): one `scrypt` stanza.
+
+The format is the C2SP age specification (https://c2sp.org/age); this module
+implements only the parts these files use, on the `cryptography` package the
+API already locks. Keys and recipients are Bech32 (BIP 173), as age writes them.
+age's post-quantum hybrid recipients (`mlkem768x25519`, `AGE-SECRET-KEY-PQ-1`)
+are not supported: export writes X25519 only, and import refuses a PQ key file.
+A passphrase file looks like this:
 
     age-encryption.org/v1
     -> scrypt <salt, base64> <work factor>
     <wrapped file key, base64>
     --- <header MAC, base64>
     <16-byte nonce><STREAM payload: 64 KiB chunks, ChaCha20-Poly1305>
+
+A key file's package has `-> X25519 <ephemeral share, base64>` and the wrapped
+file key in place of the scrypt stanza; everything after the stanza is the same.
 
 pyrage was not used: its passphrase API takes and returns whole byte strings,
 and a package can be several GB. Both directions here stream: the encryptor is a
@@ -12121,7 +12278,8 @@ from hashlib import sha256
 from typing import BinaryIO
 
 from cryptography.exceptions import InvalidTag
-from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
@@ -12139,6 +12297,10 @@ _NONCE = 16
 WORK_FACTOR = 18
 MAX_WORK_FACTOR = 20
 _SCRYPT_LABEL = b"age-encryption.org/v1/scrypt"
+_X25519_LABEL = b"age-encryption.org/v1/X25519"
+# The longest key file import reads (POST /import and the loader): age's own is
+# about 190 characters.
+KEY_FILE_MAX = 4096
 # A passphrase file's header is about 150 bytes. Reading stops well before a
 # hostile file could make the parser hold a large one.
 HEADER_MAX = 64 * 1024
@@ -12159,8 +12321,11 @@ class AgeError(Exception):
 
     header      not a valid age header (or not an age file at all), a scrypt
                 work factor that is not a decimal without a sign or leading
-                zero included (#549)
+                zero included (#549); a malformed X25519 stanza, one whose
+                share gives an all-zero secret, or a scrypt stanza next to it
     recipient   a valid age header, but not for a passphrase
+    key         an X25519 key that unwraps none of the file's X25519 stanzas
+    identity    a key file that isn't one valid age X25519 secret key
     work_factor the scrypt work factor is above MAX_WORK_FACTOR, a decimal of
                 more than two digits included
     nonce       the file ends inside the 16-byte payload nonce
@@ -12337,18 +12502,214 @@ def verify_mac(header: Header, file_key: bytes) -> None:
         raise AgeError("hmac", "the age header MAC does not match")
 
 
-def check_header(fh: BinaryIO) -> bool:
-    """True when `fh` starts with a valid age passphrase header. No scrypt runs,
-    and the work factor is not held against the limit; for the listing.
+def header_kind(fh: BinaryIO) -> str | None:
+    """`"passphrase"` when `fh` starts with a valid age passphrase header, `"key"`
+    when it starts with a valid header with an `X25519` stanza and no `scrypt`
+    (#676), else None. No scrypt or X25519 operation runs, and the work factor
+    is not held against the limit: for the listing and for choosing which
+    secret an import needs.
 
-    Any failure reading or parsing the file is False, never an exception: one
+    Any failure reading or parsing the file is None, never an exception: one
     bad file must not break the listing of the others (#27 review).
     """
     try:
-        scrypt_stanza(read_header(fh))
+        header = read_header(fh)
+        types = [s.args[0] for s in header.stanzas]
+        if "scrypt" in types:
+            scrypt_stanza(header)
+            return "passphrase"
+        return "key" if "X25519" in types else None
     except Exception:                                 # noqa: BLE001 - see above
-        return False
-    return True
+        return None
+
+
+def check_header(fh: BinaryIO) -> bool:
+    """True when `fh` starts with a valid passphrase or key header (`header_kind`)."""
+    return header_kind(fh) is not None
+
+
+# ── X25519 keys (#676) ────────────────────────────────────────────────────────
+
+_BECH32 = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+_BECH32_REV = {c: i for i, c in enumerate(_BECH32)}
+
+
+def _polymod(values) -> int:
+    gen = (0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3)
+    chk = 1
+    for v in values:
+        top = chk >> 25
+        chk = (chk & 0x1FFFFFF) << 5 ^ v
+        for i in range(5):
+            chk ^= gen[i] if (top >> i) & 1 else 0
+    return chk
+
+
+def _hrp_expand(hrp: str) -> list[int]:
+    return [ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp]
+
+
+def _convert(data, frombits: int, tobits: int, pad: bool) -> list[int]:
+    acc = bits = 0
+    out = []
+    maxv = (1 << tobits) - 1
+    for value in data:
+        acc = (acc << frombits) | value
+        bits += frombits
+        while bits >= tobits:
+            bits -= tobits
+            out.append((acc >> bits) & maxv)
+    if pad:
+        if bits:
+            out.append((acc << (tobits - bits)) & maxv)
+    elif bits >= frombits or (acc << (tobits - bits)) & maxv:
+        raise ValueError("invalid Bech32 padding")
+    return out
+
+
+def _bech32_encode(hrp: str, data: bytes) -> str:
+    """Bech32 (BIP 173), lowercase, with no length limit, as age writes keys."""
+    words = _convert(data, 8, 5, True)
+    values = _hrp_expand(hrp) + words
+    poly = _polymod(values + [0] * 6) ^ 1
+    checksum = [(poly >> 5 * (5 - i)) & 31 for i in range(6)]
+    return hrp + "1" + "".join(_BECH32[w] for w in words + checksum)
+
+
+def _bech32_decode(text: str) -> tuple[str, bytes]:
+    """The HRP (lowercase) and the data of a Bech32 string. Raises ValueError,
+    never naming the input, for mixed case, a bad character or checksum."""
+    if text.lower() != text and text.upper() != text:
+        raise ValueError("mixed-case Bech32")
+    text = text.lower()
+    pos = text.rfind("1")
+    if pos < 1 or pos + 7 > len(text) or any(ord(c) < 33 or ord(c) > 126 for c in text):
+        raise ValueError("malformed Bech32")
+    hrp, rest = text[:pos], text[pos + 1:]
+    try:
+        values = [_BECH32_REV[c] for c in rest]
+    except KeyError:
+        raise ValueError("invalid Bech32 character") from None
+    if _polymod(_hrp_expand(hrp) + values) != 1:
+        raise ValueError("invalid Bech32 checksum")
+    return hrp, bytes(_convert(values[:-6], 5, 8, False))
+
+
+_RAW = serialization.Encoding.Raw
+
+
+class Identity:
+    """An age X25519 secret key. Its repr never shows the key, and nothing
+    returns its text except `encode()`, which only the key file uses."""
+
+    __slots__ = ("_key",)
+
+    def __init__(self, key: X25519PrivateKey):
+        self._key = key
+
+    def __repr__(self) -> str:
+        return "Identity(<redacted>)"
+
+    @property
+    def public_bytes(self) -> bytes:
+        return self._key.public_key().public_bytes(_RAW, serialization.PublicFormat.Raw)
+
+    @property
+    def recipient(self) -> str:
+        """The `age1...` recipient: the public key, which is not secret."""
+        return _bech32_encode("age", self.public_bytes)
+
+    def encode(self) -> str:
+        """The `AGE-SECRET-KEY-1...` line of the key file."""
+        raw = self._key.private_bytes(_RAW, serialization.PrivateFormat.Raw,
+                                      serialization.NoEncryption())
+        return _bech32_encode("age-secret-key-", raw).upper()
+
+    def exchange(self, share: bytes) -> bytes:
+        return self._key.exchange(X25519PublicKey.from_public_bytes(share))
+
+
+def generate_identity() -> Identity:
+    """A new X25519 key pair: one per package (#676)."""
+    return Identity(X25519PrivateKey.generate())
+
+
+def parse_identity(text: str) -> Identity:
+    """The key in the contents of an age X25519 identity file (#676).
+
+    Blank lines and `#` comments are skipped, and CRLF line ends are accepted.
+    Exactly one other line must remain: one `AGE-SECRET-KEY-1...` key. Anything
+    else, a post-quantum `AGE-SECRET-KEY-PQ-1...` key included, raises
+    AgeError("identity"), whose message never contains the text.
+    """
+    bad = AgeError("identity", "the key file is not a valid age X25519 key")
+    if not isinstance(text, str) or len(text) > KEY_FILE_MAX:
+        raise bad
+    lines = [line[:-1] if line.endswith("\r") else line for line in text.split("\n")]
+    keys = [line for line in lines if line.strip() and not line.startswith("#")]
+    if len(keys) != 1 or not keys[0].startswith("AGE-SECRET-KEY-1"):
+        raise bad
+    try:
+        hrp, data = _bech32_decode(keys[0])
+    except ValueError:
+        raise bad from None
+    if hrp != "age-secret-key-" or len(data) != 32:
+        raise bad
+    return Identity(X25519PrivateKey.from_private_bytes(data))
+
+
+def identity_file(identity: Identity, created, package: str) -> str:
+    """The key file's text, in age's identity file layout, so `age -d -i` reads
+    it. `created` is a UTC datetime."""
+    return (f"# created: {created.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+            f"# public key: {identity.recipient}\n"
+            f"# The key of {package}. Store it apart from the package: anyone with "
+            "both can read it.\n"
+            f"{identity.encode()}\n")
+
+
+def _x25519_stanza(file_key: bytes, recipient: bytes) -> bytes:
+    """The `X25519` stanza wrapping `file_key` to the raw public key `recipient`."""
+    ephemeral = X25519PrivateKey.generate()
+    share = ephemeral.public_key().public_bytes(_RAW, serialization.PublicFormat.Raw)
+    secret = ephemeral.exchange(X25519PublicKey.from_public_bytes(recipient))
+    if secret == bytes(32):
+        raise ValueError("the recipient is a low-order point")
+    wrap = _hkdf(secret, share + recipient, _X25519_LABEL)
+    body = ChaCha20Poly1305(wrap).encrypt(b"\x00" * 12, file_key, None)
+    return b"-> X25519 " + _b64encode(share) + b"\n" + _b64encode(body) + b"\n"
+
+
+def x25519_unwrap(header: Header, identity: Identity) -> bytes:
+    """The file key from the first `X25519` stanza `identity` opens.
+
+    Stanzas are taken in order, as age does: other stanza types are skipped, a
+    malformed X25519 stanza met first is a header failure, and one that doesn't
+    open is passed over. A scrypt stanza must be alone (`scrypt_stanza`).
+    """
+    if "scrypt" in [s.args[0] for s in header.stanzas]:
+        raise AgeError("header", "a scrypt stanza must be the only stanza")
+    ours = identity.public_bytes
+    for stanza in header.stanzas:
+        if stanza.args[0] != "X25519":
+            continue
+        if len(stanza.args) != 2:
+            raise AgeError("header", "malformed X25519 stanza")
+        share = _b64decode(stanza.args[1].encode("ascii"))
+        if len(share) != 32 or len(stanza.body) != _FILE_KEY + _TAG:
+            raise AgeError("header", "malformed X25519 stanza")
+        try:
+            secret = identity.exchange(share)
+        except ValueError:
+            secret = bytes(32)
+        if secret == bytes(32):
+            raise AgeError("header", "the X25519 share gives an all-zero secret")
+        try:
+            return ChaCha20Poly1305(_hkdf(secret, share + ours, _X25519_LABEL)).decrypt(
+                b"\x00" * 12, stanza.body, None)
+        except InvalidTag:
+            continue
+    raise AgeError("key", "the key does not decrypt this file")
 
 
 # ── Payload (STREAM) ──────────────────────────────────────────────────────────
@@ -12443,34 +12804,48 @@ class Decryptor(io.RawIOBase):
             raise self._error
 
 
-def open_decrypt(fh: BinaryIO, passphrase: str) -> Decryptor:
-    """Parse the header, unwrap the key, check the MAC; then stream the payload."""
+def open_decrypt(fh: BinaryIO, passphrase: str | None = None, *,
+                 identity: Identity | None = None) -> Decryptor:
+    """Parse the header, unwrap the key with the passphrase or the X25519
+    identity (exactly one), check the MAC; then stream the payload."""
+    if (passphrase is None) == (identity is None):
+        raise ValueError("open_decrypt takes a passphrase or an identity")
     header = read_header(fh)
-    file_key = unwrap_file_key(header, passphrase)
+    if identity is not None:
+        file_key = x25519_unwrap(header, identity)
+    else:
+        file_key = unwrap_file_key(header, passphrase)
     verify_mac(header, file_key)
     return Decryptor(fh, file_key)
 
 
 class Encryptor(io.RawIOBase):
-    """Writes an age passphrase file to `fh` from the plaintext written to it.
+    """Writes an age file to `fh` from the plaintext written to it, for a
+    passphrase or for an X25519 recipient (`recipient`, the raw 32-byte public
+    key; #676): exactly one of them.
 
     The last chunk carries the final flag, so a full chunk is held back until
     either more data or `close()` shows whether it is the last. `close()` writes
     it and leaves `fh` open: the caller owns that file.
     """
 
-    def __init__(self, fh: BinaryIO, passphrase: str, work_factor: int | None = None):
+    def __init__(self, fh: BinaryIO, passphrase: str | None = None, work_factor: int | None = None,
+                 *, recipient: bytes | None = None):
         super().__init__()
+        if (passphrase is None) == (recipient is None):
+            raise ValueError("Encryptor takes a passphrase or a recipient")
         self._fh = fh
-        work_factor = WORK_FACTOR if work_factor is None else work_factor
         file_key = os.urandom(_FILE_KEY)
-        salt = os.urandom(16)
-        key = _scrypt(passphrase.encode("utf-8"), salt, work_factor)
-        wrapped = ChaCha20Poly1305(key).encrypt(b"\x00" * 12, file_key, None)
-        mac_input = (VERSION_LINE + b"\n"
-                     + b"-> scrypt " + _b64encode(salt) + b" " + str(work_factor).encode() + b"\n"
-                     + _b64encode(wrapped) + b"\n"   # 43 characters: one short line
-                     + b"---")
+        if recipient is not None:
+            stanza = _x25519_stanza(file_key, recipient)
+        else:
+            work_factor = WORK_FACTOR if work_factor is None else work_factor
+            salt = os.urandom(16)
+            key = _scrypt(passphrase.encode("utf-8"), salt, work_factor)
+            wrapped = ChaCha20Poly1305(key).encrypt(b"\x00" * 12, file_key, None)
+            stanza = (b"-> scrypt " + _b64encode(salt) + b" " + str(work_factor).encode() + b"\n"
+                      + _b64encode(wrapped) + b"\n")   # 43 characters: one short line
+        mac_input = VERSION_LINE + b"\n" + stanza + b"---"
         nonce = os.urandom(_NONCE)
         fh.write(mac_input + b" " + _b64encode(_header_mac(file_key, mac_input)) + b"\n" + nonce)
         self._aead = ChaCha20Poly1305(_hkdf(file_key, nonce, b"payload"))
@@ -13200,7 +13575,7 @@ def active_job_for(collection: str) -> str | None:
 
 @telemetry.traced("rag.export")
 def _run(job_id: str, collection: str, include_models: bool,
-         passphrase: str | None = None) -> None:
+         passphrase: str | None = None, encryption: str | None = None) -> None:
     job = _jobs[job_id]
 
     def progress(written: int) -> None:
@@ -13221,8 +13596,10 @@ def _run(job_id: str, collection: str, include_models: bool,
         # it is released before the terminal status is written.
         with collection_writes.guard(collection):
             job["status"] = "running"
+            # `key` only when it is asked for, so a build without one is called as before.
+            keyed = {"key": True} if encryption == "key" else {}
             result = packager.build(collection, include_models=include_models, progress=progress,
-                                    passphrase=passphrase)
+                                    passphrase=passphrase, **keyed)
     except packager.PackageError as exc:
         telemetry.outcome("error", exc)
         _log.warning("Export of %r refused (%s): %s", collection, exc.code, exc.message)
@@ -13246,13 +13623,24 @@ def _run(job_id: str, collection: str, include_models: bool,
         # export finish also sees when its package expires (#677). A failure
         # leaves the package unrecorded, never expired: the job says so. The
         # collection is recorded too: an encrypted package follows its access (#794).
+        # A key export's key file is recorded too, with the same finish time:
+        # each is deleted by its own full download, and expiry deletes both (#676).
         warnings = list(result["warnings"])
+        key_filename = result.get("key_filename")
+        finished = datetime.now(timezone.utc)
         try:
-            package_retention.record_export(result["filename"], datetime.now(timezone.utc), collection)
+            package_retention.record_export(result["filename"], finished, collection)
+            if key_filename:
+                package_retention.record_export(key_filename, finished, collection)
         except Exception:                          # noqa: BLE001 - reported in the warnings
             _log.exception("Could not record the expiry of package %s", result["filename"])
-            warnings.append("The package's expiry could not be recorded, so it won't be deleted "
-                            "automatically. Delete it from ./exports by hand once it has been copied.")
+            if key_filename:
+                warnings.append("The expiry of the package and its key file could not be recorded, so "
+                                "they won't be deleted automatically. Delete both from ./exports by hand "
+                                "once they have been copied.")
+            else:
+                warnings.append("The package's expiry could not be recorded, so it won't be deleted "
+                                "automatically. Delete it from ./exports by hand once it has been copied.")
         finish(
             status="completed",
             filename=result["filename"],
@@ -13262,6 +13650,7 @@ def _run(job_id: str, collection: str, include_models: bool,
             fidelity=result["fidelity"],
             models_bundled=result["models_bundled"],
             retrieve_script=result["retrieve_script"],
+            key_filename=key_filename,
             warnings=warnings,
         )
     finally:
@@ -13273,16 +13662,24 @@ def _run(job_id: str, collection: str, include_models: bool,
 
 
 async def start_export_job(collection: str, include_models: bool = False,
-                           passphrase: str | None = None, owner: dict | None = None) -> str:
+                           passphrase: str | None = None, owner: dict | None = None,
+                           encryption: str | None = None) -> str:
     """Register the job and run the build off the event loop.
 
-    A passphrase makes the package encrypted (#27). It is handed to the worker
-    as an argument only: the job record says `encrypted`, never the passphrase.
+    `encryption` is `"key"` (a new X25519 key per package, #676), `"passphrase"`
+    (#27) or `"none"`. Left out, it is `"passphrase"` with a passphrase and
+    `"none"` without: the API's own default, a key, is set by POST /export
+    (ExportRequest). The passphrase is handed to the worker as an argument
+    only: the job record says `encryption` and `encrypted`, never a secret.
 
     Raises ExportInProgressError carrying the running job id if one is already in flight
     for this collection; that job's record is always stored by then (#326).
     Raises ExportStartingError if that start hasn't stored it within START_WAIT.
     """
+    if encryption is None:
+        encryption = "passphrase" if passphrase is not None else "none"
+    if (encryption == "passphrase") != (passphrase is not None):
+        raise ValueError("a passphrase goes with encryption 'passphrase' only")
     job_id = str(uuid.uuid4())[:8]
     deadline = None
     while True:
@@ -13331,7 +13728,9 @@ async def start_export_job(collection: str, include_models: bool = False,
                 "fidelity": None,
                 "models_bundled": None,
                 "retrieve_script": None,
-                "encrypted": passphrase is not None,
+                "encrypted": encryption != "none",
+                "encryption": encryption,
+                "key_filename": None,
                 "warnings": [],
                 "error": None,
                 "error_code": None,
@@ -13353,7 +13752,7 @@ async def start_export_job(collection: str, include_models: bool = False,
     # export does not stall the API: queries and other collections carry on, and
     # only guarded writes to this collection wait for it (spec §6.1, #509).
     task = asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, collection, include_models,
-                                         passphrase))
+                                         passphrase, encryption))
     # _run ends it first; this also covers a task that never ran its worker.
     task.add_done_callback(lambda _task: collection_writes.end_job("export", job_id))
     return job_id
@@ -13385,10 +13784,17 @@ A package copied straight from the host folder is still deleted after the expiry
 a download is refused (409 PACKAGE_BUSY) and the sweep skips it until its next
 run. Claiming a download and the sweep's check-and-delete take the same lock.
 
-**One way to delete.** `delete` removes the package, its companion files (none
-yet; #676's key file will be one) and its record entry, and writes one
-`package.delete` audit record. `may_sweep` alone decides whether the sweep may
-delete a package, so a later "keep" flag changes only that function.
+**One way to delete.** `delete` removes the package, its companion files (none)
+and its record entry, and writes one `package.delete` audit record. `may_sweep`
+alone decides whether the sweep may delete a package, so a later "keep" flag
+changes only that function.
+
+**Key files (#676).** A key export's key file, `<package>.key`, is recorded on
+its own, with the package's finish time and collection. It follows the same
+rules by its own name: a full download of it deletes it and only it, a full
+download of the package leaves it, and expiry deletes whichever of the two is
+still there. So it is not a companion: deleting it with the package would lose
+the key of a package downloaded first.
 
 **The record.** Each entry is `{"finished_at": ..., "collection": ...}`: the
 collection is the one exported, so an encrypted package exported here follows
@@ -13429,7 +13835,9 @@ RECORD_NAME = "exported_packages.json"
 SWEEP_INTERVAL_S = 15 * 60
 # The names a download serves: what exports write (packager.package_stem). The
 # `ragpkg-` prefix rules out a leading `.` and the class rules out `/`.
-NAME = re.compile(r"ragpkg-[A-Za-z0-9._-]+\.tar\.gz(?:\.age)?")
+NAME = re.compile(r"ragpkg-[A-Za-z0-9._-]+\.tar\.gz(?:\.age(?:\.key)?)?")
+# A key export's key file (#676): `<package>.tar.gz.age.key`.
+KEY_SUFFIX = ".tar.gz.age.key"
 _TIME = "%Y-%m-%dT%H:%M:%SZ"
 
 _lock = threading.RLock()
@@ -13450,6 +13858,11 @@ def lock():
 
 def valid_name(name) -> bool:
     return isinstance(name, str) and NAME.fullmatch(name) is not None
+
+
+def is_key_name(name) -> bool:
+    """A key file's name (#676), as the download rule admits it."""
+    return valid_name(name) and name.endswith(KEY_SUFFIX)
 
 
 def _exports() -> Path:
@@ -13600,7 +14013,8 @@ def recorded_collections() -> dict[str, str | None]:
 
 
 def companions(filename: str) -> list[str]:
-    """Files deleted with a package. None yet: #676's key file will be one."""
+    """Files deleted with a package. None: a key file (#676) is recorded and
+    deleted on its own, so downloading the package never deletes its key."""
     return []
 
 
@@ -13777,6 +14191,7 @@ import asyncio
 import json
 import logging
 import os
+import stat
 import re
 import shutil
 import tempfile
@@ -13821,8 +14236,9 @@ _NAME_OK = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 
 
 class PassphraseError(Exception):
-    """A passphrase missing for an encrypted package, or given for one that is
-    not encrypted (#27). Raised before any job exists; `code` is the API code."""
+    """A passphrase or key missing for an encrypted package, given for one that
+    is not encrypted or that takes the other, or a key that isn't one (#27,
+    #676). Raised before any job exists; `code` is the API code."""
 
     def __init__(self, code: str, message: str):
         super().__init__(message)
@@ -14647,7 +15063,8 @@ def _start_access(owner, source: str, target: str, operator: bool = False):
 
 
 @telemetry.traced("rag.import")
-def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = None) -> None:
+def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = None,
+         identity: "age_stream.Identity | None" = None) -> None:
     job = _jobs[job_id]
     job["status"] = "running"
     work = Path(tempfile.mkdtemp(prefix="import-", dir=settings.upload_dir))
@@ -14672,7 +15089,9 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
 
     try:
         archive = packager.exports_dir() / Path(filename).name
-        pkg, manifest = packager.open_package(archive, work, passphrase)  # checks 1, 2
+        # checks 1, 2; an identity (#676) only when there is one, so the call is otherwise as before
+        pkg, manifest = (packager.open_package(archive, work, passphrase, identity=identity)
+                         if identity is not None else packager.open_package(archive, work, passphrase))
         packager.verify_digests(pkg, manifest)                      # check 3
         _validate_package_sources(pkg, manifest)
         _check_embedding(manifest)                                  # check 4
@@ -14847,29 +15266,72 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
         _release_targets(job_id)
 
 
+def package_kind(name: str) -> str | None:
+    """`age_stream.header_kind` of a package in ./exports: "passphrase", "key",
+    or None when it is missing, not a regular file, or not a header either
+    takes. Reads the header only: no scrypt or X25519 work (#676)."""
+    try:
+        fd = os.open(packager.exports_dir() / Path(name).name,
+                     os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return None
+    with os.fdopen(fd, "rb") as fh:
+        try:
+            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                return None
+        except OSError:
+            return None
+        return age_stream.header_kind(fh)
+
+
 async def start_import_job(filename: str, on_conflict: str, passphrase: str | None = None,
-                           owner: dict | None = None) -> str:
+                           owner: dict | None = None, *, key: str | None = None) -> str:
     """Register the job and run the import off the event loop.
 
-    An encrypted package is known by its name (`.tar.gz.age`, #27), so a missing
-    or unexpected passphrase is refused here, before any job or guard. The
-    passphrase reaches the worker as an argument only, never the job record.
+    An encrypted package is known by its name (`.tar.gz.age`, #27), and whether
+    a passphrase or its key file opens it by its age header (#676), so a missing,
+    unexpected or invalid secret is refused here, before any job or guard. An
+    unreadable header takes either secret, and the job reports why it can't be
+    read. The secret reaches the worker as an argument only, never the job record.
     """
-    key = _package_key(filename)
-    encrypted = age_stream.is_encrypted_name(key)
-    if encrypted and passphrase is None:
-        raise PassphraseError("PASSPHRASE_REQUIRED",
-                              f"'{key}' is encrypted. Send its passphrase to import it.")
+    name = _package_key(filename)
+    encrypted = age_stream.is_encrypted_name(name)
     if not encrypted and passphrase is not None:
         raise PassphraseError("PASSPHRASE_NOT_EXPECTED",
-                              f"'{key}' is not encrypted, so it takes no passphrase. "
+                              f"'{name}' is not encrypted, so it takes no passphrase. "
                               "Anyone with the file can read it.")
+    if not encrypted and key is not None:
+        raise PassphraseError("KEY_FILE_NOT_EXPECTED",
+                              f"'{name}' is not encrypted, so it takes no key. "
+                              "Anyone with the file can read it.")
+    identity = None
+    if encrypted:
+        kind = await asyncio.to_thread(package_kind, name)
+        if kind == "key" and key is None:
+            raise PassphraseError("KEY_FILE_REQUIRED",
+                                  f"'{name}' is encrypted with a key. Send its key file to import it.")
+        if kind == "passphrase" and passphrase is None:
+            raise PassphraseError("PASSPHRASE_REQUIRED",
+                                  f"'{name}' is encrypted with a passphrase. Send its passphrase to import it.")
+        if kind is None and passphrase is None and key is None:
+            raise PassphraseError("PASSPHRASE_REQUIRED",
+                                  f"'{name}' is encrypted. Send its passphrase to import it.")
+        if key is not None:
+            try:
+                identity = age_stream.parse_identity(key)
+            except age_stream.AgeError:
+                raise PassphraseError("KEY_FILE_INVALID",
+                                      "The key isn't the text of an age key file "
+                                      "(one AGE-SECRET-KEY-1... line).") from None
+            passphrase = None
+    encryption = "key" if identity is not None else "passphrase" if passphrase is not None else "none"
+    key = None                         # the key's text is not kept past here
     job_id = str(uuid.uuid4())[:8]
     # Off the event loop: the claim waits while a sweep holds the retention lock
     # (#677). A cancellation while it runs still releases it (#794).
     from services import package_retention
-    await package_retention.run_claim(lambda: _claim_package(key, filename),
-                                      lambda _: _release_package(key))
+    await package_retention.run_claim(lambda: _claim_package(name, filename),
+                                      lambda _: _release_package(name))
 
     # The first write is durable, so it runs off the event loop (#309). A start
     # cancelled meanwhile releases its guard; the store removes the record.
@@ -14890,13 +15352,18 @@ async def start_import_job(filename: str, on_conflict: str, passphrase: str | No
             "error_code": None,
             "error_detail": None,
             "encrypted": encrypted,
+            "encryption": encryption,
             "owner": owner,                     # who started it, for the job lists (#617)
         })
     except BaseException:
-        _release_package(key)
+        _release_package(name)
         raise
-    asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, filename, on_conflict,
-                                          passphrase))
+    if identity is not None:
+        asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, filename, on_conflict,
+                                              None, identity))
+    else:
+        asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, filename, on_conflict,
+                                              passphrase))
     return job_id
 ```
 
@@ -17107,6 +17574,7 @@ from models.schemas import (
     PackageListResponse,
     PackageSummary,
 )
+from config import settings
 from services import age_stream, audit, exporter, importer, job_lists, package_retention, packager
 from services import weaviate_client as wc
 from services.collection_writes import CollectionDeletingError
@@ -17118,8 +17586,14 @@ _log = logging.getLogger(__name__)
 
 @router.post("/export", response_model=ExportStartResponse, status_code=202)
 async def start_export(body: ExportRequest, request: Request = None):
-    # The audit record's parameters (#29): whether it is encrypted, never the passphrase.
-    audit.note(collection=body.collection, include_models=body.include_models, encrypted=body.passphrase is not None)
+    # The audit record's parameters (#29): how it is encrypted, never a secret.
+    audit.note(collection=body.collection, include_models=body.include_models,
+               encrypted=body.encryption != "none", encryption=body.encryption)
+    # LAN mode exports only encrypted packages (#676).
+    if settings.rag_lan_mode and body.encryption == "none":
+        return api_error(400, "ENCRYPTION_REQUIRED",
+                         "LAN mode exports only encrypted packages: use a new key (the default) "
+                         "or a passphrase.")
     # A collection the caller may not use answers as one that doesn't exist (#606).
     if not await access.check(request, body.collection):
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{body.collection}' not found.")
@@ -17138,7 +17612,7 @@ async def start_export(body: ExportRequest, request: Request = None):
         job_id = await exporter.start_export_job(
             body.collection, body.include_models,
             body.passphrase.get_secret_value() if body.passphrase is not None else None,
-            owner=job_lists.job_owner(request))
+            owner=job_lists.job_owner(request), encryption=body.encryption)
     except CollectionDeletingError:
         return collection_deleting_error(body.collection)
     except exporter.ExportStartingError:
@@ -17161,8 +17635,24 @@ async def list_export_jobs(request: Request):
     """The caller's running and recent exports (#617; see services/job_lists)."""
     principal = request.state.auth
     def build():
-        return job_lists.entries(ExportJobEntry, job_lists.job_items(exporter.job_records()), principal)
+        rows = [(job_id, {**record, **_export_extras(record)}, saved)
+                for job_id, record, saved in exporter.job_records()]
+        return job_lists.entries(ExportJobEntry, job_lists.job_items(rows), principal)
     return ExportJobList(jobs=await asyncio.to_thread(build))
+
+
+def _export_extras(job: dict) -> dict:
+    """An export record's `encryption` (records from before #676 have none) and
+    whether its key file is still in ./exports (#676)."""
+    encryption = job.get("encryption") or ("passphrase" if job.get("encrypted") else "none")
+    name = job.get("key_filename")
+    on_server = False
+    if isinstance(name, str) and package_retention.is_key_name(name):
+        try:
+            on_server = stat.S_ISREG(os.lstat(packager.exports_dir() / name).st_mode)
+        except OSError:
+            on_server = False
+    return {"encryption": encryption, "key_on_server": on_server}
 
 
 @router.get("/export/job/{job_id}", response_model=ExportJobStatusResponse)
@@ -17175,20 +17665,25 @@ async def export_job_status(job_id: str, request: Request = None):
     expires = None
     if job.get("status") == "completed" and isinstance(job.get("filename"), str):
         expires = await asyncio.to_thread(package_retention.expires_at, job["filename"])
-    return ExportJobStatusResponse(**{**job, "expires_at": expires})
+    extras = await asyncio.to_thread(_export_extras, job)
+    return ExportJobStatusResponse(**{**job, **extras, "expires_at": expires})
 
 
 @router.post("/import", response_model=ImportStartResponse, status_code=202)
 async def start_import(body: ImportRequest, request: Request = None):
     # The audit record's parameters (#29); the collection is added when the job ends.
-    audit.note(package=body.filename, on_conflict=body.on_conflict, encrypted=body.passphrase is not None)
+    # Which secret was sent, never the secret (#676).
+    encryption = "key" if body.key is not None else "passphrase" if body.passphrase is not None else "none"
+    audit.note(package=body.filename, on_conflict=body.on_conflict, encrypted=encryption != "none",
+               encryption=encryption)
     # Everything else — unreadable archive, bad digest, embedding mismatch,
     # name collision — is reported through the job, because it is only knowable
     # after reading the package, which takes long enough to need a job.
     passphrase = body.passphrase.get_secret_value() if body.passphrase is not None else None
+    key = body.key.get_secret_value() if body.key is not None else None
     try:
         job_id = await importer.start_import_job(body.filename, body.on_conflict, passphrase,
-                                                 owner=job_lists.job_owner(request))
+                                                 owner=job_lists.job_owner(request), key=key)
     except importer.PassphraseError as exc:
         # Decided by the filename before any job exists (#27).
         return api_error(400, exc.code, str(exc), detail={"filename": body.filename})
@@ -17220,17 +17715,19 @@ async def import_job_status(job_id: str, request: Request = None):
 def _summary(p: Path) -> dict:
     """One package as the listing shows it."""
     if age_stream.is_encrypted_name(p.name):
-        # No metadata without the passphrase, and no scrypt to list (#27).
+        # No metadata without the passphrase or key, and no scrypt or X25519 to
+        # list (#27); the header says which of the two opens it (#676).
         try:
             with p.open("rb") as fh:
-                readable = age_stream.check_header(fh)
+                kind = age_stream.header_kind(fh)
             size = p.stat().st_size
         except Exception:                             # noqa: BLE001
             # One bad file never breaks the listing of the others.
-            readable, size = False, 0
+            kind, size = None, 0
         return {"filename": p.name, "size_bytes": size,
                 "collection": None, "chunk_count": None, "fidelity": None,
-                "created_at": None, "readable": readable, "encrypted": True}
+                "created_at": None, "readable": kind is not None, "encrypted": True,
+                "encryption": kind}
     try:
         fields = packager.listing_fields(packager.read_manifest(p))
     except Exception:
@@ -17239,19 +17736,30 @@ def _summary(p: Path) -> dict:
         # will report precisely why it cannot be used.
         return {"filename": p.name, "size_bytes": p.stat().st_size,
                 "collection": None, "chunk_count": None,
-                "fidelity": None, "created_at": None, "readable": False}
+                "fidelity": None, "created_at": None, "readable": False, "encryption": "none"}
     return {
         "filename": p.name,
         "size_bytes": p.stat().st_size,
         **fields,
         "readable": True,
+        "encryption": "none",
     }
+
+
+def _key_on_server(root: Path, filename: str) -> bool:
+    """A regular file `<filename>.key` is in ./exports (#676)."""
+    try:
+        return stat.S_ISREG(os.lstat(root / (filename + ".key")).st_mode)
+    except OSError:
+        return False
 
 
 def _list_packages_sync() -> list[dict]:
     root = packager.exports_dir()
     expiries = package_retention.expiries()
-    return [{**_summary(p), "expires_at": expiries.get(p.name)}
+    # Key files (#676) are not packages: the two globs never match `*.key`.
+    return [{**_summary(p), "expires_at": expiries.get(p.name),
+             "key_on_server": age_stream.is_encrypted_name(p.name) and _key_on_server(root, p.name)}
             for p in sorted([*root.glob("ragpkg-*.tar.gz"), *root.glob("ragpkg-*" + age_stream.ENCRYPTED_SUFFIX)])]
 
 
@@ -17426,7 +17934,14 @@ async def download_package(filename: str, request: Request = None):
         return _package_not_found(filename)
     # The listing's access rule (#606): a package hidden from the caller there
     # answers as one that doesn't exist, and the refusal is audited.
-    summary = await asyncio.to_thread(_summary, path)
+    if package_retention.is_key_name(filename):
+        # A key file (#676) is served only when it was exported here, under its
+        # package's access: the collection recorded with it (#606/#794).
+        if not await asyncio.to_thread(package_retention.recorded, filename):
+            return _package_not_found(filename)
+        summary = {"filename": filename, "encrypted": True}
+    else:
+        summary = await asyncio.to_thread(_summary, path)
     refused = await _hidden(access.principal_of(request), [summary])
     if filename in refused:
         collection = refused[filename]
@@ -18051,13 +18566,21 @@ def get_summary(
 ```markdown
 ## Encryption
 
-A package is encrypted only when it was exported with a passphrase. Its name
-then ends in `.tar.gz.age`: it is an [age](https://age-encryption.org) file that
-only that passphrase opens, whether through import here or with `age -d`. The
-passphrase can't be recovered, and without it the package can't be opened. Send
-it by a different channel than the file.
+A package whose name ends in `.tar.gz.age` is encrypted. It is an
+[age](https://age-encryption.org) file, opened in one of two ways:
 
-A package whose name ends in `.tar.gz` is not encrypted. Nothing in it is
+- **With its own key** (the default since 1.3.1). Each export is encrypted to a
+  new key made for that package alone, and the key is written to a separate key
+  file, `<package>.key`. The key file opens the package, through import or with
+  `age -d -i <package>.key <package>`, and nothing else. It can be downloaded
+  from the server once, and it can't be recovered. Store it apart from the
+  package: anyone who has both can read it.
+- **With a passphrase**, chosen when it was exported. Import it with that
+  passphrase, or open it with `age -d`. The passphrase can't be recovered either.
+  Send it by a different channel than the file.
+
+A package whose name ends in `.tar.gz` is not encrypted. It was exported with
+encryption turned off on purpose (LAN mode doesn't allow that). Nothing in it is
 protected: `sources/` holds the original documents byte for byte, and
 `chunks.jsonl` holds their text. If the corpus contains confidential or personal
 material, the package does too. Move and store it accordingly.
@@ -18094,8 +18617,9 @@ Check any machine with `docker compose exec ollama ollama list`.
 
 ````markdown
 ```
-ragpkg-<collection>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz
-ragpkg-<collection>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz.age    (exported with a passphrase)
+ragpkg-<collection>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz          (not encrypted)
+ragpkg-<collection>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz.age      (encrypted with a new key, the default, or a passphrase)
+ragpkg-<collection>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz.age.key  (the key file of a package encrypted with a key)
 ```
 
 The collection name in the filename is lowercased and stripped of punctuation,
@@ -18173,6 +18697,8 @@ original documents it was built from.
 
 @@INCLUDE:encryption@@
 
+@@ENCRYPTION_NOTE@@
+
 ## What fidelity means
 
 @@INCLUDE:fidelity_table@@
@@ -18191,7 +18717,7 @@ This package is **`@@FIDELITY@@`**. @@FIDELITY_NOTE@@
 ```bash
 curl -X POST http://localhost:8080/api/import \
   -H 'Content-Type: application/json' \
-  -d '{"filename": "@@PACKAGE_FILENAME@@", "on_conflict": "abort"@@IMPORT_PASSPHRASE@@}'
+  -d '{"filename": "@@PACKAGE_FILENAME@@", "on_conflict": "abort"@@IMPORT_SECRET@@}'
 ```
 
 3. Poll the returned `job_id` at `GET /api/import/job/{job_id}`.
@@ -18497,8 +19023,9 @@ if __name__ == "__main__":
 ```markdown
 # Moving a RAG between machines
 
-A collection can be exported as a single `.tar.gz` (or, with a passphrase, an
-encrypted `.tar.gz.age`) and imported somewhere else —
+A collection can be exported as a single encrypted `.tar.gz.age` (with a new key
+of its own by default, or with a passphrase; or, outside LAN mode, as a plain
+`.tar.gz`) and imported somewhere else —
 another laptop, a customer's machine, an air-gapped network. The package carries
 the chunks and their vectors, the settings the collection was tuned with, a
 standalone query script and, when the originals were retained, the source
@@ -18512,9 +19039,12 @@ Everything below is rendered from the same templates that generate the
 Both directions use `./exports/` in the project directory, which is a bind mount
 rather than a Docker volume so you can pick files up and drop them in directly.
 
-- **Exporting** writes the package there.
+- **Exporting** writes the package there, and for a package encrypted with a key,
+  its key file beside it.
 - **Importing** reads from there: copy a package in first, then import by filename,
-  with its passphrase when the package is encrypted.
+  with its key file or its passphrase when the package is encrypted. The key file
+  is never copied into `./exports/` on the importing side: its text is sent with
+  the import.
 
 `GET /api/packages` lists what is currently in that directory, including files it
 cannot read — those are shown rather than hidden, so nothing disappears silently.
@@ -21035,9 +21565,11 @@ def _address(request: Request) -> str:
 
 
 def _user_body(username: str, role: str, must_change_password: bool) -> dict:
-    # query_only (#670) in every user answer, so the UI knows it from the login on.
+    # query_only (#670) and lan_mode (#26; the Transfer page hides the
+    # unencrypted export, #676) in every user answer, so the UI knows them from
+    # the login on.
     return {"username": username, "role": role, "must_change_password": must_change_password,
-            "query_only": settings.rag_query_only}
+            "query_only": settings.rag_query_only, "lan_mode": settings.rag_lan_mode}
 
 
 def _mfa_body(enrolled: bool, required: bool) -> dict:
@@ -23640,6 +24172,8 @@ export interface AuthUser {
   mfa_enrolled?: boolean; mfa_required?: boolean; mfa_enrollment_required?: boolean
   // Query-only mode (#670): the pages that change data are hidden.
   query_only?: boolean
+  // LAN mode (#26): the Transfer page offers no unencrypted export (#676).
+  lan_mode?: boolean
 }
 export interface AdminUser {
   username: string; role: Role; enabled: boolean; must_change_password: boolean; created_at: string; mfa_enrolled?: boolean
@@ -23727,8 +24261,10 @@ export interface MetricsResult {
   total_latency: LatencyStats
   history: LatencyRecord[]
 }
-// passphrase: only for an encrypted export (#27), 12 to 1024 characters.
-export interface ExportBody { collection: string; include_models: boolean; passphrase?: string }
+// encryption (#676): a new key (the API's default), a passphrase (#27, 12 to
+// 1024 characters, sent only with 'passphrase'), or none (refused in LAN mode).
+export type Encryption = 'key' | 'passphrase' | 'none'
+export interface ExportBody { collection: string; include_models: boolean; encryption?: Encryption; passphrase?: string }
 export interface ExportStart { job_id: string; status: string; collection: string }
 export interface ExportJob {
   job_id: string; status: string; collection: string; chunks_written: number
@@ -23736,12 +24272,18 @@ export interface ExportJob {
   fidelity: string | null; models_bundled: boolean | null; retrieve_script: boolean | null
   warnings: string[]; error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
   encrypted?: boolean
+  encryption?: Encryption
+  // A key export's key file (#676): its name, and whether it is still on the
+  // server (a full download of it deletes it).
+  key_filename?: string | null
+  key_on_server?: boolean
   // When the package is deleted if nobody downloads it (UTC, #677); null once
   // it has been downloaded or swept.
   expires_at?: string | null
 }
-// passphrase: required for a .tar.gz.age package and refused for any other (#27).
-export interface ImportBody { filename: string; on_conflict: string; passphrase?: string }
+// passphrase: required for a passphrase .tar.gz.age package (#27); key: the
+// text of the key file of a key package (#676). Each is refused for any other.
+export interface ImportBody { filename: string; on_conflict: string; passphrase?: string; key?: string }
 export interface ImportStart { job_id: string; status: string; filename: string }
 export interface ImportJob {
   job_id: string; status: string; filename: string; on_conflict: string
@@ -23750,6 +24292,7 @@ export interface ImportJob {
   restored_sessions?: { source_session_id: string; session_id: string; collection: string }[]
   error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
   encrypted?: boolean
+  encryption?: Encryption
 }
 // Running and recent jobs (#617). owner is null for a job recorded before
 // owners were, which only an Engineer sees ("owner unknown").
@@ -23788,6 +24331,10 @@ export interface PackageSummary {
   filename: string; size_bytes: number; collection: string | null
   chunk_count: number | null; fidelity: string | null; created_at: string | null; readable: boolean
   encrypted?: boolean
+  // 'none' for a .tar.gz; 'key' or 'passphrase' from a .tar.gz.age header, null
+  // when it can't be read (#676). key_on_server: its key file is still there.
+  encryption?: Encryption | null
+  key_on_server?: boolean
   // When a package this instance exported is deleted if nobody downloads it
   // (UTC, #677); null for one copied in to be imported.
   expires_at?: string | null
@@ -26635,7 +27182,7 @@ export default function CollectionsPage() {
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import {
-  api, CollectionInfo, ExportJob, ExportJobEntry, ImportJob, ImportJobEntry, PackageSummary, TuneOptions,
+  api, CollectionInfo, Encryption, ExportJob, ExportJobEntry, ImportJob, ImportJobEntry, PackageSummary, TuneOptions,
 } from '../api/client'
 import { useAuth, useRole } from '../context/AuthContext'
 import JobList, { JobRow, newestToOpen, useJobList } from '../components/JobList'
@@ -26664,6 +27211,18 @@ function sizeLabel(bytes: number | null): string {
 function expiresLabel(iso: string): string {
   return new Date(iso).toLocaleString()
 }
+
+// How an export is encrypted (#676), in the order the form offers them. A new
+// key is the default; "Not encrypted" is not offered in LAN mode, where the API
+// refuses it too.
+const ENCRYPTION: { id: Encryption; label: string; description: string }[] = [
+  { id: 'key', label: 'New key (recommended)',
+    description: 'Encrypts the package to a new key made for it alone. Download the key file once the export is done, and store it apart from the package: anyone with both can read it.' },
+  { id: 'passphrase', label: 'Passphrase',
+    description: 'Encrypts the package with a passphrase you choose. It can\'t be recovered, so keep it safe and send it separately from the file.' },
+  { id: 'none', label: 'Not encrypted',
+    description: 'Anyone with the file can read the collection, and the original documents if they travel with it.' },
+]
 
 const CONFLICT = [
   { id: 'abort', label: 'Abort', description: 'Fail if a collection of that name already exists. Nothing is changed.' },
@@ -26695,6 +27254,8 @@ export default function TransferPage() {
   const { role } = useRole()
   // Query-only mode (#670): no import here; packages are loaded on the host.
   const queryOnly = useAuth().user?.query_only === true
+  // LAN mode (#26): no unencrypted export (#676).
+  const lanMode = useAuth().user?.lan_mode === true
   // Running and recent exports and imports, in one list (#617). Each panel
   // opens its own newest job on the first answer, unless it already has one.
   const exportJobs = useJobList<ExportJobEntry>(loadExportJobs, transferRunning)
@@ -26706,9 +27267,9 @@ export default function TransferPage() {
   const [tune, setTune] = useState<TuneOptions | null>(null)
   const [tuneError, setTuneError] = useState('')
   const [includeModels, setIncludeModels] = useState(false)
-  // Passphrases live only in this component's state, and are cleared once a
-  // job has started with them (#27).
-  const [encrypt, setEncrypt] = useState(false)
+  // Passphrases and key file text live only in this component's state, and are
+  // cleared once a job has started with them (#27, #676).
+  const [encryption, setEncryption] = useState<Encryption>('key')
   const [passphrase, setPassphrase] = useState('')
   const [confirmPassphrase, setConfirmPassphrase] = useState('')
   const [exportJob, setExportJob] = useState<ExportJob | null>(null)
@@ -26721,6 +27282,9 @@ export default function TransferPage() {
   const [filename, setFilename] = useState('')
   const [onConflict, setOnConflict] = useState('abort')
   const [importPassphrase, setImportPassphrase] = useState('')
+  const [importKey, setImportKey] = useState('')
+  const [importKeyName, setImportKeyName] = useState('')
+  const keyInput = useRef<HTMLInputElement | null>(null)
   const [importJob, setImportJob] = useState<ImportJob | null>(null)
   const [importError, setImportError] = useState('')
   const [importWatching, setImportWatching] = useState(false)
@@ -26791,6 +27355,53 @@ export default function TransferPage() {
       }, () => {})
     }, 3000))
   }, [])
+
+  // After a Download key click (#676): re-read the export every 3 s, for at
+  // most 10 minutes, until its key file is no longer on the server.
+  const keyWatches = useRef(new Map<string, number>())
+  const watchKeyDownload = useCallback((jobId: string) => {
+    const watches = keyWatches.current
+    if (watches.has(jobId)) return
+    const started = Date.now()
+    const stop = () => { window.clearInterval(watches.get(jobId)); watches.delete(jobId) }
+    watches.set(jobId, window.setInterval(() => {
+      if (!alive.current || Date.now() - started > 10 * 60 * 1000) { stop(); return }
+      api.getExportJob(jobId).then(job => {
+        if (!alive.current) return
+        setExportJob(current => (current && current.job_id === jobId
+          ? { ...current, key_on_server: job.key_on_server } : current))
+        if (!job.key_on_server) { stop(); loadPackages() }
+      }, () => {})
+    }, 3000))
+  }, [loadPackages])
+
+  useEffect(() => {
+    const watches = keyWatches.current
+    return () => { watches.forEach(id => window.clearInterval(id)); watches.clear() }
+  }, [])
+
+  // LAN mode never sends an unencrypted export (#676).
+  useEffect(() => {
+    if (lanMode && encryption === 'none') setEncryption('key')
+  }, [lanMode, encryption])
+
+  // A key file chosen for one package is never sent with another.
+  useEffect(() => {
+    setImportKey(''); setImportKeyName('')
+    if (keyInput.current) keyInput.current.value = ''
+  }, [filename])
+
+  async function chooseKeyFile(file: File | undefined) {
+    setImportKey(''); setImportKeyName('')
+    if (!file) return
+    try {
+      const text = await file.text()
+      if (!alive.current) return
+      setImportKey(text); setImportKeyName(file.name)
+    } catch (e: unknown) {
+      setImportError(`Could not read the key file: ${message(e)}`)
+    }
+  }
 
   // Fidelity is shown before the export runs, so the choice is informed rather
   // than discovered afterwards in the manifest. A lookup that fails says so
@@ -26910,9 +27521,9 @@ export default function TransferPage() {
   async function startExport() {
     setExportError(''); setExportPollError(''); setExportJob(null)
     try {
-      const r = await api.startExport(encrypt
-        ? { collection, include_models: includeModels, passphrase }
-        : { collection, include_models: includeModels })
+      const r = await api.startExport(encryption === 'passphrase'
+        ? { collection, include_models: includeModels, encryption, passphrase }
+        : { collection, include_models: includeModels, encryption })
       setPassphrase(''); setConfirmPassphrase('')
       if (!alive.current) return
       exportTouched.current = true
@@ -26929,10 +27540,13 @@ export default function TransferPage() {
   async function startImport() {
     setImportError(''); setImportPollError(''); setImportJob(null)
     try {
-      const r = await api.startImport(selectedEncrypted
+      const r = await api.startImport(importNeeds === 'key'
+        ? { filename, on_conflict: onConflict, key: importKey }
+        : importNeeds === 'passphrase'
         ? { filename, on_conflict: onConflict, passphrase: importPassphrase }
         : { filename, on_conflict: onConflict })
-      setImportPassphrase('')
+      setImportPassphrase(''); setImportKey(''); setImportKeyName('')
+      if (keyInput.current) keyInput.current.value = ''
       if (!alive.current) return
       importTouched.current = true
       importJobs.reload()
@@ -26950,12 +27564,18 @@ export default function TransferPage() {
 
   // What still stops an encrypted export, or '' when nothing does.
   const passphraseLength = charCount(passphrase)
-  const passphraseProblem = !encrypt ? ''
+  const passphraseProblem = encryption !== 'passphrase' ? ''
     : passphraseLength < PASSPHRASE_MIN ? `The passphrase needs at least ${PASSPHRASE_MIN} characters.`
     : passphraseLength > PASSPHRASE_MAX ? `The passphrase can have at most ${PASSPHRASE_MAX} characters.`
     : passphrase !== confirmPassphrase ? 'The two passphrases do not match.'
     : ''
-  const selectedEncrypted = packages.some(p => p.filename === filename && p.encrypted)
+  // Which secret the selected package needs (#676): its key file when its header
+  // is a key header, otherwise a passphrase for any encrypted one (#27).
+  const selected = packages.find(p => p.filename === filename)
+  const importNeeds: 'key' | 'passphrase' | null = !selected?.encrypted ? null
+    : selected.encryption === 'key' ? 'key' : 'passphrase'
+  const importSecretMissing = importNeeds === 'key' ? importKey === ''
+    : importNeeds === 'passphrase' ? importPassphrase === '' : false
 
   const jobRows: (JobRow & { sort: { created_at: string | null; finished_at: string | null } })[] = [
     ...exportJobs.entries.map(entry => ({
@@ -27033,17 +27653,23 @@ export default function TransferPage() {
           </span>
         </label>
 
-        <label className="flex items-start gap-2 text-sm mb-3">
-          <input type="checkbox" checked={encrypt} onChange={e => setEncrypt(e.target.checked)} className="mt-1" />
-          <span>
-            Encrypt with a passphrase
-            <span className="block text-xs text-gray-500">
-              Writes an encrypted <code>.tar.gz.age</code> package that only this passphrase opens.
-              It can't be recovered, so keep it safe and send it separately from the file.
-            </span>
-          </span>
-        </label>
-        {encrypt && (
+        <label className="block text-sm font-medium mb-2">Encryption</label>
+        <div className="space-y-2 mb-3">
+          {ENCRYPTION.filter(c => !(lanMode && c.id === 'none')).map(c => (
+            <label key={c.id} className={`flex gap-3 p-3 border rounded cursor-pointer ${encryption === c.id ? 'border-blue-500 bg-blue-50' : 'hover:bg-gray-50'}`}>
+              <input type="radio" name="encryption" value={c.id} checked={encryption === c.id}
+                     onChange={() => setEncryption(c.id)} className="mt-1" />
+              <div>
+                <div className="text-sm font-medium">{c.label}</div>
+                <div className="text-xs text-gray-500">{c.description}</div>
+              </div>
+            </label>
+          ))}
+          {lanMode && (
+            <p className="text-xs text-gray-500">In LAN mode every export is encrypted.</p>
+          )}
+        </div>
+        {encryption === 'passphrase' && (
           <div className="mb-3 space-y-2">
             <input type="password" autoComplete="new-password" placeholder="Passphrase"
                    value={passphrase} onChange={e => setPassphrase(e.target.value)}
@@ -27077,11 +27703,30 @@ export default function TransferPage() {
                 <code className="text-xs break-all">{exportJob.filename}</code>
                 <span className="text-gray-500 text-xs">
                   {' '}({sizeLabel(exportJob.size_bytes)}, {exportJob.fidelity}
-                  {exportJob.encrypted ? ', encrypted' : ''}
+                  {exportJob.encryption === 'key' ? ', encrypted with a key'
+                    : exportJob.encrypted ? ', encrypted with a passphrase' : ''}
                   {exportJob.models_bundled ? ', models included' : ''}
                   {exportJob.retrieve_script ? ', with retrieve.py' : ', no retrieve.py'})
                 </span>
               </p>
+            )}
+            {exportJob.status === 'completed' && exportJob.encryption === 'key' && exportJob.key_filename && (
+              <div className="mt-2 p-3 border border-amber-300 bg-amber-50 rounded text-xs">
+                <p className="text-amber-800 mb-2">
+                  Download the key first. It opens this package and nothing else, it can be downloaded
+                  only once, and it can't be recovered. Store it apart from the package: anyone with both
+                  can read the collection.
+                </p>
+                {exportJob.key_on_server
+                  ? (
+                    <a href={api.packageDownloadUrl(exportJob.key_filename)} download
+                       onClick={() => watchKeyDownload(exportJob.job_id)}
+                       className="bg-amber-600 text-white px-3 py-1 rounded text-xs hover:bg-amber-700">
+                      Download key
+                    </a>
+                  )
+                  : <span className="text-gray-600">Key downloaded and deleted from ./exports. It can't be downloaded again.</span>}
+              </div>
             )}
             {exportJob.status === 'completed' && exportJob.filename && gone.has(exportJob.filename) && (
               <p className="mt-2 text-gray-500 text-xs">Downloaded and deleted from ./exports.</p>
@@ -27141,7 +27786,10 @@ export default function TransferPage() {
             <option key={p.filename} value={p.filename}>
               {p.filename}
               {p.encrypted
-                ? (p.readable ? ` — encrypted, ${sizeLabel(p.size_bytes)}` : ' — encrypted, unreadable')
+                ? (!p.readable ? ' — encrypted, unreadable'
+                  : p.encryption === 'key'
+                  ? ` — encrypted with a key, key ${p.key_on_server ? 'on' : 'not on'} the server, ${sizeLabel(p.size_bytes)}`
+                  : ` — encrypted with a passphrase, ${sizeLabel(p.size_bytes)}`)
                 : p.readable
                 ? ` — ${p.collection}, ${p.chunk_count} chunks, ${p.fidelity}, ${sizeLabel(p.size_bytes)}`
                 : ' — unreadable'}
@@ -27157,7 +27805,19 @@ export default function TransferPage() {
         )}
 
         {!queryOnly && (<>
-        {selectedEncrypted && (
+        {importNeeds === 'key' && (
+          <div className="mb-3">
+            <label className="block text-sm font-medium mb-1">Key file</label>
+            <input type="file" ref={keyInput} onChange={e => chooseKeyFile(e.target.files?.[0])}
+                   className="w-full text-sm" />
+            <p className="text-xs text-gray-500 mt-1">
+              This package is encrypted with its own key. Choose the key file that was downloaded
+              with it (<code>{filename}.key</code>).
+              {importKeyName && <> Chosen: <code>{importKeyName}</code>.</>}
+            </p>
+          </div>
+        )}
+        {importNeeds === 'passphrase' && (
           <div className="mb-3">
             <label className="block text-sm font-medium mb-1">Passphrase</label>
             <input type="password" autoComplete="off" value={importPassphrase}
@@ -27185,7 +27845,7 @@ export default function TransferPage() {
 
         <button
           onClick={startImport}
-          disabled={!filename || importBusy || (selectedEncrypted && importPassphrase === '')}
+          disabled={!filename || importBusy || importSecretMissing}
           className="bg-blue-600 text-white px-5 py-2 rounded text-sm hover:bg-blue-700 disabled:opacity-50"
         >
           {importBusy ? 'Importing…' : 'Import'}
@@ -28775,6 +29435,8 @@ mode and a non-boolean `RAG_LAN_MODE`. Only in a `--lan` run does it check the r
 for (localhost, 127.0.0.1 and the test names; another `Host` gets 421, #664),
 TLS versions and HTTP/2, the single loopback binding, the `Secure` cookie, the origin rule over HTTPS,
 a `Server` header with no nginx version (`server_tokens off`),
+`lan_mode` in the user answer and an unencrypted export refused `400 ENCRYPTION_REQUIRED` (#676),
+a default export completing as a key export whose key file and encrypted package download over HTTPS (#676),
 the API's refusal in one-off containers (`docker compose run --rm
 --no-deps`, no ports) and nginx's login rate limit (logins sent without
 waiting until one is refused `429 LOGIN_RATE_LIMITED`, #577); it also prints
@@ -29504,9 +30166,9 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `ui_ingest_check.py` | the checks of suite 22, one per subcommand, on the host, and its cleanup (#641) |
 | `23_llm_split.sh` | the build and answer models (#671), full runs only: with `BUILD_LLM_MODEL` set to a small model, preparation and gold standard use it and query uses the answer model |
 | `llm_split.py` | helper for suite 23, run in the API container: pulls the small model, runs the three tasks through the services' code and prints the models Ollama reports answering each (#671) |
-| `24_query_only.sh` | §2.6 and §10.11 — query-only mode (#670): the overlay resolved without starting it; registers `../tests/test_query_only.py`; the start-up refusal of a non-boolean `RAG_QUERY_ONLY`; the loader's refusal on a full instance; with `stack.sh run --query-only`, build and export, `stack.sh query-only-mode`, then the load, the refusals, access and Q&A on the query-only instance |
+| `24_query_only.sh` | §2.6 and §10.11 — query-only mode (#670): the overlay resolved without starting it; registers `../tests/test_query_only.py`; the start-up refusal of a non-boolean `RAG_QUERY_ONLY`; the loader's refusal on a full instance; with `stack.sh run --query-only`, build and export, `stack.sh query-only-mode`, then the load, the refusals, access and Q&A on the query-only instance, and a key package loaded with its key file on standard input and refused `KEY_FILE_REQUIRED` without it (#676) |
 | `query_only_config.py` | host-side, standard library: `docker-compose.yml` with and without `docker-compose.query-only.yml` as `docker compose config` resolves them; only the api's `RAG_QUERY_ONLY` may differ (#670) |
-| `../tests/test_query_only.py` | API image, no network (also on the host): `RAG_QUERY_ONLY` parsing, the refused and kept routes, the refusals through the app and their order, `query_only` in the user answers, the loader (usage, refusals, lock, passphrase, results `success`/`refused`/`failed`/`interrupted`, the Ctrl-C handler) and the access of a collection it creates (#670) |
+| `../tests/test_query_only.py` | API image, no network (also on the host): `RAG_QUERY_ONLY` parsing, the refused and kept routes, the refusals through the app and their order, `query_only` in the user answers, `lan_mode` in the user answers (#676), the loader (usage, refusals, lock, passphrase, a key package's key file on standard input with `KEY_FILE_REQUIRED` and `KEY_FILE_INVALID` (#676), results `success`/`refused`/`failed`/`interrupted`, the Ctrl-C handler) and the access of a collection it creates (#670) |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
 | `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
 | `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530); the nginx tag in SPECIFICATIONS.md's compose copy and 11.3 image list matches docker-compose.yml (#665), registered by infrastructure |
@@ -29718,6 +30380,16 @@ encrypted path everywhere: the listing (header check only), the import refusals 
 passphrase travels as a function argument to the worker thread and is never put in a job
 record; the request models hold it as `SecretStr`.
 
+Since #676 the module also writes and reads files for a new X25519 key: `generate_identity`,
+the key file in age's identity layout (`identity_file`, `parse_identity`), the `X25519` stanza
+on both sides, and `header_kind`, which tells a key package from a passphrase one by its header
+alone. Export encrypts to a new key by default and writes `<package>.key` (0600) beside the
+package; import and the query-only loader choose the secret by the header (`KEY_FILE_REQUIRED`,
+`KEY_FILE_INVALID`, `KEY_FILE_NOT_EXPECTED`). `test_export_encryption.py` runs the 68 testkit vectors that
+carry an X25519 key and an independent X25519 decryption, and checks the key build, the key
+file, the export choices (LAN mode's `ENCRYPTION_REQUIRED`), the import refusals and that no key
+reaches a job record, log or response.
+
 `scripts/tests/test_export_encryption.py`, run by `05_transfer.sh` in the API image with no
 network, checks the module against the vendored C2SP CCTV vectors
 (`scripts/tests/fixtures/age-testkit`, with their source in `SOURCE`) and an independent
@@ -29757,11 +30429,20 @@ Suite 05's live checks run through the proxy on the verify stack, with fixtures 
   keeps an unrecorded one;
 - an End User is refused `403`.
 
+The same file covers a key export's key file (#676): its name rule, a full download of the key
+deleting the key only, a package download leaving the key, expiry deleting both, an unrecorded
+key file and a restricted collection's key answering `404 PACKAGE_NOT_FOUND`. Suite 05's block
+"a key export (#676)" then checks on the verify stack that a default export is a key export with
+`<package>.key` at mode 600 and no plain archive in `./exports` while it runs, that two exports
+have different keys, that import without the key is refused `400 KEY_FILE_REQUIRED`, that the key's
+full download deletes the key and keeps the package, and that import with the key file's text
+completes.
+
 ## Transfer page polling and failure checks
 
 `browser/transfer_page.js`, registered in `06_ui.sh` through `ui_criteria.js`, renders the
 Transfer page with every API call stubbed in the browser and the page's 2 s poll delay cut to
-20 ms (#382). Twenty-three cases: for each half, a failed poll (a proxy 502) is shown and retried
+20 ms (#382). Twenty-seven cases: for each half, a failed poll (a proxy 502) is shown and retried
 with the button still busy and cleared by the next good poll; 30 failures in a row stop polling,
 show the last error and enable the button again, and a new start clears the message; a poll in
 flight when the page is left schedules no further poll. An export start answered after the page
@@ -29770,9 +30451,13 @@ is left starts no polling. A 409 `SOURCE_INDEX_INVALID`, 503 or 404 from `/tune`
 longer selected is ignored. A failed export shows its `error_code`, and a failed package list
 is shown without the empty-folder hint until a good Refresh. Three cases cover encryption (#27):
 an export passphrase holds Export until it has 12 characters and matches its confirmation, is
-sent only when the box is checked, and both fields clear once the export starts; an encrypted
+sent only when "Passphrase" is chosen, and both fields clear once the export starts; an encrypted
 package is labelled, asks for its passphrase, sends it and clears it, and a plain package sends
-none. Four cases cover downloading a package (#677):
+none. Five cases cover the key export (#676): the three choices with a new key first and chosen,
+"Not encrypted" sending `encryption: "none"`, no "Not encrypted" in LAN mode, Download key
+offered before the package's Download with the store-apart warning and gone once the key is
+downloaded, and a key package asking for its key file, read in the browser and sent as `key`;
+the key is never shown as text. Four cases cover downloading a package (#677):
 - a finished export offers a Download link to its package with "Expires" in local time, and none
   when it has no expiry;
 - the package list says when a package exported here expires, and its Download link follows the
@@ -32274,7 +32959,8 @@ def check_login_logout(operator_ok):
     body = json.loads(raw)
     expect(status == 200 and body == {"username": "vfy-developer", "role": "developer", "must_change_password": False,
                                       "kind": "user", "mfa_enrolled": False, "mfa_required": False,
-                                      "mfa_enrollment_required": False, "query_only": False},
+                                      "mfa_enrollment_required": False, "query_only": False,
+                                      "lan_mode": False},
            "GET /auth/me answered {} {}".format(status, body))
     status, _, _ = code("POST", "/auth/logout", token=token)
     expect(status == 200, "logout answered {}".format(status))
@@ -35019,8 +35705,6 @@ async function prepareCase(page, c, out) {
 ### scripts/verify/job_lists.py
 
 The job lists on the verify project (#617), run by `02_ingest.sh` with `--operator`.
-
-```python
 """Running and recent job lists on the verify project (#617). Host-side,
 standard library, Python 3.9+. Run by 02_ingest.sh:
 
@@ -35140,7 +35824,7 @@ def main(argv):
         expect(everyone[key_id]["owner"] == {"name": principal, "kind": "service"},
                "the Engineer sees the key's job owned by {}".format(everyone[key_id]["owner"]))
 
-        status, raw, _ = code("POST", "/export", {"collection": name}, token=dev)
+        status, raw, _ = code("POST", "/export", {"collection": name, "encryption": "none"}, token=dev)
         expect(status == 202, "the export answered {} {}".format(status, error_code(raw)))
         export_id = json.loads(raw)["job_id"]
         expect(export_id in listed("/export/jobs", token=dev), "the running or ended export isn't listed")
@@ -35290,6 +35974,10 @@ lan origin
 check "a same-origin change over HTTPS is accepted, another origin's refused 403 CROSS_ORIGIN_REFUSED" $?
 lan server-tokens
 check "nginx sends no version: the Server header is plain nginx on an API answer and on its own 421 page (#555)" $?
+lan export
+check "LAN mode refuses an unencrypted export 400 ENCRYPTION_REQUIRED, and the user answer says lan_mode (#676)" $?
+lan export-key
+check "LAN mode: a default export is a key export, and its key file and encrypted package download over HTTPS (reviewer, #676)" $?
 lan refusals
 check "the API refuses LAN mode with one line when AUTH_COOKIE_SECURE is false or no Engineer exists" $?
 lan rate-limit
@@ -35423,7 +36111,7 @@ if __name__ == "__main__":
 ```python
 """LAN mode on the verify project (#26). Host-side, standard library, Python 3.9+.
 
-    python3 lan_stack.py https|hosts|tls|bindings|cookie|origin|server-tokens|refusals|rate-limit|address
+    python3 lan_stack.py https|hosts|tls|bindings|cookie|origin|server-tokens|export|export-key|refusals|rate-limit|address
 
 Run by 18_lan.sh in a `stack.sh run --lan`, which brings the verify project up
 in LAN mode with TLS on 127.0.0.1:<verify port> only, copies the certificate
@@ -35447,6 +36135,14 @@ printing what failed:
   server-tokens
             the Server header is exactly "nginx" on an API answer and on
             nginx's own 421 page, whose body names no version either (#555)
+  export    LAN mode exports only encrypted packages (#676): the user answer
+            says lan_mode, and POST /export with encryption "none" is refused
+            400 ENCRYPTION_REQUIRED before anything else is checked
+  export-key
+            a default export (no encryption named) of a new, empty collection
+            completes as a key export in LAN mode; its key file and its
+            age-encrypted package each download over HTTPS, and the key's
+            download leaves the job saying key_on_server false (reviewer, #676)
   refusals  a one-off api container of the LAN configuration (no ports, the
             running project untouched) refuses to start, with one line, when
             AUTH_COOKIE_SECURE is false and when its account store is empty
@@ -35468,6 +36164,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import auth_setup  # noqa: E402
@@ -35671,6 +36368,72 @@ def check_origin():
     assert status == 401, "the session still works after logout ({})".format(status)
 
 
+def check_export():
+    token, _ = login()
+    cookie = "{}={}".format(auth_setup.COOKIE, token)
+    status, body, _ = request("GET", "/auth/me", headers={"Cookie": cookie})
+    assert status == 200 and (body or {}).get("lan_mode") is True, \
+        "GET /auth/me answered {} with lan_mode {!r}".format(status, (body or {}).get("lan_mode"))
+    status, body, _ = request("POST", "/export", {"collection": "VfyLanNoSuch", "encryption": "none"},
+                              {"Cookie": cookie, "Origin": origin()})
+    code = ((body or {}).get("error") or {}).get("code")
+    assert (status, code) == (400, "ENCRYPTION_REQUIRED"), "an unencrypted export got {} {}".format(status, code)
+
+
+def download(path, cookie):
+    """(status, raw body) of GET /api<path> over verified TLS."""
+    conn = http.client.HTTPSConnection("localhost", port(), context=context(), timeout=120)
+    try:
+        conn.request("GET", "/api" + path, headers={"Cookie": cookie})
+        response = conn.getresponse()
+        return response.status, response.read()
+    finally:
+        conn.close()
+
+
+def check_export_key():
+    """Reviewer (#676): a key export completes in LAN mode, and its key and
+    package download over HTTPS. The downloads delete both files."""
+    token, _ = login()
+    cookie = "{}={}".format(auth_setup.COOKIE, token)
+    headers = {"Cookie": cookie, "Origin": origin()}
+    name = "VfyLanKey" + secrets.token_hex(3)
+    status, _, _ = request("POST", "/collections", {"name": name}, headers)
+    assert status == 201, "creating {} answered {}".format(name, status)
+    try:
+        status, body, _ = request("POST", "/export", {"collection": name}, headers)
+        assert status == 202, "the default export answered {} {}".format(status, body)
+        job = "/export/job/" + body["job_id"]
+        deadline = time.time() + 300
+        while True:
+            status, body, _ = request("GET", job, headers={"Cookie": cookie})
+            if status == 200 and body["status"] in ("completed", "failed"):
+                break
+            assert time.time() < deadline, "the export is still {} after 300 s".format((body or {}).get("status"))
+            time.sleep(1)
+        package, key = body["filename"], body["key_filename"]
+        assert (body["status"], body["encryption"], body["key_on_server"]) == ("completed", "key", True), \
+            "the export ended {} {} key_on_server {} ({})".format(body["status"], body["encryption"],
+                                                                 body["key_on_server"], body.get("error_code"))
+        assert package and package.endswith(".tar.gz.age") and key == package + ".key", \
+            "package {!r}, key file {!r}".format(package, key)
+        status, raw = download("/packages/" + key, cookie)
+        lines = raw.decode("ascii", "replace").splitlines()
+        secret = [line for line in lines if line.startswith("AGE-SECRET-KEY-1")]
+        assert status == 200 and len(secret) == 1, \
+            "the key file answered {} with {} secret key line(s)".format(status, len(secret))
+        status, body, _ = request("GET", job, headers={"Cookie": cookie})
+        assert status == 200 and body["key_on_server"] is False, \
+            "after the key's download the job says key_on_server {!r}".format((body or {}).get("key_on_server"))
+        status, raw = download("/packages/" + package, cookie)
+        assert status == 200 and raw.startswith(b"age-encryption.org/v1\n-> X25519 "), \
+            "the package answered {} starting {!r}".format(status, raw[:32])
+        assert b"scrypt" not in raw.split(b"\n---", 1)[0], "the package's header has an scrypt stanza"
+    finally:
+        request("DELETE", "/collections/{}?confirm=true".format(name), headers=headers)
+        request("POST", "/auth/logout", headers=headers)
+
+
 def one_off(*env):
     """A one-off api container of the LAN configuration: (exit status, its output lines)."""
     args = ["docker", "compose", "run", "--rm", "--no-deps", "-T"]
@@ -35723,7 +36486,7 @@ def check_address():
 
 CHECKS = {"https": check_https, "hosts": check_hosts, "tls": check_tls, "bindings": check_bindings,
           "cookie": check_cookie, "origin": check_origin, "server-tokens": check_server_tokens,
-          "refusals": check_refusals,
+          "export": check_export, "export-key": check_export_key, "refusals": check_refusals,
           "rate-limit": check_rate_limit, "address": check_address}
 
 
@@ -35826,7 +36589,7 @@ curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixe
   -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$FIX/policies.txt" > /tmp/vfy_qo.json
 job=$(python3 -c "import json;print(json.load(open('/tmp/vfy_qo.json'))['job_id'])" 2>/dev/null)
 check_eq "the collection is ingested" "$(wait_for_job "/ingest/job/$job" 900)" "completed"
-api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_qo.json
+api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_qo.json
 ejob=$(jfield "['job_id']" < /tmp/vfy_qo.json)
 check_eq "the collection is exported" "$(wait_for_job "/export/job/$ejob" 1800)" "completed"
 pkg=$(api_get "/export/job/$ejob" | jfield "['filename']")
@@ -35926,10 +36689,32 @@ sys.exit(0 if r.get('answer', '').strip() and r.get('citations') else 1)"
   check "an End User asks a question on the loaded collection and gets an answer with citations" $? "$(head -c 300 /tmp/vfy_qo.json)"
 fi
 
+# The default export, encrypted to a new key (#676).
 api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_qo.json
 ejob=$(jfield "['job_id']" < /tmp/vfy_qo.json)
 check_eq "export keeps working in query-only mode" "$(wait_for_job "/export/job/$ejob" 1800)" "completed"
 check_eq "the package list keeps working" "$(api_code "$API/packages")" "200"
+
+section "Load a key package with its key file (#676)"
+kpkg=$(api_get "/export/job/$ejob" | jfield "['filename']")
+kkey=$(api_get "/export/job/$ejob" | jfield "['key_filename']")
+check_eq "the default export is encrypted with a new key" "$(api_get "/export/job/$ejob" | jfield "['encryption']")" "key"
+loader -- "$kpkg"
+rc=$?
+[ "$rc" = 1 ] && grep -q "KEY_FILE_REQUIRED" "$OUT"
+check "the loader refuses a key package with no key on standard input (exit 1, KEY_FILE_REQUIRED)" $? "exit $rc: $(tail -2 "$OUT")"
+check_eq "the refusal is an operator.load audit record" "$(last_load)" "refused KEY_FILE_REQUIRED $kpkg"
+check_eq "the key file downloads" "$(curl -s -o /tmp/vfy_qo_key.txt -m 120 -w '%{http_code}' "$API/packages/$kkey")" "200"
+_rag_require_lock_owner
+(cd "$REPO_ROOT" && docker compose exec -T api python -m loader "$kpkg" --on-conflict rename) \
+  </tmp/vfy_qo_key.txt >"$OUT" 2>&1
+rc=$?
+check_eq "the loader loads the key package with its key file on standard input (exit 0)" "$rc" "0"
+grep -q "AGE-SECRET-KEY" "$OUT"
+[ "$?" = 1 ]
+check "the loader never prints the key" $?
+rm -f /tmp/vfy_qo_key.txt
+curl -s -o /dev/null -m 600 "$API/packages/$kpkg"
 
 summary
 ```
@@ -36965,6 +37750,17 @@ class AppTests(Folders):
             self.assertIs(self.client.get("/auth/me", headers=self.session("user")).json()["query_only"], False)
         self.assertNotIn("query_only", self.client.get("/auth/status").json())
 
+    def test_user_answers_carry_lan_mode(self):
+        """LAN mode (#26) is in every user answer, so the Transfer page can hide
+        the unencrypted export (#676)."""
+        with patch.object(settings, "rag_lan_mode", True):
+            response = self.client.post("/auth/login", json={"username": "user", "password": self.passwords["user"]},
+                                        headers={"Origin": ORIGIN})
+            self.assertIs(response.json()["lan_mode"], True)
+            self.assertIs(self.client.get("/auth/me", headers=self.session("user")).json()["lan_mode"], True)
+        self.assertIs(self.client.get("/auth/me", headers=self.session("user")).json()["lan_mode"], False)
+        self.assertNotIn("lan_mode", self.client.get("/auth/status").json())
+
 
 # ── S4: the loader ───────────────────────────────────────────────────────────
 
@@ -36984,10 +37780,11 @@ class LoaderTests(Folders):
         return name
 
     def fake_run(self, status="completed", **fields):
-        def run(job_id, filename, on_conflict, passphrase=None):
+        def run(job_id, filename, on_conflict, passphrase=None, identity=None):
             job = importer._jobs[job_id]
             self.calls.append({"job": dict(job), "filename": filename, "on_conflict": on_conflict,
-                               "passphrase": passphrase, "lock_held": self.lock_is_held()})
+                               "passphrase": passphrase, "identity": identity,
+                               "lock_held": self.lock_is_held()})
             job.update({"status": status, **fields})
         return patch.object(importer, "_run", run)
 
@@ -37098,6 +37895,47 @@ class LoaderTests(Folders):
         self.assertEqual(code, 1)
         self.assertIn("PASSPHRASE_REQUIRED", err)
         self.assertEqual(len(self.calls), 1)
+
+    def key_package(self, name="ragpkg-vfy-3.tar.gz.age"):
+        """A package encrypted to a new key (#676), and the key file's text."""
+        from datetime import datetime, timezone
+        from services import age_stream
+        identity = age_stream.generate_identity()
+        with open(self.root / "exports" / name, "wb") as fh:
+            enc = age_stream.Encryptor(fh, recipient=identity.public_bytes)
+            enc.write(b"not read: the import run is replaced")
+            enc.close()
+        return name, identity, age_stream.identity_file(identity, datetime.now(timezone.utc), name)
+
+    def test_a_key_package_reads_its_key_file_from_stdin(self):
+        name, identity, text = self.key_package()
+        with self.fake_run(collection="K", original_collection="K", chunks_written=1):
+            code, err = self.main([name], stdin=text)
+        self.assertEqual(code, 0, err)
+        call = self.calls[0]
+        self.assertIsNone(call["passphrase"])
+        self.assertEqual(call["identity"].public_bytes, identity.public_bytes)
+        self.assertEqual(call["job"]["encryption"], "key")
+        line = identity.encode()
+        self.assertNotIn(line, err)
+        self.assertNotIn(line, (self.root / "audit" / "audit.jsonl").read_text())
+        details = self.records("operator.load")[-1]["details"]
+        self.assertEqual((details["encrypted"], details["encryption"]), (True, "key"))
+
+    def test_a_key_package_without_a_valid_key_is_refused_before_the_load(self):
+        name, identity, text = self.key_package()
+        for stdin, code_name in (("", "KEY_FILE_REQUIRED"), ("\n# just a comment\n", "KEY_FILE_INVALID"),
+                                 ("correct horse battery staple\n", "KEY_FILE_INVALID"),
+                                 ("x" * 5000, "KEY_FILE_INVALID")):
+            with self.subTest(code=code_name, stdin=stdin[:12]), self.fake_run():
+                code, err = self.main([name], stdin=stdin)
+                self.assertEqual(code, 1, err)
+                self.assertIn(code_name, err)
+                record = self.records("operator.load")[-1]
+                self.assertEqual((record["result"], record["details"]["code"],
+                                  record["details"]["encryption"]), ("refused", code_name, "key"))
+        self.assertEqual(self.calls, [])
+        self.assertNotIn(identity.encode(), (self.root / "audit" / "audit.jsonl").read_text())
 
     def test_progress_lines(self):
         name = self.package()
@@ -37761,7 +38599,7 @@ class PolicyTests(unittest.TestCase):
         counts = {}
         for access in policy.ACCESS.values():
             counts[access] = counts.get(access, 0) + 1
-        self.assertEqual(counts, {"public": 4, "session": 3, "mfa": 5, "end_user": 3, "developer": 37, "engineer": 30})
+        self.assertEqual(counts, {"public": 4, "session": 3, "mfa": 5, "end_user": 3, "developer": 37, "engineer": 35})
         self.assertEqual(policy.ACCESS[("GET", "/health")], "public")
         self.assertEqual(policy.ACCESS[("GET", "/health/details")], "developer")   # #750
         self.assertEqual(policy.ACCESS[("DELETE", "/collections/{name}")], "engineer")
@@ -37793,6 +38631,12 @@ class PolicyTests(unittest.TestCase):
             ("POST", "/auth/service-principals/{name}/enable"), ("POST", "/auth/service-principals/{name}/keys"),
             ("POST", "/auth/service-principals/{name}/keys/{key_id}/revoke")})
         self.assertEqual(set(principals.values()), {"engineer"})
+        # Groups for collection access (#784): the Engineer's; a group is deleted with a POST.
+        groups = {key: access for key, access in policy.ACCESS.items() if key[1].startswith("/auth/groups")}
+        self.assertEqual(groups, {("GET", "/auth/groups"): "engineer", ("POST", "/auth/groups"): "engineer",
+                                  ("POST", "/auth/groups/{name}/rename"): "engineer",
+                                  ("PUT", "/auth/groups/{name}/members"): "engineer",
+                                  ("POST", "/auth/groups/{name}/delete"): "engineer"})
         # Two-step verification (#607): the code step is public like the login;
         # the user's own routes are any session's; the switch is the Engineer's.
         own = {key: access for key, access in policy.ACCESS.items() if key[1].startswith("/auth/mfa")}
@@ -37803,10 +38647,11 @@ class PolicyTests(unittest.TestCase):
 
     def test_keys_cannot_reach_administration_or_the_session_routes(self):
         # S5 of PR 3: every account, principal and key route, logout and the
-        # password change, the audit log (#29) and per-collection access (#606);
-        # GET /auth/me stays open to a key.
+        # password change, the audit log (#29), per-collection access (#606) and
+        # groups (#784); GET /auth/me stays open to a key.
         admin = {path for _, path in policy.ACCESS
-                 if path.startswith(("/auth/users", "/auth/service-principals", "/auth/mfa"))}
+                 if path.startswith(("/auth/users", "/auth/service-principals", "/auth/mfa", "/auth/groups"))}
+        self.assertTrue({"/auth/groups", "/auth/groups/{name}/members"} <= admin)
         self.assertEqual(policy.HUMAN_ONLY, admin | {"/auth/logout", "/auth/password", "/audit", "/audit.csv",
                                                      "/collections/{name}/access"})
         self.assertNotIn("/auth/me", policy.HUMAN_ONLY)
@@ -38022,6 +38867,7 @@ class RouteTests(StoreTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"username": "eng", "role": "engineer", "must_change_password": True,
                                            "query_only": False,      # #670
+                                           "lan_mode": False,        # #676
                                            "mfa_enrolled": False, "mfa_required": False,
                                            "mfa_enrollment_required": False})
         cookie = response.headers["set-cookie"]
@@ -38682,12 +39528,18 @@ class KeyMiddlewareTests(KeyTestCase):
                                    ("POST", "/auth/service-principals/svc/enable", None),
                                    ("POST", "/auth/service-principals/svc/keys", {}),
                                    ("POST", "/auth/service-principals/svc/keys/abc/revoke", None),
+                                   ("GET", "/auth/groups", None),
+                                   ("POST", "/auth/groups", {"name": "minted"}),
+                                   ("POST", "/auth/groups/minted/rename", {"name": "other"}),
+                                   ("PUT", "/auth/groups/minted/members", {"users": ["dev"]}),
+                                   ("POST", "/auth/groups/minted/delete", None),
                                    ("POST", "/auth/logout", None),
                                    ("POST", "/auth/password", {"current_password": "x", "new_password": "y" * 12})):
             with self.subTest(route=f"{method} {path}"):
                 response = self.client.request(method, path, json=body, headers=headers)
                 self.assertEqual((response.status_code, self.code(response)), (403, "KEY_NOT_ALLOWED"))
         self.assertIsNone(store.get_user("minted"))
+        self.assertEqual(store.list_groups(), [])
         self.assertEqual(len(store.get_principal("svc").keys), 1)
         # Engineer-level data routes stay open to an engineer key.
         self.assertNotIn(self.client.get("/metrics/latency", headers=headers).status_code, (401, 403))
@@ -38697,7 +39549,8 @@ class KeyMiddlewareTests(KeyTestCase):
         response = self.client.get("/auth/me", headers=self.bearer(key))
         self.assertEqual(response.json(), {"username": "svc", "role": "end_user", "must_change_password": False,
                                            "kind": "service", "mfa_enrolled": False, "mfa_required": False,
-                                           "mfa_enrollment_required": False, "query_only": False})
+                                           "mfa_enrollment_required": False, "query_only": False,
+                                           "lan_mode": False})
         headers, _ = self.session("dev")
         self.assertEqual(self.client.get("/auth/me", headers=headers).json()["kind"], "user")
 
@@ -39767,7 +40620,8 @@ class ImplementationCopyTests(unittest.TestCase):
                      "api/auth/keys.py", "ui/src/pages/ServiceKeysPage.tsx", "api/config.py", "proxy/nginx.conf",
                      "scripts/verify/17_auth.sh", "scripts/verify/auth_setup.py", "scripts/verify/auth_stack.py",
                      "scripts/verify/auth_headers.py", "api/auth/mfa.py", "ui/src/pages/AccountPage.tsx",
-                     "api/auth/access.py", "scripts/tests/test_collection_access.py"):
+                     "api/auth/access.py", "scripts/tests/test_collection_access.py",
+                     "ui/src/pages/GroupsPage.tsx"):
             with self.subTest(name=name):
                 header = "### " + name + "\n\n```"
                 start = document.index("\n", document.index(header) + len(header)) + 1
@@ -43379,6 +44233,126 @@ class EncryptedAccessTests(DownloadTestCase):
         answer = self.get(path.name, who="user")
         self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (403, "FORBIDDEN"))
         self.assertTrue(path.exists())
+
+
+class KeyFileTests(DownloadTestCase):
+    """A key export's key file (#676): `<package>.key`, recorded with the
+    package, downloaded once on its own, expired with it, under its access."""
+
+    def setUp(self):
+        super().setUp()
+        status = self.client.put(f"/collections/{SECRET}/access", headers=self.as_("eng"),
+                                 json={"restricted": True, "users": ["dev"], "service_principals": []}).status_code
+        self.assertEqual(status, 200)
+
+    write_encrypted = EncryptedAccessTests.write_encrypted
+    listed = EncryptedAccessTests.listed
+
+    def write_pair(self, stem="ragpkg-k-20261120T000000Z-0123abcd", collection="Open1", hours_ago=0):
+        package = self.write_encrypted(stem + ".tar.gz.age", collection=None, recorded=False)
+        key = self.exports / (package.name + ".key")
+        key.write_text("# public key: age1x\nAGE-SECRET-KEY-1XYZ\n")
+        key.chmod(0o600)
+        when = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+        package_retention.record_export(package.name, when, collection)
+        package_retention.record_export(key.name, when, collection)
+        return package, key
+
+    def test_the_name_rule_admits_a_key_file_only_after_tar_gz_age(self):
+        for name, ok in (("ragpkg-a.tar.gz.age.key", True), ("ragpkg-a.tar.gz.key", False),
+                         ("ragpkg-a.key", False), ("ragpkg-a.tar.gz.age.key.key", False),
+                         ("ragpkg-a.tar.gz.age.keys", False)):
+            with self.subTest(name=name):
+                self.assertEqual(package_retention.valid_name(name), ok)
+                self.assertEqual(package_retention.is_key_name(name), ok)
+        self.assertFalse(package_retention.is_key_name("ragpkg-a.tar.gz.age"))
+
+    def test_a_complete_key_download_deletes_the_key_only(self):
+        package, key = self.write_pair()
+        data = key.read_bytes()
+        answer = self.get(key.name, who="dev2")
+        self.assertEqual(answer.status_code, 200, answer.text)
+        self.assertEqual(answer.content, data)
+        self.assertEqual(answer.headers["cache-control"], "no-store")
+        self.assertFalse(key.exists())
+        self.assertTrue(package.exists())
+        self.assertFalse(package_retention.recorded(key.name))
+        self.assertTrue(package_retention.recorded(package.name))
+        deleted = self.records("package.delete")[-1]
+        self.assertEqual(deleted["details"], {"file": key.name, "reason": "downloaded"})
+        self.assertFalse(self.listed("dev2")[package.name]["key_on_server"])
+        again = self.get(key.name, who="dev2")
+        self.assertEqual((again.status_code, again.json()["error"]["code"]), (404, "PACKAGE_NOT_FOUND"))
+
+    def test_a_package_download_leaves_its_key(self):
+        package, key = self.write_pair()
+        self.assertTrue(self.listed("dev2")[package.name]["key_on_server"])
+        self.assertEqual(self.get(package.name, who="dev2").status_code, 200)
+        self.assertFalse(package.exists())
+        self.assertTrue(key.exists())
+        self.assertTrue(package_retention.recorded(key.name))
+        self.assertEqual(self.get(key.name, who="dev2").status_code, 200)
+        self.assertFalse(key.exists())
+
+    def test_expiry_deletes_both(self):
+        package, key = self.write_pair(hours_ago=25)
+        deleted = package_retention.sweep()
+        self.assertEqual(sorted(deleted), sorted([package.name, key.name]))
+        self.assertFalse(package.exists() or key.exists())
+        package, key = self.write_pair(stem="ragpkg-k2-20261120T000000Z-0123abcd", hours_ago=25)
+        self.assertEqual(self.get(package.name, who="dev2").status_code, 200)
+        self.assertEqual(package_retention.sweep(), [key.name])
+
+    def test_a_key_file_not_exported_here_is_not_served(self):
+        key = self.exports / "ragpkg-copied.tar.gz.age.key"
+        key.write_text("AGE-SECRET-KEY-1XYZ\n")
+        for who in ("dev", "eng"):
+            answer = self.get(key.name, who=who)
+            self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (404, "PACKAGE_NOT_FOUND"))
+        self.assertTrue(key.exists())
+
+    def test_a_restricted_collections_key_answers_as_missing(self):
+        package, key = self.write_pair(collection=SECRET)
+        answer = self.get(key.name, who="dev2")
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (404, "PACKAGE_NOT_FOUND"))
+        self.assertTrue(key.exists())
+        refused = [r for r in self.records("package.download") if r["actor"] == "dev2"][-1]
+        self.assertEqual((refused["collection"], refused["details"]["code"]), (SECRET, "PACKAGE_NOT_FOUND"))
+        self.assertEqual(self.get(key.name, who="dev").status_code, 200)
+        self.assertFalse(key.exists())
+
+    def test_key_files_are_not_listed_as_packages(self):
+        package, key = self.write_pair()
+        self.assertEqual(sorted(self.listed("eng")), [package.name])
+
+    def test_an_end_user_never_reaches_a_key(self):
+        _package, key = self.write_pair()
+        self.assertEqual(self.get(key.name, who="user").status_code, 403)
+        self.assertTrue(key.exists())
+
+    def test_a_key_follows_a_groups_grant(self):
+        # Reviewer (#676 with #784): the key file's access is the package's, so a
+        # collection granted through a group reaches its members only, and a
+        # membership change applies to the next download.
+        store.create_group("team")
+        store.set_group_members("team", ["dev2"], [])
+        status = self.client.put(f"/collections/{SECRET}/access", headers=self.as_("eng"),
+                                 json={"restricted": True, "users": [], "service_principals": [],
+                                       "groups": ["team"]}).status_code
+        self.assertEqual(status, 200)
+        package, key = self.write_pair(collection=SECRET)
+        answer = self.get(key.name, who="dev")
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (404, "PACKAGE_NOT_FOUND"))
+        self.assertTrue(key.exists())
+        self.assertTrue(self.listed("dev2")[package.name]["key_on_server"])
+        store.set_group_members("team", [], [])
+        answer = self.get(key.name, who="dev2")
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (404, "PACKAGE_NOT_FOUND"))
+        self.assertTrue(key.exists())
+        store.set_group_members("team", ["dev2"], [])
+        self.assertEqual(self.get(key.name, who="dev2").status_code, 200)
+        self.assertFalse(key.exists())
+        self.assertTrue(package.exists())
 
 
 class DeletionRecordTests(DownloadTestCase):
@@ -48067,7 +49041,7 @@ api_post "/ingest/config" "{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\
 api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":6,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
 
 # ── export ───────────────────────────────────────────────────────────────────
-api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_exp.json
+api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_exp.json
 ejob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_exp.json'))['job_id'])")
 estatus=$(wait_for_job "/export/job/$ejob" 1800)
 check_eq "export completes" "$estatus" "completed"
@@ -48239,7 +49213,7 @@ e30_collections create > /tmp/vfy_e30_setup.txt 2>&1
 check "E30: mismatch fixtures created on the verify project" $? "$(tail -1 /tmp/vfy_e30_setup.txt)"
 for e30c in "$E30_DRIFT" "$E30_NAMED" "$E30_NONE"; do
   before=$(ls -A "$EXPORTS" | sort)
-  api_post "/export" "{\"collection\":\"$e30c\",\"include_models\":true}" > /tmp/vfy_e30_exp.json
+  api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$e30c\",\"include_models\":true}" > /tmp/vfy_e30_exp.json
   e30job=$(jfield "['job_id']" < /tmp/vfy_e30_exp.json)
   e30status=$(wait_for_job "/export/job/$e30job" 600)
   e30err=$(api_get "/export/job/$e30job" | jfield "['error']")
@@ -48549,7 +49523,7 @@ check "E29: the refusal doesn't echo the outside path or its contents" $?
 read -r e29stat e29name <<<"$(python3 -c "
 import json; d=json.load(open('/tmp/vfy_e29job.json')); print(d['status'], d.get('collection') or '-')")"
 if [ "$e29stat" = "completed" ] && [ "$e29name" != "-" ]; then
-  api_post "/export" "{\"collection\":\"$e29name\",\"include_models\":false}" > /tmp/vfy_e29exp.json
+  api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$e29name\",\"include_models\":false}" > /tmp/vfy_e29exp.json
   wait_for_job "/export/job/$(jfield "['job_id']" < /tmp/vfy_e29exp.json)" 1800 >/dev/null
 fi
 check_eq "E29: a refused rename import creates no collection" "$(collection_names)" "$names_before"
@@ -48625,7 +49599,7 @@ import json; d=json.load(open('/tmp/vfy_e29job.json')); print(d['status'], d.get
 done
 
 # The valid in-directory source still round-trips after the refusals.
-api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_e29exp.json
+api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_e29exp.json
 e29job=$(jfield "['job_id']" < /tmp/vfy_e29exp.json)
 check_eq "E29: the collection still exports after refused imports" \
   "$(wait_for_job "/export/job/$e29job" 1800)" "completed"
@@ -48676,7 +49650,7 @@ ENDPY
 for mode in abs link; do
   plant "$mode"
   check "E29: planted a $mode source entry on disk" $?
-  api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_e29exp.json
+  api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_e29exp.json
   check_eq "E29: export refuses an on-disk $mode source entry" \
     "$(wait_for_job "/export/job/$(jfield "['job_id']" < /tmp/vfy_e29exp.json)" 1800)" "failed"
   leak=$(no_sentinel_in_exports); check "E29: ... and archives no outside bytes ($mode)" $? "$leak"
@@ -48830,7 +49804,7 @@ rjob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_replace.json'))['j
 rstatus=$(wait_for_job "/import/job/$rjob" 1800)
 check_eq "replace completes after verified final writes" "$rstatus" "completed"
 check_eq "replace reports confirmed target objects" "$(api_get "/import/job/$rjob" | jfield "['chunks_written']")" "$chunks_before"
-api_post "/export" "{\"collection\":\"$C\"}" > /tmp/vfy_replace_exp.json
+api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$C\"}" > /tmp/vfy_replace_exp.json
 rejob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_replace_exp.json'))['job_id'])")
 wait_for_job "/export/job/$rejob" 1800 >/dev/null
 RPKG=$(api_get "/export/job/$rejob" | jfield "['filename']")
@@ -48838,7 +49812,7 @@ RPKG=$(api_get "/export/job/$rejob" | jfield "['filename']")
 check "replace fidelity compares an independent re-export" $?
 
 # ── import is lossless ───────────────────────────────────────────────────────
-api_post "/export" "{\"collection\":\"$iname\"}" > /tmp/vfy_exp2.json
+api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$iname\"}" > /tmp/vfy_exp2.json
 ejob2=$(python3 -c "import json;print(json.load(open('/tmp/vfy_exp2.json'))['job_id'])")
 wait_for_job "/export/job/$ejob2" 1800 >/dev/null
 PKG2=$(api_get "/export/job/$ejob2" | jfield "['filename']")
@@ -49243,7 +50217,7 @@ ENDPY
   check "a 30,000-chunk collection is built for the interrupted export" $? \
     "$(grep -E 'Error' /tmp/vfy_xrestart_prepare.log | tail -1)"
   builds_before=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/uploads/export-* 2>/dev/null' | sort)
-  api_post "/export" "{\"collection\":\"$XR\",\"include_models\":false}" > /tmp/vfy_xrestart_start.json
+  api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$XR\",\"include_models\":false}" > /tmp/vfy_xrestart_start.json
   xjob=$(jfield "['job_id']" < /tmp/vfy_xrestart_start.json)
   state=""
   for _ in $(seq 1 600); do
@@ -49302,7 +50276,7 @@ ENDPY
   # An import killed part-way reads `failed` with INTERRUPTED (#309): the same
   # collection, exported whole, dropped and imported back. The startup sweep
   # removes the half-built collection the killed import leaves.
-  api_post "/export" "{\"collection\":\"$XR\",\"include_models\":false}" > /tmp/vfy_irestart_export.json
+  api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$XR\",\"include_models\":false}" > /tmp/vfy_irestart_export.json
   xpkg_job=$(jfield "['job_id']" < /tmp/vfy_irestart_export.json)
   xpkg_status=$(wait_for_job "/export/job/$xpkg_job" 1800)
   xpkg=$(api_get "/export/job/$xpkg_job" | jfield "['filename']")
@@ -49370,7 +50344,7 @@ check_eq "#372: the upload completes" \
 api_get "/tune/$SC" > /tmp/vfy_sp_tune.json
 check_eq "#372: '$SC' finds the originals uploaded as '$SL' (re-chunk offered)" \
   "$(jfield "['can_rechunk']" < /tmp/vfy_sp_tune.json)" "True"
-api_post "/export" "{\"collection\":\"$SC\",\"include_models\":false}" > /tmp/vfy_sp_exp.json
+api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$SC\",\"include_models\":false}" > /tmp/vfy_sp_exp.json
 spjob=$(jfield "['job_id']" < /tmp/vfy_sp_exp.json)
 check_eq "#372: the export of '$SC' completes" "$(wait_for_job "/export/job/$spjob" 1800)" "completed"
 api_get "/export/job/$spjob" > /tmp/vfy_sp_expjob.json
@@ -49409,7 +50383,7 @@ r = [r for r in json.load(sys.stdin)['records'] if r['details'].get('file') == s
 sys.exit(0 if r and eval(sys.argv[2], {'r': r[0]}) else 1)" "$2" "$3"
 }
 
-api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_dl_exp.json
+api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_dl_exp.json
 djob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_dl_exp.json'))['job_id'])")
 check_eq "#677: an export to download completes" "$(wait_for_job "/export/job/$djob" 1800)" "completed"
 DPKG=$(api_get "/export/job/$djob" | jfield "['filename']")
@@ -49457,6 +50431,117 @@ check_eq "#677: an End User is refused GET /packages/{filename}" \
 retention exists "$NPKG"
 check "#677: ... and the package stays" $?
 retention remove "$NPKG"
+
+# ── a key export: encrypted by default, a new key each time (#676) ───────────
+# A default export writes <package>.tar.gz.age and <package>.key (0600) and
+# never a plain archive; each export has its own key; import needs the key
+# file's text; a full download of the key deletes the key and keeps the package.
+key_export() {   # key_export <outfile>: start a default export, print its job id
+  api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > "$1"
+  python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['job_id'])" "$1"
+}
+plain_before=$(ls -A "$EXPORTS" | grep -E '\.tar\.gz$' | sort)
+kjob=$(key_export /tmp/vfy_key_exp.json)
+plain_during=""
+for _ in $(seq 1 3000); do
+  plain_during="$plain_during $(comm -13 <(printf '%s\n' "$plain_before") <(ls -A "$EXPORTS" | grep -E '\.tar\.gz$' | sort) | tr '\n' ' ')"
+  st=$(api_get "/export/job/$kjob" | jfield "['status']")
+  [ "$st" = "completed" ] || [ "$st" = "failed" ] && break
+  sleep 0.2
+done
+check_eq "#676: a default export completes" "$st" "completed"
+[ -z "$(echo "$plain_during" | tr -d ' ')" ]
+check "#676: no unencrypted archive appears in ./exports while it runs" $? "$plain_during"
+api_get "/export/job/$kjob" > /tmp/vfy_key_job.json
+KPKG=$(jfield "['filename']" < /tmp/vfy_key_job.json)
+KKEY=$(jfield "['key_filename']" < /tmp/vfy_key_job.json)
+check_eq "#676: ... encrypted with a new key" "$(jfield "['encryption']" < /tmp/vfy_key_job.json)" "key"
+check_eq "#676: ... its key file is <package>.key" "$KKEY" "$KPKG.key"
+check_eq "#676: ./exports holds exactly the package and its key file for it" \
+  "$(ls -A "$EXPORTS" | grep -F "${KPKG%.tar.gz.age}" | sort | tr '\n' ' ')" "$KPKG $KKEY "
+check_eq "#676: the key file's mode is 600" \
+  "$(cd "$REPO_ROOT" && docker compose exec -T api stat -c %a "/app/exports/$KKEY" | tr -d '\r')" "600"
+kpub=$(cd "$REPO_ROOT" && docker compose exec -T api grep '^# public key: ' "/app/exports/$KKEY" | tr -d '\r')
+
+# A package's name carries its export's second (RAG_EXPORT_SPECIFICATIONS.md §4.1):
+# two exports of one collection that start in the same second get the same name,
+# and the second replaces the first package and its key file. Start the second
+# export in a later second so the checks below use two different packages.
+sleep 1.1
+kjob2=$(key_export /tmp/vfy_key_exp2.json)
+check_eq "#676: a second default export completes" "$(wait_for_job "/export/job/$kjob2" 1800)" "completed"
+api_get "/export/job/$kjob2" > /tmp/vfy_key_job2.json
+KPKG2=$(jfield "['filename']" < /tmp/vfy_key_job2.json); KKEY2=$(jfield "['key_filename']" < /tmp/vfy_key_job2.json)
+check_eq "#676: the two exports are two packages (different names)" "$([ "$KPKG2" != "$KPKG" ] && echo different || echo "same: $KPKG")" "different"
+kpub2=$(cd "$REPO_ROOT" && docker compose exec -T api grep '^# public key: ' "/app/exports/$KKEY2" | tr -d '\r')
+[ -n "$kpub" ] && [ -n "$kpub2" ] && [ "$kpub" != "$kpub2" ]
+check "#676: each export has its own key" $? "$kpub / $kpub2"
+
+code=$(post_code "/import" "{\"filename\":\"$KPKG\",\"on_conflict\":\"rename\"}" /tmp/vfy_key_nokey.json)
+check_eq "#676: import without the key is refused 400" "$code" "400"
+check_eq "#676: ... KEY_FILE_REQUIRED" "$(jfield "['error']['code']" < /tmp/vfy_key_nokey.json)" "KEY_FILE_REQUIRED"
+
+kcode=$(curl -s -o /tmp/vfy_key.txt -m 120 -w '%{http_code}' "$API/packages/$KKEY")
+check_eq "#676: GET /packages/<package>.key downloads the key file" "$kcode" "200"
+grep -q '^AGE-SECRET-KEY-1' /tmp/vfy_key.txt
+check "#676: ... an age key file" $?
+[ ! -e "$EXPORTS/$KKEY" ] && [ -e "$EXPORTS/$KPKG" ]
+check "#676: the key's full download deletes the key and keeps the package" $?
+api_get "/packages" | python3 -c "
+import json, sys
+p = next(p for p in json.load(sys.stdin)['packages'] if p['filename'] == sys.argv[1])
+sys.exit(0 if p['encryption'] == 'key' and p['key_on_server'] is False else 1)" "$KPKG"
+check "#676: GET /packages says the package is a key package whose key is no longer on the server" $?
+
+python3 - "$KPKG" /tmp/vfy_key.txt > /tmp/vfy_key_import_body.json <<'ENDPY'
+import json, sys
+print(json.dumps({"filename": sys.argv[1], "on_conflict": "rename", "key": open(sys.argv[2]).read()}))
+ENDPY
+api_post "/import" "@/tmp/vfy_key_import_body.json" > /tmp/vfy_key_imp.json
+kimp=$(jfield "['job_id']" < /tmp/vfy_key_imp.json)
+check_eq "#676: import with the key file completes" "$(wait_for_job "/import/job/$kimp" 1800)" "completed"
+kcoll=$(api_get "/import/job/$kimp" | jfield "['collection']")
+[ -n "$kcoll" ] && [ "$kcoll" != "None" ] && drop_collection "$kcoll"
+# A wrong key (reviewer, #676): the first package's key on the second package
+# fails the job DECRYPT_FAILED (reason key), names no key, and touches nothing.
+state_before=$(enc_state)
+ksum() { python3 -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$EXPORTS/$KPKG2"; }
+ksum_before=$(ksum)
+python3 - "$KPKG2" /tmp/vfy_key.txt > /tmp/vfy_key_wrong_body.json <<'ENDPY'
+import json, sys
+print(json.dumps({"filename": sys.argv[1], "on_conflict": "replace", "key": open(sys.argv[2]).read()}))
+ENDPY
+api_post "/import" "@/tmp/vfy_key_wrong_body.json" > /tmp/vfy_key_wrong.json
+kwjob=$(jfield "['job_id']" < /tmp/vfy_key_wrong.json)
+wait_for_job "/import/job/$kwjob" 900 >/dev/null
+api_get "/import/job/$kwjob" > /tmp/vfy_key_wrong_job.json
+python3 - /tmp/vfy_key_wrong_job.json > /tmp/vfy_key_wrong.txt 2>&1 <<'ENDPY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(d["status"], d["error_code"], d["error_detail"], d.get("encryption"))
+sys.exit(0 if d["status"] == "failed" and d["error_code"] == "DECRYPT_FAILED"
+         and d["error_detail"] == {"reason": "key"} and d.get("encryption") == "key"
+         and "AGE-SECRET-KEY" not in json.dumps(d) else 1)
+ENDPY
+check "#676: a wrong key fails the import DECRYPT_FAILED (reason key) and the job names no key" $? "$(tail -1 /tmp/vfy_key_wrong.txt)"
+[ "$(enc_state)" = "$state_before" ] && [ "$(ksum)" = "$ksum_before" ]
+check "#676: ... and touches nothing: collections, their counts and the package file unchanged" $?
+rm -f /tmp/vfy_key_wrong_body.json
+
+# The package's full download leaves its key (reviewer, #676): each file is
+# deleted by its own download, so downloading the package first never loses the key.
+check_eq "#676: the second package downloads" "$(curl -s -o /dev/null -m 600 -w '%{http_code}' "$API/packages/$KPKG2")" "200"
+[ ! -e "$EXPORTS/$KPKG2" ] && [ -e "$EXPORTS/$KKEY2" ]
+check "#676: the package's full download deletes the package and keeps its key file" $?
+check_eq "#676: ... and the export job still says its key is on the server" \
+  "$(api_get "/export/job/$kjob2" | jfield "['key_on_server']")" "True"
+check_eq "#676: the key file still downloads after its package" \
+  "$(curl -s -o /dev/null -m 120 -w '%{http_code}' "$API/packages/$KKEY2")" "200"
+[ ! -e "$EXPORTS/$KKEY2" ]
+check "#676: ... and its full download deletes it" $?
+rm -f /tmp/vfy_key.txt /tmp/vfy_key_import_body.json
+# A full download deletes each remaining file (#677, #676): that is the clean-up.
+curl -s -o /dev/null -m 600 "$API/packages/$KPKG"
 
 # ── verified recovery across an API restart (#43, #44; opt-in: restarts the API) ──
 RP="${PREFIX}BatchRecovery"
@@ -49565,7 +50650,7 @@ check_eq "the suite's collection is ingested" \
 chunks=$(count_of "$C")
 api_post "/ingest/config" "{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\",\"chunk_size\":150,\"min_chunk_size\":40}" >/dev/null
 api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":6,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
-api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_p_exp.json
+api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_p_exp.json
 check_eq "... and exported" \
   "$(wait_for_job "/export/job/$(jfield "['job_id']" < /tmp/vfy_p_exp.json)" 1800)" "completed"
 PKG=$(api_get "/export/job/$(jfield "['job_id']" < /tmp/vfy_p_exp.json)" | jfield "['filename']")
@@ -55305,7 +56390,7 @@ with tempfile.TemporaryDirectory(prefix='owned-import-session-') as directory:
                 session={'session_id':sid,'collection':collection,'status':'completed','pairs_total':1,'pairs_completed':1,'pairs':[{'pair_id':'p_owned','question':'Inert question','answer':'Original exported answer','contexts':['Owned inert evaluation context'],'ground_truth':'Inert truth','source_file':'inert.txt','chunk_index':0,'status':'approved'}]}
                 await asyncio.to_thread(gs.store_session,session)
                 print('PASS owned real collection, supplied-vector object and synthetic evaluation session created',flush=True)
-                start=await client.post('/export',json={'collection':collection,'include_models':False});assert start.status_code==202,start.text
+                start=await client.post('/export',json={'collection':collection,'include_models':False,'encryption':'none'});assert start.status_code==202,start.text
                 jobs.append((exporter,start.json()['job_id']))
                 exported=await completed(client,'/export/job/'+start.json()['job_id']);archive=root/'exports'/exported['filename'];digest=await asyncio.to_thread(file_digest,archive)
                 retained=await asyncio.to_thread(archive_session,archive,sid);assert retained['pairs'][0]['answer']=='Original exported answer'
@@ -55339,7 +56424,7 @@ with tempfile.TemporaryDirectory(prefix='owned-import-session-') as directory:
                 reload=await asyncio.to_thread(subprocess.run,[sys.executable,'-c',code,str(root/'uploads'),*identities],text=True,capture_output=True,check=True)
                 fresh=json.loads(reload.stdout);assert [row['collection'] for row in fresh]==[collection,*targets];assert fresh[0]['pairs'][0]['answer']=='Newer acknowledged human answer';assert all(row['imported_from']['session_id']==sid for row in fresh[1:])
                 print('PASS fresh independent API process restores all three session identities, newer original review and imported provenance',flush=True)
-                start=await client.post('/export',json={'collection':targets[0],'include_models':False});assert start.status_code==202,start.text
+                start=await client.post('/export',json={'collection':targets[0],'include_models':False,'encryption':'none'});assert start.status_code==202,start.text
                 jobs.append((exporter,start.json()['job_id']))
                 reexported=await completed(client,'/export/job/'+start.json()['job_id'])
                 imported_sid=mappings[0]['session_id'];retained=await asyncio.to_thread(archive_session,root/'exports'/reexported['filename'],imported_sid)
@@ -58795,8 +59880,11 @@ const SEALED = 'ragpkg-vfytransfera-20261021-0000-abcd1234.tar.gz.age';
 const BROKEN = 'ragpkg-vfytransfera-20261021-0000-ffff0000.tar.gz.age';
 const packagesBody = { packages: [
   { filename: PACKAGE, size_bytes: 2048, collection: A, chunk_count: 3, fidelity: 'with-sources', created_at: null, readable: true, encrypted: false },
-  { filename: SEALED, size_bytes: 2100, collection: null, chunk_count: null, fidelity: null, created_at: null, readable: true, encrypted: true },
+  { filename: SEALED, size_bytes: 2100, collection: null, chunk_count: null, fidelity: null, created_at: null, readable: true, encrypted: true, encryption: 'passphrase' },
 ] };
+// A package encrypted to its own key (#676), its key file still on the server.
+const KEYED = 'ragpkg-vfytransfera-20261021-0000-cccc1111.tar.gz.age';
+const keyedPackage = { filename: KEYED, size_bytes: 2200, collection: null, chunk_count: null, fidelity: null, created_at: null, readable: true, encrypted: true, encryption: 'key', key_on_server: true };
 const tuneBody = name => ({ collection: name, fidelity: 'with-sources', source_document_count: 2, can_rechunk: true, can_reembed: true, can_reindex: true, note: '' });
 const json = (status, body) => ({ status, body: JSON.stringify(body) });
 const apiError = (status, code, msg) => json(status, { error: { code, message: msg, detail: null } });
@@ -58813,7 +59901,7 @@ const HALVES = {
             done: importJob('completed', { collection: A, chunks_written: 3, fidelity: 'with-sources' }) },
 };
 
-async function fixture(browser, base, { hold = [] } = {}) {
+async function fixture(browser, base, { hold = [], lanMode = false } = {}) {
   const ctx = await browser.createBrowserContext();
   const page = await ctx.newPage();
   const errors = [];
@@ -58846,6 +59934,17 @@ async function fixture(browser, base, { hold = [] } = {}) {
   }, fixed);
   // The engineer, as GET /api/auth/me answers it, without a backend (#25).
   await stubAuth(page, 'engineer');
+  if (lanMode) {
+    // The same engineer, with LAN mode on in the user answer (#676).
+    await page.evaluateOnNewDocument(() => {
+      const inner = window.fetch.bind(window);
+      window.fetch = (input, init) => {
+        const path = new URL(typeof input === 'string' ? input : input.url, location.href).pathname;
+        if (path === '/api/auth/me') return Promise.resolve(new Response(JSON.stringify({ username: 'vfy-engineer', role: 'engineer', must_change_password: false, lan_mode: true }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+        return inner(input, init);
+      };
+    });
+  }
   await page.goto(base + '/transfer', { waitUntil: 'domcontentloaded' });
   await page.waitForFunction(() => document.querySelectorAll('select option').length > 0 && document.body.innerText.includes('Export a collection'));
   return { ctx, page, errors };
@@ -58902,13 +60001,16 @@ const stopped = half => `Stopped checking ${HALVES[half].progress} after 30 fail
 
 async function sleep(ms) { await new Promise(r => setTimeout(r, ms)); }
 
-// Encryption controls (#27).
+// Encryption controls (#27, #676): three radio choices.
 const passwords = page => page.evaluate(() => [...document.querySelectorAll('input[type=password]')].map(i => i.value));
 const typePassword = (page, index, value) => setValue(page, `() => document.querySelectorAll('input[type=password]')[${index}]`, value);
-const checkEncrypt = page => page.evaluate(() => {
-  const label = [...document.querySelectorAll('label')].find(l => l.textContent.includes('Encrypt with a passphrase'));
-  if (!label) return false; label.querySelector('input[type=checkbox]').click(); return true;
-});
+const encryptionChoices = page => page.evaluate(() => [...document.querySelectorAll('input[type=radio][name=encryption]')]
+  .map(i => ({ value: i.value, checked: i.checked, label: i.closest('label').querySelector(':scope > div > div').textContent })));
+const chooseEncryption = (page, value) => page.evaluate(v => {
+  const input = document.querySelector(`input[type=radio][name=encryption][value=${v}]`);
+  if (!input) return false; input.click(); return true;
+}, value);
+const checkEncrypt = page => chooseEncryption(page, 'passphrase');
 const sentBody = (page, path) => page.evaluate(p => {
   const r = window.transferFixture.requests.filter(x => x.path === p && x.method === 'POST').pop();
   return r && r.body ? JSON.parse(r.body) : null;
@@ -59011,8 +60113,8 @@ async function runTransferPageTests(browser, base, reporter) {
   }, { hold: ['GET /api/packages'] }]);
 
   cases.push(['export encryption: the passphrase rules hold Export, a valid matching pair sends it, and the fields clear (#27)', async page => {
-    assert.deepEqual(await passwords(page), [], 'passphrase fields shown before the box is checked');
-    assert.equal(await checkEncrypt(page), true, 'no "Encrypt with a passphrase" checkbox');
+    assert.deepEqual(await passwords(page), [], 'passphrase fields shown before "Passphrase" is chosen');
+    assert.equal(await checkEncrypt(page), true, 'no "Passphrase" choice');
     await page.waitForFunction(() => document.querySelectorAll('input[type=password]').length === 2);
     await waitText(page, 'The passphrase needs at least 12 characters.');
     assert.equal((await button(page, 'export')).disabled, true, 'Export enabled with no passphrase');
@@ -59028,14 +60130,14 @@ async function runTransferPageTests(browser, base, reporter) {
     await expectButton(page, 'export', false);
     assert.equal(await click(page, 'Export'), true, 'no Export button');
     await pending(page, '/api/export', 'POST');
-    assert.deepEqual(await sentBody(page, '/api/export'), { collection: A, include_models: false, passphrase: 'correct horse battery' });
+    assert.deepEqual(await sentBody(page, '/api/export'), { collection: A, include_models: false, encryption: 'passphrase', passphrase: 'correct horse battery' });
     await release(page, '/api/export', HALVES.export.started, 'POST');
     await page.waitForFunction(() => [...document.querySelectorAll('input[type=password]')].every(i => i.value === ''));
     await release(page, HALVES.export.poll, exportJob('completed', { chunks_written: 3, filename: 'ragpkg-vfy.tar.gz.age', size_bytes: 4096, fidelity: 'with-sources', models_bundled: false, retrieve_script: true, encrypted: true }));
     await waitText(page, 'with-sources, encrypted');
   }]);
   cases.push(['export encryption: the bounds count characters, 1025 holds Export, and a refused start keeps the fields (#27)', async page => {
-    assert.equal(await checkEncrypt(page), true, 'no "Encrypt with a passphrase" checkbox');
+    assert.equal(await checkEncrypt(page), true, 'no "Passphrase" choice');
     await page.waitForFunction(() => document.querySelectorAll('input[type=password]').length === 2);
     const lock = '\u{1F512}';   // one character, two UTF-16 units
     await typePassword(page, 0, lock.repeat(11));
@@ -59060,10 +60162,71 @@ async function runTransferPageTests(browser, base, reporter) {
     assert.deepEqual(await passwords(page), ['a'.repeat(1024), 'a'.repeat(1024)], 'the fields were cleared after a refused start');
     await expectButton(page, 'export', false);
   }]);
-  cases.push(['export encryption: an unchecked box sends no passphrase (#27)', async page => {
+  cases.push(['export encryption: three choices, a new key first and chosen; the default sends encryption "key" and no passphrase (#676)', async page => {
+    const choices = await encryptionChoices(page);
+    assert.deepEqual(choices.map(c => [c.value, c.label, c.checked]),
+      [['key', 'New key (recommended)', true], ['passphrase', 'Passphrase', false], ['none', 'Not encrypted', false]]);
+    assert.deepEqual(await passwords(page), [], 'passphrase fields shown for a key export');
     await start(page, 'export');
-    assert.deepEqual(await sentBody(page, '/api/export'), { collection: A, include_models: false });
+    assert.deepEqual(await sentBody(page, '/api/export'), { collection: A, include_models: false, encryption: 'key' });
   }]);
+  cases.push(['export encryption: "Not encrypted" sends encryption "none" (#676)', async page => {
+    assert.equal(await chooseEncryption(page, 'none'), true, 'no "Not encrypted" choice');
+    await start(page, 'export');
+    assert.deepEqual(await sentBody(page, '/api/export'), { collection: A, include_models: false, encryption: 'none' });
+  }]);
+  cases.push(['export encryption: in LAN mode "Not encrypted" isn\'t offered (#676)', async page => {
+    await waitText(page, 'In LAN mode every export is encrypted.');
+    const choices = await encryptionChoices(page);
+    assert.deepEqual(choices.map(c => c.value), ['key', 'passphrase']);
+    await start(page, 'export');
+    assert.deepEqual(await sentBody(page, '/api/export'), { collection: A, include_models: false, encryption: 'key' });
+  }, { lanMode: true }]);
+  cases.push(['export: a finished key export offers Download key first, with the store-apart warning, and never shows the key (#676)', async page => {
+    await startAndPoll(page, 'export');
+    const done = JSON.parse(HALVES.export.done.body);
+    const name = 'ragpkg-vfy.tar.gz.age';
+    await release(page, HALVES.export.poll, json(200, { ...done, filename: name, encrypted: true, encryption: 'key', key_filename: name + '.key', key_on_server: true }));
+    await waitText(page, 'Download the key first.');
+    await waitText(page, 'Store it apart from the package');
+    await waitText(page, 'encrypted with a key');
+    const links = await page.evaluate(() => [...document.querySelectorAll('a')].filter(a => ['Download key', 'Download'].includes(a.textContent.trim()))
+      .map(a => ({ label: a.textContent.trim(), href: a.getAttribute('href'), download: a.hasAttribute('download') })));
+    assert.deepEqual(links.slice(0, 2), [
+      { label: 'Download key', href: '/api/packages/' + name + '.key', download: true },
+      { label: 'Download', href: '/api/packages/' + name, download: true }]);
+    assert.ok(!(await text(page)).includes('AGE-SECRET-KEY'), 'the key is shown as text');
+    // After the click the page re-reads the export until the key is gone.
+    await page.evaluate(() => document.addEventListener('click', e => e.preventDefault(), true));
+    await page.evaluate(() => [...document.querySelectorAll('a')].find(a => a.textContent.trim() === 'Download key').click());
+    await release(page, HALVES.export.poll, json(200, { ...done, filename: name, encrypted: true, encryption: 'key', key_filename: name + '.key', key_on_server: false }));
+    await waitText(page, 'Key downloaded and deleted from ./exports.');
+    assert.ok(!(await page.evaluate(() => [...document.querySelectorAll('a')].some(a => a.textContent.trim() === 'Download key'))), 'Download key still offered');
+  }]);
+  cases.push(['import encryption: a key package is labelled, asks for its key file, reads it in the browser and sends its text as key (#676)', async page => {
+    await release(page, '/api/packages', json(200, { packages: [...packagesBody.packages, keyedPackage] }));
+    await page.waitForFunction(n => [...document.querySelectorAll('option')].some(o => o.value === n), { timeout: 5000 }, KEYED);
+    const label = await page.evaluate(n => [...document.querySelectorAll('option')].find(o => o.value === n).textContent, KEYED);
+    assert.ok(label.includes('encrypted with a key, key on the server'), label);
+    await selectPackage(page, KEYED);
+    await waitText(page, 'This package is encrypted with its own key.');
+    assert.deepEqual(await passwords(page), [], 'a passphrase field for a key package');
+    assert.equal((await button(page, 'import')).disabled, true, 'Import enabled without a key file');
+    const keyText = '# public key: age1vfy\nAGE-SECRET-KEY-1VFYNOTAREALKEY\n';
+    await page.evaluate(t => {
+      const input = document.querySelector('input[type=file]');
+      const files = new DataTransfer();
+      files.items.add(new File([t], 'vfy.key'));
+      input.files = files.files;
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    }, keyText);
+    await waitText(page, 'Chosen: vfy.key.');
+    await expectButton(page, 'import', false);
+    assert.equal(await click(page, 'Import'), true, 'no Import button');
+    await pending(page, '/api/import', 'POST');
+    assert.deepEqual(await sentBody(page, '/api/import'), { filename: KEYED, on_conflict: 'abort', key: keyText });
+    assert.ok(!(await text(page)).includes('AGE-SECRET-KEY'), 'the key is shown as text');
+  }, { hold: ['GET /api/packages'] }]);
   cases.push(['import encryption: an encrypted package is labelled, asks for its passphrase and sends it; a plain one sends none (#27)', async page => {
     const label = await page.evaluate(n => [...document.querySelectorAll('option')].find(o => o.value === n)?.textContent || '', SEALED);
     assert.ok(label.includes('encrypted') && !label.includes('null'), label);
@@ -61783,7 +62946,7 @@ function transferCases() {
       await waitFor(s.page, () => window.__forms !== undefined, 'page');
       await new Promise(r => setTimeout(r, 300));
       const posts = callsTo(s, 'POST', '/api/export');
-      assert.deepEqual(posts.map(c => c.body), [{ collection: A, include_models: false }, { collection: A, include_models: true }]);
+      assert.deepEqual(posts.map(c => c.body), [{ collection: A, include_models: false, encryption: 'key' }, { collection: A, include_models: true, encryption: 'key' }]);
     } },
     (() => {
       let phase = 'running';
@@ -62204,7 +63367,7 @@ def run(api, collection, exports, repo_root):
         loaded = request('/retrieval/config/' + collection)
         expect('legacy ef: the Retrieval page can still load the saved settings',
                loaded['ef'] == 10000 and loaded['top_k'] == 7, loaded)
-        job = wait('/export/job/' + request('/export', {'collection': collection,
+        job = wait('/export/job/' + request('/export', {'collection': collection, 'encryption': 'none',
                                                         'include_models': False})['job_id'])
         expect('legacy ef: export completes', job['status'] == 'completed', job)
         package = exports / job['filename']
@@ -62266,7 +63429,7 @@ def run(api, collection, exports, repo_root):
                                ([], ['not a JSON object'])]:
             write_saved(value)
             before = listing()
-            job = wait('/export/job/' + request('/export', {'collection': collection,
+            job = wait('/export/job/' + request('/export', {'collection': collection, 'encryption': 'none',
                                                             'include_models': False})['job_id'])
             error = job.get('error') or ''
             expect(f'invalid saved settings {value!r}: export fails', job['status'] == 'failed', job)

@@ -117,7 +117,7 @@ def main(argv):
         expect(everyone[key_id]["owner"] == {"name": principal, "kind": "service"},
                "the Engineer sees the key's job owned by {}".format(everyone[key_id]["owner"]))
 
-        status, raw, _ = code("POST", "/export", {"collection": name}, token=dev)
+        status, raw, _ = code("POST", "/export", {"collection": name, "encryption": "none"}, token=dev)
         expect(status == 202, "the export answered {} {}".format(status, error_code(raw)))
         export_id = json.loads(raw)["job_id"]
         expect(export_id in listed("/export/jobs", token=dev), "the running or ended export isn't listed")

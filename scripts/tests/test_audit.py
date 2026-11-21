@@ -365,6 +365,7 @@ class MiddlewareTests(AuditTestCase):
                              json={"collection": "Docs", "passphrase": "correct horse battery staple"})
         record = self.last("export")
         self.assertEqual(record["details"], {"include_models": False, "encrypted": True,
+                                             "encryption": "passphrase",     # #676
                                              "code": "COLLECTION_NOT_FOUND"})
         self.assertNotIn("correct horse battery staple", self.raw())
 
