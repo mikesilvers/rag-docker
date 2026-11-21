@@ -18,6 +18,7 @@ the default, so the file runs in seconds.
 """
 import asyncio
 import base64
+import errno
 import hashlib
 import io
 import json
@@ -32,6 +33,7 @@ import unittest
 import uuid
 import zlib
 from contextlib import ExitStack
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -965,12 +967,13 @@ class KeyExports(Fixture):
                  self.assertRaises(OSError):
                 self.build(key=True)
             self.assertEqual(list(self.exports.iterdir()), [])
-        real = Path.replace
-        def fail_package(path, target):
-            if str(path).endswith(".tar.gz.age.partial"):
-                raise OSError("disk full")
-            return real(path, target)
-        with patch.object(Path, "replace", fail_package), self.assertRaises(OSError):
+        # The package's placement fails after its key file was placed (#860).
+        real = os.link
+        def fail_package(src, dst, *args, **kwargs):
+            if str(dst).endswith(".tar.gz.age"):
+                raise OSError(errno.EIO, "disk full")
+            return real(src, dst, *args, **kwargs)
+        with patch.object(packager.os, "link", fail_package), self.assertRaises(OSError):
             self.build(key=True)
         self.assertEqual(list(self.exports.iterdir()), [])
 
@@ -999,6 +1002,114 @@ class KeyExports(Fixture):
         work = self.root / "right"
         work.mkdir()
         packager.open_package(archive, work, identity=identity)
+
+
+class SameSecondNames(Fixture):
+    """Two exports of one collection in the same second get distinct names and
+    no export replaces a file in ./exports (#860, spec §4.1)."""
+
+    WHEN = datetime(2026, 11, 21, 12, 0, 0, tzinfo=timezone.utc)
+
+    def setUp(self):
+        super().setUp()
+        self.stack.enter_context(patch.object(packager, "_given", set()))
+        self.stack.enter_context(patch.object(packager, "_now", return_value=self.WHEN))
+
+    def files(self):
+        return {p.name: p.read_bytes() for p in self.exports.iterdir()}
+
+    def stem(self, result):
+        return result["filename"].split(".tar.gz")[0]
+
+    def test_same_second_exports_get_distinct_names_and_keep_every_file(self):
+        first = self.build(key=True)
+        kept = self.files()
+        second = self.build(key=True)
+        third = self.build(passphrase=PASSPHRASE)
+        stem = self.stem(first)
+        self.assertTrue(stem.endswith("-20261121T120000Z-" + first["id8"]), stem)
+        self.assertEqual([self.stem(second), self.stem(third)], [stem + "-2", stem + "-3"])
+        self.assertEqual(second["id8"], first["id8"])
+        names = [first["filename"], first["key_filename"], second["filename"], second["key_filename"],
+                 third["filename"]]
+        files = self.files()
+        self.assertEqual(sorted(files), sorted(names))
+        for name, data in kept.items():
+            self.assertEqual(files[name], data, name)
+        self.assertIsNone(third["key_filename"])
+        for result in (first, second):
+            work = self.root / ("open-" + self.stem(result))
+            work.mkdir()
+            identity = age_stream.parse_identity((self.exports / result["key_filename"]).read_text())
+            pkg, manifest = packager.open_package(self.exports / result["filename"], work, identity=identity)
+            packager.verify_digests(pkg, manifest)
+            self.assertEqual(pkg.name, self.stem(result))
+            self.assertIn(result["filename"], (pkg / "README.md").read_text())
+        with self.assertRaises(packager.PackageError) as caught:
+            packager.open_package(self.exports / second["filename"], self.root / "wrong",
+                                  identity=age_stream.parse_identity(
+                                      (self.exports / first["key_filename"]).read_text()))
+        self.assertEqual(caught.exception.code, "DECRYPT_FAILED")
+
+    def test_a_leftover_key_file_takes_the_name(self):
+        first = self.build(key=True)
+        (self.exports / first["filename"]).unlink()           # the package was downloaded
+        key = (self.exports / first["key_filename"]).read_bytes()
+        packager._given.clear()                               # a new process: only the folder counts
+        second = self.build(key=True)
+        self.assertEqual(self.stem(second), self.stem(first) + "-2")
+        self.assertEqual((self.exports / first["key_filename"]).read_bytes(), key)
+
+    def test_a_name_given_in_this_process_is_not_given_again(self):
+        first = self.build()
+        (self.exports / first["filename"]).unlink()           # downloaded and deleted
+        second = self.build()
+        self.assertEqual(second["filename"], self.stem(first) + "-2.tar.gz")
+
+    def plant_during_build(self, suffix):
+        """Wrap `_write_archive` so a file appears at the chosen name's `suffix`
+        after the name was chosen, as if something else wrote it."""
+        real = packager._write_archive
+        planted = []
+
+        def write(stage, stem, dest, *args, **kwargs):
+            path = self.exports / (stem + suffix)
+            path.write_bytes(b"someone else's file")
+            planted.append(path)
+            return real(stage, stem, dest, *args, **kwargs)
+        return patch.object(packager, "_write_archive", write), planted
+
+    def test_a_name_taken_after_it_was_chosen_fails_and_replaces_nothing(self):
+        for suffix in (".tar.gz.age", ".tar.gz.age.key"):
+            with self.subTest(planted=suffix):
+                for p in self.exports.iterdir():
+                    p.unlink()
+                wrapper, planted = self.plant_during_build(suffix)
+                with wrapper, self.assertRaises(FileExistsError) as caught:
+                    self.build(key=True)
+                self.assertIn(planted[0].name, str(caught.exception))
+                self.assertEqual(self.files(), {planted[0].name: b"someone else's file"})
+
+    def test_without_hard_links_the_fallback_places_and_refuses(self):
+        no_links = patch.object(packager.os, "link", side_effect=PermissionError(errno.EPERM, "no links"))
+        with no_links:
+            result = self.build(key=True)
+        self.assertEqual(sorted(self.files()), sorted([result["filename"], result["key_filename"]]))
+        self.assertEqual(os.stat(self.exports / result["key_filename"]).st_mode & 0o777, 0o600)
+        for p in self.exports.iterdir():
+            p.unlink()
+        wrapper, planted = self.plant_during_build(".tar.gz.age")
+        with no_links, wrapper, self.assertRaises(FileExistsError):
+            self.build(key=True)
+        self.assertEqual(self.files(), {planted[0].name: b"someone else's file"})
+
+    def test_no_free_name_fails_and_writes_nothing(self):
+        first = self.build()
+        (self.exports / (self.stem(first) + "-2.tar.gz.age.key")).write_bytes(b"x")
+        before = self.files()
+        with patch.object(packager, "MAX_NAME_SUFFIX", 2), self.assertRaises(RuntimeError):
+            self.build()
+        self.assertEqual(self.files(), before)
 
 
 class KeyApi(Fixture):

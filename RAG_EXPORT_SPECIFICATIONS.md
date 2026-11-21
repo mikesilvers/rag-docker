@@ -181,18 +181,28 @@ saved settings are defaults, not a constraint.
 ### 4.1 Filename (normative)
 
 ```
-ragpkg-<collection-slug>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz
-ragpkg-<collection-slug>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz.age    (encrypted, §4.6)
-ragpkg-<collection-slug>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz.age.key  (its key file, for a key package, §4.6)
+ragpkg-<collection-slug>-<YYYYMMDDTHHMMSSZ>-<id8>[-<n>].tar.gz
+ragpkg-<collection-slug>-<YYYYMMDDTHHMMSSZ>-<id8>[-<n>].tar.gz.age    (encrypted, §4.6)
+ragpkg-<collection-slug>-<YYYYMMDDTHHMMSSZ>-<id8>[-<n>].tar.gz.age.key  (its key file, for a key package, §4.6)
 ```
 
 - `<collection-slug>`: stored collection name, lowercased, each run of characters
   outside `[a-z0-9]` replaced by `-`, leading/trailing `-` trimmed.
 - `<YYYYMMDDTHHMMSSZ>`: UTC, basic ISO 8601, no separators.
 - `<id8>`: first 8 lowercase hex of the manifest digest (§4.4).
+- `-<n>` (#860): absent unless the name without it is taken. Two exports of one
+  collection with the same content that start in the same second have the same
+  name without it; the later one gets `-<n>`, the smallest `<n>` from 2 whose
+  name is free, so both packages and both key files are kept. A name is taken
+  when a file of it (`.tar.gz`, `.tar.gz.age` or `.tar.gz.age.key`, or the
+  temporary `.<file>.partial` of one) is in the exports folder, as any kind of
+  entry, or when the running API has already given it to an export. A package
+  and its key file are put in place by a step that never replaces an existing
+  file: if the name has been taken meanwhile, the export fails and the existing
+  file is left as it is.
 
 The archive MUST expand to a single directory of the same name minus `.tar.gz`
-(minus `.tar.gz.age` for an encrypted package, once decrypted).
+(minus `.tar.gz.age` for an encrypted package, once decrypted), `-<n>` included.
 
 **The filename is a label, never an input.** The slug is lossy: it lowercases a
 name Weaviate capitalised, and two distinct collections can slug identically.
