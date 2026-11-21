@@ -4741,12 +4741,15 @@ Two-step verification (#607). These are ticked once the tests reviewer's full `s
 - [x] Groups for collection access (#784): Engineers create, rename and delete groups and set their members (people
   and service principals) in browser sessions only; a collection granted to a group is listed and usable by its
   members while the grant and the membership hold, and by no one else; a change applies to the next request;
-  deleting a group removes its grants and never opens a collection; a rename keeps members and grants; a deleted
-  collection drops its group grants; copies, imports and failed creates carry group grants under the account rules
-  (narrowest across a chain, never wider); every change and refusal is audited; the Collections page's Access
-  dialog offers groups and the Groups page manages them.
+  deleting a group removes its grants and never opens a collection, and its audit record names the collections whose
+  grant was removed (`details.collections`) and the members it removed (`details.removed`, #857); a rename keeps
+  members and grants; a deleted collection drops its group grants; copies, imports and failed creates carry group
+  grants under the account rules (narrowest across a chain, never wider), and a failed create or import puts a group
+  grant back only to the same group, matched on its id and `created_at`, never on its name (#857); every change and refusal is audited; the Collections page's Access dialog offers groups and the Groups page manages them.
   *Evidence: `scripts/tests/test_collection_access.py` `GroupRuleTests`, `GroupAccessRouteTests`,
-  `GroupRouteTests`, `GroupCopyTests` (suite 17), which fail on the code before #784; `test_auth.py` and
+  `GroupRouteTests` (its `test_the_audit_records` checks the delete record's `details.collections` and
+  `details.removed`), `GroupCopyTests` (its `test_put_back_matches_a_group_by_identity`: a reused id or name is not the same group, a
+  renamed group is, #857) (suite 17), which fail on the code before #784; `test_auth.py` and
   `test_query_only.py` for the routes' policy; `auth_stack.py collection-access` (its group case) and the matrix
   rows (suite 17); `scripts/verify/browser/ui_controls.js` Access (#784) and Groups page cases (suite 06).*
 
