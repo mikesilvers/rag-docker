@@ -24,6 +24,7 @@ import io
 import json
 import logging
 import os
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -1110,6 +1111,43 @@ class SameSecondNames(Fixture):
         with patch.object(packager, "MAX_NAME_SUFFIX", 2), self.assertRaises(RuntimeError):
             self.build()
         self.assertEqual(self.files(), before)
+
+    # Reviewer tests (rag-pr-review, #860).
+    def test_a_failed_removal_of_the_temporary_takes_the_placed_file_back(self):
+        # The link placed the file but the temporary can't be removed: the
+        # placed name is removed again, so the export leaves no half-placed pair.
+        tmp, final = self.exports / ".x.tar.gz.partial", self.exports / "x.tar.gz"
+        tmp.write_bytes(b"data")
+        real = os.unlink
+
+        def unlink(path, *args, **kwargs):
+            if str(path) == str(tmp):
+                raise OSError(errno.EIO, "busy")
+            return real(path, *args, **kwargs)
+        with patch.object(packager.os, "unlink", unlink), self.assertRaises(OSError):
+            packager._place(tmp, final)
+        self.assertFalse(final.exists())
+        self.assertEqual(tmp.read_bytes(), b"data")
+
+    def test_validate_package_accepts_a_suffixed_name_and_refuses_a_malformed_one(self):
+        first = self.build()
+        second = self.build()
+        self.assertEqual(second["filename"], self.stem(first) + "-2.tar.gz")
+        script = ROOT / "scripts" / "verify" / "validate_package.py"
+        # Only the name clauses are checked here: this fixture's mocked build
+        # leaves embedding.dimensions empty, which suite 05 checks on a real one.
+        ran = subprocess.run([sys.executable, str(script), str(self.exports / second["filename"])],
+                             capture_output=True, text=True, timeout=120)
+        self.assertIn("PASS  E5 filename matches the §4.1 pattern", ran.stdout, ran.stdout + ran.stderr)
+        self.assertIn("PASS  E19 README names the package file as delivered", ran.stdout)
+        for bad in ("-01", "-0", "-x"):
+            with self.subTest(suffix=bad):
+                renamed = self.exports / (self.stem(first) + bad + ".tar.gz")
+                renamed.write_bytes((self.exports / first["filename"]).read_bytes())
+                ran = subprocess.run([sys.executable, str(script), str(renamed)],
+                                     capture_output=True, text=True, timeout=120)
+                self.assertNotEqual(ran.returncode, 0)
+                self.assertIn("FAIL  E5 filename matches the §4.1 pattern", ran.stdout)
 
 
 class KeyApi(Fixture):

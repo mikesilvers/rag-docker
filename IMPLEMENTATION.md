@@ -44075,6 +44075,19 @@ class RecordTests(DownloadTestCase):
         self.assertEqual(calls[0][0][0], "ragpkg-open1-x.tar.gz")
         self.assertEqual(calls[0][1], {"key_filename": "ragpkg-open1-x.tar.gz.age.key"})
 
+    # Reviewer test (rag-pr-review, #860): a key export whose record fails
+    # completes, records neither file and warns about both by name.
+    def test_a_key_export_whose_record_fails_records_neither_and_warns_about_both(self):
+        def broken(*_args, **_kwargs):
+            raise OSError("disk full")
+        with self.assertLogs("services.exporter", "ERROR"):
+            job = self.run_export(record=broken, key_filename="ragpkg-open1-x.tar.gz.age.key")
+        self.assertEqual(job["status"], "completed")
+        self.assertTrue(any("package and its key file could not be recorded" in w for w in job["warnings"]),
+                        job["warnings"])
+        self.assertFalse(package_retention.recorded("ragpkg-open1-x.tar.gz"))
+        self.assertFalse(package_retention.recorded("ragpkg-open1-x.tar.gz.age.key"))
+
 
 class ListingTests(DownloadTestCase):
     def test_the_listing_says_when_recorded_packages_expire(self):
