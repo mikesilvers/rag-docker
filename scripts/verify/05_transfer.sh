@@ -1483,12 +1483,15 @@ kpub=$(cd "$REPO_ROOT" && docker compose exec -T api grep '^# public key: ' "/ap
 # Two key builds of one collection in the same second (#860), run in the API
 # container with the build's clock fixed to a past second no export uses: the
 # second gets `-2` (RAG_EXPORT_SPECIFICATIONS.md §4.1) and all four files are
-# kept. Every file the builds open for writing in ./exports is recorded through
+# kept. The collision is forced: two real builds of one collection can differ
+# in <id8> (chunks.jsonl's key order follows Weaviate's, #863), so both builds
+# are given the first build's plain stem through a wrapped package_stem. Only
+# these builds are patched; export output is unchanged. Every file the builds open for writing in ./exports is recorded through
 # Python's `open` audit event, so "no unencrypted archive" is checked on each
 # write instead of by sampling the folder (#860): only the encrypted package's
 # and the key's temporaries are written, and each package is an age file.
 (cd "$REPO_ROOT" && docker compose exec -T api python - "$C") > /tmp/vfy_same_second.txt 2>&1 <<'ENDPY'
-import os, sys
+import hashlib, os, sys
 sys.path.insert(0, "/app")
 from datetime import datetime, timezone
 from unittest.mock import patch
@@ -1510,19 +1513,38 @@ def check(ok, name, detail=""):
     print(f"{0 if ok else 1}|{name}|{detail}".replace("\n", " "))
 
 
+def digest(name):
+    return hashlib.sha256((exports / name).read_bytes()).hexdigest()
+
+
+real_stem, stems = packager.package_stem, []
+
+
+def forced_stem(collection, when, id8):
+    # Every build gets the first build's <id8>, so the second's plain stem is taken.
+    stems.append(real_stem(collection, when, stems[0].rsplit("-", 1)[1] if stems else id8))
+    return stems[-1]
+
+
 sys.addaudithook(hook)
 built = []
 try:
-    with patch.object(packager, "_now", return_value=datetime(2001, 1, 1, tzinfo=timezone.utc)):
+    with patch.object(packager, "_now", return_value=datetime(2001, 1, 1, tzinfo=timezone.utc)), \
+         patch.object(packager, "package_stem", forced_stem):
         recording[0] = True
-        for _ in range(2):
-            built.append(packager.build(sys.argv[1], key=True))
+        built.append(packager.build(sys.argv[1], key=True))
+        kept = {built[0][k]: digest(built[0][k]) for k in ("filename", "key_filename")}
+        built.append(packager.build(sys.argv[1], key=True))
         recording[0] = False
     first, second = built
     stem = first["filename"][:-len(age_stream.ENCRYPTED_SUFFIX)]
     check(second["filename"] == stem + "-2" + age_stream.ENCRYPTED_SUFFIX,
           "#860: two exports of one collection in the same second get distinct names, the second -2",
           f'{first["filename"]} / {second["filename"]}')
+    check(len(stems) == 2 and stems == [stem, stem],
+          "#860: ... the second build was given the first build's name, which was taken", " / ".join(stems))
+    check(all(digest(n) == d for n, d in kept.items()),
+          "#860: ... and the first build's package and key file are unchanged", " ".join(kept))
     names = [r[k] for r in built for k in ("filename", "key_filename")]
     check(all((exports / n).is_file() for n in names),
           "#860: ... and both packages and both key files are kept", " ".join(names))
@@ -1548,8 +1570,8 @@ finally:
             if r.get(k):
                 (exports / r[k]).unlink(missing_ok=True)
 ENDPY
-[ "$(grep -c '^[01]|' /tmp/vfy_same_second.txt)" = "6" ]
-check "#860: the same-second check ran all six of its checks" $? "$(tail -5 /tmp/vfy_same_second.txt | tr '\n' ' ')"
+[ "$(grep -c '^[01]|' /tmp/vfy_same_second.txt)" = "8" ]
+check "#860: the same-second check ran all eight of its checks" $? "$(tail -5 /tmp/vfy_same_second.txt | tr '\n' ' ')"
 while IFS='|' read -r rc name detail; do
   check "$name" "$rc" "$detail"
 done < <(grep '^[01]|' /tmp/vfy_same_second.txt)
