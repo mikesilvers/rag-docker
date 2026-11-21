@@ -30,7 +30,8 @@ changes only that function.
 its own, with the package's finish time and collection. It follows the same
 rules by its own name: a full download of it deletes it and only it, a full
 download of the package leaves it, and expiry deletes whichever of the two is
-still there. So it is not a companion: deleting it with the package would lose
+still there. It is recorded in the same write as its package (#860), so one is
+never recorded without the other. So it is not a companion: deleting it with the package would lose
 the key of a package downloaded first.
 
 **The record.** Each entry is `{"finished_at": ..., "collection": ...}`: the
@@ -189,13 +190,18 @@ def _write(entries: dict[str, dict]) -> None:
         raise
 
 
-def record_export(filename: str, finished: datetime, collection: str | None = None) -> None:
+def record_export(filename: str, finished: datetime, collection: str | None = None,
+                  key_filename: str | None = None) -> None:
     """Record a package this instance exported, with the collection it holds
-    (#794). Raises when it can't be written."""
+    (#794), and a key export's key file with the same entry, in one write
+    (#860). Raises when it can't be written; then neither is recorded."""
     with _lock:
         entries = _read()
-        entries[filename] = {"finished_at": finished.astimezone(timezone.utc).strftime(_TIME),
-                             "collection": collection}
+        entry = {"finished_at": finished.astimezone(timezone.utc).strftime(_TIME),
+                 "collection": collection}
+        entries[filename] = entry
+        if key_filename:
+            entries[key_filename] = dict(entry)
         _write(entries)
 
 
