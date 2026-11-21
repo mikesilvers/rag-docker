@@ -24,17 +24,32 @@ rb_need_docker() {
   command -v docker >/dev/null 2>&1 || rb_die "docker is not on PATH"
 }
 
+# The SHA-256 of stdin, in hex: sha256sum where there is one (Linux), else
+# shasum (macOS).
+rb_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print $1}'
+  else
+    rb_die "neither sha256sum nor shasum is on PATH"
+  fi
+}
+
 # Sets RB_IMAGE, building the image if this machine doesn't have it. The tag
-# holds both pins of scripts/age/Dockerfile, the age package version and the
-# first 12 hex digits of the alpine digest, so a change of either builds a new
-# image instead of reusing the old one.
+# holds the age package version and the first 12 hex digits of the SHA-256 of
+# the instruction lines of scripts/age/Dockerfile (comments and blank lines
+# left out), so a change of any instruction, the two pins included, builds a
+# new image instead of reusing the old one; an edit of a comment doesn't.
 rb_image() {
-  local version digest
+  local version pinned hash
   version=$(sed -n 's/^RUN apk add --no-cache age=\([0-9A-Za-z._-]*\)$/\1/p' "$RB_ROOT/scripts/age/Dockerfile")
   [ -n "$version" ] || rb_die "scripts/age/Dockerfile names no age version"
-  digest=$(sed -n 's/^FROM [^@ ]*@sha256:\([0-9a-f]\{12\}\)[0-9a-f]\{52\}$/\1/p' "$RB_ROOT/scripts/age/Dockerfile")
-  [ -n "$digest" ] || rb_die "scripts/age/Dockerfile names no alpine digest"
-  RB_IMAGE="rag-docker-age:$version-$digest"
+  pinned=$(sed -n 's/^FROM [^@ ]*@sha256:\([0-9a-f]\{12\}\)[0-9a-f]\{52\}$/\1/p' "$RB_ROOT/scripts/age/Dockerfile")
+  [ -n "$pinned" ] || rb_die "scripts/age/Dockerfile names no alpine digest"
+  hash=$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "$RB_ROOT/scripts/age/Dockerfile" | rb_sha256) ||
+    exit 1
+  RB_IMAGE="rag-docker-age:$version-${hash:0:12}"
   if ! docker image inspect "$RB_IMAGE" >/dev/null 2>&1; then
     echo "Building the age image $RB_IMAGE from scripts/age (once; this needs the network)..."
     docker build -q -t "$RB_IMAGE" "$RB_ROOT/scripts/age" >/dev/null ||
@@ -81,7 +96,7 @@ rb_exists() {
 }
 
 rb_count() {
-  rb_run -v "${RB_PREFIX}_$1:/data:ro" "$RB_IMAGE" sh -c 'find /data -mindepth 1 | wc -l' | tr -d ' '
+  rb_run -v "${RB_PREFIX}_$1:/data:ro" "$RB_IMAGE" sh -c 'find /data -mindepth 1 ! -path "/data/.rag-docker-restore.*" | wc -l' | tr -d ' '
 }
 
 rb_volume_list_line() {

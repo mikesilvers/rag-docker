@@ -24,6 +24,7 @@ build failure fails it.
 Run: python3 scripts/tests/test_backup_scripts.py
 """
 from pathlib import Path
+import hashlib
 import os
 import re
 import secrets
@@ -61,10 +62,12 @@ def dockerfile():
 
 
 def age_image(text=None):
-    """The tag rb_image gives the age image: the age version and the alpine digest's first 12 hex digits."""
+    """The tag rb_image gives the age image: the age version and the first 12 hex digits of the
+    SHA-256 of the Dockerfile's instruction lines (comments and blank lines left out, #856)."""
     text = dockerfile() if text is None else text
     version = re.search(r'^RUN apk add --no-cache age=(\S+)$', text, re.M).group(1)
-    digest = re.search(r'^FROM \S+@sha256:([0-9a-f]{64})$', text, re.M).group(1)
+    lines = [line for line in text.splitlines() if line.strip() and not line.lstrip().startswith('#')]
+    digest = hashlib.sha256(''.join(line + '\n' for line in lines).encode()).hexdigest()
     return 'rag-docker-age:' + version + '-' + digest[:12]
 
 
@@ -90,9 +93,9 @@ class StaticTests(unittest.TestCase):
     def test_age_is_pinned_to_an_exact_package_version(self):
         self.assertRegex(dockerfile(), r'(?m)^RUN apk add --no-cache age=\d+\.\d+\.\d+-r\d+$')
 
-    def test_the_tag_follows_both_pins(self):
-        # A new alpine digest with the same age version gives a new tag, so the
-        # image is built again rather than reused (#852).
+    def test_the_tag_follows_the_whole_dockerfile(self):
+        # Any change of an instruction gives a new tag, so the image is built
+        # again rather than reused; a comment or a blank line doesn't (#852, #856).
         with tempfile.TemporaryDirectory() as folder:
             folder = Path(folder).resolve()
             (folder / 'scripts' / 'age').mkdir(parents=True)
@@ -104,10 +107,19 @@ class StaticTests(unittest.TestCase):
             log = folder / 'docker.log'
             env = dict(os.environ, PATH=str(stub.parent) + os.pathsep + os.environ['PATH'], STUB_LOG=str(log))
             today = dockerfile()
-            other = re.sub(r'@sha256:[0-9a-f]{64}', '@sha256:' + 'ab12' * 16, today)
-            self.assertNotEqual(other, today)
-            tags = []
-            for text in (today, other):
+            changed = {
+                'a new alpine digest': re.sub(r'@sha256:[0-9a-f]{64}', '@sha256:' + 'ab12' * 16, today),
+                'an added instruction': today + 'RUN echo added\n',
+            }
+            same = {
+                'an added comment': today + '# a comment\n',
+                'an added blank line': today + '\n   \n',
+                'a changed comment': today.replace('# The age tool', '# The age utility', 1),
+            }
+            for name, text in list(changed.items()) + list(same.items()):
+                self.assertNotEqual(text, today, name)
+
+            def tag_of(text):
                 (folder / 'scripts/age/Dockerfile').write_text(text)
                 log.write_text('')
                 run = subprocess.run(['bash', '-c', '. scripts/backup-common.sh; rb_image; echo "tag=$RB_IMAGE"'],
@@ -117,9 +129,15 @@ class StaticTests(unittest.TestCase):
                 tag = re.search(r'^tag=(\S+)$', run.stdout, re.M).group(1)
                 self.assertEqual(tag, age_image(text))
                 self.assertIn('build -q -t {} {}/scripts/age'.format(tag, folder), log.read_text().splitlines())
-                tags.append(tag)
-            self.assertEqual(tags[0], age_image())
-            self.assertNotEqual(tags[0], tags[1])
+                return tag
+
+            original = tag_of(today)
+            self.assertEqual(original, age_image())
+            tags = {tag_of(text) for text in changed.values()}
+            self.assertEqual(len(tags), len(changed))
+            self.assertNotIn(original, tags)
+            for name, text in same.items():
+                self.assertEqual(tag_of(text), original, name)
             (folder / 'scripts/age/Dockerfile').write_text(re.sub(r'@sha256:[0-9a-f]{64}', '', today))
             log.write_text('')
             run = subprocess.run(['bash', '-c', '. scripts/backup-common.sh; rb_image'], cwd=str(folder), env=env,
@@ -315,6 +333,33 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(len(set(stanzas)), 6)
 
     # Refusals before anything is stopped or emptied
+
+    def test_an_interrupted_restores_staging_folder_is_not_backed_up(self):
+        # An interrupted restore leaves .rag-docker-restore.<x> in the volume; a
+        # backup skips it, leaves it alone, and the next restore removes it (#856).
+        self.create_volume('weaviate_data')
+        before = self.listing('weaviate_data')
+        entries = self.in_volume('weaviate_data', 'find /data -mindepth 1 | wc -l').strip()
+        self.in_volume('weaviate_data', 'mkdir -p /data/.rag-docker-restore.abc123/sub && '
+                       'echo left > /data/.rag-docker-restore.abc123/sub/file && '
+                       'echo hid > /data/.rag-docker-restore.abc123/.hidden')
+        result, run = self.backup()
+        # The count shown before the backup skips the folder; the archive's own count adds its root entry './'.
+        self.assertIn('{}_weaviate_data  {} files and folders'.format(self.prefix, entries), result.stdout)
+        self.assertIn('weaviate_data: {} entries ->'.format(int(entries) + 1), result.stdout)
+        self.assertIn('.rag-docker-restore.abc123', self.listing('weaviate_data'), 'a backup removed the folder')
+        archive, key = self.pairs(run, ['weaviate_data'])
+        with open(archive, 'rb') as stream:
+            listed = docker('run', '--rm', '-i', '--network', 'none', '-v', key + ':/run/age.key:ro', self.image,
+                            'sh', '-c', 'age -d -i /run/age.key | tar tzf -', stdin=stream)
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertNotIn('.rag-docker-restore.', listed.stdout)
+        self.assertIn('./docs/sub/note.txt', listed.stdout)
+        self.assertIn('./.hidden', listed.stdout)
+        self.in_volume('weaviate_data', 'rm -r /data/docs')
+        restored = self.restore(archive, key)
+        self.assertEqual(restored.returncode, 0, restored.stdout + restored.stderr)
+        self.assertEqual(self.listing('weaviate_data'), before)
 
     def test_a_wrong_or_missing_key_or_a_damaged_archive_changes_nothing(self):
         for name in ('weaviate_data', 'auth_data'):
