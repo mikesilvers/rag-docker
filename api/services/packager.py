@@ -9,6 +9,7 @@ Format reference: RAG_EXPORT_SPECIFICATIONS.md §4.
 from __future__ import annotations
 from services import telemetry
 
+import errno
 import fnmatch
 import hashlib
 import json
@@ -19,6 +20,7 @@ import shutil
 import stat
 import tarfile
 import tempfile
+import threading
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterator
@@ -130,6 +132,72 @@ def timestamp(when: datetime) -> str:
 
 def package_stem(collection: str, when: datetime, id8: str) -> str:
     return f"ragpkg-{slug(collection)}-{timestamp(when)}-{id8}"
+
+
+def _now() -> datetime:
+    """The build's clock: the one place it is read, so a test can fix it."""
+    return datetime.now(timezone.utc)
+
+
+# Two exports of one collection with the same content that start in the same
+# second have the same plain stem. The second gets `-2` (then `-3`, ...), so
+# both packages and both key files are kept (#860, spec §4.1).
+MAX_NAME_SUFFIX = 1000
+_names_lock = threading.Lock()
+# Stems this process has given to an export: never given twice, even once the
+# files are downloaded and deleted.
+_given: set[str] = set()
+_DELIVERED = (".tar.gz", age_stream.ENCRYPTED_SUFFIX, age_stream.ENCRYPTED_SUFFIX + ".key")
+# No hard links in the folder: placement checks and renames under the lock.
+_NO_LINKS = {errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EMLINK, errno.ENOSYS, errno.EXDEV}
+
+
+def _stem_taken(out_dir: Path, stem: str) -> bool:
+    """Whether any file of `stem`, or its temporary, is in the folder (a link counts)."""
+    return any(os.path.lexists(out_dir / name)
+               for suffix in _DELIVERED
+               for name in (stem + suffix, f".{stem}{suffix}.partial"))
+
+
+def reserve_stem(out_dir: Path, collection: str, when: datetime, id8: str) -> str:
+    """The package's stem: the plain one when it is free, else the first free
+    `-<n>` from 2 (#860). Chosen and reserved under one lock."""
+    base = package_stem(collection, when, id8)
+    with _names_lock:
+        for n in range(1, MAX_NAME_SUFFIX + 1):
+            stem = base if n == 1 else f"{base}-{n}"
+            if stem not in _given and not _stem_taken(out_dir, stem):
+                _given.add(stem)
+                return stem
+    raise RuntimeError(f"No free package name for {base} up to -{MAX_NAME_SUFFIX}: "
+                       "delete old packages from ./exports and export again.")
+
+
+def _taken(final: Path) -> FileExistsError:
+    return FileExistsError(errno.EEXIST, f"{final.name} is already in the exports folder; it was "
+                           "left as it is and this export wasn't put in place", str(final))
+
+
+def _place(tmp: Path, final: Path) -> None:
+    """Move `tmp` to `final`, never replacing an existing entry (#860)."""
+    try:
+        os.link(tmp, final)
+    except FileExistsError:
+        raise _taken(final) from None
+    except OSError as exc:
+        if exc.errno not in _NO_LINKS:
+            raise
+        # Every export chooses and places names under this lock.
+        with _names_lock:
+            if os.path.lexists(final):
+                raise _taken(final) from None
+            os.rename(tmp, final)
+        return
+    try:
+        os.unlink(tmp)
+    except BaseException:
+        final.unlink(missing_ok=True)
+        raise
 
 
 # ── Digests ───────────────────────────────────────────────────────────────────
@@ -424,7 +492,7 @@ def build(
     if key and passphrase is not None:
         raise ValueError("a package takes a passphrase or a key, not both")
     encryption = "key" if key else "passphrase" if passphrase is not None else "none"
-    created = datetime.now(timezone.utc)
+    created = _now()
     created_at = created.strftime("%Y-%m-%dT%H:%M:%SZ")
     out_dir = exports_dir()
     warnings: list[str] = []
@@ -618,7 +686,8 @@ def build(
         id8 = sha256_file(manifest_path)[:8]
 
         # 7. the generated pair, which embed <id8>
-        stem = package_stem(collection, created, id8)
+        # A name no other export has, never replacing a file (#860).
+        stem = reserve_stem(out_dir, collection, created, id8)
         # The README and retrieve.py name the file as delivered (#27).
         filename = f"{stem}{age_stream.ENCRYPTED_SUFFIX if encryption != 'none' else '.tar.gz'}"
 
@@ -658,16 +727,17 @@ def build(
         key_filename = None
         if identity is not None:
             # The key file first, 0600 from its creation (#676); the package is
-            # put in place only once its key is.
+            # put in place only once its key is. Neither replaces a file (#860):
+            # `placed_key` is set only once this build has placed it.
             key_filename = filename + ".key"
             tmp_key = out_dir / f".{key_filename}.partial"
             _write_key_file(tmp_key, age_stream.identity_file(identity, created, filename))
             identity = None
+            _place(tmp_key, out_dir / key_filename)
             placed_key = out_dir / key_filename
-            tmp_key.replace(placed_key)
             tmp_key = None
         final = out_dir / filename
-        tmp_archive.replace(final)
+        _place(tmp_archive, final)
         tmp_archive = None
         placed_key = None
 

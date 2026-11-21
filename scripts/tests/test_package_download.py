@@ -177,10 +177,10 @@ class RecordTests(DownloadTestCase):
                 package_retention.record_export("ragpkg-new.tar.gz", NOW)
         self.assertEqual(record.read_text(), '{"packages": "wrong shape"}')
 
-    def run_export(self, record=None):
+    def run_export(self, record=None, key_filename=None):
         result = {"filename": "ragpkg-open1-x.tar.gz", "size_bytes": 1, "chunk_count": 1,
                   "source_document_count": 0, "fidelity": "chunks-only", "models_bundled": False,
-                  "retrieve_script": True, "warnings": []}
+                  "retrieve_script": True, "warnings": [], "key_filename": key_filename}
         exporter._jobs["j677"] = {"job_id": "j677", "status": "queued", "collection": "Open1",
                                   "chunks_written": 0, "filename": None, "warnings": [], "error": None}
         self.addCleanup(exporter._jobs.pop, "j677", None)
@@ -286,7 +286,7 @@ class RecordTests(DownloadTestCase):
         self.assertIn("'ragpkg-x/../y.tar.gz'", logs.output[0])
 
     def test_an_export_whose_record_fails_still_completes_and_says_so(self):
-        def broken(*_):
+        def broken(*_args, **_kwargs):
             raise OSError("disk full")
         with self.assertLogs("services.exporter", "ERROR"):
             job = self.run_export(record=broken)
@@ -294,6 +294,48 @@ class RecordTests(DownloadTestCase):
         self.assertTrue(any("expiry could not be recorded" in w for w in job["warnings"]))
         answer = self.client.get("/export/job/j677", headers=self.as_("eng"))
         self.assertIsNone(answer.json()["expires_at"])
+
+    # #860: a key export's package and key file are recorded in one write.
+    def test_a_key_export_is_recorded_in_one_write(self):
+        key = "ragpkg-open1-x.tar.gz.age.key"
+        with patch.object(package_retention, "_write", wraps=package_retention._write) as write:
+            package_retention.record_export("ragpkg-open1-x.tar.gz.age", NOW, "Open1", key_filename=key)
+        self.assertEqual(write.call_count, 1)
+        entries = json.loads((self.root / "uploads" / "exported_packages.json").read_text())["packages"]
+        self.assertEqual(entries["ragpkg-open1-x.tar.gz.age"], entries[key])
+        self.assertEqual(entries[key]["collection"], "Open1")
+
+    def test_a_failed_write_records_neither_the_package_nor_its_key(self):
+        with patch.object(package_retention, "_write", side_effect=OSError("disk full")), \
+                self.assertRaises(OSError):
+            package_retention.record_export("ragpkg-open1-x.tar.gz.age", NOW, "Open1",
+                                            key_filename="ragpkg-open1-x.tar.gz.age.key")
+        self.assertFalse(package_retention.recorded("ragpkg-open1-x.tar.gz.age"))
+        self.assertFalse(package_retention.recorded("ragpkg-open1-x.tar.gz.age.key"))
+
+    def test_a_key_export_job_records_both_in_one_call(self):
+        calls = []
+
+        def record(*args, **kwargs):
+            calls.append((args, kwargs))
+        job = self.run_export(record=record, key_filename="ragpkg-open1-x.tar.gz.age.key")
+        self.assertEqual(job["status"], "completed")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0][0], "ragpkg-open1-x.tar.gz")
+        self.assertEqual(calls[0][1], {"key_filename": "ragpkg-open1-x.tar.gz.age.key"})
+
+    # Reviewer test (rag-pr-review, #860): a key export whose record fails
+    # completes, records neither file and warns about both by name.
+    def test_a_key_export_whose_record_fails_records_neither_and_warns_about_both(self):
+        def broken(*_args, **_kwargs):
+            raise OSError("disk full")
+        with self.assertLogs("services.exporter", "ERROR"):
+            job = self.run_export(record=broken, key_filename="ragpkg-open1-x.tar.gz.age.key")
+        self.assertEqual(job["status"], "completed")
+        self.assertTrue(any("package and its key file could not be recorded" in w for w in job["warnings"]),
+                        job["warnings"])
+        self.assertFalse(package_retention.recorded("ragpkg-open1-x.tar.gz"))
+        self.assertFalse(package_retention.recorded("ragpkg-open1-x.tar.gz.age.key"))
 
 
 class ListingTests(DownloadTestCase):

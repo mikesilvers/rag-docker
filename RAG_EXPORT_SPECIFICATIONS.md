@@ -181,18 +181,28 @@ saved settings are defaults, not a constraint.
 ### 4.1 Filename (normative)
 
 ```
-ragpkg-<collection-slug>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz
-ragpkg-<collection-slug>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz.age    (encrypted, §4.6)
-ragpkg-<collection-slug>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz.age.key  (its key file, for a key package, §4.6)
+ragpkg-<collection-slug>-<YYYYMMDDTHHMMSSZ>-<id8>[-<n>].tar.gz
+ragpkg-<collection-slug>-<YYYYMMDDTHHMMSSZ>-<id8>[-<n>].tar.gz.age    (encrypted, §4.6)
+ragpkg-<collection-slug>-<YYYYMMDDTHHMMSSZ>-<id8>[-<n>].tar.gz.age.key  (its key file, for a key package, §4.6)
 ```
 
 - `<collection-slug>`: stored collection name, lowercased, each run of characters
   outside `[a-z0-9]` replaced by `-`, leading/trailing `-` trimmed.
 - `<YYYYMMDDTHHMMSSZ>`: UTC, basic ISO 8601, no separators.
 - `<id8>`: first 8 lowercase hex of the manifest digest (§4.4).
+- `-<n>` (#860): absent unless the name without it is taken. Two exports of one
+  collection with the same content that start in the same second have the same
+  name without it; the later one gets `-<n>`, the smallest `<n>` from 2 whose
+  name is free, so both packages and both key files are kept. A name is taken
+  when a file of it (`.tar.gz`, `.tar.gz.age` or `.tar.gz.age.key`, or the
+  temporary `.<file>.partial` of one) is in the exports folder, as any kind of
+  entry, or when the running API has already given it to an export. A package
+  and its key file are put in place by a step that never replaces an existing
+  file: if the name has been taken meanwhile, the export fails and the existing
+  file is left as it is.
 
 The archive MUST expand to a single directory of the same name minus `.tar.gz`
-(minus `.tar.gz.age` for an encrypted package, once decrypted).
+(minus `.tar.gz.age` for an encrypted package, once decrypted), `-<n>` included.
 
 **The filename is a label, never an input.** The slug is lossy: it lowercases a
 name Weaviate capitalised, and two distinct collections can slug identically.
@@ -1147,6 +1157,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E42 | A package's `manifest.json` records `answer_llm` and `build_llm` as `{"model": <name>}`, with `llm` the same as `answer_llm`, at `package_format` 1; with a build model that differs from the answer model, `include_models: true` bundles the embedding and answer models only (#671), by `test_retrieval_import.py` and `validate_package.py` on a real export |
 | E43 | Import checks and installs only this instance's answer model: a build model that differs, absent or not, is neither checked, installed nor noted (#671), by `test_retrieval_import.py` |
 | E44 | A default export is a key export (#676): `<stem>.tar.gz.age` with one `X25519` stanza and `<stem>.tar.gz.age.key` (0600, age's identity layout) beside it, a new key every time, no plaintext archive and nothing left by a failure; the package opens with the key file through import and an independent decryption, every vendored CCTV vector with an X25519 key behaves as its `expect:` says, `KEY_FILE_REQUIRED`, `KEY_FILE_INVALID`, `KEY_FILE_NOT_EXPECTED` and `ENCRYPTION_REQUIRED` refuse before any job, a wrong key fails `DECRYPT_FAILED` (`reason` `key`) touching nothing, and the key file is downloaded once and expired on its own, by `test_export_encryption.py`, `test_package_download.py`, `test_query_only.py` and suites 05, 18 and 24 |
+| E45 | Two exports of one collection whose names would be the same (the same `<id8>` in the same second) get distinct names, the later one `-2`, then `-3` (§4.1, #860): both packages and both key files are kept, no export replaces a file in `./exports`, and a name taken after it was chosen fails the export and leaves that file, by `test_export_encryption.py` (`SameSecondNames`) and suite 05's same-second check |
 
 ---
 
