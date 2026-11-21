@@ -44,7 +44,7 @@ import sqlite3
 import time
 from collections.abc import Iterable
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from config import settings
@@ -871,6 +871,9 @@ class CollectionAccess:
     users: tuple[str, ...] = ()
     service_principals: tuple[str, ...] = ()
     groups: tuple[str, ...] = ()                 # #784
+    # Each granted group's identity, (id, created_at), in the order of `groups`,
+    # for put_back (#854): a name can be reused, and so can an id. Not compared.
+    group_ids: tuple[tuple[int, float], ...] = field(default=(), compare=False, repr=False)
 
 
 def _access(conn, collection: str) -> CollectionAccess:
@@ -878,11 +881,13 @@ def _access(conn, collection: str) -> CollectionAccess:
         return CollectionAccess(False)
     rows = conn.execute("SELECT u.username, u.kind FROM collection_grants g JOIN users u ON u.id = g.user_id "
                         "WHERE g.collection = ? ORDER BY u.username", (collection,)).fetchall()
-    groups = conn.execute("SELECT gr.name FROM collection_group_grants gg JOIN groups gr ON gr.id = gg.group_id "
-                          "WHERE gg.collection = ? ORDER BY gr.name", (collection,)).fetchall()
+    groups = conn.execute("SELECT gr.id, gr.created_at, gr.name FROM collection_group_grants gg "
+                          "JOIN groups gr ON gr.id = gg.group_id WHERE gg.collection = ? ORDER BY gr.name",
+                          (collection,)).fetchall()
     return CollectionAccess(True, tuple(r["username"] for r in rows if r["kind"] == "user"),
                             tuple(r["username"] for r in rows if r["kind"] == "service"),
-                            tuple(r["name"] for r in groups))
+                            tuple(r["name"] for r in groups),
+                            tuple((r["id"], r["created_at"]) for r in groups))
 
 
 def collection_access(collection: str) -> CollectionAccess:
@@ -1070,7 +1075,11 @@ def put_back(collection: str, expected: CollectionAccess, previous: CollectionAc
     create wrote. A concurrent create or import that wrote its own state since
     keeps it, so a failure never takes another's grants nor opens a collection.
     An account or group in `previous` that no longer exists is left out
-    (narrower, never wider). One transaction. True when it put the state back."""
+    (narrower, never wider). A group is matched by its identity, its id and
+    creation time, not its name (#854): one deleted since is left out even when
+    another has been made under its name or with its reused id, and one renamed
+    since is the same group; a state with no group identities puts back no
+    group. One transaction. True when it put the state back."""
     collection = _canonical(collection)
     with _connect(write=True) as conn:
         if _access(conn, collection) != expected:
@@ -1085,8 +1094,9 @@ def put_back(collection: str, expected: CollectionAccess, previous: CollectionAc
                 if row is not None:
                     ids.append(row["id"])
         group_ids = []
-        for name in previous.groups:
-            row = conn.execute("SELECT id FROM groups WHERE name = ?", (name,)).fetchone()
+        for group_id, created_at in previous.group_ids:
+            row = conn.execute("SELECT id FROM groups WHERE id = ? AND created_at = ?",
+                               (group_id, created_at)).fetchone()
             if row is not None:
                 group_ids.append(row["id"])
         _restrict(conn, collection, ids, group_ids)
@@ -1174,16 +1184,18 @@ def set_group_members(name: str, users=(), service_principals=()) -> tuple[Group
         return before, _group(conn, row)
 
 
-def delete_group(name: str) -> list[str]:
+def delete_group(name: str) -> tuple[list[str], Group]:
     """The group, its members and every collection grant to it, in one
     transaction. A collection restricted only through it stays restricted.
-    Returns the collections whose grant was removed, sorted."""
+    Returns the collections whose grant was removed, sorted, and the group as
+    it was, with the members the delete removed (#854)."""
     with _connect(write=True) as conn:
         row = _existing_group(conn, name)
+        group = _group(conn, row)
         collections = sorted(r["collection"] for r in
                              conn.execute("SELECT collection FROM collection_group_grants WHERE group_id = ?",
                                           (row["id"],)))
         conn.execute("DELETE FROM collection_group_grants WHERE group_id = ?", (row["id"],))
         conn.execute("DELETE FROM group_members WHERE group_id = ?", (row["id"],))
         conn.execute("DELETE FROM groups WHERE id = ?", (row["id"],))
-        return collections
+        return collections, group

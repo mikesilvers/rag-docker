@@ -19257,7 +19257,7 @@ import sqlite3
 import time
 from collections.abc import Iterable
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from config import settings
@@ -20084,6 +20084,9 @@ class CollectionAccess:
     users: tuple[str, ...] = ()
     service_principals: tuple[str, ...] = ()
     groups: tuple[str, ...] = ()                 # #784
+    # Each granted group's identity, (id, created_at), in the order of `groups`,
+    # for put_back (#854): a name can be reused, and so can an id. Not compared.
+    group_ids: tuple[tuple[int, float], ...] = field(default=(), compare=False, repr=False)
 
 
 def _access(conn, collection: str) -> CollectionAccess:
@@ -20091,11 +20094,13 @@ def _access(conn, collection: str) -> CollectionAccess:
         return CollectionAccess(False)
     rows = conn.execute("SELECT u.username, u.kind FROM collection_grants g JOIN users u ON u.id = g.user_id "
                         "WHERE g.collection = ? ORDER BY u.username", (collection,)).fetchall()
-    groups = conn.execute("SELECT gr.name FROM collection_group_grants gg JOIN groups gr ON gr.id = gg.group_id "
-                          "WHERE gg.collection = ? ORDER BY gr.name", (collection,)).fetchall()
+    groups = conn.execute("SELECT gr.id, gr.created_at, gr.name FROM collection_group_grants gg "
+                          "JOIN groups gr ON gr.id = gg.group_id WHERE gg.collection = ? ORDER BY gr.name",
+                          (collection,)).fetchall()
     return CollectionAccess(True, tuple(r["username"] for r in rows if r["kind"] == "user"),
                             tuple(r["username"] for r in rows if r["kind"] == "service"),
-                            tuple(r["name"] for r in groups))
+                            tuple(r["name"] for r in groups),
+                            tuple((r["id"], r["created_at"]) for r in groups))
 
 
 def collection_access(collection: str) -> CollectionAccess:
@@ -20283,7 +20288,11 @@ def put_back(collection: str, expected: CollectionAccess, previous: CollectionAc
     create wrote. A concurrent create or import that wrote its own state since
     keeps it, so a failure never takes another's grants nor opens a collection.
     An account or group in `previous` that no longer exists is left out
-    (narrower, never wider). One transaction. True when it put the state back."""
+    (narrower, never wider). A group is matched by its identity, its id and
+    creation time, not its name (#854): one deleted since is left out even when
+    another has been made under its name or with its reused id, and one renamed
+    since is the same group; a state with no group identities puts back no
+    group. One transaction. True when it put the state back."""
     collection = _canonical(collection)
     with _connect(write=True) as conn:
         if _access(conn, collection) != expected:
@@ -20298,8 +20307,9 @@ def put_back(collection: str, expected: CollectionAccess, previous: CollectionAc
                 if row is not None:
                     ids.append(row["id"])
         group_ids = []
-        for name in previous.groups:
-            row = conn.execute("SELECT id FROM groups WHERE name = ?", (name,)).fetchone()
+        for group_id, created_at in previous.group_ids:
+            row = conn.execute("SELECT id FROM groups WHERE id = ? AND created_at = ?",
+                               (group_id, created_at)).fetchone()
             if row is not None:
                 group_ids.append(row["id"])
         _restrict(conn, collection, ids, group_ids)
@@ -20387,19 +20397,21 @@ def set_group_members(name: str, users=(), service_principals=()) -> tuple[Group
         return before, _group(conn, row)
 
 
-def delete_group(name: str) -> list[str]:
+def delete_group(name: str) -> tuple[list[str], Group]:
     """The group, its members and every collection grant to it, in one
     transaction. A collection restricted only through it stays restricted.
-    Returns the collections whose grant was removed, sorted."""
+    Returns the collections whose grant was removed, sorted, and the group as
+    it was, with the members the delete removed (#854)."""
     with _connect(write=True) as conn:
         row = _existing_group(conn, name)
+        group = _group(conn, row)
         collections = sorted(r["collection"] for r in
                              conn.execute("SELECT collection FROM collection_group_grants WHERE group_id = ?",
                                           (row["id"],)))
         conn.execute("DELETE FROM collection_group_grants WHERE group_id = ?", (row["id"],))
         conn.execute("DELETE FROM group_members WHERE group_id = ?", (row["id"],))
         conn.execute("DELETE FROM groups WHERE id = ?", (row["id"],))
-        return collections
+        return collections, group
 ```
 
 ### api/auth/middleware.py
@@ -20842,8 +20854,8 @@ def headers(role: str = "engineer", base_url: str = "http://testserver") -> dict
 A collection is open, or restricted to the accounts granted it (people or
 service principals; a key acts as its principal), directly or through a group
 granted it (#784: store.has_access and store.restricted_collections answer for
-both). Engineers reach every collection. The state is in the store (store.py, schema 4); this module holds
-the rule and the check the routes call.
+both). Engineers reach every collection. The state is in the store (store.py,
+schema 5); this module holds the rule and the check the routes call.
 
 A refused caller gets the answer the route gives a collection, session, job or
 file that doesn't exist, so a restricted collection's name isn't confirmed. The
@@ -21777,10 +21789,11 @@ async def delete_group(name: str, request: Request):
     if target is None:
         return _group_not_found(actor, "delete", _shown(name))
     try:
-        collections = await asyncio.to_thread(store.delete_group, target)
+        collections, group = await asyncio.to_thread(store.delete_group, target)
     except store.Refused as exc:
         return _group_refused(actor, "delete", target, exc)
-    audit.note(collections=collections)
+    audit.note(collections=collections,
+               removed={"users": list(group.users), "service_principals": list(group.service_principals)})
     _log.warning("Admin %r deleted group %r; its grants on %d collections were removed", actor, target,
                  len(collections))
     return {"name": target, "collections": collections}
@@ -32860,7 +32873,6 @@ def check_collection_access(operator_ok):
             expect(got[0] == 200, "{}: the granted collection's settings answered {}".format(who, got))
         expect(not listed("End User"), "the End User sees a collection not granted to it")
 
-
         # The Prepare area (#606 Q18, #788): a .csv is labelled from its data,
         # with no LLM call, so preparing it is quick.
         status, body = upload(dev_token, "vfy-access-{}.csv".format(secrets.token_hex(3)), b"name,team\nAda,core\n")
@@ -42484,7 +42496,7 @@ class GroupRuleTests(GroupTestCase):
 
     def test_deleting_the_group_keeps_the_collection_restricted(self):
         self.put(SECRET, {"restricted": True, "groups": ["team"]})
-        self.assertEqual(store.delete_group("team"), [SECRET])
+        self.assertEqual(store.delete_group("team")[0], [SECRET])
         self.assertEqual(store.collection_access(SECRET), store.CollectionAccess(True, (), (), ()))
         self.assertFalse(store.has_access(store.get_user("dev2").id, "developer", SECRET))
         self.assertEqual(self.names("user"), [OPEN])
@@ -42648,6 +42660,7 @@ class GroupRouteTests(GroupTestCase):
         self.assertEqual(records[2]["details"]["removed"], {"users": ["dev", "user"], "service_principals": ["svc"]})
         self.assertEqual(records[3]["details"]["name"], "squad")
         self.assertEqual(records[4]["details"]["collections"], [SECRET])
+        self.assertEqual(records[4]["details"]["removed"], {"users": ["dev2"], "service_principals": []})   # #854
         self.assertEqual(records[5]["details"]["code"], "GROUP_EXISTS")
         self.assertEqual(self.records("admin.group.list"), [])
         self.assertIn("admin.group.delete", audit.ALL_ACTIONS)
@@ -42703,6 +42716,35 @@ class GroupCopyTests(GroupTestCase):
         self.assertFalse(store.put_back(SECRET, written, previous))          # not the state it wrote: kept
         self.assertEqual(store.collection_access(SECRET).groups, ("crew",))
 
+    def test_put_back_matches_a_group_by_identity(self):
+        # #854: a group is put back only if it is the same group, by id and
+        # creation time, not by name; SQLite may reuse a deleted group's id.
+        old_id = store.get_group("team").id                           # the only group: the highest id
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        previous, written = store.restrict_to(SECRET, None)
+        store.delete_group("team")
+        store.create_group("team")
+        self.assertEqual(store.get_group("team").id, old_id)            # the id is reused
+        self.assertTrue(store.put_back(SECRET, written, previous))
+        self.assertEqual(store.collection_access(SECRET), store.CollectionAccess(True, (), (), ()))
+        store.create_group("crew")                                      # now the highest id
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        old_id = store.get_group("team").id
+        previous, written = store.restrict_to(SECRET, None)
+        store.delete_group("team")
+        store.create_group("team")
+        self.assertNotEqual(store.get_group("team").id, old_id)         # a new id
+        self.assertTrue(store.put_back(SECRET, written, previous))
+        self.assertEqual(store.collection_access(SECRET).groups, ())
+        self.put(SECRET, {"restricted": True, "groups": ["crew"]})     # a renamed group is the same group
+        previous, written = store.restrict_to(SECRET, None)
+        store.rename_group("crew", "squad")
+        self.assertTrue(store.put_back(SECRET, written, previous))
+        self.assertEqual(store.collection_access(SECRET).groups, ("squad",))
+        previous, written = store.restrict_to(SECRET, None)             # a state with names but no identities
+        self.assertTrue(store.put_back(SECRET, written, store.CollectionAccess(True, (), (), ("squad",))))
+        self.assertEqual(store.collection_access(SECRET).groups, ())
+
     def test_a_new_collection_starts_with_no_group(self):
         self.put(SECRET, {"restricted": True, "groups": ["team"]})
         store.restrict_to("Brandnew", store.get_user("dev2").id)
@@ -42739,7 +42781,7 @@ class GroupRecoveryTests(GroupTestCase):
         conn.close()
         self.assertFalse(store.collection_access(copy).restricted)
         # Deleting the group removes its grant on the kept copy too, which stays restricted.
-        self.assertEqual(store.delete_group("team"), sorted([SECRET, kept]))
+        self.assertEqual(store.delete_group("team")[0], sorted([SECRET, kept]))
         self.assertEqual(store.collection_access(kept), store.CollectionAccess(True, ("dev",), (), ()))
         self.assertFalse(store.has_access(store.get_user("dev2").id, "developer", kept))
 
