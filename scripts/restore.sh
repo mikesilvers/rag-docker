@@ -5,7 +5,8 @@
 # its key and read to its end; a missing or wrong key, or a damaged or
 # incomplete archive, stops the script before anything is stopped or emptied.
 # Only then are the stack's running containers stopped (never removed) and each
-# volume emptied and filled from its archive, decrypted while streaming. See
+# volume replaced by its archive's contents, decrypted while streaming into a
+# staging folder in the volume and swapped in only once that has succeeded. See
 # README "Backing up and restoring".
 #
 # Usage: scripts/restore.sh [--prefix <name>] [--yes] <archive.tgz.age> <key> [<archive.tgz.age> <key> ...]
@@ -89,11 +90,14 @@ fi
 
 echo "Checking each archive with its key..."
 printf '%s' "$pairs" | while IFS="$tab" read -r v archive key; do
-  if rb_run -i -v "$key:/run/age.key:ro" "$RB_IMAGE" \
-    sh -c 'set -o pipefail; age -d -i /run/age.key | tar tzf - >/dev/null' <"$archive" 2>/dev/null; then
+  # stderr is kept to show it on failure: age's and Docker's messages hold no
+  # secret, and stdout (the listing) is discarded.
+  if err=$(rb_run -i -v "$key:/run/age.key:ro" "$RB_IMAGE" \
+    sh -c 'set -o pipefail; age -d -i /run/age.key | tar tzf - >/dev/null' <"$archive" 2>&1 >/dev/null); then
     echo "  $v: OK"
   else
-    echo "$RB_NAME: $archive can't be decrypted with $key: a wrong key, or a damaged or incomplete archive." >&2
+    echo "$RB_NAME: $archive failed its check with $key: a wrong key, a damaged or incomplete archive, or a Docker error." >&2
+    rb_show_error "$err"
     exit 1
   fi
 done || nothing "an archive failed its check."
@@ -107,10 +111,30 @@ rb_confirm "Go on?"
 
 rb_stop
 
+# Each archive is extracted into a new staging folder inside its volume first.
+# Only when that has succeeded are the volume's other entries deleted and the
+# staged ones moved up by rename (same filesystem: no space needed, nothing
+# half-copied), and the volume's root given the archive root's mode and owner,
+# as an extraction in place would. A failed extraction removes the staging
+# folder and exits 3: the volume is unchanged. A staging folder left by an
+# interrupted earlier restore goes with the old contents.
+STAGED_RESTORE='set -o pipefail
+s=$(mktemp -d /data/.rag-docker-restore.XXXXXX) || exit 3
+if ! age -d -i /run/age.key | tar xzf - -C "$s"; then rm -rf "$s"; exit 3; fi
+find /data -mindepth 1 -maxdepth 1 ! -path "$s" -exec rm -rf {} \; || exit 4
+[ -z "$(find /data -mindepth 1 -maxdepth 1 ! -path "$s")" ] || exit 4
+find "$s" -mindepth 1 -maxdepth 1 -exec mv {} /data/ \; || exit 4
+chown "$(stat -c %u:%g "$s")" /data && chmod "$(stat -c %a "$s")" /data && rmdir "$s" || exit 4'
+
 printf '%s' "$pairs" | while IFS="$tab" read -r v archive key; do
-  if rb_run -i -v "${RB_PREFIX}_$v:/data" -v "$key:/run/age.key:ro" "$RB_IMAGE" \
-    sh -c 'find /data -mindepth 1 -delete && set -o pipefail && age -d -i /run/age.key | tar xzf - -C /data' <"$archive"; then
+  rb_run -i -v "${RB_PREFIX}_$v:/data" -v "$key:/run/age.key:ro" "$RB_IMAGE" \
+    sh -c "$STAGED_RESTORE" <"$archive"
+  rc=$?
+  if [ "$rc" = 0 ]; then
     echo "$v: restored"
+  elif [ "$rc" = 3 ]; then
+    echo "$v: restore FAILED: the archive could not be extracted; this volume is unchanged. The archives are unchanged; fix the cause and run the restore again." >&2
+    exit 1
   else
     echo "$v: restore FAILED: this volume may be partly restored. The archives are unchanged; fix the cause and run the restore again." >&2
     exit 1
