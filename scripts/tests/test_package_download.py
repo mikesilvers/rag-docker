@@ -666,6 +666,30 @@ class KeyFileTests(DownloadTestCase):
         self.assertEqual(self.get(key.name, who="user").status_code, 403)
         self.assertTrue(key.exists())
 
+    def test_a_key_follows_a_groups_grant(self):
+        # Reviewer (#676 with #784): the key file's access is the package's, so a
+        # collection granted through a group reaches its members only, and a
+        # membership change applies to the next download.
+        store.create_group("team")
+        store.set_group_members("team", ["dev2"], [])
+        status = self.client.put(f"/collections/{SECRET}/access", headers=self.as_("eng"),
+                                 json={"restricted": True, "users": [], "service_principals": [],
+                                       "groups": ["team"]}).status_code
+        self.assertEqual(status, 200)
+        package, key = self.write_pair(collection=SECRET)
+        answer = self.get(key.name, who="dev")
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (404, "PACKAGE_NOT_FOUND"))
+        self.assertTrue(key.exists())
+        self.assertTrue(self.listed("dev2")[package.name]["key_on_server"])
+        store.set_group_members("team", [], [])
+        answer = self.get(key.name, who="dev2")
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (404, "PACKAGE_NOT_FOUND"))
+        self.assertTrue(key.exists())
+        store.set_group_members("team", ["dev2"], [])
+        self.assertEqual(self.get(key.name, who="dev2").status_code, 200)
+        self.assertFalse(key.exists())
+        self.assertTrue(package.exists())
+
 
 class DeletionRecordTests(DownloadTestCase):
     def test_a_deletion_is_audited_and_the_sweep_goes_on_when_the_record_cant_be_rewritten(self):
