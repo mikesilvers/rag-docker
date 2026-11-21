@@ -15,6 +15,7 @@ Runs on the host with the standard library (Python 3.9+), from the repository ro
 skipped without them. `15_transfer_paths.sh` runs it.
 """
 import gzip
+import hashlib
 import io
 import json
 import os
@@ -108,11 +109,13 @@ def offline_images():
 
 
 def age_image():
-    """The tag scripts/backup-common.sh gives the age image (#852): the age version and
-    the alpine digest's first 12 hex digits, from scripts/age/Dockerfile."""
+    """The tag scripts/backup-common.sh gives the age image (#852, #856): the age version and
+    the first 12 hex digits of the SHA-256 of scripts/age/Dockerfile's instruction lines
+    (comments and blank lines left out)."""
     text = (ROOT / "scripts" / "age" / "Dockerfile").read_text()
     version = re.search(r"^RUN apk add --no-cache age=(\S+)$", text, re.M).group(1)
-    digest = re.search(r"^FROM \S+@sha256:([0-9a-f]{64})$", text, re.M).group(1)
+    lines = [line for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+    digest = hashlib.sha256("".join(line + "\n" for line in lines).encode()).hexdigest()
     return f"rag-docker-age:{version}-{digest[:12]}"
 
 

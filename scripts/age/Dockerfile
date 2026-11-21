@@ -1,8 +1,9 @@
 # The age tool for scripts/backup.sh and scripts/restore.sh (#848).
 #
 # The scripts build this image on first use, tagged rag-docker-age:<the age
-# package version below>-<the first 12 hex digits of the alpine digest>, so a
-# change of either pin builds a new image; the build needs the network once.
+# package version below>-<the first 12 hex digits of the SHA-256 of this file's
+# instruction lines, comments and blank lines left out>, so a change of any
+# instruction builds a new image; the build needs the network once.
 # package-offline.sh builds it too and carries it in the offline bundle. Every
 # backup and restore runs age and tar in a container of it, so nothing
 # unencrypted leaves the container.
