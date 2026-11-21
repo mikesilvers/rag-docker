@@ -146,6 +146,43 @@ class StaticTests(unittest.TestCase):
             self.assertIn('scripts/age/Dockerfile names no alpine digest', run.stderr)
             self.assertNotIn('build', log.read_text())
 
+    def test_the_tag_without_sha256sum_uses_shasum_and_without_either_stops(self):
+        # rb_sha256 falls back to shasum where there is no sha256sum, with the same
+        # tag, and with neither it stops before building anything (#856).
+        tools = {name: shutil.which(name) for name in ('sed', 'awk', 'dirname', 'basename', 'shasum')}
+        if not all(tools.values()):
+            self.skipTest('missing on this host: ' + ', '.join(n for n, p in tools.items() if not p))
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder).resolve()
+            (folder / 'scripts' / 'age').mkdir(parents=True)
+            shutil.copy2(str(ROOT / 'scripts/backup-common.sh'), str(folder / 'scripts'))
+            (folder / 'scripts/age/Dockerfile').write_text(dockerfile())
+            log = folder / 'docker.log'
+            for case in ('shasum', 'neither'):
+                bin_dir = folder / ('bin-' + case)
+                bin_dir.mkdir()
+                stub = bin_dir / 'docker'
+                stub.write_text(STUB_DOCKER)
+                stub.chmod(0o755)
+                for name, path in tools.items():
+                    if name != 'shasum' or case == 'shasum':
+                        (bin_dir / name).symlink_to(path)
+                log.write_text('')
+                run = subprocess.run([shutil.which('bash'), '-c',
+                                      '. scripts/backup-common.sh; rb_image; echo "tag=$RB_IMAGE"'],
+                                     cwd=str(folder), env=dict(os.environ, PATH=str(bin_dir), STUB_LOG=str(log)),
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+                if case == 'shasum':
+                    self.assertEqual(run.returncode, 0, run.stderr)
+                    self.assertIn('tag=' + age_image(), run.stdout.splitlines())
+                    self.assertIn('build -q -t {} {}/scripts/age'.format(age_image(), folder),
+                                  log.read_text().splitlines())
+                else:
+                    self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+                    self.assertIn('neither sha256sum nor shasum is on PATH', run.stderr)
+                    self.assertNotIn('tag=', run.stdout)
+                    self.assertNotIn('build', log.read_text())
+
     def test_gitignore_lists_key_files(self):
         self.assertIn('*.key', (ROOT / '.gitignore').read_text().splitlines())
 
