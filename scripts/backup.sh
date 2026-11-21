@@ -109,7 +109,7 @@ for v in $found; do
     recipient=$(rb_run -i "$RB_IMAGE" age-keygen -y <"$key") &&
     case "$recipient" in age1*) true ;; *) false ;; esac &&
     rb_run -v "${RB_PREFIX}_$v:/data:ro" "$RB_IMAGE" \
-      sh -c 'set -o pipefail; tar czf - -C /data . | age -r "$1"' sh "$recipient" >"$tmp" &&
+      sh -c 'set -o pipefail; tar czf - -C /data --exclude "./.rag-docker-restore.*" . | age -r "$1"' sh "$recipient" >"$tmp" &&
     n=$(rb_run -i -v "$key:/run/age.key:ro" "$RB_IMAGE" \
       sh -c 'set -o pipefail; age -d -i /run/age.key | tar tzf - | wc -l' <"$tmp") &&
     mv "$tmp" "$arc"; then

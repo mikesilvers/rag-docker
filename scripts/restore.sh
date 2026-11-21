@@ -117,7 +117,8 @@ rb_stop
 # half-copied), and the volume's root given the archive root's mode and owner,
 # as an extraction in place would. A failed extraction removes the staging
 # folder and exits 3: the volume is unchanged. A staging folder left by an
-# interrupted earlier restore goes with the old contents.
+# interrupted earlier restore goes with the old contents; a backup skips it
+# (#856).
 STAGED_RESTORE='set -o pipefail
 s=$(mktemp -d /data/.rag-docker-restore.XXXXXX) || exit 3
 if ! age -d -i /run/age.key | tar xzf - -C "$s"; then rm -rf "$s"; exit 3; fi
