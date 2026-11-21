@@ -1055,7 +1055,7 @@ class GroupRuleTests(GroupTestCase):
 
     def test_deleting_the_group_keeps_the_collection_restricted(self):
         self.put(SECRET, {"restricted": True, "groups": ["team"]})
-        self.assertEqual(store.delete_group("team"), [SECRET])
+        self.assertEqual(store.delete_group("team")[0], [SECRET])
         self.assertEqual(store.collection_access(SECRET), store.CollectionAccess(True, (), (), ()))
         self.assertFalse(store.has_access(store.get_user("dev2").id, "developer", SECRET))
         self.assertEqual(self.names("user"), [OPEN])
@@ -1219,6 +1219,7 @@ class GroupRouteTests(GroupTestCase):
         self.assertEqual(records[2]["details"]["removed"], {"users": ["dev", "user"], "service_principals": ["svc"]})
         self.assertEqual(records[3]["details"]["name"], "squad")
         self.assertEqual(records[4]["details"]["collections"], [SECRET])
+        self.assertEqual(records[4]["details"]["removed"], {"users": ["dev2"], "service_principals": []})   # #854
         self.assertEqual(records[5]["details"]["code"], "GROUP_EXISTS")
         self.assertEqual(self.records("admin.group.list"), [])
         self.assertIn("admin.group.delete", audit.ALL_ACTIONS)
@@ -1274,6 +1275,35 @@ class GroupCopyTests(GroupTestCase):
         self.assertFalse(store.put_back(SECRET, written, previous))          # not the state it wrote: kept
         self.assertEqual(store.collection_access(SECRET).groups, ("crew",))
 
+    def test_put_back_matches_a_group_by_identity(self):
+        # #854: a group is put back only if it is the same group, by id and
+        # creation time, not by name; SQLite may reuse a deleted group's id.
+        old_id = store.get_group("team").id                           # the only group: the highest id
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        previous, written = store.restrict_to(SECRET, None)
+        store.delete_group("team")
+        store.create_group("team")
+        self.assertEqual(store.get_group("team").id, old_id)            # the id is reused
+        self.assertTrue(store.put_back(SECRET, written, previous))
+        self.assertEqual(store.collection_access(SECRET), store.CollectionAccess(True, (), (), ()))
+        store.create_group("crew")                                      # now the highest id
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        old_id = store.get_group("team").id
+        previous, written = store.restrict_to(SECRET, None)
+        store.delete_group("team")
+        store.create_group("team")
+        self.assertNotEqual(store.get_group("team").id, old_id)         # a new id
+        self.assertTrue(store.put_back(SECRET, written, previous))
+        self.assertEqual(store.collection_access(SECRET).groups, ())
+        self.put(SECRET, {"restricted": True, "groups": ["crew"]})     # a renamed group is the same group
+        previous, written = store.restrict_to(SECRET, None)
+        store.rename_group("crew", "squad")
+        self.assertTrue(store.put_back(SECRET, written, previous))
+        self.assertEqual(store.collection_access(SECRET).groups, ("squad",))
+        previous, written = store.restrict_to(SECRET, None)             # a state with names but no identities
+        self.assertTrue(store.put_back(SECRET, written, store.CollectionAccess(True, (), (), ("squad",))))
+        self.assertEqual(store.collection_access(SECRET).groups, ())
+
     def test_a_new_collection_starts_with_no_group(self):
         self.put(SECRET, {"restricted": True, "groups": ["team"]})
         store.restrict_to("Brandnew", store.get_user("dev2").id)
@@ -1310,7 +1340,7 @@ class GroupRecoveryTests(GroupTestCase):
         conn.close()
         self.assertFalse(store.collection_access(copy).restricted)
         # Deleting the group removes its grant on the kept copy too, which stays restricted.
-        self.assertEqual(store.delete_group("team"), sorted([SECRET, kept]))
+        self.assertEqual(store.delete_group("team")[0], sorted([SECRET, kept]))
         self.assertEqual(store.collection_access(kept), store.CollectionAccess(True, ("dev",), (), ()))
         self.assertFalse(store.has_access(store.get_user("dev2").id, "developer", kept))
 

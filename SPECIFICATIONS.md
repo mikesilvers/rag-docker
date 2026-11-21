@@ -1815,9 +1815,10 @@ session's and key's next request, as a grant does. A copy (an import under a new
 takes its source's group grants with its account grants; across a chain it keeps an account or a group only when
 every restricted collection in the chain grants that same account directly or that same group, so it is never wider
 than any of them, and a group grant stays a group grant (a membership change reaches the copy too). A failed create
-or import puts group grants back like account grants; a group deleted since is left out. A new collection starts
-with no group. Groups don't change roles, and the operator command has no group commands (Engineers reach every
-collection).
+or import puts group grants back like account grants; a group is matched by its identity, not its name, so a group
+deleted since is left out even when another of the same name has been made, and a group renamed since is put back.
+A new collection starts with no group. Groups don't change roles, and the operator command has no group commands
+(Engineers reach every collection).
 
 | Route | Request | Success |
 |---|---|---|
@@ -1958,7 +1959,8 @@ code attempt that reaches a live challenge, never counted in a window: actor the
 `admin.key.issue`, `admin.key.revoke`; groups for collection access (#784): `admin.group.create`,
 `admin.group.rename` (`target` the old name, `details.name` the new), `admin.group.members` (`added` and `removed`,
 each `{users, service_principals}`), `admin.group.delete` (`details.collections`: those whose grant to it was
-removed); `audit.view`, `audit.download`; `operator.bootstrap`, `operator.create-user`,
+removed; `details.removed`: the members it removed, `{users, service_principals}`); `audit.view`,
+`audit.download`; `operator.bootstrap`, `operator.create-user`,
 `operator.reset-password`, `operator.set-role`, `operator.disable`, `operator.enable`, `operator.reset-mfa` (`python -m auth`; not `list`,
 not usage errors); `operator.load` (`python -m loader`, §2.6; not usage errors); `system.start` (each API start, after the job records are loaded, with `question_text_logged`,
 `max_bytes` and `keep`); document preparation (§3.1.11): `prepare.upload` (names, count, bytes), `prepare.start`
@@ -2274,9 +2276,12 @@ Standard error codes:
 | `LAST_ENGINEER` | 409 | The change would demote or disable the last enabled engineer |
 | `SELF_RESET_REFUSED` | 409 | An engineer's reset of their own password; they use `POST /auth/password` |
 | `KEY_INVALID` | 401 | An `Authorization` header that isn't one valid `Bearer` key: unknown, malformed, expired, revoked or of a disabled principal |
-| `KEY_NOT_ALLOWED` | 403 | An API key on account, principal or key administration, logout, password change or the audit log |
+| `KEY_NOT_ALLOWED` | 403 | An API key on account, principal, key or group administration, logout, password change or the audit log |
 | `PRINCIPAL_EXISTS` | 409 | `POST /auth/service-principals`: a person or principal already has the name |
 | `PRINCIPAL_NOT_FOUND` | 404 | No service principal has the name in the path |
+| `INVALID_GROUP_NAME` | 422 | `POST /auth/groups` or `POST /auth/groups/{name}/rename`: the new name breaks the rule; the message states it |
+| `GROUP_EXISTS` | 409 | `POST /auth/groups` or `POST /auth/groups/{name}/rename`: a group already has the name |
+| `GROUP_NOT_FOUND` | 404 | No group has the name in the path |
 | `KEY_NOT_FOUND` | 404 | The principal has no key with the id in the path |
 
 ---

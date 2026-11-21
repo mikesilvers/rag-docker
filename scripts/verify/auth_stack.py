@@ -1036,7 +1036,6 @@ def check_collection_access(operator_ok):
             expect(got[0] == 200, "{}: the granted collection's settings answered {}".format(who, got))
         expect(not listed("End User"), "the End User sees a collection not granted to it")
 
-
         # The Prepare area (#606 Q18, #788): a .csv is labelled from its data,
         # with no LLM call, so preparing it is quick.
         status, body = upload(dev_token, "vfy-access-{}.csv".format(secrets.token_hex(3)), b"name,team\nAda,core\n")
