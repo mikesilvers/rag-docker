@@ -104,6 +104,8 @@ export default function TransferPage() {
   const [importKey, setImportKey] = useState('')
   const [importKeyName, setImportKeyName] = useState('')
   const keyInput = useRef<HTMLInputElement | null>(null)
+  // The package selected now, for a key file read that ends later (#860).
+  const selectedPackage = useRef(filename)
   const [importJob, setImportJob] = useState<ImportJob | null>(null)
   const [importError, setImportError] = useState('')
   const [importWatching, setImportWatching] = useState(false)
@@ -206,6 +208,7 @@ export default function TransferPage() {
 
   // A key file chosen for one package is never sent with another.
   useEffect(() => {
+    selectedPackage.current = filename
     setImportKey(''); setImportKeyName('')
     if (keyInput.current) keyInput.current.value = ''
   }, [filename])
@@ -213,11 +216,14 @@ export default function TransferPage() {
   async function chooseKeyFile(file: File | undefined) {
     setImportKey(''); setImportKeyName('')
     if (!file) return
+    // A read that ends after another package was chosen is dropped (#860).
+    const forPackage = filename
     try {
       const text = await file.text()
-      if (!alive.current) return
+      if (!alive.current || selectedPackage.current !== forPackage) return
       setImportKey(text); setImportKeyName(file.name)
     } catch (e: unknown) {
+      if (!alive.current || selectedPackage.current !== forPackage) return
       setImportError(`Could not read the key file: ${message(e)}`)
     }
   }
