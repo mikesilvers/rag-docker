@@ -80,7 +80,7 @@ Use `completed` for work that is done, and `"not planned"` for a duplicate or a 
 - **Lanes by shared files:** tickets share a lane only when they change the same files, not by theme. Tickets that share no file go in separate lanes, or are marked independent inside a lane (`·` in the Order column), so they can be worked in parallel.
 - **Blocks** when the whole ticket waits. `createJiraIssueLink` with `linkType: "Blocks"`: `inwardIssue` is the blocker and `outwardIssue` the blocked ticket ("inwardIssue blocks outwardIssue").
 - **Relates** when only part of a ticket waits, for example its UI after a toolchain upgrade. `createJiraIssueLink` with `linkType: "Relates"`, plus a comment on the waiting ticket saying which part waits, and for what.
-- **No link** for a same-file conflict that only needs a rebase: whichever PR lands second rebases. It is listed in the epic's Lanes section.
+- **No link** for a same-file conflict with no ordering need. Whichever PR lands second merges the current `develop` into its branch and resolves the conflict (never rebase or force-push). It is listed in the epic's Lanes section.
 - **Verify note:** one machine runs one verify stack at a time (`rag-verify` on port 8081, behind a lock). Lanes can be developed and reviewed in parallel, but their verify runs and `rag-pr-review` evaluations queue.
 - **Limit on open PRs:** no non-Markdown PR from the release opens while 2 or more non-Markdown PRs from the release wait for or are in evaluation. Markdown-only PRs (every changed file is `*.md`) don't count: they take the fast path and don't use the verify stack. A fix agent's question round doesn't count as a PR.
 - **Prepared branches:** while the limit is reached, a fix agent may still start and prepare its branch, with no PR yet; at most 2 prepared branches from the release at a time. It stays In Progress, with the checkpoint comment `Prepared: <branch> @ <sha>, waiting for an open-PR slot`, and opens its PR when a slot frees, after merging the current `develop`.
@@ -93,7 +93,7 @@ Added to the epic description below its existing text, which stays as it is:
 ```markdown
 ## Lanes (work in parallel)
 
-Each lane is a set of tickets that change the same files. Tickets that share no file are in separate lanes, or marked independent with `·`. Claim a lane by assigning yourself its tickets, so two agents never work in the same files. Filter one lane with `labels = lane-x-...`. Ordering dependencies are **Blocks** links on the tickets. **Relates** links mark tickets where only part waits; the comment on the ticket says which.
+Each lane is a set of tickets that change the same files. Tickets that share no file are in separate lanes, or marked independent with `·`. Claim a lane by assigning yourself its tickets, so two agents never work in the same files. Joe's agents and our side also post the claim, and its release, in Governed Talks, and wait for the other side's acknowledgement (AGENTS.md §2). Filter one lane with `labels = lane-x-...`. Ordering dependencies are **Blocks** links on the tickets. **Relates** links mark tickets where only part waits; the comment on the ticket says which.
 
 | Lane (label) | Order | Waits on other lanes |
 | --- | --- | --- |
@@ -103,7 +103,7 @@ Start now: RD-n, RD-k · …
 
 Longest chain: RD-n → RD-m → …
 
-Same-file conflicts with no ordering need are not linked; whichever PR lands second rebases. They are `<file>` (RD-n, RD-m).
+Same-file conflicts with no ordering need are not linked. Whichever PR lands second merges the current `develop` into its branch and resolves the conflict (never rebase or force-push). They are `<file>` (RD-n, RD-m).
 
 **Verification is the bottleneck.** One machine runs one verify stack at a time (`rag-verify` on port 8081, behind a lock), so verify runs and rag-pr-review evaluations queue across lanes.
 
@@ -124,7 +124,7 @@ A Markdown file, `<EPIC>-release-plan.md`, in the session's scratchpad directory
 4. **Recommended moves, closes, folds and splits:** a table of item, recommendation and why. Name each overridden placement by the maintainer, with its date.
 5. **What stays:** grouped, with the count. The counts add up: children = moved + closed + folded + stay.
 6. **Dependencies:** a table of item, depends on, kind (hard, soft, or a scope note), and why, with the evidence.
-7. **Lanes:** the lane table (lane and label, order inside the lane, waits on other lanes), grouped by the files the tickets change, with tickets that share no file in separate lanes or marked independent; the start-now list, the longest chain, the rebase-only conflicts, the verify note, the limit on open PRs with prepared branches, and the evaluation queue order.
+7. **Lanes:** the lane table (lane and label, order inside the lane, waits on other lanes), grouped by the files the tickets change, with tickets that share no file in separate lanes or marked independent; the start-now list, the longest chain, the same-file conflicts with no ordering need, the verify note, the limit on open PRs with prepared branches, and the evaluation queue order.
 8. **Decisions for the maintainer:** a numbered list, each a question that can be answered yes or no or by a choice.
 9. **Review log:** one line per review, saying what changed or "No changes".
 

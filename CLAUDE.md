@@ -21,7 +21,7 @@ Code from forks is built or run only after a clean security review and the maint
 - Moving a ticket to Done also closes its GitHub issue, if it is still open.
 - A new GitHub issue gets the current release's label only when it is an urgent bug. Otherwise leave it unlabelled and ask the maintainer which release. Never add `Triage` to an issue we open.
 - A ready patch from the rag-pr-review tests reviewer (every test in it ran and passed) goes into the PR before it merges, on a PR by `mikesilvers` that isn't from a fork, READY or NOT READY, whatever the finding's severity: the coordinating session sends it to the PR's fix agent, and the new head gets its own evaluation, patch-only when it adds only the patch (`.claude/skills/rag-pr-review/reference.md`, "Reviewer patches before merge").
-- After a PR merges, its Medium and Low findings with no ready reviewer patch become a "Follow-ups from #N" issue.
+- After a PR merges, its Medium and Low findings with no ready reviewer patch become a "Follow-ups from #N" issue. For a PR by `joefeser`, Joe's agents open that issue instead (`AGENTS.md` §6), and we create its RD ticket.
 - The details are in the `rag-jira` skill.
 
 ## Working with Joe's agents

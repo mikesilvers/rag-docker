@@ -27,7 +27,7 @@ After every step, save it in the work folder ("Work folder" in `reference.md`).
 
 1. **Take the ticket.** Read it. Take it as assignee, unless someone else holds it: then stop and return that. How to read, assign and transition a ticket is in the `rag-jira` skill. Taking it also moves it to In Progress (`rag-jira`, "Statuses").
 2. **Check its blockers.** Read its "is blocked by" links. If any blocker isn't Done, stop and return the blocker; don't start.
-3. **Check its lane.** If it has a lane label and another ticket in the same lane is In Progress under another assignee, stop and return that: a lane's tickets touch the same files, and a lane is claimed by assigning yourself its tickets. What lanes and links mean is in the `rag-release-plan` skill.
+3. **Check its lane.** If it has a lane label and another ticket in the same lane is In Progress under another assignee, stop and return that: a lane's tickets touch the same files, and a lane is claimed by assigning yourself its tickets. When Joe's agents are working the release, the claim is also posted in Governed Talks and acknowledged by the other side (`AGENTS.md` §2, `docs/WORKFLOW.md` §4). What lanes and links mean is in the `rag-release-plan` skill.
 4. **Set up or resume the work folder** `~/repo/rag-docker-work/RD-<n>/`, following that repository's README: from `_template/` for a new ticket, or through its "Resuming" steps when the folder already has a checkpoint.
 
 ### 2. Dev-docs
@@ -91,7 +91,7 @@ After an evaluation of your PR, the coordinating session may resume you, or star
 
 ## After the merge
 
-For whoever handles a merged PR's findings: every Medium or Low finding from its evaluation with no ready reviewer patch becomes a "Follow-ups from #N" GitHub issue and an RD ticket for it (the ticket as the `rag-jira` skill describes). Leave the issue unlabelled for the maintainer to triage, and never add `Triage`.
+For whoever handles a merged PR's findings: every Medium or Low finding from its evaluation with no ready reviewer patch becomes a "Follow-ups from #N" GitHub issue and an RD ticket for it (the ticket as the `rag-jira` skill describes). Leave an issue we open unlabelled for the maintainer to triage, and never add `Triage`. For a PR by `joefeser`, Joe's agents open the follow-up issue instead, and a repository workflow labels it `Triage`; the session creates its RD ticket, and the maintainer decides its release (`AGENTS.md` §6, "Maintainer follow-ups (PRs by `joefeser`)" in `rag-pr-review` reference.md).
 
 ## Common mistakes
 

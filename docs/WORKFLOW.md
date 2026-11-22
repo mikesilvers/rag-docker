@@ -63,7 +63,7 @@ All of this is in `rag-release-plan` (SKILL.md steps 7 and 14; reference.md "Lan
 - **Order inside a lane.** In the Order column of the lane table, `→` means "then", `·` separates independent chains, and `+` joins tickets done together.
 - **Blocks** links mark a whole ticket that waits. In `createJiraIssueLink`, `inwardIssue` is the blocker and `outwardIssue` is the blocked ticket. (`rag-jira` reference.md "Links and lanes")
 - **Relates** links mark a ticket where only part waits. The waiting ticket gets a comment saying which part waits, and for what.
-- **Rebase-only conflicts get no link.** When two tickets touch the same file with no ordering need, whichever PR lands second rebases. These conflicts are listed in the epic's Lanes section.
+- **Same-file conflicts with no ordering need get no link.** Two tickets may touch the same file with no ordering need. Whichever PR lands second merges the current `develop` into its branch and resolves the conflict (never rebase or force-push). These conflicts are listed in the epic's Lanes section.
 - **The longest chain** and **the start-now list** are in the epic's Lanes section too.
 
 ### Example: v1.3.0 (RD-1)
@@ -161,7 +161,7 @@ Just before merging, every check runs again: the author, the clean evaluation on
 
 - **Done.** The session that merged the PR moves the ticket to Done. When the maintainer merged the PR himself (`joefeser` PRs, fork PRs, release PRs, or any he merges by hand), the session moves it once it sees the PR has landed, as for its own merges. (`rag-jira` "Statuses", "Finish a ticket")
 - **The GitHub issue closes.** `Closes #N` closes it on the merge into `develop`. Moving the ticket to Done also closes the issue if it is still open: check its state first. (`CLAUDE.md`, `rag-jira` reference.md "Done closes GitHub")
-- **Follow-ups, any PR.** The merged PR's Medium and Low findings with no ready reviewer patch become a "Follow-ups from #N" issue (`CLAUDE.md`), with an RD ticket. The issue is left unlabelled for the maintainer to triage, and never gets `Triage`. (`rag-fix` SKILL.md "After the merge")
+- **Follow-ups, any PR.** The merged PR's Medium and Low findings with no ready reviewer patch become a "Follow-ups from #N" issue (`CLAUDE.md`), with an RD ticket. An issue we open is left unlabelled for the maintainer to triage, and never gets `Triage`. (`rag-fix` SKILL.md "After the merge") For a PR by `joefeser`, his agents open the issue, as the next point says.
 - **Follow-ups, PRs by `joefeser`.** Only High findings go back to Joe; his PR is never held for Medium or Low findings. Joe's agents open the follow-up as a GitHub issue listing the Mediums, and the Lows worth doing, each with its `path:line`, end it with a `Recommended release:` line, and tell us in Governed Talks. We create its RD ticket, and the maintainer decides the release. Checks scored flaky or environmental are left out. Reviewer patches before merge don't apply to his PRs. (`AGENTS.md` §6, `rag-pr-review` reference.md "Maintainer follow-ups (PRs by `joefeser`)")
 
 ## 7. Joe's side
