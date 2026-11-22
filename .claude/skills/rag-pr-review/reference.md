@@ -318,6 +318,7 @@ For a PR whose author is `joefeser`, only High findings go back to him. "Author"
 
 - The recap carries the "Medium and Low findings" line shown in the recap format, so his team doesn't also fix them. On a NOT READY recap, the line still applies: he fixes the Highs only.
 - The coordinator doesn't offer a follow-up issue for his PR: Joe's agents open it, listing the Mediums, and the Lows worth doing, each with its `path:line` from the recap, end it with a `Recommended release:` line, and tell us in Governed Talks. Its RD ticket is created as `rag-jira` says, and the maintainer decides its release. Checks scored flaky or environmental are left out: they aren't follow-up work. The follow-up's PR is evaluated like any other.
+- **After his PR merges,** the session that moves its ticket to Done (`rag-jira` "Finish a ticket") checks that the follow-up issue exists and lists every Medium from the recap of the merged head. If it doesn't, the session tells the maintainer. The check applies only when that recap has a Medium: Joe's agents list the Mediums and only the Lows worth doing, so with no Medium there may be no issue.
 - After the recap is posted, the coordinator also posts a short summary in Governed Talks: `Review of PR #<n>: READY TO MERGE | NOT READY` and the recap's link (`AGENTS.md` §5 and §7).
 - Severities are graded exactly as for any other PR. The rule changes who fixes a Medium or Low, never what counts as High.
 - Conflicts with `develop` are still his to resolve.

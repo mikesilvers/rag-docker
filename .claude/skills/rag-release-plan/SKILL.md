@@ -102,7 +102,7 @@ Group the items that stay into lanes by the files they actually change, not by t
 Also give:
 - the start-now list;
 - the longest chain;
-- the same-file conflicts that only need a rebase (no ordering need);
+- the same-file conflicts with no ordering need;
 - the verify note: verify runs are serial on one machine (one `rag-verify` project behind a lock), so verify runs and `rag-pr-review` evaluations queue across lanes;
 - the limit on open PRs, prepared branches and the evaluation queue order ("Running the release").
 
@@ -155,13 +155,13 @@ Follow "Closing, folding and splitting" in `reference.md`. Each one gets a comme
 
 - Add its lane label `lane-<x>-<name>` to every ticket that stays.
 - A whole-ticket wait gets a **Blocks** link; a partial wait gets a **Relates** link plus a comment on the waiting ticket saying which part waits and for what.
-- A rebase-only same-file conflict gets no link. It is listed on the epic (step 15).
+- A same-file conflict with no ordering need gets no link. It is listed on the epic (step 15).
 
 See "Lanes and links" in `reference.md` for the link calls.
 
 ### 15. Update the epic description
 
-Keep the existing text, the theme included, and add the "Lanes" section of `reference.md`: the lane table, the start-now list, the longest chain, the rebase-only conflicts, the verify note, the limit on open PRs with prepared branches, and the evaluation queue order.
+Keep the existing text, the theme included, and add the "Lanes" section of `reference.md`: the lane table, the start-now list, the longest chain, the same-file conflicts with no ordering need, the verify note, the limit on open PRs with prepared branches, and the evaluation queue order.
 
 ### 16. Attach the report
 
@@ -215,7 +215,7 @@ Use this when the maintainer says the release has shipped, or asks to mark its v
 | Writing anything in phase 1 | Phase 1 is read-only. Every change waits for the maintainer's approval. |
 | Asking several questions at once | One question at a time with AskUserQuestion, waiting for each answer. |
 | Applying a change the report didn't propose | Stop and ask. Phase 2 applies only the approved decisions. |
-| Linking a rebase-only conflict | No link. List it in the epic's Lanes section. |
+| Linking a same-file conflict with no ordering need | No link. List it in the epic's Lanes section. |
 | Grouping lanes by theme | Group tickets by the files they change. Tickets that share no file go in separate lanes, or are marked independent. |
 | Opening a non-Markdown PR while 2 or more non-Markdown PRs wait for or are in evaluation | Prepare the branch instead, and open it when a slot frees, in queue order. Markdown-only PRs and question rounds don't count. |
 | Starting a third prepared branch from the release | At most 2 prepared branches at a time. Wait until one opens its PR. |
