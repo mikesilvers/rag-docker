@@ -100,10 +100,19 @@ MATRIX = (
     # Two-step verification (#607): a 404 for no such account, a 422 for no value.
     ("POST", "/auth/users/vfy-no-such-user/reset-mfa", None, "engineer"),
     ("POST", "/auth/mfa/policy", {}, "engineer"),
+    # Groups for collection access (#784): a list, a 422 for no name, or a 404
+    # for a group that doesn't exist; nothing changes.
+    ("GET", "/auth/groups", None, "engineer"),
+    ("POST", "/auth/groups", {}, "engineer"),
+    ("POST", "/auth/groups/vfy-no-such-group/rename", {"name": "vfy-no-such-other"}, "engineer"),
+    ("PUT", "/auth/groups/vfy-no-such-group/members", {}, "engineer"),
+    ("POST", "/auth/groups/vfy-no-such-group/delete", None, "engineer"),
 )
 # Routes an API key can't use whatever its role (S5 of PR 3): every account,
-# principal and key route, logout and the password change; and the audit log (#29).
-KEY_REFUSED = ("/auth/users", "/auth/service-principals", "/auth/logout", "/auth/password", "/audit", "/auth/mfa")
+# principal and key route, logout and the password change; the audit log (#29);
+# and groups (#784).
+KEY_REFUSED = ("/auth/users", "/auth/service-principals", "/auth/logout", "/auth/password", "/audit", "/auth/mfa",
+               "/auth/groups")
 # And per-collection access (#606), by its path's end.
 KEY_REFUSED_SUFFIX = "/access"
 SESSION_ROUTES = (("GET", "/auth/me", None), ("POST", "/auth/logout", None), ("POST", "/auth/password", {}))
@@ -428,7 +437,8 @@ def check_login_logout(operator_ok):
     body = json.loads(raw)
     expect(status == 200 and body == {"username": "vfy-developer", "role": "developer", "must_change_password": False,
                                       "kind": "user", "mfa_enrolled": False, "mfa_required": False,
-                                      "mfa_enrollment_required": False, "query_only": False},
+                                      "mfa_enrollment_required": False, "query_only": False,
+                                      "lan_mode": False},
            "GET /auth/me answered {} {}".format(status, body))
     status, _, _ = code("POST", "/auth/logout", token=token)
     expect(status == 200, "logout answered {}".format(status))
@@ -975,11 +985,13 @@ def check_collection_access(operator_ok):
     and a Developer key can't see or use it until granted, and the access routes
     refuse a key. Changes and refusals are in the audit log. In the Prepare
     area, a document the granted Developer imports into it is hidden from a
-    Developer without access (#788)."""
+    Developer without access (#788). Granted to a group, the collection
+    reaches a Developer not granted directly while it is a member, and no
+    longer once removed (#784)."""
     expect(operator_ok, "creates accounts, a service principal and a collection, so it runs only on the verify project")
     admin = role_token("engineer")
     name = "VfyAccess" + secrets.token_hex(4)
-    users, principal = [], None
+    users, principal, group = [], None, None
     document, document_owner = None, None
     try:
         status, raw, _ = code("POST", "/collections", {"name": name}, token=admin)
@@ -1016,7 +1028,8 @@ def check_collection_access(operator_ok):
 
         status, raw, _ = code("PUT", "/collections/{}/access".format(name),
                               {"restricted": True, "users": [dev], "service_principals": [principal]}, token=admin)
-        expect(status == 200 and json.loads(raw) == {"restricted": True, "users": [dev], "service_principals": [principal]},
+        expect(status == 200 and json.loads(raw) == {"restricted": True, "users": [dev], "service_principals": [principal],
+                                                     "groups": []},
                "granting answered {} {}".format(status, raw[:200]))
         for who in ("Developer", "key"):
             expect(listed(who), "{} doesn't see the collection once granted".format(who))
@@ -1052,6 +1065,35 @@ def check_collection_access(operator_ok):
         status, raw, _ = code("GET", "/prepare/documents/" + document, token=other_token)
         expect((status, error_code(raw)) == (404, "DOCUMENT_NOT_FOUND"),
                "a Developer without access reading the document answered {} {}".format(status, error_code(raw)))
+        callers["Other"] = {"token": other_token}
+        # Groups (#784): a Developer not granted directly reaches the collection
+        # through a group, and no longer once removed from it.
+        group = "vfy-g-" + secrets.token_hex(4)
+        status, raw, _ = code("POST", "/auth/groups", {"name": group}, token=admin)
+        expect(status == 201, "creating group {} answered {} {}".format(group, status, error_code(raw)))
+        status, raw, _ = code("PUT", "/auth/groups/{}/members".format(group), {"users": [other]}, token=admin)
+        expect(status == 200, "adding the Developer to {} answered {} {}".format(group, status, error_code(raw)))
+        expect(not listed("Other"), "a group not granted the collection gave the Developer access")
+        status, raw, _ = code("PUT", "/collections/{}/access".format(name),
+                              {"restricted": True, "users": [dev], "service_principals": [principal], "groups": [group]},
+                              token=admin)
+        expect(status == 200 and json.loads(raw).get("groups") == [group],
+               "granting the group answered {} {}".format(status, raw[:200]))
+        expect(listed("Other"), "the Developer doesn't see the collection granted to its group")
+        got = answer("Other", "GET", "/ingest/config/" + name)
+        expect(got[0] == 200, "Developer: the collection granted to its group answered {}".format(got))
+        got = answer("key", "GET", "/auth/groups")
+        expect(got == (403, "KEY_NOT_ALLOWED"), "a key listing groups answered {}".format(got))
+        status, raw, _ = code("PUT", "/auth/groups/{}/members".format(group), {}, token=admin)
+        expect(status == 200, "emptying {} answered {} {}".format(group, status, error_code(raw)))
+        expect(not listed("Other"), "the Developer still sees the collection after leaving the group")
+        status, raw, _ = code("POST", "/auth/groups/{}/delete".format(group), token=admin)
+        expect(status == 200 and json.loads(raw).get("collections") == [name],
+               "deleting {} answered {} {}".format(group, status, raw[:200]))
+        group = None
+        status, raw, _ = code("GET", "/collections/{}/access".format(name), token=admin)
+        expect(json.loads(raw) == {"restricted": True, "users": [dev], "service_principals": [principal], "groups": []},
+               "after the group's delete the access is {}".format(raw[:200]))
         got = answer("key", "PUT", "/collections/{}/access".format(name), {"restricted": False})
         expect(got == (403, "KEY_NOT_ALLOWED"), "a key changing access answered {}".format(got))
         got = answer("key", "GET", "/collections/{}/access".format(name))
@@ -1062,16 +1104,20 @@ def check_collection_access(operator_ok):
             status, raw, _ = code("GET", query, token=admin)
             expect(status == 200, "GET /audit answered {}".format(status))
             return [r for r in json.loads(raw)["records"] if all(r.get(k) == v for k, v in match.items())]
-        # The newest record is the key's refused change below; this is the Engineer's grant.
+        # The newest records are the key's refused change below and the group's
+        # grant (#784); the oldest is the Engineer's first grant.
         change = audited("collection.access", result="success")
-        expect(change and change[0]["details"].get("added") == {"users": [dev], "service_principals": [principal]},
-               "the change's audit record is {}".format(change[:1]))
+        expect(change and change[-1]["details"].get("added") == {"users": [dev], "service_principals": [principal],
+                                                                 "groups": []},
+               "the change's audit record is {}".format(change[-1:]))
         refused = audited("query", actor=user)
         expect(refused and refused[0]["result"] == "refused" and refused[0]["details"].get("reason") == "collection_access",
                "the refused query's audit record is {}".format(refused[:1]))
         expect(audited("collection.access.refused", actor=principal),
                "no collection.access.refused record for the key's settings read")
     finally:
+        if group:
+            code("POST", "/auth/groups/{}/delete".format(group), token=admin)
         if document:
             code("DELETE", "/prepare/documents/" + document, token=document_owner)
         code("DELETE", "/collections/{}?confirm=true".format(name), token=admin)

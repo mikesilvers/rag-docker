@@ -514,7 +514,7 @@ class PolicyTests(unittest.TestCase):
         counts = {}
         for access in policy.ACCESS.values():
             counts[access] = counts.get(access, 0) + 1
-        self.assertEqual(counts, {"public": 4, "session": 3, "mfa": 5, "end_user": 3, "developer": 37, "engineer": 30})
+        self.assertEqual(counts, {"public": 4, "session": 3, "mfa": 5, "end_user": 3, "developer": 37, "engineer": 35})
         self.assertEqual(policy.ACCESS[("GET", "/health")], "public")
         self.assertEqual(policy.ACCESS[("GET", "/health/details")], "developer")   # #750
         self.assertEqual(policy.ACCESS[("DELETE", "/collections/{name}")], "engineer")
@@ -546,6 +546,12 @@ class PolicyTests(unittest.TestCase):
             ("POST", "/auth/service-principals/{name}/enable"), ("POST", "/auth/service-principals/{name}/keys"),
             ("POST", "/auth/service-principals/{name}/keys/{key_id}/revoke")})
         self.assertEqual(set(principals.values()), {"engineer"})
+        # Groups for collection access (#784): the Engineer's; a group is deleted with a POST.
+        groups = {key: access for key, access in policy.ACCESS.items() if key[1].startswith("/auth/groups")}
+        self.assertEqual(groups, {("GET", "/auth/groups"): "engineer", ("POST", "/auth/groups"): "engineer",
+                                  ("POST", "/auth/groups/{name}/rename"): "engineer",
+                                  ("PUT", "/auth/groups/{name}/members"): "engineer",
+                                  ("POST", "/auth/groups/{name}/delete"): "engineer"})
         # Two-step verification (#607): the code step is public like the login;
         # the user's own routes are any session's; the switch is the Engineer's.
         own = {key: access for key, access in policy.ACCESS.items() if key[1].startswith("/auth/mfa")}
@@ -556,10 +562,11 @@ class PolicyTests(unittest.TestCase):
 
     def test_keys_cannot_reach_administration_or_the_session_routes(self):
         # S5 of PR 3: every account, principal and key route, logout and the
-        # password change, the audit log (#29) and per-collection access (#606);
-        # GET /auth/me stays open to a key.
+        # password change, the audit log (#29), per-collection access (#606) and
+        # groups (#784); GET /auth/me stays open to a key.
         admin = {path for _, path in policy.ACCESS
-                 if path.startswith(("/auth/users", "/auth/service-principals", "/auth/mfa"))}
+                 if path.startswith(("/auth/users", "/auth/service-principals", "/auth/mfa", "/auth/groups"))}
+        self.assertTrue({"/auth/groups", "/auth/groups/{name}/members"} <= admin)
         self.assertEqual(policy.HUMAN_ONLY, admin | {"/auth/logout", "/auth/password", "/audit", "/audit.csv",
                                                      "/collections/{name}/access"})
         self.assertNotIn("/auth/me", policy.HUMAN_ONLY)
@@ -775,6 +782,7 @@ class RouteTests(StoreTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"username": "eng", "role": "engineer", "must_change_password": True,
                                            "query_only": False,      # #670
+                                           "lan_mode": False,        # #676
                                            "mfa_enrolled": False, "mfa_required": False,
                                            "mfa_enrollment_required": False})
         cookie = response.headers["set-cookie"]
@@ -1435,12 +1443,18 @@ class KeyMiddlewareTests(KeyTestCase):
                                    ("POST", "/auth/service-principals/svc/enable", None),
                                    ("POST", "/auth/service-principals/svc/keys", {}),
                                    ("POST", "/auth/service-principals/svc/keys/abc/revoke", None),
+                                   ("GET", "/auth/groups", None),
+                                   ("POST", "/auth/groups", {"name": "minted"}),
+                                   ("POST", "/auth/groups/minted/rename", {"name": "other"}),
+                                   ("PUT", "/auth/groups/minted/members", {"users": ["dev"]}),
+                                   ("POST", "/auth/groups/minted/delete", None),
                                    ("POST", "/auth/logout", None),
                                    ("POST", "/auth/password", {"current_password": "x", "new_password": "y" * 12})):
             with self.subTest(route=f"{method} {path}"):
                 response = self.client.request(method, path, json=body, headers=headers)
                 self.assertEqual((response.status_code, self.code(response)), (403, "KEY_NOT_ALLOWED"))
         self.assertIsNone(store.get_user("minted"))
+        self.assertEqual(store.list_groups(), [])
         self.assertEqual(len(store.get_principal("svc").keys), 1)
         # Engineer-level data routes stay open to an engineer key.
         self.assertNotIn(self.client.get("/metrics/latency", headers=headers).status_code, (401, 403))
@@ -1450,7 +1464,8 @@ class KeyMiddlewareTests(KeyTestCase):
         response = self.client.get("/auth/me", headers=self.bearer(key))
         self.assertEqual(response.json(), {"username": "svc", "role": "end_user", "must_change_password": False,
                                            "kind": "service", "mfa_enrolled": False, "mfa_required": False,
-                                           "mfa_enrollment_required": False, "query_only": False})
+                                           "mfa_enrollment_required": False, "query_only": False,
+                                           "lan_mode": False})
         headers, _ = self.session("dev")
         self.assertEqual(self.client.get("/auth/me", headers=headers).json()["kind"], "user")
 
@@ -2520,7 +2535,8 @@ class ImplementationCopyTests(unittest.TestCase):
                      "api/auth/keys.py", "ui/src/pages/ServiceKeysPage.tsx", "api/config.py", "proxy/nginx.conf",
                      "scripts/verify/17_auth.sh", "scripts/verify/auth_setup.py", "scripts/verify/auth_stack.py",
                      "scripts/verify/auth_headers.py", "api/auth/mfa.py", "ui/src/pages/AccountPage.tsx",
-                     "api/auth/access.py", "scripts/tests/test_collection_access.py"):
+                     "api/auth/access.py", "scripts/tests/test_collection_access.py",
+                     "ui/src/pages/GroupsPage.tsx"):
             with self.subTest(name=name):
                 header = "### " + name + "\n\n```"
                 start = document.index("\n", document.index(header) + len(header)) + 1

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import {
-  api, CollectionInfo, ExportJob, ExportJobEntry, ImportJob, ImportJobEntry, PackageSummary, TuneOptions,
+  api, CollectionInfo, Encryption, ExportJob, ExportJobEntry, ImportJob, ImportJobEntry, PackageSummary, TuneOptions,
 } from '../api/client'
 import { useAuth, useRole } from '../context/AuthContext'
 import JobList, { JobRow, newestToOpen, useJobList } from '../components/JobList'
@@ -30,6 +30,18 @@ function sizeLabel(bytes: number | null): string {
 function expiresLabel(iso: string): string {
   return new Date(iso).toLocaleString()
 }
+
+// How an export is encrypted (#676), in the order the form offers them. A new
+// key is the default; "Not encrypted" is not offered in LAN mode, where the API
+// refuses it too.
+const ENCRYPTION: { id: Encryption; label: string; description: string }[] = [
+  { id: 'key', label: 'New key (recommended)',
+    description: 'Encrypts the package to a new key made for it alone. Download the key file once the export is done, and store it apart from the package: anyone with both can read it.' },
+  { id: 'passphrase', label: 'Passphrase',
+    description: 'Encrypts the package with a passphrase you choose. It can\'t be recovered, so keep it safe and send it separately from the file.' },
+  { id: 'none', label: 'Not encrypted',
+    description: 'Anyone with the file can read the collection, and the original documents if they travel with it.' },
+]
 
 const CONFLICT = [
   { id: 'abort', label: 'Abort', description: 'Fail if a collection of that name already exists. Nothing is changed.' },
@@ -61,6 +73,8 @@ export default function TransferPage() {
   const { role } = useRole()
   // Query-only mode (#670): no import here; packages are loaded on the host.
   const queryOnly = useAuth().user?.query_only === true
+  // LAN mode (#26): no unencrypted export (#676).
+  const lanMode = useAuth().user?.lan_mode === true
   // Running and recent exports and imports, in one list (#617). Each panel
   // opens its own newest job on the first answer, unless it already has one.
   const exportJobs = useJobList<ExportJobEntry>(loadExportJobs, transferRunning)
@@ -72,9 +86,9 @@ export default function TransferPage() {
   const [tune, setTune] = useState<TuneOptions | null>(null)
   const [tuneError, setTuneError] = useState('')
   const [includeModels, setIncludeModels] = useState(false)
-  // Passphrases live only in this component's state, and are cleared once a
-  // job has started with them (#27).
-  const [encrypt, setEncrypt] = useState(false)
+  // Passphrases and key file text live only in this component's state, and are
+  // cleared once a job has started with them (#27, #676).
+  const [encryption, setEncryption] = useState<Encryption>('key')
   const [passphrase, setPassphrase] = useState('')
   const [confirmPassphrase, setConfirmPassphrase] = useState('')
   const [exportJob, setExportJob] = useState<ExportJob | null>(null)
@@ -87,6 +101,11 @@ export default function TransferPage() {
   const [filename, setFilename] = useState('')
   const [onConflict, setOnConflict] = useState('abort')
   const [importPassphrase, setImportPassphrase] = useState('')
+  const [importKey, setImportKey] = useState('')
+  const [importKeyName, setImportKeyName] = useState('')
+  const keyInput = useRef<HTMLInputElement | null>(null)
+  // The package selected now, for a key file read that ends later (#860).
+  const selectedPackage = useRef(filename)
   const [importJob, setImportJob] = useState<ImportJob | null>(null)
   const [importError, setImportError] = useState('')
   const [importWatching, setImportWatching] = useState(false)
@@ -157,6 +176,57 @@ export default function TransferPage() {
       }, () => {})
     }, 3000))
   }, [])
+
+  // After a Download key click (#676): re-read the export every 3 s, for at
+  // most 10 minutes, until its key file is no longer on the server.
+  const keyWatches = useRef(new Map<string, number>())
+  const watchKeyDownload = useCallback((jobId: string) => {
+    const watches = keyWatches.current
+    if (watches.has(jobId)) return
+    const started = Date.now()
+    const stop = () => { window.clearInterval(watches.get(jobId)); watches.delete(jobId) }
+    watches.set(jobId, window.setInterval(() => {
+      if (!alive.current || Date.now() - started > 10 * 60 * 1000) { stop(); return }
+      api.getExportJob(jobId).then(job => {
+        if (!alive.current) return
+        setExportJob(current => (current && current.job_id === jobId
+          ? { ...current, key_on_server: job.key_on_server } : current))
+        if (!job.key_on_server) { stop(); loadPackages() }
+      }, () => {})
+    }, 3000))
+  }, [loadPackages])
+
+  useEffect(() => {
+    const watches = keyWatches.current
+    return () => { watches.forEach(id => window.clearInterval(id)); watches.clear() }
+  }, [])
+
+  // LAN mode never sends an unencrypted export (#676).
+  useEffect(() => {
+    if (lanMode && encryption === 'none') setEncryption('key')
+  }, [lanMode, encryption])
+
+  // A key file chosen for one package is never sent with another.
+  useEffect(() => {
+    selectedPackage.current = filename
+    setImportKey(''); setImportKeyName('')
+    if (keyInput.current) keyInput.current.value = ''
+  }, [filename])
+
+  async function chooseKeyFile(file: File | undefined) {
+    setImportKey(''); setImportKeyName('')
+    if (!file) return
+    // A read that ends after another package was chosen is dropped (#860).
+    const forPackage = filename
+    try {
+      const text = await file.text()
+      if (!alive.current || selectedPackage.current !== forPackage) return
+      setImportKey(text); setImportKeyName(file.name)
+    } catch (e: unknown) {
+      if (!alive.current || selectedPackage.current !== forPackage) return
+      setImportError(`Could not read the key file: ${message(e)}`)
+    }
+  }
 
   // Fidelity is shown before the export runs, so the choice is informed rather
   // than discovered afterwards in the manifest. A lookup that fails says so
@@ -276,9 +346,9 @@ export default function TransferPage() {
   async function startExport() {
     setExportError(''); setExportPollError(''); setExportJob(null)
     try {
-      const r = await api.startExport(encrypt
-        ? { collection, include_models: includeModels, passphrase }
-        : { collection, include_models: includeModels })
+      const r = await api.startExport(encryption === 'passphrase'
+        ? { collection, include_models: includeModels, encryption, passphrase }
+        : { collection, include_models: includeModels, encryption })
       setPassphrase(''); setConfirmPassphrase('')
       if (!alive.current) return
       exportTouched.current = true
@@ -295,10 +365,13 @@ export default function TransferPage() {
   async function startImport() {
     setImportError(''); setImportPollError(''); setImportJob(null)
     try {
-      const r = await api.startImport(selectedEncrypted
+      const r = await api.startImport(importNeeds === 'key'
+        ? { filename, on_conflict: onConflict, key: importKey }
+        : importNeeds === 'passphrase'
         ? { filename, on_conflict: onConflict, passphrase: importPassphrase }
         : { filename, on_conflict: onConflict })
-      setImportPassphrase('')
+      setImportPassphrase(''); setImportKey(''); setImportKeyName('')
+      if (keyInput.current) keyInput.current.value = ''
       if (!alive.current) return
       importTouched.current = true
       importJobs.reload()
@@ -316,12 +389,18 @@ export default function TransferPage() {
 
   // What still stops an encrypted export, or '' when nothing does.
   const passphraseLength = charCount(passphrase)
-  const passphraseProblem = !encrypt ? ''
+  const passphraseProblem = encryption !== 'passphrase' ? ''
     : passphraseLength < PASSPHRASE_MIN ? `The passphrase needs at least ${PASSPHRASE_MIN} characters.`
     : passphraseLength > PASSPHRASE_MAX ? `The passphrase can have at most ${PASSPHRASE_MAX} characters.`
     : passphrase !== confirmPassphrase ? 'The two passphrases do not match.'
     : ''
-  const selectedEncrypted = packages.some(p => p.filename === filename && p.encrypted)
+  // Which secret the selected package needs (#676): its key file when its header
+  // is a key header, otherwise a passphrase for any encrypted one (#27).
+  const selected = packages.find(p => p.filename === filename)
+  const importNeeds: 'key' | 'passphrase' | null = !selected?.encrypted ? null
+    : selected.encryption === 'key' ? 'key' : 'passphrase'
+  const importSecretMissing = importNeeds === 'key' ? importKey === ''
+    : importNeeds === 'passphrase' ? importPassphrase === '' : false
 
   const jobRows: (JobRow & { sort: { created_at: string | null; finished_at: string | null } })[] = [
     ...exportJobs.entries.map(entry => ({
@@ -399,17 +478,23 @@ export default function TransferPage() {
           </span>
         </label>
 
-        <label className="flex items-start gap-2 text-sm mb-3">
-          <input type="checkbox" checked={encrypt} onChange={e => setEncrypt(e.target.checked)} className="mt-1" />
-          <span>
-            Encrypt with a passphrase
-            <span className="block text-xs text-gray-500">
-              Writes an encrypted <code>.tar.gz.age</code> package that only this passphrase opens.
-              It can't be recovered, so keep it safe and send it separately from the file.
-            </span>
-          </span>
-        </label>
-        {encrypt && (
+        <label className="block text-sm font-medium mb-2">Encryption</label>
+        <div className="space-y-2 mb-3">
+          {ENCRYPTION.filter(c => !(lanMode && c.id === 'none')).map(c => (
+            <label key={c.id} className={`flex gap-3 p-3 border rounded cursor-pointer ${encryption === c.id ? 'border-blue-500 bg-blue-50' : 'hover:bg-gray-50'}`}>
+              <input type="radio" name="encryption" value={c.id} checked={encryption === c.id}
+                     onChange={() => setEncryption(c.id)} className="mt-1" />
+              <div>
+                <div className="text-sm font-medium">{c.label}</div>
+                <div className="text-xs text-gray-500">{c.description}</div>
+              </div>
+            </label>
+          ))}
+          {lanMode && (
+            <p className="text-xs text-gray-500">In LAN mode every export is encrypted.</p>
+          )}
+        </div>
+        {encryption === 'passphrase' && (
           <div className="mb-3 space-y-2">
             <input type="password" autoComplete="new-password" placeholder="Passphrase"
                    value={passphrase} onChange={e => setPassphrase(e.target.value)}
@@ -443,11 +528,30 @@ export default function TransferPage() {
                 <code className="text-xs break-all">{exportJob.filename}</code>
                 <span className="text-gray-500 text-xs">
                   {' '}({sizeLabel(exportJob.size_bytes)}, {exportJob.fidelity}
-                  {exportJob.encrypted ? ', encrypted' : ''}
+                  {exportJob.encryption === 'key' ? ', encrypted with a key'
+                    : exportJob.encrypted ? ', encrypted with a passphrase' : ''}
                   {exportJob.models_bundled ? ', models included' : ''}
                   {exportJob.retrieve_script ? ', with retrieve.py' : ', no retrieve.py'})
                 </span>
               </p>
+            )}
+            {exportJob.status === 'completed' && exportJob.encryption === 'key' && exportJob.key_filename && (
+              <div className="mt-2 p-3 border border-amber-300 bg-amber-50 rounded text-xs">
+                <p className="text-amber-800 mb-2">
+                  Download the key first. It opens this package and nothing else, it can be downloaded
+                  only once, and it can't be recovered. Store it apart from the package: anyone with both
+                  can read the collection.
+                </p>
+                {exportJob.key_on_server
+                  ? (
+                    <a href={api.packageDownloadUrl(exportJob.key_filename)} download
+                       onClick={() => watchKeyDownload(exportJob.job_id)}
+                       className="bg-amber-600 text-white px-3 py-1 rounded text-xs hover:bg-amber-700">
+                      Download key
+                    </a>
+                  )
+                  : <span className="text-gray-600">Key downloaded and deleted from ./exports. It can't be downloaded again.</span>}
+              </div>
             )}
             {exportJob.status === 'completed' && exportJob.filename && gone.has(exportJob.filename) && (
               <p className="mt-2 text-gray-500 text-xs">Downloaded and deleted from ./exports.</p>
@@ -507,7 +611,10 @@ export default function TransferPage() {
             <option key={p.filename} value={p.filename}>
               {p.filename}
               {p.encrypted
-                ? (p.readable ? ` — encrypted, ${sizeLabel(p.size_bytes)}` : ' — encrypted, unreadable')
+                ? (!p.readable ? ' — encrypted, unreadable'
+                  : p.encryption === 'key'
+                  ? ` — encrypted with a key, key ${p.key_on_server ? 'on' : 'not on'} the server, ${sizeLabel(p.size_bytes)}`
+                  : ` — encrypted with a passphrase, ${sizeLabel(p.size_bytes)}`)
                 : p.readable
                 ? ` — ${p.collection}, ${p.chunk_count} chunks, ${p.fidelity}, ${sizeLabel(p.size_bytes)}`
                 : ' — unreadable'}
@@ -523,7 +630,19 @@ export default function TransferPage() {
         )}
 
         {!queryOnly && (<>
-        {selectedEncrypted && (
+        {importNeeds === 'key' && (
+          <div className="mb-3">
+            <label className="block text-sm font-medium mb-1">Key file</label>
+            <input type="file" ref={keyInput} onChange={e => chooseKeyFile(e.target.files?.[0])}
+                   className="w-full text-sm" />
+            <p className="text-xs text-gray-500 mt-1">
+              This package is encrypted with its own key. Choose the key file that was downloaded
+              with it (<code>{filename}.key</code>).
+              {importKeyName && <> Chosen: <code>{importKeyName}</code>.</>}
+            </p>
+          </div>
+        )}
+        {importNeeds === 'passphrase' && (
           <div className="mb-3">
             <label className="block text-sm font-medium mb-1">Passphrase</label>
             <input type="password" autoComplete="off" value={importPassphrase}
@@ -551,7 +670,7 @@ export default function TransferPage() {
 
         <button
           onClick={startImport}
-          disabled={!filename || importBusy || (selectedEncrypted && importPassphrase === '')}
+          disabled={!filename || importBusy || importSecretMissing}
           className="bg-blue-600 text-white px-5 py-2 rounded text-sm hover:bg-blue-700 disabled:opacity-50"
         >
           {importBusy ? 'Importing…' : 'Import'}

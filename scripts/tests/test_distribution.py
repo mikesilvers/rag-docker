@@ -15,6 +15,7 @@ Runs on the host with the standard library (Python 3.9+), from the repository ro
 skipped without them. `15_transfer_paths.sh` runs it.
 """
 import gzip
+import hashlib
 import io
 import json
 import os
@@ -78,6 +79,7 @@ case "$1 $2" in
 esac
 case "$1" in
   info) exit "${STUB_INFO_RC:-0}" ;;
+  build) exit "${STUB_BUILD_RC:-0}" ;;
   save) shift; printf 'saved: %s' "$*"; exit 0 ;;
   run)
     for arg in "$@"; do
@@ -104,6 +106,17 @@ def offline_images():
     text = (ROOT / "package-offline.sh").read_text()
     block = re.search(r"^IMAGES=\(\n(.*?)^\)", text, re.S | re.M).group(1)
     return [line.strip() for line in block.splitlines() if line.strip()]
+
+
+def age_image():
+    """The tag scripts/backup-common.sh gives the age image (#852, #856): the age version and
+    the first 12 hex digits of the SHA-256 of scripts/age/Dockerfile's instruction lines
+    (comments and blank lines left out)."""
+    text = (ROOT / "scripts" / "age" / "Dockerfile").read_text()
+    version = re.search(r"^RUN apk add --no-cache age=(\S+)$", text, re.M).group(1)
+    lines = [line for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+    digest = hashlib.sha256("".join(line + "\n" for line in lines).encode()).hexdigest()
+    return f"rag-docker-age:{version}-{digest[:12]}"
 
 
 def entrypoint_models(**settings):
@@ -250,16 +263,19 @@ class OfflinePackageTests(Workspace):
             images = gzip.decompress(bundle.extractfile("rag-docker/offline/images.tar.gz").read())
             weights = bundle.extractfile("rag-docker/offline/ollama_models.tar.gz").read()
             offline = sorted(n for n in names if n.startswith("rag-docker/offline/"))
-        self.assertEqual(images.decode(), "saved: " + " ".join(offline_images()))
+        # The compose images and the age image the backup scripts run in (#852).
+        self.assertEqual(images.decode(), "saved: " + " ".join(offline_images() + [age_image()]))
         with tarfile.open(fileobj=io.BytesIO(weights), mode="r:gz") as models:
             self.assertIn("./models/blob", models.getnames())
         self.assertEqual(offline, ["rag-docker/offline/", "rag-docker/offline/images.tar.gz",
                                    "rag-docker/offline/ollama_models.tar.gz"])
         calls = self.calls()
-        self.assertEqual([c[2] for c in calls if c[:2] == ["image", "inspect"]], offline_images())
+        self.assertEqual([c[2] for c in calls if c[:2] == ["image", "inspect"]],
+                         offline_images() + [age_image()])
         self.assertIn(["volume", "inspect", "rag-docker_ollama_models"], calls)
         save = [c for c in calls if c[0] == "save"]
-        self.assertEqual(save, [["save"] + offline_images()])
+        self.assertEqual(save, [["save"] + offline_images() + [age_image()]])
+        self.assertEqual([c for c in calls if c[0] == "build"], [])
         run = next(c for c in calls if c[0] == "run")
         self.assertIn("rag-docker_ollama_models:/models:ro", run)
         self.assertIn("ollama/ollama:0.3.14", run)
@@ -277,6 +293,28 @@ class OfflinePackageTests(Workspace):
         self.assertIn("ERROR: image 'nginx:1.29-alpine' not found locally.", result.stderr)
         self.assertFalse(out.exists())
         self.assertEqual([c for c in self.calls() if c[0] in ("save", "run")], [])
+
+    def test_a_missing_age_image_is_built_from_the_bundles_source(self):
+        # Built from the staged copy of scripts/age, the one the bundle ships (#852).
+        result, out, _files = self.build({}, STUB_MISSING_IMAGES=age_image())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        builds = [c for c in self.calls() if c[0] == "build"]
+        self.assertEqual(len(builds), 1, builds)
+        self.assertEqual(builds[0][:4], ["build", "-q", "-t", age_image()])
+        context = Path(builds[0][4])
+        self.assertEqual(context.parts[-3:], ("rag-docker", "scripts", "age"))
+        self.assertNotEqual(context, (self.temp / "src" / "scripts" / "age").resolve())
+        self.assertIn(f"Building the age image {age_image()}", result.stdout)
+        save = [c for c in self.calls() if c[0] == "save"]
+        self.assertEqual(save, [["save"] + offline_images() + [age_image()]])
+        self.assertTrue(out.exists())
+
+    def test_a_failed_age_image_build_stops_before_anything_is_saved(self):
+        result, out, _files = self.build({}, STUB_MISSING_IMAGES=age_image(), STUB_BUILD_RC="1")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"could not build the age image {age_image()}", result.stderr)
+        self.assertFalse(out.exists())
+        self.assertEqual([c for c in self.calls() if c[0] == "save"], [])
 
     def test_a_missing_model_volume_stops_before_anything_is_saved(self):
         result, out, _files = self.build({}, STUB_NO_VOLUME="1")

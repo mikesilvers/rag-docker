@@ -30,6 +30,7 @@ from models.schemas import (
     PackageListResponse,
     PackageSummary,
 )
+from config import settings
 from services import age_stream, audit, exporter, importer, job_lists, package_retention, packager
 from services import weaviate_client as wc
 from services.collection_writes import CollectionDeletingError
@@ -41,8 +42,14 @@ _log = logging.getLogger(__name__)
 
 @router.post("/export", response_model=ExportStartResponse, status_code=202)
 async def start_export(body: ExportRequest, request: Request = None):
-    # The audit record's parameters (#29): whether it is encrypted, never the passphrase.
-    audit.note(collection=body.collection, include_models=body.include_models, encrypted=body.passphrase is not None)
+    # The audit record's parameters (#29): how it is encrypted, never a secret.
+    audit.note(collection=body.collection, include_models=body.include_models,
+               encrypted=body.encryption != "none", encryption=body.encryption)
+    # LAN mode exports only encrypted packages (#676).
+    if settings.rag_lan_mode and body.encryption == "none":
+        return api_error(400, "ENCRYPTION_REQUIRED",
+                         "LAN mode exports only encrypted packages: use a new key (the default) "
+                         "or a passphrase.")
     # A collection the caller may not use answers as one that doesn't exist (#606).
     if not await access.check(request, body.collection):
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{body.collection}' not found.")
@@ -61,7 +68,7 @@ async def start_export(body: ExportRequest, request: Request = None):
         job_id = await exporter.start_export_job(
             body.collection, body.include_models,
             body.passphrase.get_secret_value() if body.passphrase is not None else None,
-            owner=job_lists.job_owner(request))
+            owner=job_lists.job_owner(request), encryption=body.encryption)
     except CollectionDeletingError:
         return collection_deleting_error(body.collection)
     except exporter.ExportStartingError:
@@ -84,8 +91,24 @@ async def list_export_jobs(request: Request):
     """The caller's running and recent exports (#617; see services/job_lists)."""
     principal = request.state.auth
     def build():
-        return job_lists.entries(ExportJobEntry, job_lists.job_items(exporter.job_records()), principal)
+        rows = [(job_id, {**record, **_export_extras(record)}, saved)
+                for job_id, record, saved in exporter.job_records()]
+        return job_lists.entries(ExportJobEntry, job_lists.job_items(rows), principal)
     return ExportJobList(jobs=await asyncio.to_thread(build))
+
+
+def _export_extras(job: dict) -> dict:
+    """An export record's `encryption` (records from before #676 have none) and
+    whether its key file is still in ./exports (#676)."""
+    encryption = job.get("encryption") or ("passphrase" if job.get("encrypted") else "none")
+    name = job.get("key_filename")
+    on_server = False
+    if isinstance(name, str) and package_retention.is_key_name(name):
+        try:
+            on_server = stat.S_ISREG(os.lstat(packager.exports_dir() / name).st_mode)
+        except OSError:
+            on_server = False
+    return {"encryption": encryption, "key_on_server": on_server}
 
 
 @router.get("/export/job/{job_id}", response_model=ExportJobStatusResponse)
@@ -98,20 +121,25 @@ async def export_job_status(job_id: str, request: Request = None):
     expires = None
     if job.get("status") == "completed" and isinstance(job.get("filename"), str):
         expires = await asyncio.to_thread(package_retention.expires_at, job["filename"])
-    return ExportJobStatusResponse(**{**job, "expires_at": expires})
+    extras = await asyncio.to_thread(_export_extras, job)
+    return ExportJobStatusResponse(**{**job, **extras, "expires_at": expires})
 
 
 @router.post("/import", response_model=ImportStartResponse, status_code=202)
 async def start_import(body: ImportRequest, request: Request = None):
     # The audit record's parameters (#29); the collection is added when the job ends.
-    audit.note(package=body.filename, on_conflict=body.on_conflict, encrypted=body.passphrase is not None)
+    # Which secret was sent, never the secret (#676).
+    encryption = "key" if body.key is not None else "passphrase" if body.passphrase is not None else "none"
+    audit.note(package=body.filename, on_conflict=body.on_conflict, encrypted=encryption != "none",
+               encryption=encryption)
     # Everything else — unreadable archive, bad digest, embedding mismatch,
     # name collision — is reported through the job, because it is only knowable
     # after reading the package, which takes long enough to need a job.
     passphrase = body.passphrase.get_secret_value() if body.passphrase is not None else None
+    key = body.key.get_secret_value() if body.key is not None else None
     try:
         job_id = await importer.start_import_job(body.filename, body.on_conflict, passphrase,
-                                                 owner=job_lists.job_owner(request))
+                                                 owner=job_lists.job_owner(request), key=key)
     except importer.PassphraseError as exc:
         # Decided by the filename before any job exists (#27).
         return api_error(400, exc.code, str(exc), detail={"filename": body.filename})
@@ -143,17 +171,19 @@ async def import_job_status(job_id: str, request: Request = None):
 def _summary(p: Path) -> dict:
     """One package as the listing shows it."""
     if age_stream.is_encrypted_name(p.name):
-        # No metadata without the passphrase, and no scrypt to list (#27).
+        # No metadata without the passphrase or key, and no scrypt or X25519 to
+        # list (#27); the header says which of the two opens it (#676).
         try:
             with p.open("rb") as fh:
-                readable = age_stream.check_header(fh)
+                kind = age_stream.header_kind(fh)
             size = p.stat().st_size
         except Exception:                             # noqa: BLE001
             # One bad file never breaks the listing of the others.
-            readable, size = False, 0
+            kind, size = None, 0
         return {"filename": p.name, "size_bytes": size,
                 "collection": None, "chunk_count": None, "fidelity": None,
-                "created_at": None, "readable": readable, "encrypted": True}
+                "created_at": None, "readable": kind is not None, "encrypted": True,
+                "encryption": kind}
     try:
         fields = packager.listing_fields(packager.read_manifest(p))
     except Exception:
@@ -162,19 +192,30 @@ def _summary(p: Path) -> dict:
         # will report precisely why it cannot be used.
         return {"filename": p.name, "size_bytes": p.stat().st_size,
                 "collection": None, "chunk_count": None,
-                "fidelity": None, "created_at": None, "readable": False}
+                "fidelity": None, "created_at": None, "readable": False, "encryption": "none"}
     return {
         "filename": p.name,
         "size_bytes": p.stat().st_size,
         **fields,
         "readable": True,
+        "encryption": "none",
     }
+
+
+def _key_on_server(root: Path, filename: str) -> bool:
+    """A regular file `<filename>.key` is in ./exports (#676)."""
+    try:
+        return stat.S_ISREG(os.lstat(root / (filename + ".key")).st_mode)
+    except OSError:
+        return False
 
 
 def _list_packages_sync() -> list[dict]:
     root = packager.exports_dir()
     expiries = package_retention.expiries()
-    return [{**_summary(p), "expires_at": expiries.get(p.name)}
+    # Key files (#676) are not packages: the two globs never match `*.key`.
+    return [{**_summary(p), "expires_at": expiries.get(p.name),
+             "key_on_server": age_stream.is_encrypted_name(p.name) and _key_on_server(root, p.name)}
             for p in sorted([*root.glob("ragpkg-*.tar.gz"), *root.glob("ragpkg-*" + age_stream.ENCRYPTED_SUFFIX)])]
 
 
@@ -349,7 +390,14 @@ async def download_package(filename: str, request: Request = None):
         return _package_not_found(filename)
     # The listing's access rule (#606): a package hidden from the caller there
     # answers as one that doesn't exist, and the refusal is audited.
-    summary = await asyncio.to_thread(_summary, path)
+    if package_retention.is_key_name(filename):
+        # A key file (#676) is served only when it was exported here, under its
+        # package's access: the collection recorded with it (#606/#794).
+        if not await asyncio.to_thread(package_retention.recorded, filename):
+            return _package_not_found(filename)
+        summary = {"filename": filename, "encrypted": True}
+    else:
+        summary = await asyncio.to_thread(_summary, path)
     refused = await _hidden(access.principal_of(request), [summary])
     if filename in refused:
         collection = refused[filename]

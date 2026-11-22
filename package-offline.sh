@@ -10,7 +10,9 @@
 #   * the source tree: the files git tracks in the current commit (HEAD),
 #     built with `git archive`, exactly as package.sh does. Untracked and
 #     ignored files and uncommitted changes are left out (#384).
-#   * all five Docker images, pre-built (docker save)
+#   * all five Docker images, pre-built (docker save), and the age image that
+#     scripts/backup.sh and scripts/restore.sh run in (#852), so backups work
+#     on the target with no network
 #   * the Ollama model weights (by default llama3.1:8b + nomic-embed-text; a
 #     different build or answer LLM too, #671), the whole model volume: a model
 #     left in it, such as phi3.5 from before 1.2.1, is carried too
@@ -106,8 +108,15 @@ echo "==> Copying source (tracked files of the current commit)"
 # root and the user cannot drop files into ./ingest-inbox.
 git archive --format=tar HEAD | ( cd "$STAGE/rag-docker" && tar xf - )
 
+# The age image, tagged from the bundle's own scripts/age/Dockerfile (the copy
+# just archived), so the backup scripts on the target find it and never build.
+# It is built here if this machine doesn't have it (this needs the network).
+echo "==> Checking the age image for scripts/backup.sh and scripts/restore.sh"
+. "$STAGE/rag-docker/scripts/backup-common.sh"
+rb_image
+
 echo "==> Saving images (this is the slow part)"
-docker save "${IMAGES[@]}" | gzip > "$STAGE/rag-docker/offline/images.tar.gz"
+docker save "${IMAGES[@]}" "$RB_IMAGE" | gzip > "$STAGE/rag-docker/offline/images.tar.gz"
 
 if [ "$TELEMETRY" = 1 ]; then
   echo "==> Saving optional pinned collector (Python 3.11+ required)"

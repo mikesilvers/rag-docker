@@ -25,12 +25,12 @@ def check(name, ok, detail=""):
     if not ok: fails.append(name)
 
 # E5 — filename (§4.1)
-NAME_RE = re.compile(r"^ragpkg-([a-z0-9]+(?:-[a-z0-9]+)*)-(\d{8}T\d{6}Z)-([0-9a-f]{8})\.tar\.gz(?:\.age)?$")
+NAME_RE = re.compile(r"^ragpkg-([a-z0-9]+(?:-[a-z0-9]+)*)-(\d{8}T\d{6}Z)-([0-9a-f]{8})(?:-([1-9][0-9]*))?\.tar\.gz(?:\.age)?$")
 m = NAME_RE.match(archive.name)
 check("E5 filename matches the §4.1 pattern", m is not None, archive.name)
 if not m:
     sys.exit(1)
-slug, ts, id8 = m.groups()
+slug, ts, id8, _n = m.groups()   # -<n>: a same-second export (#860)
 
 with tempfile.TemporaryDirectory() as td:
     source = archive

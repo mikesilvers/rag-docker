@@ -68,7 +68,7 @@ api_post "/ingest/config" "{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\
 api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":6,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
 
 # ── export ───────────────────────────────────────────────────────────────────
-api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_exp.json
+api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_exp.json
 ejob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_exp.json'))['job_id'])")
 estatus=$(wait_for_job "/export/job/$ejob" 1800)
 check_eq "export completes" "$estatus" "completed"
@@ -240,7 +240,7 @@ e30_collections create > /tmp/vfy_e30_setup.txt 2>&1
 check "E30: mismatch fixtures created on the verify project" $? "$(tail -1 /tmp/vfy_e30_setup.txt)"
 for e30c in "$E30_DRIFT" "$E30_NAMED" "$E30_NONE"; do
   before=$(ls -A "$EXPORTS" | sort)
-  api_post "/export" "{\"collection\":\"$e30c\",\"include_models\":true}" > /tmp/vfy_e30_exp.json
+  api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$e30c\",\"include_models\":true}" > /tmp/vfy_e30_exp.json
   e30job=$(jfield "['job_id']" < /tmp/vfy_e30_exp.json)
   e30status=$(wait_for_job "/export/job/$e30job" 600)
   e30err=$(api_get "/export/job/$e30job" | jfield "['error']")
@@ -550,7 +550,7 @@ check "E29: the refusal doesn't echo the outside path or its contents" $?
 read -r e29stat e29name <<<"$(python3 -c "
 import json; d=json.load(open('/tmp/vfy_e29job.json')); print(d['status'], d.get('collection') or '-')")"
 if [ "$e29stat" = "completed" ] && [ "$e29name" != "-" ]; then
-  api_post "/export" "{\"collection\":\"$e29name\",\"include_models\":false}" > /tmp/vfy_e29exp.json
+  api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$e29name\",\"include_models\":false}" > /tmp/vfy_e29exp.json
   wait_for_job "/export/job/$(jfield "['job_id']" < /tmp/vfy_e29exp.json)" 1800 >/dev/null
 fi
 check_eq "E29: a refused rename import creates no collection" "$(collection_names)" "$names_before"
@@ -626,7 +626,7 @@ import json; d=json.load(open('/tmp/vfy_e29job.json')); print(d['status'], d.get
 done
 
 # The valid in-directory source still round-trips after the refusals.
-api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_e29exp.json
+api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_e29exp.json
 e29job=$(jfield "['job_id']" < /tmp/vfy_e29exp.json)
 check_eq "E29: the collection still exports after refused imports" \
   "$(wait_for_job "/export/job/$e29job" 1800)" "completed"
@@ -677,7 +677,7 @@ ENDPY
 for mode in abs link; do
   plant "$mode"
   check "E29: planted a $mode source entry on disk" $?
-  api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_e29exp.json
+  api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_e29exp.json
   check_eq "E29: export refuses an on-disk $mode source entry" \
     "$(wait_for_job "/export/job/$(jfield "['job_id']" < /tmp/vfy_e29exp.json)" 1800)" "failed"
   leak=$(no_sentinel_in_exports); check "E29: ... and archives no outside bytes ($mode)" $? "$leak"
@@ -831,7 +831,7 @@ rjob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_replace.json'))['j
 rstatus=$(wait_for_job "/import/job/$rjob" 1800)
 check_eq "replace completes after verified final writes" "$rstatus" "completed"
 check_eq "replace reports confirmed target objects" "$(api_get "/import/job/$rjob" | jfield "['chunks_written']")" "$chunks_before"
-api_post "/export" "{\"collection\":\"$C\"}" > /tmp/vfy_replace_exp.json
+api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$C\"}" > /tmp/vfy_replace_exp.json
 rejob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_replace_exp.json'))['job_id'])")
 wait_for_job "/export/job/$rejob" 1800 >/dev/null
 RPKG=$(api_get "/export/job/$rejob" | jfield "['filename']")
@@ -839,7 +839,7 @@ RPKG=$(api_get "/export/job/$rejob" | jfield "['filename']")
 check "replace fidelity compares an independent re-export" $?
 
 # ── import is lossless ───────────────────────────────────────────────────────
-api_post "/export" "{\"collection\":\"$iname\"}" > /tmp/vfy_exp2.json
+api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$iname\"}" > /tmp/vfy_exp2.json
 ejob2=$(python3 -c "import json;print(json.load(open('/tmp/vfy_exp2.json'))['job_id'])")
 wait_for_job "/export/job/$ejob2" 1800 >/dev/null
 PKG2=$(api_get "/export/job/$ejob2" | jfield "['filename']")
@@ -1244,7 +1244,7 @@ ENDPY
   check "a 30,000-chunk collection is built for the interrupted export" $? \
     "$(grep -E 'Error' /tmp/vfy_xrestart_prepare.log | tail -1)"
   builds_before=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/uploads/export-* 2>/dev/null' | sort)
-  api_post "/export" "{\"collection\":\"$XR\",\"include_models\":false}" > /tmp/vfy_xrestart_start.json
+  api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$XR\",\"include_models\":false}" > /tmp/vfy_xrestart_start.json
   xjob=$(jfield "['job_id']" < /tmp/vfy_xrestart_start.json)
   state=""
   for _ in $(seq 1 600); do
@@ -1303,7 +1303,7 @@ ENDPY
   # An import killed part-way reads `failed` with INTERRUPTED (#309): the same
   # collection, exported whole, dropped and imported back. The startup sweep
   # removes the half-built collection the killed import leaves.
-  api_post "/export" "{\"collection\":\"$XR\",\"include_models\":false}" > /tmp/vfy_irestart_export.json
+  api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$XR\",\"include_models\":false}" > /tmp/vfy_irestart_export.json
   xpkg_job=$(jfield "['job_id']" < /tmp/vfy_irestart_export.json)
   xpkg_status=$(wait_for_job "/export/job/$xpkg_job" 1800)
   xpkg=$(api_get "/export/job/$xpkg_job" | jfield "['filename']")
@@ -1371,7 +1371,7 @@ check_eq "#372: the upload completes" \
 api_get "/tune/$SC" > /tmp/vfy_sp_tune.json
 check_eq "#372: '$SC' finds the originals uploaded as '$SL' (re-chunk offered)" \
   "$(jfield "['can_rechunk']" < /tmp/vfy_sp_tune.json)" "True"
-api_post "/export" "{\"collection\":\"$SC\",\"include_models\":false}" > /tmp/vfy_sp_exp.json
+api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$SC\",\"include_models\":false}" > /tmp/vfy_sp_exp.json
 spjob=$(jfield "['job_id']" < /tmp/vfy_sp_exp.json)
 check_eq "#372: the export of '$SC' completes" "$(wait_for_job "/export/job/$spjob" 1800)" "completed"
 api_get "/export/job/$spjob" > /tmp/vfy_sp_expjob.json
@@ -1410,7 +1410,7 @@ r = [r for r in json.load(sys.stdin)['records'] if r['details'].get('file') == s
 sys.exit(0 if r and eval(sys.argv[2], {'r': r[0]}) else 1)" "$2" "$3"
 }
 
-api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_dl_exp.json
+api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_dl_exp.json
 djob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_dl_exp.json'))['job_id'])")
 check_eq "#677: an export to download completes" "$(wait_for_job "/export/job/$djob" 1800)" "completed"
 DPKG=$(api_get "/export/job/$djob" | jfield "['filename']")
@@ -1458,6 +1458,198 @@ check_eq "#677: an End User is refused GET /packages/{filename}" \
 retention exists "$NPKG"
 check "#677: ... and the package stays" $?
 retention remove "$NPKG"
+
+# ── a key export: encrypted by default, a new key each time (#676) ───────────
+# A default export writes <package>.tar.gz.age and <package>.key (0600) and
+# never a plain archive; each export has its own key; import needs the key
+# file's text; a full download of the key deletes the key and keeps the package.
+key_export() {   # key_export <outfile>: start a default export, print its job id
+  api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > "$1"
+  python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['job_id'])" "$1"
+}
+kjob=$(key_export /tmp/vfy_key_exp.json)
+check_eq "#676: a default export completes" "$(wait_for_job "/export/job/$kjob" 1800)" "completed"
+api_get "/export/job/$kjob" > /tmp/vfy_key_job.json
+KPKG=$(jfield "['filename']" < /tmp/vfy_key_job.json)
+KKEY=$(jfield "['key_filename']" < /tmp/vfy_key_job.json)
+check_eq "#676: ... encrypted with a new key" "$(jfield "['encryption']" < /tmp/vfy_key_job.json)" "key"
+check_eq "#676: ... its key file is <package>.key" "$KKEY" "$KPKG.key"
+check_eq "#676: ./exports holds exactly the package and its key file for it" \
+  "$(ls -A "$EXPORTS" | grep -F "${KPKG%.tar.gz.age}" | sort | tr '\n' ' ')" "$KPKG $KKEY "
+check_eq "#676: the key file's mode is 600" \
+  "$(cd "$REPO_ROOT" && docker compose exec -T api stat -c %a "/app/exports/$KKEY" | tr -d '\r')" "600"
+kpub=$(cd "$REPO_ROOT" && docker compose exec -T api grep '^# public key: ' "/app/exports/$KKEY" | tr -d '\r')
+
+# Two key builds of one collection in the same second (#860), run in the API
+# container with the build's clock fixed to a past second no export uses: the
+# second gets `-2` (RAG_EXPORT_SPECIFICATIONS.md §4.1) and all four files are
+# kept. The collision is forced: two real builds of one collection can differ
+# in <id8> (chunks.jsonl's key order follows Weaviate's, #863), so both builds
+# are given the first build's plain stem through a wrapped package_stem. Only
+# these builds are patched; export output is unchanged. Every file the builds open for writing in ./exports is recorded through
+# Python's `open` audit event, so "no unencrypted archive" is checked on each
+# write instead of by sampling the folder (#860): only the encrypted package's
+# and the key's temporaries are written, and each package is an age file.
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$C") > /tmp/vfy_same_second.txt 2>&1 <<'ENDPY'
+import hashlib, os, sys
+sys.path.insert(0, "/app")
+from datetime import datetime, timezone
+from unittest.mock import patch
+from services import age_stream, packager
+
+exports = packager.exports_dir()
+root = os.path.abspath(exports)
+writes, recording = [], [False]
+WRITE = os.O_WRONLY | os.O_RDWR | os.O_CREAT
+
+
+def hook(event, args):
+    if recording[0] and event == "open" and isinstance(args[0], str) and isinstance(args[2], int) \
+            and args[2] & WRITE and os.path.dirname(os.path.abspath(args[0])) == root:
+        writes.append(os.path.basename(args[0]))
+
+
+def check(ok, name, detail=""):
+    print(f"{0 if ok else 1}|{name}|{detail}".replace("\n", " "))
+
+
+def digest(name):
+    return hashlib.sha256((exports / name).read_bytes()).hexdigest()
+
+
+real_stem, stems = packager.package_stem, []
+
+
+def forced_stem(collection, when, id8):
+    # Every build gets the first build's <id8>, so the second's plain stem is taken.
+    stems.append(real_stem(collection, when, stems[0].rsplit("-", 1)[1] if stems else id8))
+    return stems[-1]
+
+
+sys.addaudithook(hook)
+built = []
+try:
+    with patch.object(packager, "_now", return_value=datetime(2001, 1, 1, tzinfo=timezone.utc)), \
+         patch.object(packager, "package_stem", forced_stem):
+        recording[0] = True
+        built.append(packager.build(sys.argv[1], key=True))
+        kept = {built[0][k]: digest(built[0][k]) for k in ("filename", "key_filename")}
+        built.append(packager.build(sys.argv[1], key=True))
+        recording[0] = False
+    first, second = built
+    stem = first["filename"][:-len(age_stream.ENCRYPTED_SUFFIX)]
+    check(second["filename"] == stem + "-2" + age_stream.ENCRYPTED_SUFFIX,
+          "#860: two exports of one collection in the same second get distinct names, the second -2",
+          f'{first["filename"]} / {second["filename"]}')
+    check(len(stems) == 2 and stems == [stem, stem],
+          "#860: ... the second build was given the first build's name, which was taken", " / ".join(stems))
+    check(all(digest(n) == d for n, d in kept.items()),
+          "#860: ... and the first build's package and key file are unchanged", " ".join(kept))
+    names = [r[k] for r in built for k in ("filename", "key_filename")]
+    check(all((exports / n).is_file() for n in names),
+          "#860: ... and both packages and both key files are kept", " ".join(names))
+    texts = [(exports / r["key_filename"]).read_text() for r in built]
+    publics = [next(l for l in t.splitlines() if l.startswith("# public key: ")) for t in texts]
+    check(publics[0] != publics[1] and all(r["filename"] in t for r, t in zip(built, texts)),
+          "#860: ... each key file holds its own key and names its own package", " / ".join(publics))
+    temps = {f".{n}.partial" for n in names}
+    check(bool(writes) and set(writes) <= temps,
+          "#676: a key build writes only the package's and the key's temporaries in ./exports",
+          " ".join(writes))
+    check(not any(w.endswith(".tar.gz") or w.endswith(".tar.gz.partial") for w in writes),
+          "#676: ... and never an unencrypted archive", " ".join(writes))
+    heads = []
+    for r in built:
+        with (exports / r["filename"]).open("rb") as fh:
+            heads.append(fh.read(len(age_stream.VERSION_LINE)))
+    check(all(h == age_stream.VERSION_LINE for h in heads),
+          "#676: ... and each placed package is an age file", repr(heads))
+finally:
+    for r in built:
+        for k in ("filename", "key_filename"):
+            if r.get(k):
+                (exports / r[k]).unlink(missing_ok=True)
+ENDPY
+[ "$(grep -c '^[01]|' /tmp/vfy_same_second.txt)" = "8" ]
+check "#860: the same-second check ran all eight of its checks" $? "$(tail -5 /tmp/vfy_same_second.txt | tr '\n' ' ')"
+while IFS='|' read -r rc name detail; do
+  check "$name" "$rc" "$detail"
+done < <(grep '^[01]|' /tmp/vfy_same_second.txt)
+
+kjob2=$(key_export /tmp/vfy_key_exp2.json)
+check_eq "#676: a second default export completes" "$(wait_for_job "/export/job/$kjob2" 1800)" "completed"
+api_get "/export/job/$kjob2" > /tmp/vfy_key_job2.json
+KPKG2=$(jfield "['filename']" < /tmp/vfy_key_job2.json); KKEY2=$(jfield "['key_filename']" < /tmp/vfy_key_job2.json)
+check_eq "#676: the two exports are two packages (different names)" "$([ "$KPKG2" != "$KPKG" ] && echo different || echo "same: $KPKG")" "different"
+kpub2=$(cd "$REPO_ROOT" && docker compose exec -T api grep '^# public key: ' "/app/exports/$KKEY2" | tr -d '\r')
+[ -n "$kpub" ] && [ -n "$kpub2" ] && [ "$kpub" != "$kpub2" ]
+check "#676: each export has its own key" $? "$kpub / $kpub2"
+
+code=$(post_code "/import" "{\"filename\":\"$KPKG\",\"on_conflict\":\"rename\"}" /tmp/vfy_key_nokey.json)
+check_eq "#676: import without the key is refused 400" "$code" "400"
+check_eq "#676: ... KEY_FILE_REQUIRED" "$(jfield "['error']['code']" < /tmp/vfy_key_nokey.json)" "KEY_FILE_REQUIRED"
+
+kcode=$(curl -s -o /tmp/vfy_key.txt -m 120 -w '%{http_code}' "$API/packages/$KKEY")
+check_eq "#676: GET /packages/<package>.key downloads the key file" "$kcode" "200"
+grep -q '^AGE-SECRET-KEY-1' /tmp/vfy_key.txt
+check "#676: ... an age key file" $?
+[ ! -e "$EXPORTS/$KKEY" ] && [ -e "$EXPORTS/$KPKG" ]
+check "#676: the key's full download deletes the key and keeps the package" $?
+api_get "/packages" | python3 -c "
+import json, sys
+p = next(p for p in json.load(sys.stdin)['packages'] if p['filename'] == sys.argv[1])
+sys.exit(0 if p['encryption'] == 'key' and p['key_on_server'] is False else 1)" "$KPKG"
+check "#676: GET /packages says the package is a key package whose key is no longer on the server" $?
+
+python3 - "$KPKG" /tmp/vfy_key.txt > /tmp/vfy_key_import_body.json <<'ENDPY'
+import json, sys
+print(json.dumps({"filename": sys.argv[1], "on_conflict": "rename", "key": open(sys.argv[2]).read()}))
+ENDPY
+api_post "/import" "@/tmp/vfy_key_import_body.json" > /tmp/vfy_key_imp.json
+kimp=$(jfield "['job_id']" < /tmp/vfy_key_imp.json)
+check_eq "#676: import with the key file completes" "$(wait_for_job "/import/job/$kimp" 1800)" "completed"
+kcoll=$(api_get "/import/job/$kimp" | jfield "['collection']")
+[ -n "$kcoll" ] && [ "$kcoll" != "None" ] && drop_collection "$kcoll"
+# A wrong key (reviewer, #676): the first package's key on the second package
+# fails the job DECRYPT_FAILED (reason key), names no key, and touches nothing.
+state_before=$(enc_state)
+ksum() { python3 -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$EXPORTS/$KPKG2"; }
+ksum_before=$(ksum)
+python3 - "$KPKG2" /tmp/vfy_key.txt > /tmp/vfy_key_wrong_body.json <<'ENDPY'
+import json, sys
+print(json.dumps({"filename": sys.argv[1], "on_conflict": "replace", "key": open(sys.argv[2]).read()}))
+ENDPY
+api_post "/import" "@/tmp/vfy_key_wrong_body.json" > /tmp/vfy_key_wrong.json
+kwjob=$(jfield "['job_id']" < /tmp/vfy_key_wrong.json)
+wait_for_job "/import/job/$kwjob" 900 >/dev/null
+api_get "/import/job/$kwjob" > /tmp/vfy_key_wrong_job.json
+python3 - /tmp/vfy_key_wrong_job.json > /tmp/vfy_key_wrong.txt 2>&1 <<'ENDPY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(d["status"], d["error_code"], d["error_detail"], d.get("encryption"))
+sys.exit(0 if d["status"] == "failed" and d["error_code"] == "DECRYPT_FAILED"
+         and d["error_detail"] == {"reason": "key"} and d.get("encryption") == "key"
+         and "AGE-SECRET-KEY" not in json.dumps(d) else 1)
+ENDPY
+check "#676: a wrong key fails the import DECRYPT_FAILED (reason key) and the job names no key" $? "$(tail -1 /tmp/vfy_key_wrong.txt)"
+[ "$(enc_state)" = "$state_before" ] && [ "$(ksum)" = "$ksum_before" ]
+check "#676: ... and touches nothing: collections, their counts and the package file unchanged" $?
+rm -f /tmp/vfy_key_wrong_body.json
+
+# The package's full download leaves its key (reviewer, #676): each file is
+# deleted by its own download, so downloading the package first never loses the key.
+check_eq "#676: the second package downloads" "$(curl -s -o /dev/null -m 600 -w '%{http_code}' "$API/packages/$KPKG2")" "200"
+[ ! -e "$EXPORTS/$KPKG2" ] && [ -e "$EXPORTS/$KKEY2" ]
+check "#676: the package's full download deletes the package and keeps its key file" $?
+check_eq "#676: ... and the export job still says its key is on the server" \
+  "$(api_get "/export/job/$kjob2" | jfield "['key_on_server']")" "True"
+check_eq "#676: the key file still downloads after its package" \
+  "$(curl -s -o /dev/null -m 120 -w '%{http_code}' "$API/packages/$KKEY2")" "200"
+[ ! -e "$EXPORTS/$KKEY2" ]
+check "#676: ... and its full download deletes it" $?
+rm -f /tmp/vfy_key.txt /tmp/vfy_key_import_body.json
+# A full download deletes each remaining file (#677, #676): that is the clean-up.
+curl -s -o /dev/null -m 600 "$API/packages/$KPKG"
 
 # ── verified recovery across an API restart (#43, #44; opt-in: restarts the API) ──
 RP="${PREFIX}BatchRecovery"

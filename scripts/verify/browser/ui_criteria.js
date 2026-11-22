@@ -85,8 +85,8 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     for (const p of ['/qa', '/collections', '/health', '/qa']) {
       await s.page.goto(BASE + p, { waitUntil: 'networkidle2' }); await sleep(500);
     }
-    const pages = (await readNav(s.page).catch(() => ({ pages: [] }))).pages;  // the Engineer's 12: Q&A and the menus' 11 (#616, Prepare #638)
-    r.check('the session survives navigation and reloads', pages.length === 12, JSON.stringify(pages));
+    const pages = (await readNav(s.page).catch(() => ({ pages: [] }))).pages;  // the Engineer's 13: Q&A and the menus' 12 (#616, Prepare #638, Groups #784)
+    r.check('the session survives navigation and reloads', pages.length === 13, JSON.stringify(pages));
     await chooseFromMenu(s.page, 'account', 'Log out').catch(() => {});
     await s.page.waitForFunction(() => location.pathname === '/login', { timeout: 10000 }).catch(() => {});
     const me = await s.page.evaluate(async () => (await fetch('/api/auth/me')).status);
@@ -188,7 +188,7 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     const s = await session(browser, BASE, 'engineer');
     await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' }); await sleep(1500);
     const links = (await readNav(s.page).catch(() => ({ pages: [] }))).pages;  // through the menus (#616)
-    for (const want of ['Q&A', 'Import', 'Prepare', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health', 'Users', 'Service keys', 'Audit']) {
+    for (const want of ['Q&A', 'Import', 'Prepare', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health', 'Users', 'Service keys', 'Groups', 'Audit']) {
       r.check(`Engineer nav includes ${want}`, links.includes(want), JSON.stringify(links));
     }
     await s.ctx.close();

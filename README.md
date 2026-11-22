@@ -130,9 +130,13 @@ low, `403 FORBIDDEN`. Programs use service API keys instead of a session
 user: anyone with the role may poll or open them, if they may use the collection.
 
 **Who may use each collection** (#606). On top of the role, each collection is
-*open* (every account whose role allows it) or *restricted* to the people and
-service principals an AI Engineer grants it; AI Engineers reach every
-collection. A **new collection starts restricted to whoever made it**: one
+*open* (every account whose role allows it) or *restricted* to the people,
+service principals and groups an AI Engineer grants it; AI Engineers reach every
+collection. A **group** (#784, the **Groups** page in the Admin menu) holds
+people and service principals: its members may use the collections granted to
+it while they are members, and a change to a group applies to everyone's next
+request. Deleting a group removes its grants and never opens a collection.
+A **new collection starts restricted to whoever made it**: one
 created on the Collections page or with **+ New** on the Import page, or by an
 import under a new name (an import next to an existing collection copies that
 collection's access). End Users and other Developers don't see it until an AI
@@ -583,7 +587,10 @@ audit log, health, and export with the package list and download.
 ### Two machines: export, copy, load, query
 
 1. **Export** on the build machine (the Transfer page). The package is written
-   to that machine's `./exports/`. Copy it off in time: a package exported
+   to that machine's `./exports/`, encrypted to a new key by default, with its
+   key file beside it. Download the key file (**Download key**, or `curl`; on a
+   Linux host the key file belongs to root, so download it rather than copying
+   it) and keep it apart from the package until the load. Copy the package off in time: a package exported
    there is deleted `EXPORT_RETENTION_HOURS` after its export (24 hours by
    default), or as soon as it has been fully downloaded through the API
    ([Downloading a package](#downloading-a-package-and-when-packages-are-deleted)).
@@ -614,9 +621,12 @@ audit log, health, and export with the package list and download.
    newer build over the existing collection. While any load runs, whatever
    its mode, a question or export of its collection can meet it half-built or
    fail: wait for the loader to finish. For an encrypted package
-   (`.tar.gz.age`) the loader asks for the passphrase, or reads it as the first
-   line of standard input with `docker compose exec -T api python -m loader
-   <package> < passphrase-file`; it is never an argument. One load runs at a
+   (`.tar.gz.age`) its age header says which secret opens it. A key package
+   reads its key file on standard input, `docker compose exec -T api python -m
+   loader <package> < <package>.key`, or asks for the `AGE-SECRET-KEY-1...` line
+   without echo on a terminal (`KEY_FILE_REQUIRED`, `KEY_FILE_INVALID` refuse the load). A
+   passphrase package asks for the passphrase, or reads it as the first line of
+   standard input with `... < passphrase-file`. Neither is ever an argument. One load runs at a
    time. Each step is a line starting `loader:`; the exit status is 0 loaded,
    1 refused or failed, 2 a usage error; each run is an `operator.load` record
    in the [audit log](#audit-log), with result `success`, `refused` (before the
@@ -655,7 +665,7 @@ the build model is the answer model (for example `BUILD_LLM_MODEL` equal to
 
 **AI Engineers** can manage collections, including deleting them, from the dedicated **Collections** page. **Developers** can create a collection inline from the Import page using the **+ New** button next to the collection selector.
 
-A new collection is restricted to the account that created it (#606). For End Users or other Developers to see it, an AI Engineer opens it, or grants it to them, with **Access** on the Collections page ([Who may use each collection](#accounts-and-roles)).
+A new collection is restricted to the account that created it (#606). For End Users or other Developers to see it, an AI Engineer opens it, or grants it to them or to a group they belong to, with **Access** on the Collections page ([Who may use each collection](#accounts-and-roles)).
 
 A collection is a named vector index that holds chunks from one or more documents. Choose HNSW (approximate, fast) or Flat (exact, slower at scale).
 
@@ -774,6 +784,8 @@ replaces a changed file instead of rewriting it, so a running proxy keeps readin
 ## Updating to a newer version
 
 Run these commands in the `rag-docker` folder. Your collections, accounts and downloaded models are kept: they live in Docker volumes that these steps don't touch. There are two ways to get the new code: the latest release, for normal use, or `develop`, for testing.
+
+Back up first: [Backing up and restoring](#backing-up-and-restoring) makes an encrypted copy of your data that you can restore if the update goes wrong.
 
 Coming from 1.1.0? Follow [Upgrading from 1.1.0 to 1.2.0](#upgrading-from-110-to-120) first: it includes these steps.
 
@@ -933,6 +945,8 @@ Follow these steps once, to move an instance from 1.1.0 to 1.2.0. The first star
 
    The throwaway container is alpine 3.24.4, pinned by its digest; Docker downloads it (a few MB) if this machine doesn't have it. git ignores the `backups/` folder: switching to another branch or tag leaves the backups in place, and they don't go into packages.
 
+   These `.tgz` files are **not encrypted**: anyone who can read them can read your documents, password hashes and sessions. Delete them (`rm -r backups`) once 1.2.0 runs and you no longer need to roll back. This block is for a 1.1.0 instance, which doesn't have the backup scripts; for later updates, use [Backing up and restoring](#backing-up-and-restoring), which encrypts every backup.
+
 3. **Check your local compose override, if you keep one.** Carry over the new settings in `docker-compose.yml`, all with working defaults: `MAX_ZIP_EXPANDED_BYTES`, `MAX_ZIP_MEMBERS`, `MAX_ZIP_MEMBER_RATIO`, `MAX_PACKAGE_EXPANDED_BYTES`, `MAX_PACKAGE_MEMBERS`, `AUTH_COOKIE_SECURE`, `AUDIT_LOG_QUESTIONS`, `AUDIT_LOG_MAX_BYTES`, `AUDIT_LOG_KEEP`, `PREPARATION_DIR`, `MAX_PREPARATION_BYTES`, `HF_HUB_OFFLINE` and `TRANSFORMERS_OFFLINE`. If it publishes the proxy on an address other than `127.0.0.1`, switch to LAN mode (`docker-compose.lan.yml`) instead. Do that after step 6: LAN mode won't start without an AI Engineer.
 
 **Update**
@@ -1056,6 +1070,21 @@ In LAN mode, stop with `docker compose -f docker-compose.yml -f docker-compose.l
 
   `package-offline.sh` bundles the whole model volume, so remove phi3.5 before building an offline bundle, or the bundle carries it too.
 
+### Upgrading to 1.3.1: exports are encrypted by default
+
+From 1.3.1 every export is encrypted unless you say otherwise (#676). An export
+request that sends no `passphrase` now writes a package encrypted to a new key of
+its own, `ragpkg-...tar.gz.age`, and its key file `ragpkg-...tar.gz.age.key` beside
+it ([Encrypting a package](#encrypting-a-package)).
+
+- **Scripts that export.** A script that exports without a passphrase and then
+  reads the `.tar.gz` gets a `.tar.gz.age` and a key file instead. Download the
+  key file too, and import with its text as `key`. To keep writing an unencrypted
+  package, send `"encryption": "none"`; LAN mode refuses that
+  (`400 ENCRYPTION_REQUIRED`).
+- **Packages exported before 1.3.1** import as before: an unencrypted `.tar.gz`
+  with no secret, a passphrase `.tar.gz.age` with its passphrase.
+
 ## GPU acceleration (optional)
 
 To use a CUDA GPU for Ollama, uncomment the `deploy` block in `docker-compose.yml`:
@@ -1136,7 +1165,62 @@ Six named Docker volumes persist data across restarts:
 | `rag_preparation` | The preparation area (#638): raw documents uploaded on **Data → Prepare** and their prepared parts, until deleted. At most `MAX_PREPARATION_BYTES`. Not part of collection export packages |
 | `auth_data` | Accounts, password hashes, sessions and the login throttle (`auth.db`, SQLite, #25); two-step verification (#607): sealed TOTP secrets, recovery-code hashes and the switch in `auth.db`, and the sealing key `mfa.key` |
 
-Run `docker compose down -v` to delete all volumes and start fresh. Updating keeps every volume; see [Don't run these](#dont-run-these) for the commands that delete them.
+LAN mode adds a seventh, `lan_certs`: the certificate and key it serves ([Sharing with your office](#sharing-with-your-office)).
+
+Run `docker compose down -v` to delete all volumes and start fresh. Updating keeps every volume; see [Don't run these](#dont-run-these) for the commands that delete them. To keep a copy of them, see [Backing up and restoring](#backing-up-and-restoring).
+
+## Backing up and restoring
+
+`scripts/backup.sh` makes an encrypted backup of the stack's data, and `scripts/restore.sh` puts it back. Run them in the `rag-docker` folder.
+
+**What is backed up.** Every named volume except `ollama_models`, which holds only models the stack downloads again: `weaviate_data`, `ingest_uploads`, `rag_sources`, `rag_preparation`, `auth_data`, and `lan_certs` if you have used LAN mode. A volume that doesn't exist is skipped, with a message.
+
+### Making a backup
+
+```bash
+scripts/backup.sh
+```
+
+The script:
+
+1. finds the volume prefix: the compose project name, usually the folder name (`rag-docker`, so the volumes are `rag-docker_weaviate_data` and so on). If no volume has that prefix, it stops and lists the prefixes that have rag-docker volumes; pass the right one with `--prefix <name>`;
+2. lists each volume it found with the number of files and folders in it (`(empty)` for an empty one: if a volume should hold data, the prefix is wrong) and asks you to confirm;
+3. stops the stack's running containers. It never removes a container or a volume;
+4. writes each volume to `<volume>-<timestamp>.tgz.age` in a new folder, `~/rag-docker-backups/<prefix>-<timestamp>/`, encrypted with [age](https://age-encryption.org) to **a new key pair for that volume alone**. The secret key goes in `<volume>-<timestamp>.key` beside it. Nothing unencrypted is written: tar and age run in a container, and only the encrypted stream reaches the disk. Each archive is decrypted and read back once before the script counts it as done;
+5. leaves the stack stopped and prints the command to start it again (`docker compose up -d`, or with the two `-f` options in LAN mode).
+
+Options:
+
+- `--dir <folder>` puts the backup folder somewhere else, for example an external disk. A folder inside the `rag-docker` checkout is refused, except under its `backups/` folder, which git ignores.
+- `--prefix <name> --yes` runs without asking, for a scheduled backup. `--yes` works only with `--prefix`, so a detected prefix is always confirmed.
+
+The backup folder is created readable by you only (mode 0700), and every file in it 0600.
+
+**Keep the keys apart from the backups.** An archive opens only with its own `.key` file, and anyone who has both can read everything in that volume, password hashes and sessions included. Move the `.key` files somewhere else, such as another disk or a password manager. Without its key an archive can't be restored. git ignores `*.key` files.
+
+**Delete backups you no longer need**, with their keys: `rm -r ~/rag-docker-backups/<prefix>-<timestamp>`.
+
+### Restoring
+
+Give each archive followed by its own key file:
+
+```bash
+scripts/restore.sh ~/rag-docker-backups/rag-docker-20261120T153000Z/weaviate_data-20261120T153000Z.tgz.age /path/to/weaviate_data-20261120T153000Z.key ~/rag-docker-backups/rag-docker-20261120T153000Z/auth_data-20261120T153000Z.tgz.age /path/to/auth_data-20261120T153000Z.key
+```
+
+Each archive restores the volume its name starts with. The script first decrypts every archive with its key and reads it to the end. A missing key file, a wrong key, or a damaged or incomplete archive stops it there, with `Nothing was stopped, emptied or restored.` Only then does it list the volumes that will be **emptied and replaced**, ask you to confirm (or take `--prefix <name> --yes`), stop the stack's running containers, and restore each volume, decrypting as it reads. What changed in those volumes since the backup is lost. Each archive is first extracted into a staging folder inside its volume, and the volume's old contents are replaced only once that has succeeded, so a restore whose extraction fails (a full disk, an archive changed since the check) stops at that volume and leaves it unchanged. That needs free Docker disk space for the volume's old and restored contents together. Volumes restored before it stay restored. The archives are unchanged, so fix the cause and run it again. A restore that is interrupted (Ctrl-C, a killed container) can leave a hidden `.rag-docker-restore.*` folder in the volume: backups skip it, and the next restore removes it.
+
+The volumes must exist. On a machine where the stack has never run, create them first, without starting anything: `docker compose create` (in LAN mode, `docker compose -f docker-compose.yml -f docker-compose.lan.yml create`).
+
+### The age image
+
+The scripts run age and tar in a small image, `rag-docker-age`, built from `scripts/age/Dockerfile`: alpine 3.24.4, pinned by its digest, plus Alpine's `age` package, pinned to an exact version. An install from the offline bundle (`package-offline.sh`) already has it: the bundle carries it. On any other install the first backup or restore builds it, which needs the network once: on a machine that will later be offline, make a first backup while it is online. If Alpine has replaced that package version, the build fails and no backup is written; the pin in `scripts/age/Dockerfile` then needs updating.
+
+A backup is a standard age file, so you can also check one by hand with your own `age` tool:
+
+```bash
+age -d -i weaviate_data-20261120T153000Z.key weaviate_data-20261120T153000Z.tgz.age | tar tzf -
+```
 
 ## Project structure
 
@@ -1145,6 +1229,11 @@ rag-docker/
 ├── package.sh            # Builds a source-only zip (~1.3 MB; target needs internet)
 ├── package-offline.sh    # Builds a self-contained offline bundle (~4.6 GB)
 ├── install-offline.sh    # Installs from that bundle with no network access
+├── scripts/
+│   ├── backup.sh         # Encrypted volume backup, a new age key per volume (#848)
+│   ├── restore.sh        # Restores it; checks every archive with its key first (#848)
+│   ├── backup-common.sh  # Shared by the two: volumes, prefix, the age image
+│   └── age/Dockerfile    # The age image: pinned alpine plus a pinned age package
 ├── api/                  # FastAPI backend
 │   ├── Dockerfile
 │   ├── .dockerignore
@@ -1193,7 +1282,7 @@ vectors, the settings it was tuned with, a standalone query script, and (when
 the originals were retained) the source documents themselves.
 
 ```bash
-# start an export
+# start an export (encrypted to a new key by default)
 curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/export \
   -H 'Content-Type: application/json' \
   -d '{"collection": "Policies"}'
@@ -1206,15 +1295,19 @@ curl -b ~/.rag-session http://localhost:8080/api/packages
 ```
 
 The package lands in `./exports/` on the host, named
-`ragpkg-<collection>-<timestamp>-<id8>.tar.gz`. Every package carries its own
-`README.md` explaining what it contains, how to import it and how to run its
-`retrieve.py`.
+`ragpkg-<collection>-<timestamp>-<id8>.tar.gz.age`, with its key file
+`ragpkg-<collection>-<timestamp>-<id8>.tar.gz.age.key` beside it. Every package
+carries its own `README.md` explaining what it contains, how to import it and how
+to run its `retrieve.py`.
 
 Three things worth knowing before you move one:
 
-- **Packages are not encrypted unless you give a passphrase.** A `with-sources`
-  package contains the original documents byte for byte. Treat a plain `.tar.gz`
-  as you would the corpus, or encrypt it (below).
+- **Packages are encrypted by default, each with a new key** (#676). Download the
+  key file with the package and store it apart from it ([Encrypting a
+  package](#encrypting-a-package)). A passphrase is the alternative, and an
+  unencrypted package is an explicit opt-out that LAN mode refuses. A
+  `with-sources` package contains the original documents byte for byte: treat an
+  unencrypted `.tar.gz` as you would the corpus.
 - **An export holds its collection's writer guard.** Chunks and original
   documents come from one point in time, so ingest, re-chunking and other writes to
   that collection wait until the export finishes, and gold-standard generation for
@@ -1267,6 +1360,14 @@ package list.
   neither a download nor the sweep deletes it. Packages already in `./exports/`
   before this version aren't recorded either; delete them by hand once you no
   longer need them.
+- **A key file follows the same rules on its own** (#676). `GET
+  /packages/<package>.key` downloads it, and a full download deletes the key file
+  and only it: downloading the package doesn't delete its key, and downloading
+  the key doesn't delete the package. Expiry deletes whichever of the two is still
+  there. The key file is served only when it was exported here, under its
+  package's access rule. `GET /packages` doesn't list key files; each package's
+  `key_on_server` says whether its key is still there, and the export's job
+  status names its `key_filename`.
 - Each download is audited as `package.download` (a `HEAD` with `head: true`)
   and each deletion as `package.delete`, with the reason (`downloaded` or
   `expired`).
@@ -1285,8 +1386,40 @@ package list.
 
 ### Encrypting a package
 
-Add a `passphrase` (12 to 1024 characters) to the export, or tick **Encrypt with a
-passphrase** on the Transfer page:
+Every export is encrypted unless you turn it off (#676). `POST /export` takes
+`encryption`, and the Transfer page offers the same three choices:
+
+| `encryption` | Transfer page | The package |
+|---|---|---|
+| `"key"` (the default) | **New key (recommended)** | encrypted to a new X25519 key made for this package alone; the key goes to a separate key file |
+| `"passphrase"` | **Passphrase** | encrypted with the `passphrase` you send (12 to 1024 characters) |
+| `"none"` | **Not encrypted** | a plain `.tar.gz`; refused `400 ENCRYPTION_REQUIRED` in LAN mode, where the Transfer page doesn't offer it |
+
+Left out, `encryption` is `"passphrase"` when the request has a `passphrase` and
+`"key"` when it doesn't, so a request written before 1.3.1 with a passphrase
+works as before. `"passphrase"` without a passphrase, or a passphrase with
+`"key"` or `"none"`, is refused `422`.
+
+**A new key (the default).** The package is written as `ragpkg-...tar.gz.age`, an
+[age](https://age-encryption.org) file encrypted to a key generated for it, and
+the key is written to `ragpkg-...tar.gz.age.key` beside it with mode 0600, in
+age's own key file format. The key exists nowhere else: it is never logged,
+stored or returned, except in that file and its download. On the Transfer page a
+finished export shows **Download key** first, with the package's **Download**
+after it; with `curl`, the job status names the `key_filename`:
+
+```bash
+curl -b ~/.rag-session -OJ http://localhost:8080/api/packages/<filename>.key
+```
+
+The key file can be downloaded once: a full download deletes it from the server,
+and it can't be recovered. Store it apart from the package, since anyone with
+both can read the collection. `age -d -i <filename>.key <filename>` opens the
+package as well as import does. On a Linux host the key file in `./exports/` is
+owned by root (the API runs as root), so download it rather than copying it from
+the folder.
+
+**A passphrase.**
 
 ```bash
 curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/export \
@@ -1294,15 +1427,16 @@ curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localho
   -d '{"collection": "Policies", "passphrase": "<a long passphrase>"}'
 ```
 
-The package is then written as `ragpkg-...tar.gz.age`: an
-[age](https://age-encryption.org) file encrypted with that passphrase (scrypt).
-The archive is encrypted as it is written, so it is never held in memory and no
+The package is then written as `ragpkg-...tar.gz.age`: an age file encrypted with
+that passphrase (scrypt).
+
+Either way the archive is encrypted as it is written, so it is never held in memory and no
 unencrypted archive is written. While the export runs, the package's files are
 staged unencrypted only inside the container, in a work folder on the API's
 upload volume, never in `./exports/`; that folder is removed when the export
 ends (or at the next start-up if the API was killed).
-Import needs the same passphrase, and `age -d` opens the file as well. Import
-accepts a scrypt work factor of at most 20 (about 1 GiB of memory to derive the
+A passphrase package's import needs the same passphrase, and `age -d` opens the
+file as well. Import accepts a scrypt work factor of at most 20 (about 1 GiB of memory to derive the
 key) and refuses a higher one as `DECRYPT_FAILED` before deriving anything; age's
 own default, 18, which export uses, is well within it. The
 passphrase is never stored, logged or returned, and it can't be recovered: send it
@@ -1321,11 +1455,32 @@ curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localho
 curl -b ~/.rag-session http://localhost:8080/api/import/job/<job_id>
 ```
 
-An encrypted package needs its passphrase in the same request
-(`"passphrase": "..."`); without it the import is refused `400
-PASSPHRASE_REQUIRED`, and a passphrase sent for an unencrypted package is refused
-`400 PASSPHRASE_NOT_EXPECTED`. A wrong passphrase, or a damaged encrypted file,
-fails the import job with `DECRYPT_FAILED` before anything is touched.
+An encrypted package needs its secret in the same request; its age header says
+which. A package encrypted with a key takes the text of its key file as `key`,
+which is never stored, logged or returned (the key file itself stays wherever you
+keep it):
+
+```bash
+jq -n --rawfile key ragpkg-policies-...tar.gz.age.key \
+  '{filename: "ragpkg-policies-...tar.gz.age", on_conflict: "abort", key: $key}' |
+curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/import \
+  -H 'Content-Type: application/json' -d @-
+```
+
+A passphrase package takes `"passphrase": "..."`. The refusals, all before any
+job starts:
+
+| Refusal | When |
+|---|---|
+| `400 KEY_FILE_REQUIRED` | a key package without `key` (a passphrase alone included) |
+| `400 KEY_FILE_INVALID` | `key` isn't the text of an age key file (one `AGE-SECRET-KEY-1...` line) |
+| `400 PASSPHRASE_REQUIRED` | a passphrase package without `passphrase` (a key alone included), or an encrypted file whose header can't be read and no secret |
+| `400 KEY_FILE_NOT_EXPECTED`, `400 PASSPHRASE_NOT_EXPECTED` | a secret sent for an unencrypted package |
+| `422` | both `key` and `passphrase` |
+
+A wrong key or passphrase, or a damaged encrypted file, fails the import job with
+`DECRYPT_FAILED` (`error_detail.reason` `key` or `passphrase`) before anything is
+touched.
 
 `on_conflict` is required and has no default, because the wrong choice can
 delete a collection:
@@ -1492,7 +1647,7 @@ internet access.
 | | `package.sh` | `package-offline.sh` |
 |---|---|---|
 | Archive size | ~1.3 MB | **~4.6 GB** |
-| Contains | source only | source + all 5 images + model weights |
+| Contains | source only | source + all 5 images + the backup scripts' age image + model weights |
 | Target needs internet | **yes** (~8–10 GB downloaded) | **no** |
 | First-run time on target | 10–20 min (downloads + build) | a few min (decompress + load only) |
 | Docker disk on target | 20 GB | ~12 GB (no build cache needed) |
@@ -1569,7 +1724,9 @@ bash package-offline.sh              # writes rag-docker-offline.tar (~7.7 GB)
 
 Its source tree is the same as `package.sh`'s: the files git tracks in the
 current commit, so run it in a git checkout too. It runs `docker save` on all
-five images (~2.5 GB compressed) and exports the
+five images (~2.5 GB compressed), and on the small age image that
+`scripts/backup.sh` and `scripts/restore.sh` run in (built first if this machine
+doesn't have it, which needs the network), and exports the
 Ollama model weights from the `ollama_models` volume (~5.2 GB). Expect a few
 minutes; saving the image layers is the slow part. It stops if the volume doesn't
 hold every model the stack pulls (an install from before 1.2.1 may hold only
@@ -1750,7 +1907,7 @@ host variables through. No destination or secret is supplied by this repository.
 | `RAG_OTEL_HEADERS_FILE` | Optional mounted UTF-8 JSON regular file containing `Authorization` and/or `X-Api-Key`; max 8 KiB, max 2 KiB per value |
 | `RAG_OTEL_CA_FILE` | Optional mounted PEM CA bundle (a regular file) for an HTTPS endpoint; max 1 MiB; replaces the bundled roots |
 | `RAG_OTEL_SERVICE_NAME` | `rag-api` |
-| `RAG_OTEL_SERVICE_VERSION` | `1.3.0` |
+| `RAG_OTEL_SERVICE_VERSION` | `1.3.1` |
 | `RAG_OTEL_ENVIRONMENT` | `development` |
 | `RAG_OTEL_TRACES`, `RAG_OTEL_LOGS`, `RAG_OTEL_METRICS` | Each `true`; exact booleans |
 | `RAG_OTEL_SAMPLE_RATIO` | `1.0`; finite 0–1, root-independent ratio sampling |

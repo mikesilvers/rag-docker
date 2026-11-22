@@ -1496,10 +1496,13 @@ restricted with no grants, so only AI Engineers can use it until one opens it
 or grants it on the Collections page; it never copies another collection's
 access. Only a replace keeps the collection's access.
 
-The passphrase of an encrypted package is asked for without echo when standard
-input is a terminal, and otherwise read as the first line of standard input
-(`docker compose exec -T api python -m loader NAME < file`). It is never an
-argument, never printed and never recorded.
+An encrypted package is opened by its key file (a key export, the default since
+#676) or its passphrase (#27); its age header says which. The key is asked for
+without echo when standard input is a terminal (paste the AGE-SECRET-KEY-1...
+line), and otherwise read as the whole of standard input, the key file itself
+(`docker compose exec -T api python -m loader NAME < NAME.key`). A passphrase is
+asked for the same way, or read as the first line of standard input
+(`... < passphrase-file`). Neither is ever an argument, printed or recorded.
 
 Each step is one line on standard error, prefixed "loader: ". Exit status: 0
 loaded, 1 refused or failed, 2 usage error. Every run past the arguments writes
@@ -1556,6 +1559,8 @@ def _audit(package: str, on_conflict: str, encrypted: bool, collection: str | No
            result: str = "success", code: str | None = None, chunks: int | None = None) -> None:
     from services import audit
     details: dict = {"on_conflict": on_conflict, "encrypted": encrypted}
+    if _state.get("encryption"):
+        details["encryption"] = _state["encryption"]    # "key" or "passphrase", never the secret (#676)
     if chunks is not None:
         details["chunks"] = chunks
     if code:
@@ -1596,6 +1601,18 @@ def _passphrase() -> str:
     return sys.stdin.readline().rstrip("\r\n")
 
 
+def _key(limit: int) -> str:
+    """The key file's text (#676): a hidden prompt on a terminal, otherwise the
+    whole of standard input, refused past `limit` characters."""
+    if sys.stdin.isatty():
+        return getpass.getpass("Key (the AGE-SECRET-KEY-1... line): ")
+    text = sys.stdin.read(limit + 1)
+    if len(text) > limit:
+        raise _Refused("KEY_FILE_INVALID", f"the key on standard input is longer than {limit} characters; "
+                                      "give the package's key file")
+    return text
+
+
 def _lock(upload_dir: str):
     """The one-load-at-a-time lock, held until the returned file is closed."""
     Path(upload_dir).mkdir(parents=True, exist_ok=True)
@@ -1618,7 +1635,7 @@ def _progress(job: dict, done: threading.Event) -> None:
             _say(f"chunks written: {count}")
 
 
-def _load(package: str, on_conflict: str, passphrase: str | None) -> dict:
+def _load(package: str, on_conflict: str, passphrase: str | None, identity=None) -> dict:
     """Run the import code on the package and return its finished job record."""
     from services import importer
     job_id = "load-" + uuid.uuid4().hex[:8]
@@ -1628,7 +1645,8 @@ def _load(package: str, on_conflict: str, passphrase: str | None) -> dict:
         "job_id": job_id, "status": "queued", "filename": package, "on_conflict": on_conflict,
         "collection": None, "original_collection": None, "chunks_written": 0, "fidelity": None,
         "renamed": False, "notes": [], "restored_sessions": [], "error": None, "error_code": None,
-        "error_detail": None, "encrypted": passphrase is not None,
+        "error_detail": None, "encrypted": passphrase is not None or identity is not None,
+        "encryption": "key" if identity is not None else "passphrase" if passphrase is not None else "none",
         "owner": None, "operator": True,        # access: restricted, no grants (#670)
     }
     job = importer._jobs[job_id]
@@ -1637,7 +1655,10 @@ def _load(package: str, on_conflict: str, passphrase: str | None) -> dict:
     ticker = threading.Thread(target=_progress, args=(job, done), daemon=True)
     ticker.start()
     try:
-        importer._run(job_id, package, on_conflict, passphrase)
+        if identity is not None:
+            importer._run(job_id, package, on_conflict, passphrase, identity=identity)
+        else:
+            importer._run(job_id, package, on_conflict, passphrase)
     finally:
         done.set()
     return job
@@ -1680,8 +1701,22 @@ def main(argv=None) -> int:
             regular = False
         if not regular:
             raise _Refused("PACKAGE_NOT_FOUND", f"no package named '{package}' in ./exports; copy it there first")
-        passphrase = None
-        if encrypted:
+        passphrase = identity = None
+        if encrypted and importer.package_kind(package) == "key":
+            # A key export (#676): its header says so.
+            _state["encryption"] = "key"
+            text = _key(age_stream.KEY_FILE_MAX)
+            if not text.strip():
+                raise _Refused("KEY_FILE_REQUIRED", f"'{package}' is encrypted with a key; give its key file "
+                                               "on standard input")
+            try:
+                identity = age_stream.parse_identity(text)
+            except age_stream.AgeError:
+                raise _Refused("KEY_FILE_INVALID", "that isn't the package's key file (one AGE-SECRET-KEY-1... "
+                                              "line)") from None
+            text = None
+        elif encrypted:
+            _state["encryption"] = "passphrase"
             passphrase = _passphrase()
             if not passphrase:
                 raise _Refused("PASSPHRASE_REQUIRED", f"'{package}' is encrypted; give its passphrase")
@@ -1689,7 +1724,7 @@ def main(argv=None) -> int:
         # API runs at its start. Under the lock, and nothing else imports here.
         for removed in importer.sweep_interrupted_imports():
             _say(f"removed a collection an interrupted load left half-built: {removed}")
-        job = _load(package, on_conflict, passphrase)
+        job = _load(package, on_conflict, passphrase, identity)
     except _Refused as refused:
         _state["done"] = True
         _say(f"load refused: {refused.code}: {refused}")
@@ -2037,6 +2072,7 @@ from __future__ import annotations
 from typing import Any, Optional, Annotated, Literal
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, BeforeValidator, ValidationError, field_validator, model_validator, SecretStr, StrictInt
 
+from services.age_stream import KEY_FILE_MAX
 from services.collection_writes import canonical
 
 
@@ -2122,17 +2158,19 @@ class CollectionsResponse(BaseModel):
 
 class CollectionAccessRequest(BaseModel):
     """PUT /collections/{name}/access (#606): the whole state at once. Open
-    takes no names; restricted grants exactly the people and service
-    principals named (none: Engineers only)."""
+    takes no names; restricted grants exactly the people, service principals
+    and groups (#784) named (none: Engineers only). A body without `groups`
+    grants no group."""
     model_config = ConfigDict(extra="forbid")
     restricted: bool
     users: list[Annotated[str, Field(max_length=64)]] = Field(default_factory=list, max_length=1000)
     service_principals: list[Annotated[str, Field(max_length=64)]] = Field(default_factory=list, max_length=1000)
+    groups: list[Annotated[str, Field(max_length=64)]] = Field(default_factory=list, max_length=1000)
 
     @model_validator(mode="after")
     def _names_only_when_restricted(self):
-        if not self.restricted and (self.users or self.service_principals):
-            raise ValueError("an open collection takes no users or service principals")
+        if not self.restricted and (self.users or self.service_principals or self.groups):
+            raise ValueError("an open collection takes no users, service principals or groups")
         return self
 
 
@@ -2140,6 +2178,7 @@ class CollectionAccessResponse(BaseModel):
     restricted: bool
     users: list[str]
     service_principals: list[str]
+    groups: list[str]
 
 
 # ── Ingest ────────────────────────────────────────────────────────────────────
@@ -2260,10 +2299,23 @@ def _utf8_passphrase(v: Optional[SecretStr]) -> Optional[SecretStr]:
 class ExportRequest(BaseModel):
     collection: CollectionName
     include_models: bool = False
-    # Optional: given, the package is written encrypted as `.tar.gz.age` (#27).
+    # How the package is encrypted (#676): a new X25519 key, written to a key
+    # file beside it (the default); a passphrase (#27); or not at all, an
+    # explicit opt-out refused in LAN mode. Left out, a request with a
+    # passphrase is a passphrase export and one without is a key export.
+    encryption: Optional[Literal["key", "passphrase", "none"]] = None
+    # Given, the package is written encrypted as `.tar.gz.age` (#27).
     # SecretStr keeps it out of any repr or log line, and the 422 handler drops
     # `input`, so a refused passphrase is never echoed.
     passphrase: Optional[SecretStr] = None
+
+    @model_validator(mode="after")
+    def _encryption(self):
+        if self.encryption is None:
+            self.encryption = "passphrase" if self.passphrase is not None else "key"
+        elif (self.encryption == "passphrase") != (self.passphrase is not None):
+            raise ValueError("a passphrase goes with encryption 'passphrase', and that needs one")
+        return self
 
     @field_validator("passphrase")
     @classmethod
@@ -2294,9 +2346,16 @@ class ExportJobStatusResponse(BaseModel):
     retrieve_script: Optional[bool]
     warnings: list[str]
     error: Optional[str]
-    # Whether the export was requested with a passphrase (#27). Records from
-    # before #27 have no such key.
+    # Whether the package is encrypted (#27). Records from before #27 have no
+    # such key.
     encrypted: bool = False
+    # "key", "passphrase" or "none" (#676); records from before #676 read as
+    # "passphrase" when encrypted, else "none".
+    encryption: Optional[str] = None
+    # A key export's key file (#676): its name, never its contents, and whether
+    # it is still in ./exports (it is deleted by its own full download).
+    key_filename: Optional[str] = None
+    key_on_server: bool = False
 
     error_code: Optional[str] = None
     error_detail: Optional[dict] = None
@@ -2309,14 +2368,30 @@ class ImportRequest(BaseModel):
     # Required, no default (spec §6.4): silently picking a conflict policy could
     # delete a collection the caller did not mean to touch.
     on_conflict: str
-    # Required for a `.tar.gz.age` package and refused for any other (#27).
-    # Its length is checked on export only; any encodable value is tried here.
+    # Required for a passphrase `.tar.gz.age` package and refused for any other
+    # (#27). Its length is checked on export only; any encodable value is tried here.
     passphrase: Optional[SecretStr] = None
+    # The text of the key file of a key-encrypted package (#676): required for
+    # one and refused for any other. Never stored, logged or returned.
+    key: Optional[SecretStr] = None
 
     @field_validator("passphrase")
     @classmethod
     def _passphrase(cls, v: Optional[SecretStr]) -> Optional[SecretStr]:
         return _utf8_passphrase(v)
+
+    @field_validator("key")
+    @classmethod
+    def _key(cls, v: Optional[SecretStr]) -> Optional[SecretStr]:
+        if v is not None and len(v.get_secret_value()) > KEY_FILE_MAX:
+            raise ValueError(f"key must be at most {KEY_FILE_MAX} characters: the text of the key file")
+        return _utf8_passphrase(v)
+
+    @model_validator(mode="after")
+    def _one_secret(self):
+        if self.passphrase is not None and self.key is not None:
+            raise ValueError("send a passphrase or a key, not both")
+        return self
 
     @field_validator("on_conflict")
     @classmethod
@@ -2357,6 +2432,8 @@ class ImportJobStatusResponse(BaseModel):
     error_code: Optional[str]
     error_detail: Optional[dict]
     encrypted: bool = False
+    # "key", "passphrase" or "none", by the secret the import was sent (#676).
+    encryption: Optional[str] = None
 
 
 class PackageSummary(BaseModel):
@@ -2373,6 +2450,11 @@ class PackageSummary(BaseModel):
     # can't be read without the passphrase. `readable` then says whether its
     # age header is valid.
     encrypted: bool = False
+    # "none" for a `.tar.gz`; "key" or "passphrase" from a `.tar.gz.age` header,
+    # null when that header can't be read (#676). `key_on_server`: the package's
+    # key file is still in ./exports.
+    encryption: Optional[str] = None
+    key_on_server: bool = False
     # When a package this instance exported is deleted if nobody downloads it
     # (UTC, #677); null for one copied in to be imported or from before #677.
     expires_at: Optional[str] = None
@@ -2708,6 +2790,8 @@ class AuthUser(BaseModel):
     mfa_enrollment_required: Optional[bool] = None
     # Query-only mode (#670): the UI hides the pages that change data.
     query_only: Optional[bool] = None
+    # LAN mode (#26): the Transfer page hides the unencrypted export (#676).
+    lan_mode: Optional[bool] = None
 
 
 class AdminUser(BaseModel):
@@ -2773,6 +2857,43 @@ class PrincipalCreateRequest(BaseModel):
 class KeyIssueRequest(BaseModel):
     label: str = Field(default="", max_length=64)
     days: StrictInt = Field(default=90, ge=1, le=365)
+
+
+# Groups for collection access (#784).
+
+class Group(BaseModel):
+    name: str
+    created_at: str
+    users: list[str]
+    service_principals: list[str]
+
+
+class GroupList(BaseModel):
+    groups: list[Group]
+
+
+class GroupResult(BaseModel):
+    group: Group
+
+
+class GroupCreateRequest(BaseModel):
+    name: str   # no length cap: the route refuses any name breaking the rule as INVALID_GROUP_NAME
+
+
+class GroupRenameRequest(BaseModel):
+    name: str   # the new name; refused as INVALID_GROUP_NAME when it breaks the rule
+
+
+class GroupMembersRequest(BaseModel):
+    """PUT /auth/groups/{name}/members: the whole member list at once."""
+    model_config = ConfigDict(extra="forbid")
+    users: list[Annotated[str, Field(max_length=64)]] = Field(default_factory=list, max_length=1000)
+    service_principals: list[Annotated[str, Field(max_length=64)]] = Field(default_factory=list, max_length=1000)
+
+
+class GroupDeleteResult(BaseModel):
+    name: str
+    collections: list[str]
 
 
 # ── Error ─────────────────────────────────────────────────────────────────────
@@ -11011,6 +11132,7 @@ Format reference: RAG_EXPORT_SPECIFICATIONS.md §4.
 from __future__ import annotations
 from services import telemetry
 
+import errno
 import fnmatch
 import hashlib
 import json
@@ -11021,6 +11143,7 @@ import shutil
 import stat
 import tarfile
 import tempfile
+import threading
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterator
@@ -11063,8 +11186,9 @@ def exports_dir() -> Path:
 # Staging is now `{UPLOAD_DIR}/export-*`, swept with the other work directories
 # there (#549); `.build-*` is staging left here by earlier versions.
 _BUILD_DIR = ".build-*"
-# An encrypted export is written as `.<stem>.tar.gz.age.partial` (#27).
-_PARTIAL_ARCHIVES = (".*.tar.gz.partial", ".*.tar.gz.age.partial")
+# An encrypted export is written as `.<stem>.tar.gz.age.partial` (#27), and a
+# key export's key file as `.<stem>.tar.gz.age.key.partial` (#676).
+_PARTIAL_ARCHIVES = (".*.tar.gz.partial", ".*.tar.gz.age.partial", ".*.tar.gz.age.key.partial")
 
 
 def remove_leftover(entry: Path, *, directory: bool = False,
@@ -11131,6 +11255,72 @@ def timestamp(when: datetime) -> str:
 
 def package_stem(collection: str, when: datetime, id8: str) -> str:
     return f"ragpkg-{slug(collection)}-{timestamp(when)}-{id8}"
+
+
+def _now() -> datetime:
+    """The build's clock: the one place it is read, so a test can fix it."""
+    return datetime.now(timezone.utc)
+
+
+# Two exports of one collection with the same content that start in the same
+# second have the same plain stem. The second gets `-2` (then `-3`, ...), so
+# both packages and both key files are kept (#860, spec §4.1).
+MAX_NAME_SUFFIX = 1000
+_names_lock = threading.Lock()
+# Stems this process has given to an export: never given twice, even once the
+# files are downloaded and deleted.
+_given: set[str] = set()
+_DELIVERED = (".tar.gz", age_stream.ENCRYPTED_SUFFIX, age_stream.ENCRYPTED_SUFFIX + ".key")
+# No hard links in the folder: placement checks and renames under the lock.
+_NO_LINKS = {errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EMLINK, errno.ENOSYS, errno.EXDEV}
+
+
+def _stem_taken(out_dir: Path, stem: str) -> bool:
+    """Whether any file of `stem`, or its temporary, is in the folder (a link counts)."""
+    return any(os.path.lexists(out_dir / name)
+               for suffix in _DELIVERED
+               for name in (stem + suffix, f".{stem}{suffix}.partial"))
+
+
+def reserve_stem(out_dir: Path, collection: str, when: datetime, id8: str) -> str:
+    """The package's stem: the plain one when it is free, else the first free
+    `-<n>` from 2 (#860). Chosen and reserved under one lock."""
+    base = package_stem(collection, when, id8)
+    with _names_lock:
+        for n in range(1, MAX_NAME_SUFFIX + 1):
+            stem = base if n == 1 else f"{base}-{n}"
+            if stem not in _given and not _stem_taken(out_dir, stem):
+                _given.add(stem)
+                return stem
+    raise RuntimeError(f"No free package name for {base} up to -{MAX_NAME_SUFFIX}: "
+                       "delete old packages from ./exports and export again.")
+
+
+def _taken(final: Path) -> FileExistsError:
+    return FileExistsError(errno.EEXIST, f"{final.name} is already in the exports folder; it was "
+                           "left as it is and this export wasn't put in place", str(final))
+
+
+def _place(tmp: Path, final: Path) -> None:
+    """Move `tmp` to `final`, never replacing an existing entry (#860)."""
+    try:
+        os.link(tmp, final)
+    except FileExistsError:
+        raise _taken(final) from None
+    except OSError as exc:
+        if exc.errno not in _NO_LINKS:
+            raise
+        # Every export chooses and places names under this lock.
+        with _names_lock:
+            if os.path.lexists(final):
+                raise _taken(final) from None
+            os.rename(tmp, final)
+        return
+    try:
+        os.unlink(tmp)
+    except BaseException:
+        final.unlink(missing_ok=True)
+        raise
 
 
 # ── Digests ───────────────────────────────────────────────────────────────────
@@ -11338,6 +11528,21 @@ def _fidelity_note(fidelity: str) -> str:
             "work; re-chunking does not.")
 
 
+def _encryption_note(encryption: str, filename: str) -> str:
+    """The package README's line on how this package opens (#27, #676)."""
+    if encryption == "key":
+        return (f"This package is encrypted with its own key, in `{filename}.key`, written "
+                "beside it when it was exported. Open it with "
+                f"`age -d -i {filename}.key {filename}`, or import it with the key file (the "
+                "Transfer page, or the key file's text sent as `key`, for example built with "
+                f"`jq -n --rawfile key {filename}.key`). Store the key apart from the package: "
+                "anyone with both can read it.")
+    if encryption == "passphrase":
+        return ("This package is encrypted with the passphrase it was exported with; import "
+                "it with that passphrase, or open it with `age -d`.")
+    return "This package is not encrypted."
+
+
 def _retrieve_section(has_script: bool, cfg: dict, collection: str) -> str:
     if not has_script:
         return ("`retrieve.py` is **not** included in this package, because the "
@@ -11362,23 +11567,25 @@ def _add_members(tar: tarfile.TarFile, stage: Path, stem: str) -> None:
             tar.add(stage / entry, arcname=f"{stem}/{entry}")
 
 
-def _write_archive(stage: Path, stem: str, dest: Path, passphrase: str | None = None) -> None:
+def _write_archive(stage: Path, stem: str, dest: Path, passphrase: str | None = None,
+                   recipient: bytes | None = None) -> None:
     """Archive the staged package as `<stem>/`, with manifest.json first (#383).
 
     The directory entry, then the manifest, then everything else in the sorted
     order `tar.add(stage, arcname=stem)` gives, so the listing can stop reading
     at the manifest instead of decompressing chunks.jsonl to reach it.
 
-    With a passphrase the same tar.gz stream goes through the age encryptor on
-    its way to `dest` (#27): no plaintext archive is written, and only one
-    64 KiB chunk is held at a time, so a package of several GB streams.
+    With a passphrase (#27) or an X25519 recipient (#676) the same tar.gz stream
+    goes through the age encryptor on its way to `dest`: no plaintext archive is
+    written, and only one 64 KiB chunk is held at a time, so a package of
+    several GB streams.
     """
-    if passphrase is None:
+    if passphrase is None and recipient is None:
         with tarfile.open(dest, "w:gz") as tar:
             _add_members(tar, stage, stem)
         return
     with dest.open("wb") as fh:
-        encryptor = age_stream.Encryptor(fh, passphrase)
+        encryptor = age_stream.Encryptor(fh, passphrase, recipient=recipient)
         with tarfile.open(fileobj=encryptor, mode="w|gz") as tar:
             _add_members(tar, stage, stem)
         # Writes the final chunk; an exception above skips it, and build()
@@ -11392,6 +11599,7 @@ def build(
     include_models: bool = False,
     progress: Callable[[int], None] | None = None,
     passphrase: str | None = None,
+    key: bool = False,
 ) -> dict:
     """Write one package and return a summary. Blocking; run it in a thread.
 
@@ -11400,9 +11608,14 @@ def build(
     the manifest digest. Manifest last is what makes <id8> derivable.
 
     With a passphrase the package is written encrypted, as `<stem>.tar.gz.age`
-    (#27). The passphrase is used, never stored or logged.
+    (#27). The passphrase is used, never stored or logged. With `key` it is
+    encrypted to a new X25519 key instead (#676), whose secret goes only to the
+    key file `<filename>.key` (0600) beside it.
     """
-    created = datetime.now(timezone.utc)
+    if key and passphrase is not None:
+        raise ValueError("a package takes a passphrase or a key, not both")
+    encryption = "key" if key else "passphrase" if passphrase is not None else "none"
+    created = _now()
     created_at = created.strftime("%Y-%m-%dT%H:%M:%SZ")
     out_dir = exports_dir()
     warnings: list[str] = []
@@ -11415,6 +11628,8 @@ def build(
     upload.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(dir=upload, prefix="export-"))
     tmp_archive: Path | None = None
+    tmp_key: Path | None = None
+    placed_key: Path | None = None
     try:
         b = _Builder(stage)
 
@@ -11594,9 +11809,10 @@ def build(
         id8 = sha256_file(manifest_path)[:8]
 
         # 7. the generated pair, which embed <id8>
-        stem = package_stem(collection, created, id8)
+        # A name no other export has, never replacing a file (#860).
+        stem = reserve_stem(out_dir, collection, created, id8)
         # The README and retrieve.py name the file as delivered (#27).
-        filename = f"{stem}{age_stream.ENCRYPTED_SUFFIX if passphrase is not None else '.tar.gz'}"
+        filename = f"{stem}{age_stream.ENCRYPTED_SUFFIX if encryption != 'none' else '.tar.gz'}"
 
         if has_saved_retrieval:
             (stage / "retrieve.py").write_text(_render_retrieve(collection, retrieval_cfg, {
@@ -11619,18 +11835,34 @@ def build(
             "CREATED_AT": created_at,
             "ID8": id8,
             "PACKAGE_FILENAME": filename,
-            "IMPORT_PASSPHRASE": (', "passphrase": "<the passphrase>"'
-                                  if passphrase is not None else ""),
+            "IMPORT_SECRET": {"passphrase": ', "passphrase": "<the passphrase>"',
+                              "key": ', "key": "<the key file\'s text>"'}.get(encryption, ""),
+            "ENCRYPTION_NOTE": _encryption_note(encryption, filename),
             "RETRIEVE_SECTION": _retrieve_section(has_saved_retrieval, retrieval_cfg, collection),
         }))
 
         # 8. archive under a temporary name, then rename, so a partial file is
         #    never mistaken for a package.
         tmp_archive = out_dir / f".{filename}.partial"
-        _write_archive(stage, stem, tmp_archive, passphrase)
+        identity = age_stream.generate_identity() if encryption == "key" else None
+        _write_archive(stage, stem, tmp_archive, passphrase,
+                       identity.public_bytes if identity is not None else None)
+        key_filename = None
+        if identity is not None:
+            # The key file first, 0600 from its creation (#676); the package is
+            # put in place only once its key is. Neither replaces a file (#860):
+            # `placed_key` is set only once this build has placed it.
+            key_filename = filename + ".key"
+            tmp_key = out_dir / f".{key_filename}.partial"
+            _write_key_file(tmp_key, age_stream.identity_file(identity, created, filename))
+            identity = None
+            _place(tmp_key, out_dir / key_filename)
+            placed_key = out_dir / key_filename
+            tmp_key = None
         final = out_dir / filename
-        tmp_archive.replace(final)
+        _place(tmp_archive, final)
         tmp_archive = None
+        placed_key = None
 
         return {
             "filename": filename,
@@ -11641,13 +11873,27 @@ def build(
             "models_bundled": models_bundled,
             "retrieve_script": has_saved_retrieval,
             "id8": id8,
-            "encrypted": passphrase is not None,
+            "encrypted": encryption != "none",
+            "encryption": encryption,
+            "key_filename": key_filename,
             "warnings": warnings,
         }
     finally:
         shutil.rmtree(stage, ignore_errors=True)
-        if tmp_archive is not None:
-            tmp_archive.unlink(missing_ok=True)
+        # A failed build leaves neither the package nor its key (#676).
+        for leftover in (tmp_archive, tmp_key, placed_key):
+            if leftover is not None:
+                leftover.unlink(missing_ok=True)
+
+
+def _write_key_file(path: Path, text: str) -> None:
+    """Create `path` with mode 0600 (the umask can only narrow it), never
+    following a link and never over an existing file, and write `text` (#676)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(fd, "w", encoding="ascii") as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
 
 
 # ── Reading a package back ────────────────────────────────────────────────────
@@ -11893,11 +12139,12 @@ def _safe_extract_stream(tar: tarfile.TarFile, dest: Path, name: str) -> None:
 
 
 # Why an encrypted package could not be decrypted, for `error_detail.reason`.
-_DECRYPT_REASONS = {"work_factor": "work_factor", "passphrase": "passphrase",
+_DECRYPT_REASONS = {"work_factor": "work_factor", "passphrase": "passphrase", "key": "key",
                     "hmac": "header", "payload": "payload", "nonce": "payload"}
 
 
-def _extract_encrypted(archive: Path, dest: Path, passphrase: str) -> None:
+def _extract_encrypted(archive: Path, dest: Path, passphrase: str | None,
+                       identity: "age_stream.Identity | None" = None) -> None:
     """Check 1 for a `.tar.gz.age` package: decrypt it as a stream into the tar
     reader, then authenticate the rest of the file to its end (#27).
 
@@ -11906,31 +12153,36 @@ def _extract_encrypted(archive: Path, dest: Path, passphrase: str) -> None:
     """
     try:
         with archive.open("rb") as fh:
-            decryptor = age_stream.open_decrypt(fh, passphrase)
+            if identity is not None:
+                decryptor = age_stream.open_decrypt(fh, identity=identity)
+            else:
+                decryptor = age_stream.open_decrypt(fh, passphrase)
             with tarfile.open(fileobj=decryptor, mode="r|gz") as tar:
                 _safe_extract_stream(tar, dest, archive.name)
             # tarfile stops at the end-of-archive blocks; the final chunk, and
             # anything after it, still has to be authenticated.
             decryptor.drain()
     except age_stream.AgeError as exc:
-        if exc.kind in ("header", "recipient"):
+        if exc.kind in ("header", "recipient", "identity"):
             raise PackageError(
                 "PACKAGE_UNREADABLE",
-                f"'{archive.name}' is not a passphrase-encrypted age file.",
+                f"'{archive.name}' is not "
+                f"{'a key-encrypted' if identity is not None else 'a passphrase-encrypted'} age file.",
                 {"reason": str(exc)}) from None
         raise PackageError(
             "DECRYPT_FAILED",
-            f"'{archive.name}' could not be decrypted: the passphrase is wrong or "
-            "the file is damaged.",
+            f"'{archive.name}' could not be decrypted: the "
+            f"{'key' if identity is not None else 'passphrase'} is wrong or the file is damaged.",
             {"reason": _DECRYPT_REASONS[exc.kind]}) from None
 
 
 @telemetry.traced("rag.package")
-def open_package(archive: Path, dest: Path, passphrase: str | None = None) -> tuple[Path, dict]:
+def open_package(archive: Path, dest: Path, passphrase: str | None = None,
+                 identity: "age_stream.Identity | None" = None) -> tuple[Path, dict]:
     """Checks 1 and 2 of spec §6.2: readable archive, understood format.
 
-    A `.tar.gz.age` package is decrypted with `passphrase` as it is unpacked
-    (#27); everything from check 2 on reads the decrypted files, as for an
+    A `.tar.gz.age` package is decrypted with `passphrase` (#27), or with the
+    X25519 `identity` of its key file (#676), as it is unpacked; everything from check 2 on reads the decrypted files, as for an
     unencrypted package. Returns (package root directory, manifest).
     """
     if not archive.is_file():
@@ -11939,7 +12191,8 @@ def open_package(archive: Path, dest: Path, passphrase: str | None = None) -> tu
     encrypted = age_stream.is_encrypted_name(archive.name)
     try:
         if encrypted:
-            _extract_encrypted(archive, dest, passphrase or "")
+            _extract_encrypted(archive, dest, None if identity is not None else passphrase or "",
+                               identity)
         else:
             with tarfile.open(archive, "r:gz") as tar:
                 _safe_extract(tar, dest, archive.name)
@@ -12046,18 +12299,32 @@ def iter_chunks_file(pkg: Path) -> Iterator[dict]:
 ### api/services/age_stream.py
 
 ```python
-"""Passphrase encryption of export packages in the age v1 format (#27).
+"""Encryption of export packages in the age v1 format (#27, #676).
 
-An encrypted package is an ordinary age file with one `scrypt` (passphrase)
-recipient, so `age -d` opens it as well as import does. The format is the C2SP
-age specification (https://c2sp.org/age); this module implements only the parts
-a passphrase file uses, on the `cryptography` package the API already locks:
+An encrypted package is an ordinary age file, so `age -d` opens it as well as
+import does. It has one recipient, of one of two kinds:
+
+- a new X25519 key per package (#676, the default): one `X25519` stanza. The
+  secret key is written once, to the package's key file, in age's own identity
+  file layout (`# created:`, `# public key: age1...`, `AGE-SECRET-KEY-1...`),
+  so `age -d -i <package>.key` opens it too;
+- a passphrase (#27): one `scrypt` stanza.
+
+The format is the C2SP age specification (https://c2sp.org/age); this module
+implements only the parts these files use, on the `cryptography` package the
+API already locks. Keys and recipients are Bech32 (BIP 173), as age writes them.
+age's post-quantum hybrid recipients (`mlkem768x25519`, `AGE-SECRET-KEY-PQ-1`)
+are not supported: export writes X25519 only, and import refuses a PQ key file.
+A passphrase file looks like this:
 
     age-encryption.org/v1
     -> scrypt <salt, base64> <work factor>
     <wrapped file key, base64>
     --- <header MAC, base64>
     <16-byte nonce><STREAM payload: 64 KiB chunks, ChaCha20-Poly1305>
+
+A key file's package has `-> X25519 <ephemeral share, base64>` and the wrapped
+file key in place of the scrypt stanza; everything after the stanza is the same.
 
 pyrage was not used: its passphrase API takes and returns whole byte strings,
 and a package can be several GB. Both directions here stream: the encryptor is a
@@ -12081,7 +12348,8 @@ from hashlib import sha256
 from typing import BinaryIO
 
 from cryptography.exceptions import InvalidTag
-from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
@@ -12099,6 +12367,10 @@ _NONCE = 16
 WORK_FACTOR = 18
 MAX_WORK_FACTOR = 20
 _SCRYPT_LABEL = b"age-encryption.org/v1/scrypt"
+_X25519_LABEL = b"age-encryption.org/v1/X25519"
+# The longest key file import reads (POST /import and the loader): age's own is
+# about 190 characters.
+KEY_FILE_MAX = 4096
 # A passphrase file's header is about 150 bytes. Reading stops well before a
 # hostile file could make the parser hold a large one.
 HEADER_MAX = 64 * 1024
@@ -12119,8 +12391,11 @@ class AgeError(Exception):
 
     header      not a valid age header (or not an age file at all), a scrypt
                 work factor that is not a decimal without a sign or leading
-                zero included (#549)
+                zero included (#549); a malformed X25519 stanza, one whose
+                share gives an all-zero secret, or a scrypt stanza next to it
     recipient   a valid age header, but not for a passphrase
+    key         an X25519 key that unwraps none of the file's X25519 stanzas
+    identity    a key file that isn't one valid age X25519 secret key
     work_factor the scrypt work factor is above MAX_WORK_FACTOR, a decimal of
                 more than two digits included
     nonce       the file ends inside the 16-byte payload nonce
@@ -12297,18 +12572,214 @@ def verify_mac(header: Header, file_key: bytes) -> None:
         raise AgeError("hmac", "the age header MAC does not match")
 
 
-def check_header(fh: BinaryIO) -> bool:
-    """True when `fh` starts with a valid age passphrase header. No scrypt runs,
-    and the work factor is not held against the limit; for the listing.
+def header_kind(fh: BinaryIO) -> str | None:
+    """`"passphrase"` when `fh` starts with a valid age passphrase header, `"key"`
+    when it starts with a valid header with an `X25519` stanza and no `scrypt`
+    (#676), else None. No scrypt or X25519 operation runs, and the work factor
+    is not held against the limit: for the listing and for choosing which
+    secret an import needs.
 
-    Any failure reading or parsing the file is False, never an exception: one
+    Any failure reading or parsing the file is None, never an exception: one
     bad file must not break the listing of the others (#27 review).
     """
     try:
-        scrypt_stanza(read_header(fh))
+        header = read_header(fh)
+        types = [s.args[0] for s in header.stanzas]
+        if "scrypt" in types:
+            scrypt_stanza(header)
+            return "passphrase"
+        return "key" if "X25519" in types else None
     except Exception:                                 # noqa: BLE001 - see above
-        return False
-    return True
+        return None
+
+
+def check_header(fh: BinaryIO) -> bool:
+    """True when `fh` starts with a valid passphrase or key header (`header_kind`)."""
+    return header_kind(fh) is not None
+
+
+# ── X25519 keys (#676) ────────────────────────────────────────────────────────
+
+_BECH32 = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+_BECH32_REV = {c: i for i, c in enumerate(_BECH32)}
+
+
+def _polymod(values) -> int:
+    gen = (0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3)
+    chk = 1
+    for v in values:
+        top = chk >> 25
+        chk = (chk & 0x1FFFFFF) << 5 ^ v
+        for i in range(5):
+            chk ^= gen[i] if (top >> i) & 1 else 0
+    return chk
+
+
+def _hrp_expand(hrp: str) -> list[int]:
+    return [ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp]
+
+
+def _convert(data, frombits: int, tobits: int, pad: bool) -> list[int]:
+    acc = bits = 0
+    out = []
+    maxv = (1 << tobits) - 1
+    for value in data:
+        acc = (acc << frombits) | value
+        bits += frombits
+        while bits >= tobits:
+            bits -= tobits
+            out.append((acc >> bits) & maxv)
+    if pad:
+        if bits:
+            out.append((acc << (tobits - bits)) & maxv)
+    elif bits >= frombits or (acc << (tobits - bits)) & maxv:
+        raise ValueError("invalid Bech32 padding")
+    return out
+
+
+def _bech32_encode(hrp: str, data: bytes) -> str:
+    """Bech32 (BIP 173), lowercase, with no length limit, as age writes keys."""
+    words = _convert(data, 8, 5, True)
+    values = _hrp_expand(hrp) + words
+    poly = _polymod(values + [0] * 6) ^ 1
+    checksum = [(poly >> 5 * (5 - i)) & 31 for i in range(6)]
+    return hrp + "1" + "".join(_BECH32[w] for w in words + checksum)
+
+
+def _bech32_decode(text: str) -> tuple[str, bytes]:
+    """The HRP (lowercase) and the data of a Bech32 string. Raises ValueError,
+    never naming the input, for mixed case, a bad character or checksum."""
+    if text.lower() != text and text.upper() != text:
+        raise ValueError("mixed-case Bech32")
+    text = text.lower()
+    pos = text.rfind("1")
+    if pos < 1 or pos + 7 > len(text) or any(ord(c) < 33 or ord(c) > 126 for c in text):
+        raise ValueError("malformed Bech32")
+    hrp, rest = text[:pos], text[pos + 1:]
+    try:
+        values = [_BECH32_REV[c] for c in rest]
+    except KeyError:
+        raise ValueError("invalid Bech32 character") from None
+    if _polymod(_hrp_expand(hrp) + values) != 1:
+        raise ValueError("invalid Bech32 checksum")
+    return hrp, bytes(_convert(values[:-6], 5, 8, False))
+
+
+_RAW = serialization.Encoding.Raw
+
+
+class Identity:
+    """An age X25519 secret key. Its repr never shows the key, and nothing
+    returns its text except `encode()`, which only the key file uses."""
+
+    __slots__ = ("_key",)
+
+    def __init__(self, key: X25519PrivateKey):
+        self._key = key
+
+    def __repr__(self) -> str:
+        return "Identity(<redacted>)"
+
+    @property
+    def public_bytes(self) -> bytes:
+        return self._key.public_key().public_bytes(_RAW, serialization.PublicFormat.Raw)
+
+    @property
+    def recipient(self) -> str:
+        """The `age1...` recipient: the public key, which is not secret."""
+        return _bech32_encode("age", self.public_bytes)
+
+    def encode(self) -> str:
+        """The `AGE-SECRET-KEY-1...` line of the key file."""
+        raw = self._key.private_bytes(_RAW, serialization.PrivateFormat.Raw,
+                                      serialization.NoEncryption())
+        return _bech32_encode("age-secret-key-", raw).upper()
+
+    def exchange(self, share: bytes) -> bytes:
+        return self._key.exchange(X25519PublicKey.from_public_bytes(share))
+
+
+def generate_identity() -> Identity:
+    """A new X25519 key pair: one per package (#676)."""
+    return Identity(X25519PrivateKey.generate())
+
+
+def parse_identity(text: str) -> Identity:
+    """The key in the contents of an age X25519 identity file (#676).
+
+    Blank lines and `#` comments are skipped, and CRLF line ends are accepted.
+    Exactly one other line must remain: one `AGE-SECRET-KEY-1...` key. Anything
+    else, a post-quantum `AGE-SECRET-KEY-PQ-1...` key included, raises
+    AgeError("identity"), whose message never contains the text.
+    """
+    bad = AgeError("identity", "the key file is not a valid age X25519 key")
+    if not isinstance(text, str) or len(text) > KEY_FILE_MAX:
+        raise bad
+    lines = [line[:-1] if line.endswith("\r") else line for line in text.split("\n")]
+    keys = [line for line in lines if line.strip() and not line.startswith("#")]
+    if len(keys) != 1 or not keys[0].startswith("AGE-SECRET-KEY-1"):
+        raise bad
+    try:
+        hrp, data = _bech32_decode(keys[0])
+    except ValueError:
+        raise bad from None
+    if hrp != "age-secret-key-" or len(data) != 32:
+        raise bad
+    return Identity(X25519PrivateKey.from_private_bytes(data))
+
+
+def identity_file(identity: Identity, created, package: str) -> str:
+    """The key file's text, in age's identity file layout, so `age -d -i` reads
+    it. `created` is a UTC datetime."""
+    return (f"# created: {created.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+            f"# public key: {identity.recipient}\n"
+            f"# The key of {package}. Store it apart from the package: anyone with "
+            "both can read it.\n"
+            f"{identity.encode()}\n")
+
+
+def _x25519_stanza(file_key: bytes, recipient: bytes) -> bytes:
+    """The `X25519` stanza wrapping `file_key` to the raw public key `recipient`."""
+    ephemeral = X25519PrivateKey.generate()
+    share = ephemeral.public_key().public_bytes(_RAW, serialization.PublicFormat.Raw)
+    secret = ephemeral.exchange(X25519PublicKey.from_public_bytes(recipient))
+    if secret == bytes(32):
+        raise ValueError("the recipient is a low-order point")
+    wrap = _hkdf(secret, share + recipient, _X25519_LABEL)
+    body = ChaCha20Poly1305(wrap).encrypt(b"\x00" * 12, file_key, None)
+    return b"-> X25519 " + _b64encode(share) + b"\n" + _b64encode(body) + b"\n"
+
+
+def x25519_unwrap(header: Header, identity: Identity) -> bytes:
+    """The file key from the first `X25519` stanza `identity` opens.
+
+    Stanzas are taken in order, as age does: other stanza types are skipped, a
+    malformed X25519 stanza met first is a header failure, and one that doesn't
+    open is passed over. A scrypt stanza must be alone (`scrypt_stanza`).
+    """
+    if "scrypt" in [s.args[0] for s in header.stanzas]:
+        raise AgeError("header", "a scrypt stanza must be the only stanza")
+    ours = identity.public_bytes
+    for stanza in header.stanzas:
+        if stanza.args[0] != "X25519":
+            continue
+        if len(stanza.args) != 2:
+            raise AgeError("header", "malformed X25519 stanza")
+        share = _b64decode(stanza.args[1].encode("ascii"))
+        if len(share) != 32 or len(stanza.body) != _FILE_KEY + _TAG:
+            raise AgeError("header", "malformed X25519 stanza")
+        try:
+            secret = identity.exchange(share)
+        except ValueError:
+            secret = bytes(32)
+        if secret == bytes(32):
+            raise AgeError("header", "the X25519 share gives an all-zero secret")
+        try:
+            return ChaCha20Poly1305(_hkdf(secret, share + ours, _X25519_LABEL)).decrypt(
+                b"\x00" * 12, stanza.body, None)
+        except InvalidTag:
+            continue
+    raise AgeError("key", "the key does not decrypt this file")
 
 
 # ── Payload (STREAM) ──────────────────────────────────────────────────────────
@@ -12403,34 +12874,48 @@ class Decryptor(io.RawIOBase):
             raise self._error
 
 
-def open_decrypt(fh: BinaryIO, passphrase: str) -> Decryptor:
-    """Parse the header, unwrap the key, check the MAC; then stream the payload."""
+def open_decrypt(fh: BinaryIO, passphrase: str | None = None, *,
+                 identity: Identity | None = None) -> Decryptor:
+    """Parse the header, unwrap the key with the passphrase or the X25519
+    identity (exactly one), check the MAC; then stream the payload."""
+    if (passphrase is None) == (identity is None):
+        raise ValueError("open_decrypt takes a passphrase or an identity")
     header = read_header(fh)
-    file_key = unwrap_file_key(header, passphrase)
+    if identity is not None:
+        file_key = x25519_unwrap(header, identity)
+    else:
+        file_key = unwrap_file_key(header, passphrase)
     verify_mac(header, file_key)
     return Decryptor(fh, file_key)
 
 
 class Encryptor(io.RawIOBase):
-    """Writes an age passphrase file to `fh` from the plaintext written to it.
+    """Writes an age file to `fh` from the plaintext written to it, for a
+    passphrase or for an X25519 recipient (`recipient`, the raw 32-byte public
+    key; #676): exactly one of them.
 
     The last chunk carries the final flag, so a full chunk is held back until
     either more data or `close()` shows whether it is the last. `close()` writes
     it and leaves `fh` open: the caller owns that file.
     """
 
-    def __init__(self, fh: BinaryIO, passphrase: str, work_factor: int | None = None):
+    def __init__(self, fh: BinaryIO, passphrase: str | None = None, work_factor: int | None = None,
+                 *, recipient: bytes | None = None):
         super().__init__()
+        if (passphrase is None) == (recipient is None):
+            raise ValueError("Encryptor takes a passphrase or a recipient")
         self._fh = fh
-        work_factor = WORK_FACTOR if work_factor is None else work_factor
         file_key = os.urandom(_FILE_KEY)
-        salt = os.urandom(16)
-        key = _scrypt(passphrase.encode("utf-8"), salt, work_factor)
-        wrapped = ChaCha20Poly1305(key).encrypt(b"\x00" * 12, file_key, None)
-        mac_input = (VERSION_LINE + b"\n"
-                     + b"-> scrypt " + _b64encode(salt) + b" " + str(work_factor).encode() + b"\n"
-                     + _b64encode(wrapped) + b"\n"   # 43 characters: one short line
-                     + b"---")
+        if recipient is not None:
+            stanza = _x25519_stanza(file_key, recipient)
+        else:
+            work_factor = WORK_FACTOR if work_factor is None else work_factor
+            salt = os.urandom(16)
+            key = _scrypt(passphrase.encode("utf-8"), salt, work_factor)
+            wrapped = ChaCha20Poly1305(key).encrypt(b"\x00" * 12, file_key, None)
+            stanza = (b"-> scrypt " + _b64encode(salt) + b" " + str(work_factor).encode() + b"\n"
+                      + _b64encode(wrapped) + b"\n")   # 43 characters: one short line
+        mac_input = VERSION_LINE + b"\n" + stanza + b"---"
         nonce = os.urandom(_NONCE)
         fh.write(mac_input + b" " + _b64encode(_header_mac(file_key, mac_input)) + b"\n" + nonce)
         self._aead = ChaCha20Poly1305(_hkdf(file_key, nonce, b"payload"))
@@ -13160,7 +13645,7 @@ def active_job_for(collection: str) -> str | None:
 
 @telemetry.traced("rag.export")
 def _run(job_id: str, collection: str, include_models: bool,
-         passphrase: str | None = None) -> None:
+         passphrase: str | None = None, encryption: str | None = None) -> None:
     job = _jobs[job_id]
 
     def progress(written: int) -> None:
@@ -13181,8 +13666,10 @@ def _run(job_id: str, collection: str, include_models: bool,
         # it is released before the terminal status is written.
         with collection_writes.guard(collection):
             job["status"] = "running"
+            # `key` only when it is asked for, so a build without one is called as before.
+            keyed = {"key": True} if encryption == "key" else {}
             result = packager.build(collection, include_models=include_models, progress=progress,
-                                    passphrase=passphrase)
+                                    passphrase=passphrase, **keyed)
     except packager.PackageError as exc:
         telemetry.outcome("error", exc)
         _log.warning("Export of %r refused (%s): %s", collection, exc.code, exc.message)
@@ -13206,13 +13693,24 @@ def _run(job_id: str, collection: str, include_models: bool,
         # export finish also sees when its package expires (#677). A failure
         # leaves the package unrecorded, never expired: the job says so. The
         # collection is recorded too: an encrypted package follows its access (#794).
+        # A key export's key file is recorded too, with the same finish time:
+        # each is deleted by its own full download, and expiry deletes both (#676).
+        # Both in one write, so the package is never recorded without its key (#860).
         warnings = list(result["warnings"])
+        key_filename = result.get("key_filename")
+        finished = datetime.now(timezone.utc)
         try:
-            package_retention.record_export(result["filename"], datetime.now(timezone.utc), collection)
+            package_retention.record_export(result["filename"], finished, collection,
+                                            key_filename=key_filename)
         except Exception:                          # noqa: BLE001 - reported in the warnings
             _log.exception("Could not record the expiry of package %s", result["filename"])
-            warnings.append("The package's expiry could not be recorded, so it won't be deleted "
-                            "automatically. Delete it from ./exports by hand once it has been copied.")
+            if key_filename:
+                warnings.append("The expiry of the package and its key file could not be recorded, so "
+                                "they won't be deleted automatically. Delete both from ./exports by hand "
+                                "once they have been copied.")
+            else:
+                warnings.append("The package's expiry could not be recorded, so it won't be deleted "
+                                "automatically. Delete it from ./exports by hand once it has been copied.")
         finish(
             status="completed",
             filename=result["filename"],
@@ -13222,6 +13720,7 @@ def _run(job_id: str, collection: str, include_models: bool,
             fidelity=result["fidelity"],
             models_bundled=result["models_bundled"],
             retrieve_script=result["retrieve_script"],
+            key_filename=key_filename,
             warnings=warnings,
         )
     finally:
@@ -13233,16 +13732,24 @@ def _run(job_id: str, collection: str, include_models: bool,
 
 
 async def start_export_job(collection: str, include_models: bool = False,
-                           passphrase: str | None = None, owner: dict | None = None) -> str:
+                           passphrase: str | None = None, owner: dict | None = None,
+                           encryption: str | None = None) -> str:
     """Register the job and run the build off the event loop.
 
-    A passphrase makes the package encrypted (#27). It is handed to the worker
-    as an argument only: the job record says `encrypted`, never the passphrase.
+    `encryption` is `"key"` (a new X25519 key per package, #676), `"passphrase"`
+    (#27) or `"none"`. Left out, it is `"passphrase"` with a passphrase and
+    `"none"` without: the API's own default, a key, is set by POST /export
+    (ExportRequest). The passphrase is handed to the worker as an argument
+    only: the job record says `encryption` and `encrypted`, never a secret.
 
     Raises ExportInProgressError carrying the running job id if one is already in flight
     for this collection; that job's record is always stored by then (#326).
     Raises ExportStartingError if that start hasn't stored it within START_WAIT.
     """
+    if encryption is None:
+        encryption = "passphrase" if passphrase is not None else "none"
+    if (encryption == "passphrase") != (passphrase is not None):
+        raise ValueError("a passphrase goes with encryption 'passphrase' only")
     job_id = str(uuid.uuid4())[:8]
     deadline = None
     while True:
@@ -13291,7 +13798,9 @@ async def start_export_job(collection: str, include_models: bool = False,
                 "fidelity": None,
                 "models_bundled": None,
                 "retrieve_script": None,
-                "encrypted": passphrase is not None,
+                "encrypted": encryption != "none",
+                "encryption": encryption,
+                "key_filename": None,
                 "warnings": [],
                 "error": None,
                 "error_code": None,
@@ -13313,7 +13822,7 @@ async def start_export_job(collection: str, include_models: bool = False,
     # export does not stall the API: queries and other collections carry on, and
     # only guarded writes to this collection wait for it (spec §6.1, #509).
     task = asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, collection, include_models,
-                                         passphrase))
+                                         passphrase, encryption))
     # _run ends it first; this also covers a task that never ran its worker.
     task.add_done_callback(lambda _task: collection_writes.end_job("export", job_id))
     return job_id
@@ -13345,10 +13854,18 @@ A package copied straight from the host folder is still deleted after the expiry
 a download is refused (409 PACKAGE_BUSY) and the sweep skips it until its next
 run. Claiming a download and the sweep's check-and-delete take the same lock.
 
-**One way to delete.** `delete` removes the package, its companion files (none
-yet; #676's key file will be one) and its record entry, and writes one
-`package.delete` audit record. `may_sweep` alone decides whether the sweep may
-delete a package, so a later "keep" flag changes only that function.
+**One way to delete.** `delete` removes the package, its companion files (none)
+and its record entry, and writes one `package.delete` audit record. `may_sweep`
+alone decides whether the sweep may delete a package, so a later "keep" flag
+changes only that function.
+
+**Key files (#676).** A key export's key file, `<package>.key`, is recorded on
+its own, with the package's finish time and collection. It follows the same
+rules by its own name: a full download of it deletes it and only it, a full
+download of the package leaves it, and expiry deletes whichever of the two is
+still there. It is recorded in the same write as its package (#860), so one is
+never recorded without the other. So it is not a companion: deleting it with the package would lose
+the key of a package downloaded first.
 
 **The record.** Each entry is `{"finished_at": ..., "collection": ...}`: the
 collection is the one exported, so an encrypted package exported here follows
@@ -13389,7 +13906,9 @@ RECORD_NAME = "exported_packages.json"
 SWEEP_INTERVAL_S = 15 * 60
 # The names a download serves: what exports write (packager.package_stem). The
 # `ragpkg-` prefix rules out a leading `.` and the class rules out `/`.
-NAME = re.compile(r"ragpkg-[A-Za-z0-9._-]+\.tar\.gz(?:\.age)?")
+NAME = re.compile(r"ragpkg-[A-Za-z0-9._-]+\.tar\.gz(?:\.age(?:\.key)?)?")
+# A key export's key file (#676): `<package>.tar.gz.age.key`.
+KEY_SUFFIX = ".tar.gz.age.key"
 _TIME = "%Y-%m-%dT%H:%M:%SZ"
 
 _lock = threading.RLock()
@@ -13410,6 +13929,11 @@ def lock():
 
 def valid_name(name) -> bool:
     return isinstance(name, str) and NAME.fullmatch(name) is not None
+
+
+def is_key_name(name) -> bool:
+    """A key file's name (#676), as the download rule admits it."""
+    return valid_name(name) and name.endswith(KEY_SUFFIX)
 
 
 def _exports() -> Path:
@@ -13499,13 +14023,18 @@ def _write(entries: dict[str, dict]) -> None:
         raise
 
 
-def record_export(filename: str, finished: datetime, collection: str | None = None) -> None:
+def record_export(filename: str, finished: datetime, collection: str | None = None,
+                  key_filename: str | None = None) -> None:
     """Record a package this instance exported, with the collection it holds
-    (#794). Raises when it can't be written."""
+    (#794), and a key export's key file with the same entry, in one write
+    (#860). Raises when it can't be written; then neither is recorded."""
     with _lock:
         entries = _read()
-        entries[filename] = {"finished_at": finished.astimezone(timezone.utc).strftime(_TIME),
-                             "collection": collection}
+        entry = {"finished_at": finished.astimezone(timezone.utc).strftime(_TIME),
+                 "collection": collection}
+        entries[filename] = entry
+        if key_filename:
+            entries[key_filename] = dict(entry)
         _write(entries)
 
 
@@ -13560,7 +14089,8 @@ def recorded_collections() -> dict[str, str | None]:
 
 
 def companions(filename: str) -> list[str]:
-    """Files deleted with a package. None yet: #676's key file will be one."""
+    """Files deleted with a package. None: a key file (#676) is recorded and
+    deleted on its own, so downloading the package never deletes its key."""
     return []
 
 
@@ -13737,6 +14267,7 @@ import asyncio
 import json
 import logging
 import os
+import stat
 import re
 import shutil
 import tempfile
@@ -13781,8 +14312,9 @@ _NAME_OK = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 
 
 class PassphraseError(Exception):
-    """A passphrase missing for an encrypted package, or given for one that is
-    not encrypted (#27). Raised before any job exists; `code` is the API code."""
+    """A passphrase or key missing for an encrypted package, given for one that
+    is not encrypted or that takes the other, or a key that isn't one (#27,
+    #676). Raised before any job exists; `code` is the API code."""
 
     def __init__(self, code: str, message: str):
         super().__init__(message)
@@ -14607,7 +15139,8 @@ def _start_access(owner, source: str, target: str, operator: bool = False):
 
 
 @telemetry.traced("rag.import")
-def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = None) -> None:
+def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = None,
+         identity: "age_stream.Identity | None" = None) -> None:
     job = _jobs[job_id]
     job["status"] = "running"
     work = Path(tempfile.mkdtemp(prefix="import-", dir=settings.upload_dir))
@@ -14632,7 +15165,9 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
 
     try:
         archive = packager.exports_dir() / Path(filename).name
-        pkg, manifest = packager.open_package(archive, work, passphrase)  # checks 1, 2
+        # checks 1, 2; an identity (#676) only when there is one, so the call is otherwise as before
+        pkg, manifest = (packager.open_package(archive, work, passphrase, identity=identity)
+                         if identity is not None else packager.open_package(archive, work, passphrase))
         packager.verify_digests(pkg, manifest)                      # check 3
         _validate_package_sources(pkg, manifest)
         _check_embedding(manifest)                                  # check 4
@@ -14807,29 +15342,72 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
         _release_targets(job_id)
 
 
+def package_kind(name: str) -> str | None:
+    """`age_stream.header_kind` of a package in ./exports: "passphrase", "key",
+    or None when it is missing, not a regular file, or not a header either
+    takes. Reads the header only: no scrypt or X25519 work (#676)."""
+    try:
+        fd = os.open(packager.exports_dir() / Path(name).name,
+                     os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return None
+    with os.fdopen(fd, "rb") as fh:
+        try:
+            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                return None
+        except OSError:
+            return None
+        return age_stream.header_kind(fh)
+
+
 async def start_import_job(filename: str, on_conflict: str, passphrase: str | None = None,
-                           owner: dict | None = None) -> str:
+                           owner: dict | None = None, *, key: str | None = None) -> str:
     """Register the job and run the import off the event loop.
 
-    An encrypted package is known by its name (`.tar.gz.age`, #27), so a missing
-    or unexpected passphrase is refused here, before any job or guard. The
-    passphrase reaches the worker as an argument only, never the job record.
+    An encrypted package is known by its name (`.tar.gz.age`, #27), and whether
+    a passphrase or its key file opens it by its age header (#676), so a missing,
+    unexpected or invalid secret is refused here, before any job or guard. An
+    unreadable header takes either secret, and the job reports why it can't be
+    read. The secret reaches the worker as an argument only, never the job record.
     """
-    key = _package_key(filename)
-    encrypted = age_stream.is_encrypted_name(key)
-    if encrypted and passphrase is None:
-        raise PassphraseError("PASSPHRASE_REQUIRED",
-                              f"'{key}' is encrypted. Send its passphrase to import it.")
+    name = _package_key(filename)
+    encrypted = age_stream.is_encrypted_name(name)
     if not encrypted and passphrase is not None:
         raise PassphraseError("PASSPHRASE_NOT_EXPECTED",
-                              f"'{key}' is not encrypted, so it takes no passphrase. "
+                              f"'{name}' is not encrypted, so it takes no passphrase. "
                               "Anyone with the file can read it.")
+    if not encrypted and key is not None:
+        raise PassphraseError("KEY_FILE_NOT_EXPECTED",
+                              f"'{name}' is not encrypted, so it takes no key. "
+                              "Anyone with the file can read it.")
+    identity = None
+    if encrypted:
+        kind = await asyncio.to_thread(package_kind, name)
+        if kind == "key" and key is None:
+            raise PassphraseError("KEY_FILE_REQUIRED",
+                                  f"'{name}' is encrypted with a key. Send its key file to import it.")
+        if kind == "passphrase" and passphrase is None:
+            raise PassphraseError("PASSPHRASE_REQUIRED",
+                                  f"'{name}' is encrypted with a passphrase. Send its passphrase to import it.")
+        if kind is None and passphrase is None and key is None:
+            raise PassphraseError("PASSPHRASE_REQUIRED",
+                                  f"'{name}' is encrypted. Send its passphrase to import it.")
+        if key is not None:
+            try:
+                identity = age_stream.parse_identity(key)
+            except age_stream.AgeError:
+                raise PassphraseError("KEY_FILE_INVALID",
+                                      "The key isn't the text of an age key file "
+                                      "(one AGE-SECRET-KEY-1... line).") from None
+            passphrase = None
+    encryption = "key" if identity is not None else "passphrase" if passphrase is not None else "none"
+    key = None                         # the key's text is not kept past here
     job_id = str(uuid.uuid4())[:8]
     # Off the event loop: the claim waits while a sweep holds the retention lock
     # (#677). A cancellation while it runs still releases it (#794).
     from services import package_retention
-    await package_retention.run_claim(lambda: _claim_package(key, filename),
-                                      lambda _: _release_package(key))
+    await package_retention.run_claim(lambda: _claim_package(name, filename),
+                                      lambda _: _release_package(name))
 
     # The first write is durable, so it runs off the event loop (#309). A start
     # cancelled meanwhile releases its guard; the store removes the record.
@@ -14850,13 +15428,18 @@ async def start_import_job(filename: str, on_conflict: str, passphrase: str | No
             "error_code": None,
             "error_detail": None,
             "encrypted": encrypted,
+            "encryption": encryption,
             "owner": owner,                     # who started it, for the job lists (#617)
         })
     except BaseException:
-        _release_package(key)
+        _release_package(name)
         raise
-    asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, filename, on_conflict,
-                                          passphrase))
+    if identity is not None:
+        asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, filename, on_conflict,
+                                              None, identity))
+    else:
+        asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, filename, on_conflict,
+                                              passphrase))
     return job_id
 ```
 
@@ -16286,7 +16869,7 @@ async def delete_collection(name: CollectionName, confirm: str | None = None):
 
 def _access_body(state: store.CollectionAccess) -> CollectionAccessResponse:
     return CollectionAccessResponse(restricted=state.restricted, users=list(state.users),
-                                    service_principals=list(state.service_principals))
+                                    service_principals=list(state.service_principals), groups=list(state.groups))
 
 
 async def _missing(name: str, outcome: str):
@@ -16316,25 +16899,26 @@ def _names(before: tuple, after: tuple) -> tuple[list, list]:
 
 @router.put("/{name}/access", response_model=CollectionAccessResponse)
 async def set_collection_access(name: CollectionName, body: CollectionAccessRequest, request: Request = None):
-    """Set who may use the collection, the whole state at once (#606)."""
+    """Set who may use the collection, the whole state at once (#606), groups included (#784)."""
     audit.note(collection=name)
     missing = await _missing(name, "Nothing was changed")
     if missing is not None:
         return missing
     try:
         before, after = await asyncio.to_thread(store.set_collection_access, name, body.restricted,
-                                                body.users, body.service_principals)
+                                                body.users, body.service_principals, body.groups)
     except store.Refused as exc:
         return api_error(422, "INVALID_PARAMETER", str(exc))
     added_users, removed_users = _names(before.users, after.users)
     added_svc, removed_svc = _names(before.service_principals, after.service_principals)
+    added_groups, removed_groups = _names(before.groups, after.groups)
     audit.note(restricted_before=before.restricted, restricted_after=after.restricted,
-               added={"users": added_users, "service_principals": added_svc},
-               removed={"users": removed_users, "service_principals": removed_svc})
+               added={"users": added_users, "service_principals": added_svc, "groups": added_groups},
+               removed={"users": removed_users, "service_principals": removed_svc, "groups": removed_groups})
     actor = getattr(access.principal_of(request), "username", "?")
-    _log.warning("Admin %r set the access of collection %r: %s, %d people and %d service principals granted",
-                 actor, name, "restricted" if after.restricted else "open", len(after.users),
-                 len(after.service_principals))
+    _log.warning("Admin %r set the access of collection %r: %s, %d people, %d service principals and %d groups "
+                 "granted", actor, name, "restricted" if after.restricted else "open", len(after.users),
+                 len(after.service_principals), len(after.groups))
     return _access_body(after)
 ```
 
@@ -17066,6 +17650,7 @@ from models.schemas import (
     PackageListResponse,
     PackageSummary,
 )
+from config import settings
 from services import age_stream, audit, exporter, importer, job_lists, package_retention, packager
 from services import weaviate_client as wc
 from services.collection_writes import CollectionDeletingError
@@ -17077,8 +17662,14 @@ _log = logging.getLogger(__name__)
 
 @router.post("/export", response_model=ExportStartResponse, status_code=202)
 async def start_export(body: ExportRequest, request: Request = None):
-    # The audit record's parameters (#29): whether it is encrypted, never the passphrase.
-    audit.note(collection=body.collection, include_models=body.include_models, encrypted=body.passphrase is not None)
+    # The audit record's parameters (#29): how it is encrypted, never a secret.
+    audit.note(collection=body.collection, include_models=body.include_models,
+               encrypted=body.encryption != "none", encryption=body.encryption)
+    # LAN mode exports only encrypted packages (#676).
+    if settings.rag_lan_mode and body.encryption == "none":
+        return api_error(400, "ENCRYPTION_REQUIRED",
+                         "LAN mode exports only encrypted packages: use a new key (the default) "
+                         "or a passphrase.")
     # A collection the caller may not use answers as one that doesn't exist (#606).
     if not await access.check(request, body.collection):
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{body.collection}' not found.")
@@ -17097,7 +17688,7 @@ async def start_export(body: ExportRequest, request: Request = None):
         job_id = await exporter.start_export_job(
             body.collection, body.include_models,
             body.passphrase.get_secret_value() if body.passphrase is not None else None,
-            owner=job_lists.job_owner(request))
+            owner=job_lists.job_owner(request), encryption=body.encryption)
     except CollectionDeletingError:
         return collection_deleting_error(body.collection)
     except exporter.ExportStartingError:
@@ -17120,8 +17711,24 @@ async def list_export_jobs(request: Request):
     """The caller's running and recent exports (#617; see services/job_lists)."""
     principal = request.state.auth
     def build():
-        return job_lists.entries(ExportJobEntry, job_lists.job_items(exporter.job_records()), principal)
+        rows = [(job_id, {**record, **_export_extras(record)}, saved)
+                for job_id, record, saved in exporter.job_records()]
+        return job_lists.entries(ExportJobEntry, job_lists.job_items(rows), principal)
     return ExportJobList(jobs=await asyncio.to_thread(build))
+
+
+def _export_extras(job: dict) -> dict:
+    """An export record's `encryption` (records from before #676 have none) and
+    whether its key file is still in ./exports (#676)."""
+    encryption = job.get("encryption") or ("passphrase" if job.get("encrypted") else "none")
+    name = job.get("key_filename")
+    on_server = False
+    if isinstance(name, str) and package_retention.is_key_name(name):
+        try:
+            on_server = stat.S_ISREG(os.lstat(packager.exports_dir() / name).st_mode)
+        except OSError:
+            on_server = False
+    return {"encryption": encryption, "key_on_server": on_server}
 
 
 @router.get("/export/job/{job_id}", response_model=ExportJobStatusResponse)
@@ -17134,20 +17741,25 @@ async def export_job_status(job_id: str, request: Request = None):
     expires = None
     if job.get("status") == "completed" and isinstance(job.get("filename"), str):
         expires = await asyncio.to_thread(package_retention.expires_at, job["filename"])
-    return ExportJobStatusResponse(**{**job, "expires_at": expires})
+    extras = await asyncio.to_thread(_export_extras, job)
+    return ExportJobStatusResponse(**{**job, **extras, "expires_at": expires})
 
 
 @router.post("/import", response_model=ImportStartResponse, status_code=202)
 async def start_import(body: ImportRequest, request: Request = None):
     # The audit record's parameters (#29); the collection is added when the job ends.
-    audit.note(package=body.filename, on_conflict=body.on_conflict, encrypted=body.passphrase is not None)
+    # Which secret was sent, never the secret (#676).
+    encryption = "key" if body.key is not None else "passphrase" if body.passphrase is not None else "none"
+    audit.note(package=body.filename, on_conflict=body.on_conflict, encrypted=encryption != "none",
+               encryption=encryption)
     # Everything else — unreadable archive, bad digest, embedding mismatch,
     # name collision — is reported through the job, because it is only knowable
     # after reading the package, which takes long enough to need a job.
     passphrase = body.passphrase.get_secret_value() if body.passphrase is not None else None
+    key = body.key.get_secret_value() if body.key is not None else None
     try:
         job_id = await importer.start_import_job(body.filename, body.on_conflict, passphrase,
-                                                 owner=job_lists.job_owner(request))
+                                                 owner=job_lists.job_owner(request), key=key)
     except importer.PassphraseError as exc:
         # Decided by the filename before any job exists (#27).
         return api_error(400, exc.code, str(exc), detail={"filename": body.filename})
@@ -17179,17 +17791,19 @@ async def import_job_status(job_id: str, request: Request = None):
 def _summary(p: Path) -> dict:
     """One package as the listing shows it."""
     if age_stream.is_encrypted_name(p.name):
-        # No metadata without the passphrase, and no scrypt to list (#27).
+        # No metadata without the passphrase or key, and no scrypt or X25519 to
+        # list (#27); the header says which of the two opens it (#676).
         try:
             with p.open("rb") as fh:
-                readable = age_stream.check_header(fh)
+                kind = age_stream.header_kind(fh)
             size = p.stat().st_size
         except Exception:                             # noqa: BLE001
             # One bad file never breaks the listing of the others.
-            readable, size = False, 0
+            kind, size = None, 0
         return {"filename": p.name, "size_bytes": size,
                 "collection": None, "chunk_count": None, "fidelity": None,
-                "created_at": None, "readable": readable, "encrypted": True}
+                "created_at": None, "readable": kind is not None, "encrypted": True,
+                "encryption": kind}
     try:
         fields = packager.listing_fields(packager.read_manifest(p))
     except Exception:
@@ -17198,19 +17812,30 @@ def _summary(p: Path) -> dict:
         # will report precisely why it cannot be used.
         return {"filename": p.name, "size_bytes": p.stat().st_size,
                 "collection": None, "chunk_count": None,
-                "fidelity": None, "created_at": None, "readable": False}
+                "fidelity": None, "created_at": None, "readable": False, "encryption": "none"}
     return {
         "filename": p.name,
         "size_bytes": p.stat().st_size,
         **fields,
         "readable": True,
+        "encryption": "none",
     }
+
+
+def _key_on_server(root: Path, filename: str) -> bool:
+    """A regular file `<filename>.key` is in ./exports (#676)."""
+    try:
+        return stat.S_ISREG(os.lstat(root / (filename + ".key")).st_mode)
+    except OSError:
+        return False
 
 
 def _list_packages_sync() -> list[dict]:
     root = packager.exports_dir()
     expiries = package_retention.expiries()
-    return [{**_summary(p), "expires_at": expiries.get(p.name)}
+    # Key files (#676) are not packages: the two globs never match `*.key`.
+    return [{**_summary(p), "expires_at": expiries.get(p.name),
+             "key_on_server": age_stream.is_encrypted_name(p.name) and _key_on_server(root, p.name)}
             for p in sorted([*root.glob("ragpkg-*.tar.gz"), *root.glob("ragpkg-*" + age_stream.ENCRYPTED_SUFFIX)])]
 
 
@@ -17385,7 +18010,14 @@ async def download_package(filename: str, request: Request = None):
         return _package_not_found(filename)
     # The listing's access rule (#606): a package hidden from the caller there
     # answers as one that doesn't exist, and the refusal is audited.
-    summary = await asyncio.to_thread(_summary, path)
+    if package_retention.is_key_name(filename):
+        # A key file (#676) is served only when it was exported here, under its
+        # package's access: the collection recorded with it (#606/#794).
+        if not await asyncio.to_thread(package_retention.recorded, filename):
+            return _package_not_found(filename)
+        summary = {"filename": filename, "encrypted": True}
+    else:
+        summary = await asyncio.to_thread(_summary, path)
     refused = await _hidden(access.principal_of(request), [summary])
     if filename in refused:
         collection = refused[filename]
@@ -18010,13 +18642,21 @@ def get_summary(
 ```markdown
 ## Encryption
 
-A package is encrypted only when it was exported with a passphrase. Its name
-then ends in `.tar.gz.age`: it is an [age](https://age-encryption.org) file that
-only that passphrase opens, whether through import here or with `age -d`. The
-passphrase can't be recovered, and without it the package can't be opened. Send
-it by a different channel than the file.
+A package whose name ends in `.tar.gz.age` is encrypted. It is an
+[age](https://age-encryption.org) file, opened in one of two ways:
 
-A package whose name ends in `.tar.gz` is not encrypted. Nothing in it is
+- **With its own key** (the default since 1.3.1). Each export is encrypted to a
+  new key made for that package alone, and the key is written to a separate key
+  file, `<package>.key`. The key file opens the package, through import or with
+  `age -d -i <package>.key <package>`, and nothing else. It can be downloaded
+  from the server once, and it can't be recovered. Store it apart from the
+  package: anyone who has both can read it.
+- **With a passphrase**, chosen when it was exported. Import it with that
+  passphrase, or open it with `age -d`. The passphrase can't be recovered either.
+  Send it by a different channel than the file.
+
+A package whose name ends in `.tar.gz` is not encrypted. It was exported with
+encryption turned off on purpose (LAN mode doesn't allow that). Nothing in it is
 protected: `sources/` holds the original documents byte for byte, and
 `chunks.jsonl` holds their text. If the corpus contains confidential or personal
 material, the package does too. Move and store it accordingly.
@@ -18053,13 +18693,19 @@ Check any machine with `docker compose exec ollama ollama list`.
 
 ````markdown
 ```
-ragpkg-<collection>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz
-ragpkg-<collection>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz.age    (exported with a passphrase)
+ragpkg-<collection>-<YYYYMMDDTHHMMSSZ>-<id8>[-<n>].tar.gz          (not encrypted)
+ragpkg-<collection>-<YYYYMMDDTHHMMSSZ>-<id8>[-<n>].tar.gz.age      (encrypted with a new key, the default, or a passphrase)
+ragpkg-<collection>-<YYYYMMDDTHHMMSSZ>-<id8>[-<n>].tar.gz.age.key  (the key file of a package encrypted with a key)
 ```
 
 The collection name in the filename is lowercased and stripped of punctuation,
 so it is lossy, and two different collections can produce the same label. `<id8>`
 is the first eight hex characters of the manifest's own digest.
+
+`-<n>` is added only when that name is already taken: two exports of the same
+collection that start in the same second would otherwise get the same name, so
+the later one is `-2` (then `-3`, and so on). Both packages and their key files
+are kept; an export never replaces a file in `./exports`.
 
 **`manifest.json` is authoritative.** Import reads the collection name from there
 and never parses the filename. Renaming a package file changes nothing about what
@@ -18132,6 +18778,8 @@ original documents it was built from.
 
 @@INCLUDE:encryption@@
 
+@@ENCRYPTION_NOTE@@
+
 ## What fidelity means
 
 @@INCLUDE:fidelity_table@@
@@ -18150,7 +18798,7 @@ This package is **`@@FIDELITY@@`**. @@FIDELITY_NOTE@@
 ```bash
 curl -X POST http://localhost:8080/api/import \
   -H 'Content-Type: application/json' \
-  -d '{"filename": "@@PACKAGE_FILENAME@@", "on_conflict": "abort"@@IMPORT_PASSPHRASE@@}'
+  -d '{"filename": "@@PACKAGE_FILENAME@@", "on_conflict": "abort"@@IMPORT_SECRET@@}'
 ```
 
 3. Poll the returned `job_id` at `GET /api/import/job/{job_id}`.
@@ -18456,8 +19104,9 @@ if __name__ == "__main__":
 ```markdown
 # Moving a RAG between machines
 
-A collection can be exported as a single `.tar.gz` (or, with a passphrase, an
-encrypted `.tar.gz.age`) and imported somewhere else —
+A collection can be exported as a single encrypted `.tar.gz.age` (with a new key
+of its own by default, or with a passphrase; or, outside LAN mode, as a plain
+`.tar.gz`) and imported somewhere else —
 another laptop, a customer's machine, an air-gapped network. The package carries
 the chunks and their vectors, the settings the collection was tuned with, a
 standalone query script and, when the originals were retained, the source
@@ -18471,9 +19120,12 @@ Everything below is rendered from the same templates that generate the
 Both directions use `./exports/` in the project directory, which is a bind mount
 rather than a Docker volume so you can pick files up and drop them in directly.
 
-- **Exporting** writes the package there.
+- **Exporting** writes the package there, and for a package encrypted with a key,
+  its key file beside it.
 - **Importing** reads from there: copy a package in first, then import by filename,
-  with its passphrase when the package is encrypted.
+  with its key file or its passphrase when the package is encrypted. The key file
+  is never copied into `./exports/` on the importing side: its text is sent with
+  the import.
 
 `GET /api/packages` lists what is currently in that directory, including files it
 cannot read — those are shown rather than hidden, so nothing disappears silently.
@@ -19063,6 +19715,13 @@ ACCESS: dict[tuple[str, str], str] = {
     ("POST", "/auth/service-principals/{name}/enable"): ENGINEER,
     ("POST", "/auth/service-principals/{name}/keys"): ENGINEER,
     ("POST", "/auth/service-principals/{name}/keys/{key_id}/revoke"): ENGINEER,
+    # Groups for collection access (#784): Engineers, in a browser session only.
+    # Nothing under /auth uses DELETE, so a group is deleted with a POST.
+    ("GET", "/auth/groups"): ENGINEER,
+    ("POST", "/auth/groups"): ENGINEER,
+    ("POST", "/auth/groups/{name}/rename"): ENGINEER,
+    ("PUT", "/auth/groups/{name}/members"): ENGINEER,
+    ("POST", "/auth/groups/{name}/delete"): ENGINEER,
     # The audit log (#29): Engineers, in a browser session only (HUMAN_ONLY).
     ("GET", "/audit"): ENGINEER,
     ("GET", "/audit.csv"): ENGINEER,
@@ -19080,10 +19739,11 @@ ACCESS: dict[tuple[str, str], str] = {
 # GET /auth/me answers for a key. The audit log too (#29): a leaked key can't
 # read who did what, or question text when that is recorded. And two-step
 # verification (#607): service keys are unchanged and have no second factor.
-# And per-collection access (#606), so a leaked key can't open a collection to
-# another principal.
+# And per-collection access (#606), and groups (#784), so a leaked key can't
+# open a collection to another principal.
 HUMAN_ONLY = frozenset(path for _, path in ACCESS
-                       if path.startswith(("/auth/users", "/auth/service-principals", "/auth/mfa"))) | {
+                       if path.startswith(("/auth/users", "/auth/service-principals", "/auth/mfa",
+                                           "/auth/groups"))) | {
     "/auth/logout", "/auth/password", "/audit", "/audit.csv", "/collections/{name}/access"}
 
 
@@ -19190,6 +19850,13 @@ Per-collection access (#606, schema 4): a collection named in
 `collection_grants` (people or service principals) and Engineers may use it;
 any other collection is open to every account its role allows. Names are the
 canonical (stored) collection names. The rule itself is in access.py.
+
+Groups for collection access (#784, schema 5): Engineers make groups
+(`groups`) of people and service principals (`group_members`), and a
+restricted collection can be granted to a group (`collection_group_grants`) as
+well as to accounts. A member may use it while both the grant and their
+membership hold. Members and grants name the group's id, so a rename keeps
+them; deleting a group removes both, and never opens a collection.
 """
 from __future__ import annotations
 
@@ -19201,7 +19868,7 @@ import sqlite3
 import time
 from collections.abc import Iterable
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from config import settings
@@ -19220,7 +19887,7 @@ KEY_DAYS_DEFAULT = 90            # a key's lifetime when none is given (Q23) ...
 KEY_DAYS_MAX = 365               # ... and the longest allowed
 _DAY_S = 86400
 NO_PASSWORD = "!"                # a principal's password hash: never verifies
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 MFA_PENDING_S = 10 * 60          # a started set-up must be confirmed within 10 minutes
 MFA_CHALLENGE_S = 5 * 60         # the code must follow the password within 5 minutes ...
 MFA_CHALLENGE_TRIES = 5          # ... with at most 5 codes per challenge
@@ -19306,6 +19973,25 @@ CREATE TABLE IF NOT EXISTS collection_grants (
     granted_at REAL NOT NULL,
     PRIMARY KEY (collection, user_id)
 );
+CREATE TABLE IF NOT EXISTS groups (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS group_members (
+    group_id INTEGER NOT NULL REFERENCES groups(id),
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    added_at REAL NOT NULL,
+    PRIMARY KEY (group_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS group_members_user ON group_members(user_id);
+CREATE TABLE IF NOT EXISTS collection_group_grants (
+    collection TEXT NOT NULL,
+    group_id INTEGER NOT NULL REFERENCES groups(id),
+    granted_at REAL NOT NULL,
+    PRIMARY KEY (collection, group_id)
+);
+CREATE INDEX IF NOT EXISTS collection_group_grants_group ON collection_group_grants(group_id);
 """
 
 _ready: set[str] = set()
@@ -19319,7 +20005,9 @@ class Refused(Exception):
     NOT_A_USER, REFUSED for the bootstrap rules, or one of the MFA codes
     (MFA_ALREADY_ENROLLED, MFA_ENROLLMENT_NOT_STARTED, MFA_CODE_INCORRECT,
     MFA_NOT_ENROLLED, MFA_REQUIRED, MFA_ENROLL_FIRST), or UNKNOWN_ACCOUNT for a
-    collection grant naming no such account (#606)."""
+    collection grant naming no such account (#606), or for groups (#784)
+    GROUP_EXISTS, GROUP_NOT_FOUND, and UNKNOWN_GROUP for a collection grant
+    naming no such group."""
 
     def __init__(self, message: str, code: str = "REFUSED"):
         super().__init__(message)
@@ -19420,9 +20108,10 @@ def _connect(write: bool = False):
 
 
 def _migrate(conn) -> None:
-    """Version 2 (PR 3): users.kind. Versions 3 (#607) and 4 (#606) only add
-    tables, which _SCHEMA creates; version 4 leaves every existing collection
-    open, since none is named in restricted_collections. In a write transaction, so the API and the operator
+    """Version 2 (PR 3): users.kind. Versions 3 (#607), 4 (#606) and 5 (#784)
+    only add tables, which _SCHEMA creates; version 4 leaves every existing collection
+    open, since none is named in restricted_collections, and version 5 adds no
+    group, so no state changes. In a write transaction, so the API and the operator
     command can't both add the column."""
     conn.execute("BEGIN IMMEDIATE")
     columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
@@ -20005,6 +20694,10 @@ class CollectionAccess:
     restricted: bool
     users: tuple[str, ...] = ()
     service_principals: tuple[str, ...] = ()
+    groups: tuple[str, ...] = ()                 # #784
+    # Each granted group's identity, (id, created_at), in the order of `groups`,
+    # for put_back (#854): a name can be reused, and so can an id. Not compared.
+    group_ids: tuple[tuple[int, float], ...] = field(default=(), compare=False, repr=False)
 
 
 def _access(conn, collection: str) -> CollectionAccess:
@@ -20012,8 +20705,13 @@ def _access(conn, collection: str) -> CollectionAccess:
         return CollectionAccess(False)
     rows = conn.execute("SELECT u.username, u.kind FROM collection_grants g JOIN users u ON u.id = g.user_id "
                         "WHERE g.collection = ? ORDER BY u.username", (collection,)).fetchall()
+    groups = conn.execute("SELECT gr.id, gr.created_at, gr.name FROM collection_group_grants gg "
+                          "JOIN groups gr ON gr.id = gg.group_id WHERE gg.collection = ? ORDER BY gr.name",
+                          (collection,)).fetchall()
     return CollectionAccess(True, tuple(r["username"] for r in rows if r["kind"] == "user"),
-                            tuple(r["username"] for r in rows if r["kind"] == "service"))
+                            tuple(r["username"] for r in rows if r["kind"] == "service"),
+                            tuple(r["name"] for r in groups),
+                            tuple((r["id"], r["created_at"]) for r in groups))
 
 
 def collection_access(collection: str) -> CollectionAccess:
@@ -20023,10 +20721,15 @@ def collection_access(collection: str) -> CollectionAccess:
 
 
 def restricted_collections() -> dict[str, frozenset[int]]:
-    """Every restricted collection and the ids of the accounts granted it."""
+    """Every restricted collection and the ids of the accounts that may use
+    it: granted directly, or a member of a group granted it (#784)."""
     with _connect() as conn:
         found = {row["collection"]: set() for row in conn.execute("SELECT collection FROM restricted_collections")}
         for row in conn.execute("SELECT collection, user_id FROM collection_grants"):
+            if row["collection"] in found:
+                found[row["collection"]].add(row["user_id"])
+        for row in conn.execute("SELECT gg.collection, m.user_id FROM collection_group_grants gg "
+                                "JOIN group_members m ON m.group_id = gg.group_id"):
             if row["collection"] in found:
                 found[row["collection"]].add(row["user_id"])
     return {name: frozenset(ids) for name, ids in found.items()}
@@ -20034,15 +20737,19 @@ def restricted_collections() -> dict[str, frozenset[int]]:
 
 def has_access(user_id: int, role: str, collection: str) -> bool:
     """An Engineer reaches every collection; anyone else an open one, or a
-    restricted one they are granted. Read on every call, so a change applies to
-    the next request."""
+    restricted one they are granted, directly or through a group (#784). Read
+    on every call, so a change applies to the next request."""
     if role == "engineer":
         return True
     collection = _canonical(collection)
     with _connect() as conn:
         if conn.execute("SELECT 1 FROM restricted_collections WHERE collection = ?", (collection,)).fetchone() is None:
             return True
-        return conn.execute("SELECT 1 FROM collection_grants WHERE collection = ? AND user_id = ?",
+        if conn.execute("SELECT 1 FROM collection_grants WHERE collection = ? AND user_id = ?",
+                        (collection, user_id)).fetchone() is not None:
+            return True
+        return conn.execute("SELECT 1 FROM collection_group_grants gg JOIN group_members m "
+                            "ON m.group_id = gg.group_id WHERE gg.collection = ? AND m.user_id = ? LIMIT 1",
                             (collection, user_id)).fetchone() is not None
 
 
@@ -20084,30 +20791,45 @@ def _grant_ids(conn, names, kind: str) -> list[int]:
     return ids
 
 
-def _restrict(conn, collection: str, user_ids) -> None:
+def _group_ids(conn, names) -> list[int]:
+    ids = []
+    for name in names:
+        row = conn.execute("SELECT id FROM groups WHERE name = ?", (str(name).strip().lower(),)).fetchone()
+        if row is None:
+            raise Refused(f"no group is named {name!r}", "UNKNOWN_GROUP")
+        ids.append(row["id"])
+    return ids
+
+
+def _restrict(conn, collection: str, user_ids, group_ids=()) -> None:
     now = _now()
     conn.execute("INSERT OR IGNORE INTO restricted_collections (collection, restricted_at) VALUES (?, ?)",
                  (collection, now))
     conn.execute("DELETE FROM collection_grants WHERE collection = ?", (collection,))
     conn.executemany("INSERT INTO collection_grants (collection, user_id, granted_at) VALUES (?, ?, ?)",
                      [(collection, user_id, now) for user_id in dict.fromkeys(user_ids)])
+    conn.execute("DELETE FROM collection_group_grants WHERE collection = ?", (collection,))
+    conn.executemany("INSERT INTO collection_group_grants (collection, group_id, granted_at) VALUES (?, ?, ?)",
+                     [(collection, group_id, now) for group_id in dict.fromkeys(group_ids)])
 
 
 def _open(conn, collection: str) -> None:
     conn.execute("DELETE FROM collection_grants WHERE collection = ?", (collection,))
+    conn.execute("DELETE FROM collection_group_grants WHERE collection = ?", (collection,))
     conn.execute("DELETE FROM restricted_collections WHERE collection = ?", (collection,))
 
 
-def set_collection_access(collection: str, restricted: bool, users=(), service_principals=()):
+def set_collection_access(collection: str, restricted: bool, users=(), service_principals=(), groups=()):
     """An Engineer's change (PUT /collections/{name}/access): the whole state
     at once. Returns (before, after). An unknown name refuses the whole change
-    (UNKNOWN_ACCOUNT); disabled accounts may be granted."""
+    (UNKNOWN_ACCOUNT, or UNKNOWN_GROUP for a group, #784); disabled accounts may
+    be granted."""
     collection = _canonical(collection)
     with _connect(write=True) as conn:
         before = _access(conn, collection)
         if restricted:
             ids = _grant_ids(conn, users, "user") + _grant_ids(conn, service_principals, "service")
-            _restrict(conn, collection, ids)
+            _restrict(conn, collection, ids, _group_ids(conn, groups))
         else:
             _open(conn, collection)
         return before, _access(conn, collection)
@@ -20115,7 +20837,8 @@ def set_collection_access(collection: str, restricted: bool, users=(), service_p
 
 def restrict_to(collection: str, user_id: int | None) -> tuple[CollectionAccess, CollectionAccess]:
     """A new collection: restricted, granted only to its creator (none when
-    None). Returns (the state it replaced, the state written), for put_back."""
+    None), with no group. Returns (the state it replaced, the state written),
+    for put_back."""
     collection = _canonical(collection)
     with _connect(write=True) as conn:
         before = _access(conn, collection)
@@ -20132,32 +20855,41 @@ def _no_store() -> bool:
 
 
 def _grant_set(conn, collection: str):
-    """None for an open collection; otherwise the ids of the accounts granted it."""
+    """None for an open collection; otherwise the ids of the accounts granted
+    it and the ids of the groups granted it (#784)."""
     if conn.execute("SELECT 1 FROM restricted_collections WHERE collection = ?", (collection,)).fetchone() is None:
         return None
-    return [row["user_id"] for row in
-            conn.execute("SELECT user_id FROM collection_grants WHERE collection = ?", (collection,))]
+    users = [row["user_id"] for row in
+             conn.execute("SELECT user_id FROM collection_grants WHERE collection = ?", (collection,))]
+    groups = [row["group_id"] for row in
+              conn.execute("SELECT group_id FROM collection_group_grants WHERE collection = ?", (collection,))]
+    return users, groups
 
 
 def copy_collection_access(source: str, target: str,
                            narrowed_by: Iterable[str] = ()) -> tuple[CollectionAccess, CollectionAccess]:
     """The target takes the source's state: open stays open, restricted copies
-    its grants. With `narrowed_by` (the collections a staging or recovery copy
-    was made from, its chain after itself, #788, #792), it takes the narrowest
-    of them all: restricted when any is, to the accounts granted every
-    restricted one. Returns (the target's state it replaced, the state
-    written)."""
+    its grants, to accounts and to groups (#784). With `narrowed_by` (the
+    collections a staging or recovery copy was made from, its chain after
+    itself, #788, #792), it takes the narrowest of them all: restricted when
+    any is, to the accounts granted directly every restricted one and the
+    groups granted every one, each intersected on its own, so it is never
+    wider than any of them and a group grant stays one. Returns (the target's
+    state it replaced, the state written)."""
     source, target = _canonical(source), _canonical(target)
     if _no_store():
         return CollectionAccess(False), CollectionAccess(False)
     with _connect(write=True) as conn:
         before = _access(conn, target)
         sets = [_grant_set(conn, source)] + [_grant_set(conn, _canonical(n)) for n in narrowed_by]
-        restricted = [ids for ids in sets if ids is not None]
+        restricted = [grants for grants in sets if grants is not None]
         if not restricted:
             _open(conn, target)
         else:
-            _restrict(conn, target, [i for i in restricted[0] if all(i in ids for ids in restricted[1:])])
+            first_users, first_groups = restricted[0]
+            _restrict(conn, target,
+                      [i for i in first_users if all(i in users for users, _ in restricted[1:])],
+                      [g for g in first_groups if all(g in groups for _, groups in restricted[1:])])
         return before, _access(conn, target)
 
 
@@ -20166,7 +20898,12 @@ def put_back(collection: str, expected: CollectionAccess, previous: CollectionAc
     `previous`, but only while it is still `expected`, the state the failed
     create wrote. A concurrent create or import that wrote its own state since
     keeps it, so a failure never takes another's grants nor opens a collection.
-    One transaction. True when it put the state back."""
+    An account or group in `previous` that no longer exists is left out
+    (narrower, never wider). A group is matched by its identity, its id and
+    creation time, not its name (#854): one deleted since is left out even when
+    another has been made under its name or with its reused id, and one renamed
+    since is the same group; a state with no group identities puts back no
+    group. One transaction. True when it put the state back."""
     collection = _canonical(collection)
     with _connect(write=True) as conn:
         if _access(conn, collection) != expected:
@@ -20180,7 +20917,13 @@ def put_back(collection: str, expected: CollectionAccess, previous: CollectionAc
                 row = conn.execute("SELECT id FROM users WHERE username = ? AND kind = ?", (name, kind)).fetchone()
                 if row is not None:
                     ids.append(row["id"])
-        _restrict(conn, collection, ids)
+        group_ids = []
+        for group_id, created_at in previous.group_ids:
+            row = conn.execute("SELECT id FROM groups WHERE id = ? AND created_at = ?",
+                               (group_id, created_at)).fetchone()
+            if row is not None:
+                group_ids.append(row["id"])
+        _restrict(conn, collection, ids, group_ids)
         return True
 
 
@@ -20190,6 +20933,96 @@ def drop_collection_access(collection: str) -> None:
         return
     with _connect(write=True) as conn:
         _open(conn, _canonical(collection))
+
+
+# ── groups for collection access (#784) ──────────────────────────────────────
+
+@dataclass(frozen=True)
+class Group:
+    id: int
+    name: str
+    created_at: float
+    users: tuple[str, ...] = ()
+    service_principals: tuple[str, ...] = ()
+
+
+def _group(conn, row) -> Group:
+    members = conn.execute("SELECT u.username, u.kind FROM group_members m JOIN users u ON u.id = m.user_id "
+                           "WHERE m.group_id = ? ORDER BY u.username", (row["id"],)).fetchall()
+    return Group(row["id"], row["name"], row["created_at"],
+                 tuple(m["username"] for m in members if m["kind"] == "user"),
+                 tuple(m["username"] for m in members if m["kind"] == "service"))
+
+
+def _existing_group(conn, name: str):
+    row = conn.execute("SELECT * FROM groups WHERE name = ?", (name,)).fetchone()
+    if row is None:
+        raise Refused(f"there is no group {name!r}", "GROUP_NOT_FOUND")
+    return row
+
+
+def list_groups() -> list[Group]:
+    with _connect() as conn:
+        return [_group(conn, row) for row in conn.execute("SELECT * FROM groups ORDER BY name")]
+
+
+def get_group(name: str) -> Group:
+    """The group (GROUP_NOT_FOUND when there is none). `name` is the stored form."""
+    with _connect() as conn:
+        return _group(conn, _existing_group(conn, name))
+
+
+def create_group(name: str) -> Group:
+    """A new group with no members. `name` is the stored form (the router
+    checks the rule)."""
+    with _connect(write=True) as conn:
+        if conn.execute("SELECT 1 FROM groups WHERE name = ?", (name,)).fetchone() is not None:
+            raise Refused(f"a group named {name!r} already exists", "GROUP_EXISTS")
+        conn.execute("INSERT INTO groups (name, created_at) VALUES (?, ?)", (name, _now()))
+        return _group(conn, _existing_group(conn, name))
+
+
+def rename_group(name: str, new: str) -> Group:
+    """Members and grants name the group's id, so they stay. Renaming to its
+    own name changes nothing."""
+    with _connect(write=True) as conn:
+        row = _existing_group(conn, name)
+        if new != name:
+            if conn.execute("SELECT 1 FROM groups WHERE name = ?", (new,)).fetchone() is not None:
+                raise Refused(f"a group named {new!r} already exists", "GROUP_EXISTS")
+            conn.execute("UPDATE groups SET name = ? WHERE id = ?", (new, row["id"]))
+        return _group(conn, _existing_group(conn, new))
+
+
+def set_group_members(name: str, users=(), service_principals=()) -> tuple[Group, Group]:
+    """The whole member list at once. An unknown name refuses the whole change
+    (UNKNOWN_ACCOUNT); disabled accounts may be members. Returns (before, after)."""
+    with _connect(write=True) as conn:
+        row = _existing_group(conn, name)
+        before = _group(conn, row)
+        ids = _grant_ids(conn, users, "user") + _grant_ids(conn, service_principals, "service")
+        now = _now()
+        conn.execute("DELETE FROM group_members WHERE group_id = ?", (row["id"],))
+        conn.executemany("INSERT INTO group_members (group_id, user_id, added_at) VALUES (?, ?, ?)",
+                         [(row["id"], user_id, now) for user_id in dict.fromkeys(ids)])
+        return before, _group(conn, row)
+
+
+def delete_group(name: str) -> tuple[list[str], Group]:
+    """The group, its members and every collection grant to it, in one
+    transaction. A collection restricted only through it stays restricted.
+    Returns the collections whose grant was removed, sorted, and the group as
+    it was, with the members the delete removed (#854)."""
+    with _connect(write=True) as conn:
+        row = _existing_group(conn, name)
+        group = _group(conn, row)
+        collections = sorted(r["collection"] for r in
+                             conn.execute("SELECT collection FROM collection_group_grants WHERE group_id = ?",
+                                          (row["id"],)))
+        conn.execute("DELETE FROM collection_group_grants WHERE group_id = ?", (row["id"],))
+        conn.execute("DELETE FROM group_members WHERE group_id = ?", (row["id"],))
+        conn.execute("DELETE FROM groups WHERE id = ?", (row["id"],))
+        return collections, group
 ```
 
 ### api/auth/middleware.py
@@ -20630,9 +21463,10 @@ def headers(role: str = "engineer", base_url: str = "http://testserver") -> dict
 """Per-collection access (#606): who may use which collection.
 
 A collection is open, or restricted to the accounts granted it (people or
-service principals; a key acts as its principal). Engineers reach every
-collection. The state is in the store (store.py, schema 4); this module holds
-the rule and the check the routes call.
+service principals; a key acts as its principal), directly or through a group
+granted it (#784: store.has_access and store.restricted_collections answer for
+both). Engineers reach every collection. The state is in the store (store.py,
+schema 5); this module holds the rule and the check the routes call.
 
 A refused caller gets the answer the route gives a collection, session, job or
 file that doesn't exist, so a restricted collection's name isn't confirmed. The
@@ -20770,6 +21604,11 @@ challenge (the `rag_mfa` cookie) instead of a session, and POST
 own set-up, recovery codes and turn-off are under /auth/mfa; engineers reset a
 user's enrollment and switch "required for everyone". Codes and secrets are in
 their one answer only (no-store) and never logged or audited.
+
+Groups for collection access (#784): Engineers create, rename and delete groups
+of people and service principals under /auth/groups (browser sessions only, as
+account administration), and grant collections to them with PUT
+/collections/{name}/access. Each change is one WARNING line and one audit record.
 """
 from __future__ import annotations
 
@@ -20783,10 +21622,11 @@ from fastapi.responses import JSONResponse
 from auth import passwords, store
 from config import settings
 from services import audit
-from models.schemas import (AdminUserList, AdminUserResult, AuthStatus, AuthUser, KeyIssueRequest, LoginRequest,
-                            MfaCodeRequest, MfaDisableRequest, MfaPolicyRequest, PasswordChangeRequest,
-                            PrincipalCreateRequest, RoleChangeRequest, ServicePrincipalList, ServicePrincipalResult,
-                            UserCreateRequest)
+from models.schemas import (AdminUserList, AdminUserResult, AuthStatus, AuthUser, GroupCreateRequest,
+                            GroupDeleteResult, GroupList, GroupMembersRequest, GroupRenameRequest, GroupResult,
+                            KeyIssueRequest, LoginRequest, MfaCodeRequest, MfaDisableRequest, MfaPolicyRequest,
+                            PasswordChangeRequest, PrincipalCreateRequest, RoleChangeRequest, ServicePrincipalList,
+                            ServicePrincipalResult, UserCreateRequest)
 from utils import api_error
 
 router = APIRouter(prefix="/auth")
@@ -20806,9 +21646,11 @@ def _address(request: Request) -> str:
 
 
 def _user_body(username: str, role: str, must_change_password: bool) -> dict:
-    # query_only (#670) in every user answer, so the UI knows it from the login on.
+    # query_only (#670) and lan_mode (#26; the Transfer page hides the
+    # unencrypted export, #676) in every user answer, so the UI knows them from
+    # the login on.
     return {"username": username, "role": role, "must_change_password": must_change_password,
-            "query_only": settings.rag_query_only}
+            "query_only": settings.rag_query_only, "lan_mode": settings.rag_lan_mode}
 
 
 def _mfa_body(enrolled: bool, required: bool) -> dict:
@@ -21448,6 +22290,126 @@ async def revoke_key(name: str, key_id: str, request: Request):
         return _principal_refused(actor, "revoke-key", target, exc)
     _log.warning("Admin %r revoked key %s of service principal %r", actor, key_id, target)
     return JSONResponse({"principal": _principal_body(principal)})
+
+
+# ── groups for collection access (#784; Engineers only, in auth/policy.py) ────
+# Each change and each refusal is one WARNING line naming the Engineer, the
+# action and the group, as account administration's are.
+
+_GROUP_STATUS = {"GROUP_NOT_FOUND": 404, "GROUP_EXISTS": 409}
+
+
+def _group_body(group: store.Group) -> dict:
+    return {"name": group.name, "created_at": _iso(group.created_at), "users": list(group.users),
+            "service_principals": list(group.service_principals)}
+
+
+def _group_refusal(actor: str, action: str, target: str, code: str, message: str, status: int | None = None):
+    _log.warning("Admin %r: %s of group %r refused: %s", actor, action, target, message)
+    return api_error(status or _GROUP_STATUS.get(code, 409), code, message)
+
+
+def _group_refused(actor: str, action: str, target: str, exc: store.Refused):
+    message = str(exc)
+    message = message[:1].upper() + message[1:] + "."
+    if exc.code == "UNKNOWN_ACCOUNT":
+        # As PUT /collections/{name}/access answers an unknown account (#606).
+        return _group_refusal(actor, action, target, "INVALID_PARAMETER", message, 422)
+    return _group_refusal(actor, action, target, exc.code, message)
+
+
+def _group_not_found(actor: str, action: str, typed: str):
+    return _group_refusal(actor, action, typed, "GROUP_NOT_FOUND", f"There is no group {typed!r}.")
+
+
+def _invalid_group_name(actor: str, action: str, typed: str):
+    return _group_refusal(actor, action, typed, "INVALID_GROUP_NAME",
+                          f"The group name must be {passwords.USERNAME_RULE}.", 422)
+
+
+@router.get("/groups", response_model=GroupList)
+async def list_groups():
+    groups = await asyncio.to_thread(store.list_groups)
+    return {"groups": [_group_body(g) for g in groups]}
+
+
+@router.post("/groups", status_code=201, response_model=GroupResult)
+async def create_group(body: GroupCreateRequest, request: Request):
+    actor = request.state.auth.username
+    name = passwords.normalize_username(body.name)
+    audit.note(target=name or _shown(body.name))
+    if name is None:
+        return _invalid_group_name(actor, "create", _shown(body.name))
+    try:
+        group = await asyncio.to_thread(store.create_group, name)
+    except store.Refused as exc:
+        return _group_refused(actor, "create", name, exc)
+    _log.warning("Admin %r created group %r", actor, name)
+    return JSONResponse({"group": _group_body(group)}, status_code=201)
+
+
+@router.post("/groups/{name}/rename", response_model=GroupResult)
+async def rename_group(name: str, body: GroupRenameRequest, request: Request):
+    actor = request.state.auth.username
+    target = _target(name)
+    new = passwords.normalize_username(body.name)
+    audit.note(target=target or _shown(name), name=new or _shown(body.name))
+    if target is None:
+        return _group_not_found(actor, "rename", _shown(name))
+    if new is None:
+        return _invalid_group_name(actor, "rename", target)
+    try:
+        group = await asyncio.to_thread(store.rename_group, target, new)
+    except store.Refused as exc:
+        return _group_refused(actor, "rename", target, exc)
+    _log.warning("Admin %r renamed group %r to %r", actor, target, new)
+    return {"group": _group_body(group)}
+
+
+def _sorted_change(before: tuple, after: tuple) -> tuple[list, list]:
+    return sorted(set(after) - set(before)), sorted(set(before) - set(after))
+
+
+@router.put("/groups/{name}/members", response_model=GroupResult)
+async def set_group_members(name: str, body: GroupMembersRequest, request: Request):
+    """The group's members, the whole list at once."""
+    actor = request.state.auth.username
+    target = _target(name)
+    audit.note(target=target or _shown(name))
+    if target is None:
+        return _group_not_found(actor, "set-members", _shown(name))
+    try:
+        before, after = await asyncio.to_thread(store.set_group_members, target, body.users,
+                                                body.service_principals)
+    except store.Refused as exc:
+        return _group_refused(actor, "set-members", target, exc)
+    added_users, removed_users = _sorted_change(before.users, after.users)
+    added_svc, removed_svc = _sorted_change(before.service_principals, after.service_principals)
+    audit.note(added={"users": added_users, "service_principals": added_svc},
+               removed={"users": removed_users, "service_principals": removed_svc})
+    _log.warning("Admin %r set the members of group %r: %d people and %d service principals", actor, target,
+                 len(after.users), len(after.service_principals))
+    return {"group": _group_body(after)}
+
+
+@router.post("/groups/{name}/delete", response_model=GroupDeleteResult)
+async def delete_group(name: str, request: Request):
+    """The group, its members and its collection grants. A collection granted
+    only to it stays restricted."""
+    actor = request.state.auth.username
+    target = _target(name)
+    audit.note(target=target or _shown(name))
+    if target is None:
+        return _group_not_found(actor, "delete", _shown(name))
+    try:
+        collections, group = await asyncio.to_thread(store.delete_group, target)
+    except store.Refused as exc:
+        return _group_refused(actor, "delete", target, exc)
+    audit.note(collections=collections,
+               removed={"users": list(group.users), "service_principals": list(group.service_principals)})
+    _log.warning("Admin %r deleted group %r; its grants on %d collections were removed", actor, target,
+                 len(collections))
+    return {"name": target, "collections": collections}
 ```
 
 The audit log (#29). `api/services/audit.py` writes, rotates and reads the log and records each audited request in its middleware; `api/routers/audit.py` serves it to AI Engineers. See SPECIFICATIONS.md §3.1.9.
@@ -21572,6 +22534,10 @@ ACTIONS: dict[tuple[str, str], str] = {
     ("POST", "/auth/service-principals/{name}/enable"): "admin.principal.enable",
     ("POST", "/auth/service-principals/{name}/keys"): "admin.key.issue",
     ("POST", "/auth/service-principals/{name}/keys/{key_id}/revoke"): "admin.key.revoke",
+    ("POST", "/auth/groups"): "admin.group.create",                        # #784
+    ("POST", "/auth/groups/{name}/rename"): "admin.group.rename",
+    ("PUT", "/auth/groups/{name}/members"): "admin.group.members",
+    ("POST", "/auth/groups/{name}/delete"): "admin.group.delete",
     ("GET", "/audit"): "audit.view",
     ("GET", "/audit.csv"): "audit.download",
 }
@@ -22473,7 +23439,7 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
 ```json
 {
   "name": "rag-ui",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "private": true,
   "type": "module",
   "scripts": {
@@ -22682,6 +23648,7 @@ import CollectionsPage from './pages/CollectionsPage'
 import HealthPage from './pages/HealthPage'
 import UsersPage from './pages/UsersPage'
 import ServiceKeysPage from './pages/ServiceKeysPage'
+import GroupsPage from './pages/GroupsPage'
 import AuditPage from './pages/AuditPage'
 import TransferPage from './pages/TransferPage'
 import HelpTransferPage from './pages/HelpTransferPage'
@@ -22761,6 +23728,7 @@ export default function AppRouter() {
               <Route path="/health" element={<HealthPage />} />
               <Route path="/users" element={<UsersPage />} />
               <Route path="/service-keys" element={<ServiceKeysPage />} />
+              <Route path="/groups" element={<GroupsPage />} />
               <Route path="/audit" element={<AuditPage />} />
             </>
           )}
@@ -23198,6 +24166,15 @@ export const api = {
     request<{ principal: ServicePrincipal; key: ServiceKey; secret: string }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/keys`, { label, days }),
   revokeKey: (name: string, keyId: string) =>
     request<{ principal: ServicePrincipal }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/keys/${encodeURIComponent(keyId)}/revoke`),
+  // Groups for collection access (Engineers only, #784).
+  listGroups: () => request<{ groups: Group[] }>('GET', '/auth/groups'),
+  createGroup: (name: string) => request<{ group: Group }>('POST', '/auth/groups', { name }),
+  renameGroup: (name: string, newName: string) =>
+    request<{ group: Group }>('POST', `/auth/groups/${encodeURIComponent(name)}/rename`, { name: newName }),
+  setGroupMembers: (name: string, users: string[], service_principals: string[]) =>
+    request<{ group: Group }>('PUT', `/auth/groups/${encodeURIComponent(name)}/members`, { users, service_principals }),
+  deleteGroup: (name: string) =>
+    request<{ name: string; collections: string[] }>('POST', `/auth/groups/${encodeURIComponent(name)}/delete`),
   // The audit log (#29), for Engineers: a page of records, newest first.
   listAudit: (filters: AuditFilters, before?: string) =>
     request<AuditPage>('GET', `/audit${auditQuery(filters, before ? { before } : {})}`),
@@ -23206,7 +24183,7 @@ export const api = {
   // Answers with the name as stored, first letter capitalised (#372).
   createCollection: (body: CreateCollectionBody) => request<{ name: string; status: string }>('POST', '/collections', body),
   deleteCollection: (name: string) => request('DELETE', `/collections/${name}?confirm=true`),
-  // Who may use a collection (#606), for Engineers: open, or restricted to the named accounts.
+  // Who may use a collection (#606), for Engineers: open, or restricted to the named accounts and groups (#784).
   getCollectionAccess: (name: string) => request<CollectionAccess>('GET', `/collections/${encodeURIComponent(name)}/access`),
   setCollectionAccess: (name: string, body: CollectionAccess) =>
     request<CollectionAccess>('PUT', `/collections/${encodeURIComponent(name)}/access`, body),
@@ -23276,6 +24253,8 @@ export interface AuthUser {
   mfa_enrolled?: boolean; mfa_required?: boolean; mfa_enrollment_required?: boolean
   // Query-only mode (#670): the pages that change data are hidden.
   query_only?: boolean
+  // LAN mode (#26): the Transfer page offers no unencrypted export (#676).
+  lan_mode?: boolean
 }
 export interface AdminUser {
   username: string; role: Role; enabled: boolean; must_change_password: boolean; created_at: string; mfa_enrolled?: boolean
@@ -23290,7 +24269,8 @@ export interface CollectionInfo {
   name: string; object_count: number; index_type: string; distance_metric: string; created_at: string | null
   hnsw_config?: { ef: number; efConstruction: number; maxConnections: number } | null
 }
-export interface CollectionAccess { restricted: boolean; users: string[]; service_principals: string[] }
+export interface CollectionAccess { restricted: boolean; users: string[]; service_principals: string[]; groups: string[] }
+export interface Group { name: string; created_at: string; users: string[]; service_principals: string[] }
 export interface CreateCollectionBody {
   name: string; index_type: string; distance_metric: string; hnsw_config: { efConstruction: number; maxConnections: number; ef: number }
 }
@@ -23362,8 +24342,10 @@ export interface MetricsResult {
   total_latency: LatencyStats
   history: LatencyRecord[]
 }
-// passphrase: only for an encrypted export (#27), 12 to 1024 characters.
-export interface ExportBody { collection: string; include_models: boolean; passphrase?: string }
+// encryption (#676): a new key (the API's default), a passphrase (#27, 12 to
+// 1024 characters, sent only with 'passphrase'), or none (refused in LAN mode).
+export type Encryption = 'key' | 'passphrase' | 'none'
+export interface ExportBody { collection: string; include_models: boolean; encryption?: Encryption; passphrase?: string }
 export interface ExportStart { job_id: string; status: string; collection: string }
 export interface ExportJob {
   job_id: string; status: string; collection: string; chunks_written: number
@@ -23371,12 +24353,18 @@ export interface ExportJob {
   fidelity: string | null; models_bundled: boolean | null; retrieve_script: boolean | null
   warnings: string[]; error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
   encrypted?: boolean
+  encryption?: Encryption
+  // A key export's key file (#676): its name, and whether it is still on the
+  // server (a full download of it deletes it).
+  key_filename?: string | null
+  key_on_server?: boolean
   // When the package is deleted if nobody downloads it (UTC, #677); null once
   // it has been downloaded or swept.
   expires_at?: string | null
 }
-// passphrase: required for a .tar.gz.age package and refused for any other (#27).
-export interface ImportBody { filename: string; on_conflict: string; passphrase?: string }
+// passphrase: required for a passphrase .tar.gz.age package (#27); key: the
+// text of the key file of a key package (#676). Each is refused for any other.
+export interface ImportBody { filename: string; on_conflict: string; passphrase?: string; key?: string }
 export interface ImportStart { job_id: string; status: string; filename: string }
 export interface ImportJob {
   job_id: string; status: string; filename: string; on_conflict: string
@@ -23385,6 +24373,7 @@ export interface ImportJob {
   restored_sessions?: { source_session_id: string; session_id: string; collection: string }[]
   error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
   encrypted?: boolean
+  encryption?: Encryption
 }
 // Running and recent jobs (#617). owner is null for a job recorded before
 // owners were, which only an Engineer sees ("owner unknown").
@@ -23423,6 +24412,10 @@ export interface PackageSummary {
   filename: string; size_bytes: number; collection: string | null
   chunk_count: number | null; fidelity: string | null; created_at: string | null; readable: boolean
   encrypted?: boolean
+  // 'none' for a .tar.gz; 'key' or 'passphrase' from a .tar.gz.age header, null
+  // when it can't be read (#676). key_on_server: its key file is still there.
+  encryption?: Encryption | null
+  key_on_server?: boolean
   // When a package this instance exported is deleted if nobody downloads it
   // (UTC, #677); null for one copied in to be imported.
   expires_at?: string | null
@@ -23517,6 +24510,7 @@ const MENUS: MenuDef[] = [
     { label: 'Collections', to: '/collections', roles: ENGINEER },
     { label: 'Users', to: '/users', roles: ENGINEER },
     { label: 'Service keys', to: '/service-keys', roles: ENGINEER },
+    { label: 'Groups', to: '/groups', roles: ENGINEER },
     { label: 'Audit', to: '/audit', roles: ENGINEER },
     { label: 'Health', to: '/health', roles: ENGINEER },
   ] },
@@ -25933,15 +26927,18 @@ export default function GoldStandardPage() {
 
 ```typescript
 import { useState, useEffect, useRef } from 'react'
-import { api, AdminUser, CollectionAccess, CollectionInfo, ServicePrincipal } from '../api/client'
+import { api, AdminUser, CollectionAccess, CollectionInfo, Group, ServicePrincipal } from '../api/client'
 import { useAuth } from '../context/AuthContext'
 
-// Who may use each collection (#606): "Open", "Restricted (n)" with n grants,
-// or a dash when the state couldn't be read.
+// Who may use each collection (#606): "Open", "Restricted (n)" with n grants
+// (people, service principals and groups, #784), or a dash when the state
+// couldn't be read.
 function accessLabel(a: CollectionAccess | null | undefined): string {
   if (!a) return '—'
-  return a.restricted ? `Restricted (${a.users.length + a.service_principals.length})` : 'Open'
+  return a.restricted ? `Restricted (${a.users.length + a.service_principals.length + (a.groups?.length ?? 0)})` : 'Open'
 }
+
+const CLOSED: CollectionAccess = { restricted: false, users: [], service_principals: [], groups: [] }
 
 export default function CollectionsPage() {
   // Query-only mode (#670): no create or delete; the list and access stay.
@@ -25966,9 +26963,10 @@ export default function CollectionsPage() {
   // Per-collection access (#606): each row's state, and the Access dialog.
   const [access, setAccess] = useState<Record<string, CollectionAccess | null>>({})
   const [accessTarget, setAccessTarget] = useState('')
-  const [draft, setDraft] = useState<CollectionAccess>({ restricted: false, users: [], service_principals: [] })
+  const [draft, setDraft] = useState<CollectionAccess>(CLOSED)
   const [people, setPeople] = useState<AdminUser[]>([])
   const [principals, setPrincipals] = useState<ServicePrincipal[]>([])
+  const [groups, setGroups] = useState<Group[]>([])
   const [accessError, setAccessError] = useState('')
   // The dialog's own read of the state: until it succeeds the choice is
   // unknown and Save stays disabled; once the Engineer changes something, a
@@ -25977,7 +26975,7 @@ export default function CollectionsPage() {
   // since) is ignored, so it can't become this dialog's draft (#788). The
   // opening's lists of people and service principals are numbered the same
   // way, so an earlier opening's late answer or error never reaches this one
-  // (#792).
+  // (#792), and so are its groups (#784).
   const [accessLoaded, setAccessLoaded] = useState(false)
   const touched = useRef(false)
   const accessRead = useRef(0)
@@ -26000,10 +26998,10 @@ export default function CollectionsPage() {
     setAccessTarget(name)
     setAccessLoaded(false)
     touched.current = false
-    setDraft({ restricted: false, users: [], service_principals: [] })
+    setDraft(CLOSED)
     api.getCollectionAccess(name).then(a => {
       if (ticket !== accessRead.current) return
-      if (!touched.current) setDraft({ ...a })
+      if (!touched.current) setDraft({ ...a, groups: a.groups ?? [] })
       setAccessLoaded(true)
     }).catch((e: unknown) => {
       if (ticket !== accessRead.current) return
@@ -26023,6 +27021,13 @@ export default function CollectionsPage() {
       if (ticket !== accessRead.current) return
       setAccessError(`Could not load the service principals: ${e instanceof Error ? e.message : String(e)}`)
     })
+    api.listGroups().then(r => {
+      if (ticket !== accessRead.current) return
+      setGroups(r.groups)
+    }).catch((e: unknown) => {
+      if (ticket !== accessRead.current) return
+      setAccessError(`Could not load the groups: ${e instanceof Error ? e.message : String(e)}`)
+    })
   }
 
   function closeAccess() {
@@ -26031,14 +27036,14 @@ export default function CollectionsPage() {
     setAccessError('')
   }
 
-  function toggle(list: 'users' | 'service_principals', name: string) {
+  function toggle(list: 'users' | 'service_principals' | 'groups', name: string) {
     touched.current = true
     setDraft(d => ({ ...d, [list]: d[list].includes(name) ? d[list].filter(n => n !== name) : [...d[list], name] }))
   }
 
   async function saveAccess() {
     if (!accessLoaded) return
-    const body = draft.restricted ? draft : { restricted: false, users: [], service_principals: [] }
+    const body = draft.restricted ? draft : CLOSED
     try {
       const saved = await api.setCollectionAccess(accessTarget, body)
       setAccess(prev => ({ ...prev, [accessTarget]: saved }))
@@ -26189,7 +27194,7 @@ export default function CollectionsPage() {
             </label>
             <label className="flex items-center gap-2 text-sm mb-3">
               <input type="radio" name="access-mode" checked={accessLoaded && draft.restricted} disabled={!accessLoaded} onChange={() => { touched.current = true; setDraft(d => ({ ...d, restricted: true })) }} />
-              Restricted: only the accounts ticked below (and AI Engineers)
+              Restricted: only the accounts and groups ticked below (and AI Engineers)
             </label>
             {accessLoaded && draft.restricted && (
               <div className="space-y-3 mb-4">
@@ -26209,6 +27214,16 @@ export default function CollectionsPage() {
                     <label key={p.name} className="flex items-center gap-2 text-sm">
                       <input type="checkbox" checked={draft.service_principals.includes(p.name)} onChange={() => toggle('service_principals', p.name)} />
                       {p.name}{p.enabled ? '' : ' (disabled)'}
+                    </label>
+                  ))}
+                </fieldset>
+                <fieldset>
+                  <legend className="text-xs text-gray-500 mb-1">Groups</legend>
+                  {groups.length === 0 && <p className="text-xs text-gray-400">None</p>}
+                  {groups.map(g => (
+                    <label key={g.name} className="flex items-center gap-2 text-sm">
+                      <input type="checkbox" checked={draft.groups.includes(g.name)} onChange={() => toggle('groups', g.name)} />
+                      {g.name} ({g.users.length + g.service_principals.length} {g.users.length + g.service_principals.length === 1 ? 'member' : 'members'})
                     </label>
                   ))}
                 </fieldset>
@@ -26248,7 +27263,7 @@ export default function CollectionsPage() {
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import {
-  api, CollectionInfo, ExportJob, ExportJobEntry, ImportJob, ImportJobEntry, PackageSummary, TuneOptions,
+  api, CollectionInfo, Encryption, ExportJob, ExportJobEntry, ImportJob, ImportJobEntry, PackageSummary, TuneOptions,
 } from '../api/client'
 import { useAuth, useRole } from '../context/AuthContext'
 import JobList, { JobRow, newestToOpen, useJobList } from '../components/JobList'
@@ -26277,6 +27292,18 @@ function sizeLabel(bytes: number | null): string {
 function expiresLabel(iso: string): string {
   return new Date(iso).toLocaleString()
 }
+
+// How an export is encrypted (#676), in the order the form offers them. A new
+// key is the default; "Not encrypted" is not offered in LAN mode, where the API
+// refuses it too.
+const ENCRYPTION: { id: Encryption; label: string; description: string }[] = [
+  { id: 'key', label: 'New key (recommended)',
+    description: 'Encrypts the package to a new key made for it alone. Download the key file once the export is done, and store it apart from the package: anyone with both can read it.' },
+  { id: 'passphrase', label: 'Passphrase',
+    description: 'Encrypts the package with a passphrase you choose. It can\'t be recovered, so keep it safe and send it separately from the file.' },
+  { id: 'none', label: 'Not encrypted',
+    description: 'Anyone with the file can read the collection, and the original documents if they travel with it.' },
+]
 
 const CONFLICT = [
   { id: 'abort', label: 'Abort', description: 'Fail if a collection of that name already exists. Nothing is changed.' },
@@ -26308,6 +27335,8 @@ export default function TransferPage() {
   const { role } = useRole()
   // Query-only mode (#670): no import here; packages are loaded on the host.
   const queryOnly = useAuth().user?.query_only === true
+  // LAN mode (#26): no unencrypted export (#676).
+  const lanMode = useAuth().user?.lan_mode === true
   // Running and recent exports and imports, in one list (#617). Each panel
   // opens its own newest job on the first answer, unless it already has one.
   const exportJobs = useJobList<ExportJobEntry>(loadExportJobs, transferRunning)
@@ -26319,9 +27348,9 @@ export default function TransferPage() {
   const [tune, setTune] = useState<TuneOptions | null>(null)
   const [tuneError, setTuneError] = useState('')
   const [includeModels, setIncludeModels] = useState(false)
-  // Passphrases live only in this component's state, and are cleared once a
-  // job has started with them (#27).
-  const [encrypt, setEncrypt] = useState(false)
+  // Passphrases and key file text live only in this component's state, and are
+  // cleared once a job has started with them (#27, #676).
+  const [encryption, setEncryption] = useState<Encryption>('key')
   const [passphrase, setPassphrase] = useState('')
   const [confirmPassphrase, setConfirmPassphrase] = useState('')
   const [exportJob, setExportJob] = useState<ExportJob | null>(null)
@@ -26334,6 +27363,11 @@ export default function TransferPage() {
   const [filename, setFilename] = useState('')
   const [onConflict, setOnConflict] = useState('abort')
   const [importPassphrase, setImportPassphrase] = useState('')
+  const [importKey, setImportKey] = useState('')
+  const [importKeyName, setImportKeyName] = useState('')
+  const keyInput = useRef<HTMLInputElement | null>(null)
+  // The package selected now, for a key file read that ends later (#860).
+  const selectedPackage = useRef(filename)
   const [importJob, setImportJob] = useState<ImportJob | null>(null)
   const [importError, setImportError] = useState('')
   const [importWatching, setImportWatching] = useState(false)
@@ -26404,6 +27438,57 @@ export default function TransferPage() {
       }, () => {})
     }, 3000))
   }, [])
+
+  // After a Download key click (#676): re-read the export every 3 s, for at
+  // most 10 minutes, until its key file is no longer on the server.
+  const keyWatches = useRef(new Map<string, number>())
+  const watchKeyDownload = useCallback((jobId: string) => {
+    const watches = keyWatches.current
+    if (watches.has(jobId)) return
+    const started = Date.now()
+    const stop = () => { window.clearInterval(watches.get(jobId)); watches.delete(jobId) }
+    watches.set(jobId, window.setInterval(() => {
+      if (!alive.current || Date.now() - started > 10 * 60 * 1000) { stop(); return }
+      api.getExportJob(jobId).then(job => {
+        if (!alive.current) return
+        setExportJob(current => (current && current.job_id === jobId
+          ? { ...current, key_on_server: job.key_on_server } : current))
+        if (!job.key_on_server) { stop(); loadPackages() }
+      }, () => {})
+    }, 3000))
+  }, [loadPackages])
+
+  useEffect(() => {
+    const watches = keyWatches.current
+    return () => { watches.forEach(id => window.clearInterval(id)); watches.clear() }
+  }, [])
+
+  // LAN mode never sends an unencrypted export (#676).
+  useEffect(() => {
+    if (lanMode && encryption === 'none') setEncryption('key')
+  }, [lanMode, encryption])
+
+  // A key file chosen for one package is never sent with another.
+  useEffect(() => {
+    selectedPackage.current = filename
+    setImportKey(''); setImportKeyName('')
+    if (keyInput.current) keyInput.current.value = ''
+  }, [filename])
+
+  async function chooseKeyFile(file: File | undefined) {
+    setImportKey(''); setImportKeyName('')
+    if (!file) return
+    // A read that ends after another package was chosen is dropped (#860).
+    const forPackage = filename
+    try {
+      const text = await file.text()
+      if (!alive.current || selectedPackage.current !== forPackage) return
+      setImportKey(text); setImportKeyName(file.name)
+    } catch (e: unknown) {
+      if (!alive.current || selectedPackage.current !== forPackage) return
+      setImportError(`Could not read the key file: ${message(e)}`)
+    }
+  }
 
   // Fidelity is shown before the export runs, so the choice is informed rather
   // than discovered afterwards in the manifest. A lookup that fails says so
@@ -26523,9 +27608,9 @@ export default function TransferPage() {
   async function startExport() {
     setExportError(''); setExportPollError(''); setExportJob(null)
     try {
-      const r = await api.startExport(encrypt
-        ? { collection, include_models: includeModels, passphrase }
-        : { collection, include_models: includeModels })
+      const r = await api.startExport(encryption === 'passphrase'
+        ? { collection, include_models: includeModels, encryption, passphrase }
+        : { collection, include_models: includeModels, encryption })
       setPassphrase(''); setConfirmPassphrase('')
       if (!alive.current) return
       exportTouched.current = true
@@ -26542,10 +27627,13 @@ export default function TransferPage() {
   async function startImport() {
     setImportError(''); setImportPollError(''); setImportJob(null)
     try {
-      const r = await api.startImport(selectedEncrypted
+      const r = await api.startImport(importNeeds === 'key'
+        ? { filename, on_conflict: onConflict, key: importKey }
+        : importNeeds === 'passphrase'
         ? { filename, on_conflict: onConflict, passphrase: importPassphrase }
         : { filename, on_conflict: onConflict })
-      setImportPassphrase('')
+      setImportPassphrase(''); setImportKey(''); setImportKeyName('')
+      if (keyInput.current) keyInput.current.value = ''
       if (!alive.current) return
       importTouched.current = true
       importJobs.reload()
@@ -26563,12 +27651,18 @@ export default function TransferPage() {
 
   // What still stops an encrypted export, or '' when nothing does.
   const passphraseLength = charCount(passphrase)
-  const passphraseProblem = !encrypt ? ''
+  const passphraseProblem = encryption !== 'passphrase' ? ''
     : passphraseLength < PASSPHRASE_MIN ? `The passphrase needs at least ${PASSPHRASE_MIN} characters.`
     : passphraseLength > PASSPHRASE_MAX ? `The passphrase can have at most ${PASSPHRASE_MAX} characters.`
     : passphrase !== confirmPassphrase ? 'The two passphrases do not match.'
     : ''
-  const selectedEncrypted = packages.some(p => p.filename === filename && p.encrypted)
+  // Which secret the selected package needs (#676): its key file when its header
+  // is a key header, otherwise a passphrase for any encrypted one (#27).
+  const selected = packages.find(p => p.filename === filename)
+  const importNeeds: 'key' | 'passphrase' | null = !selected?.encrypted ? null
+    : selected.encryption === 'key' ? 'key' : 'passphrase'
+  const importSecretMissing = importNeeds === 'key' ? importKey === ''
+    : importNeeds === 'passphrase' ? importPassphrase === '' : false
 
   const jobRows: (JobRow & { sort: { created_at: string | null; finished_at: string | null } })[] = [
     ...exportJobs.entries.map(entry => ({
@@ -26646,17 +27740,23 @@ export default function TransferPage() {
           </span>
         </label>
 
-        <label className="flex items-start gap-2 text-sm mb-3">
-          <input type="checkbox" checked={encrypt} onChange={e => setEncrypt(e.target.checked)} className="mt-1" />
-          <span>
-            Encrypt with a passphrase
-            <span className="block text-xs text-gray-500">
-              Writes an encrypted <code>.tar.gz.age</code> package that only this passphrase opens.
-              It can't be recovered, so keep it safe and send it separately from the file.
-            </span>
-          </span>
-        </label>
-        {encrypt && (
+        <label className="block text-sm font-medium mb-2">Encryption</label>
+        <div className="space-y-2 mb-3">
+          {ENCRYPTION.filter(c => !(lanMode && c.id === 'none')).map(c => (
+            <label key={c.id} className={`flex gap-3 p-3 border rounded cursor-pointer ${encryption === c.id ? 'border-blue-500 bg-blue-50' : 'hover:bg-gray-50'}`}>
+              <input type="radio" name="encryption" value={c.id} checked={encryption === c.id}
+                     onChange={() => setEncryption(c.id)} className="mt-1" />
+              <div>
+                <div className="text-sm font-medium">{c.label}</div>
+                <div className="text-xs text-gray-500">{c.description}</div>
+              </div>
+            </label>
+          ))}
+          {lanMode && (
+            <p className="text-xs text-gray-500">In LAN mode every export is encrypted.</p>
+          )}
+        </div>
+        {encryption === 'passphrase' && (
           <div className="mb-3 space-y-2">
             <input type="password" autoComplete="new-password" placeholder="Passphrase"
                    value={passphrase} onChange={e => setPassphrase(e.target.value)}
@@ -26690,11 +27790,30 @@ export default function TransferPage() {
                 <code className="text-xs break-all">{exportJob.filename}</code>
                 <span className="text-gray-500 text-xs">
                   {' '}({sizeLabel(exportJob.size_bytes)}, {exportJob.fidelity}
-                  {exportJob.encrypted ? ', encrypted' : ''}
+                  {exportJob.encryption === 'key' ? ', encrypted with a key'
+                    : exportJob.encrypted ? ', encrypted with a passphrase' : ''}
                   {exportJob.models_bundled ? ', models included' : ''}
                   {exportJob.retrieve_script ? ', with retrieve.py' : ', no retrieve.py'})
                 </span>
               </p>
+            )}
+            {exportJob.status === 'completed' && exportJob.encryption === 'key' && exportJob.key_filename && (
+              <div className="mt-2 p-3 border border-amber-300 bg-amber-50 rounded text-xs">
+                <p className="text-amber-800 mb-2">
+                  Download the key first. It opens this package and nothing else, it can be downloaded
+                  only once, and it can't be recovered. Store it apart from the package: anyone with both
+                  can read the collection.
+                </p>
+                {exportJob.key_on_server
+                  ? (
+                    <a href={api.packageDownloadUrl(exportJob.key_filename)} download
+                       onClick={() => watchKeyDownload(exportJob.job_id)}
+                       className="bg-amber-600 text-white px-3 py-1 rounded text-xs hover:bg-amber-700">
+                      Download key
+                    </a>
+                  )
+                  : <span className="text-gray-600">Key downloaded and deleted from ./exports. It can't be downloaded again.</span>}
+              </div>
             )}
             {exportJob.status === 'completed' && exportJob.filename && gone.has(exportJob.filename) && (
               <p className="mt-2 text-gray-500 text-xs">Downloaded and deleted from ./exports.</p>
@@ -26754,7 +27873,10 @@ export default function TransferPage() {
             <option key={p.filename} value={p.filename}>
               {p.filename}
               {p.encrypted
-                ? (p.readable ? ` — encrypted, ${sizeLabel(p.size_bytes)}` : ' — encrypted, unreadable')
+                ? (!p.readable ? ' — encrypted, unreadable'
+                  : p.encryption === 'key'
+                  ? ` — encrypted with a key, key ${p.key_on_server ? 'on' : 'not on'} the server, ${sizeLabel(p.size_bytes)}`
+                  : ` — encrypted with a passphrase, ${sizeLabel(p.size_bytes)}`)
                 : p.readable
                 ? ` — ${p.collection}, ${p.chunk_count} chunks, ${p.fidelity}, ${sizeLabel(p.size_bytes)}`
                 : ' — unreadable'}
@@ -26770,7 +27892,19 @@ export default function TransferPage() {
         )}
 
         {!queryOnly && (<>
-        {selectedEncrypted && (
+        {importNeeds === 'key' && (
+          <div className="mb-3">
+            <label className="block text-sm font-medium mb-1">Key file</label>
+            <input type="file" ref={keyInput} onChange={e => chooseKeyFile(e.target.files?.[0])}
+                   className="w-full text-sm" />
+            <p className="text-xs text-gray-500 mt-1">
+              This package is encrypted with its own key. Choose the key file that was downloaded
+              with it (<code>{filename}.key</code>).
+              {importKeyName && <> Chosen: <code>{importKeyName}</code>.</>}
+            </p>
+          </div>
+        )}
+        {importNeeds === 'passphrase' && (
           <div className="mb-3">
             <label className="block text-sm font-medium mb-1">Passphrase</label>
             <input type="password" autoComplete="off" value={importPassphrase}
@@ -26798,7 +27932,7 @@ export default function TransferPage() {
 
         <button
           onClick={startImport}
-          disabled={!filename || importBusy || (selectedEncrypted && importPassphrase === '')}
+          disabled={!filename || importBusy || importSecretMissing}
           className="bg-blue-600 text-white px-5 py-2 rounded text-sm hover:bg-blue-700 disabled:opacity-50"
         >
           {importBusy ? 'Importing…' : 'Import'}
@@ -27640,6 +28774,231 @@ export default function ServiceKeysPage() {
 }
 ```
 
+### ui/src/pages/GroupsPage.tsx
+
+```typescript
+import { FormEvent, useEffect, useRef, useState } from 'react'
+import { api, AdminUser, Group, ServicePrincipal } from '../api/client'
+
+// Groups for collection access, for Engineers (#784). A group holds people and
+// service principals; a restricted collection granted to a group (Access on the
+// Collections page) is usable by its members while both hold. The API decides
+// everything: names follow the username rule, a rename keeps members and
+// grants, and deleting a group removes its grants without opening anything.
+export default function GroupsPage() {
+  const [groups, setGroups] = useState<Group[]>([])
+  const [listError, setListError] = useState('')
+  const [actionError, setActionError] = useState('')
+  const [name, setName] = useState('')
+  const [busy, setBusy] = useState(false)
+  // The Members dialog: the group, its draft, and the lists to tick. Each
+  // opening is numbered, so an earlier opening's late lists never reach it.
+  const [membersOf, setMembersOf] = useState('')
+  const [draft, setDraft] = useState<{ users: string[]; service_principals: string[] }>({ users: [], service_principals: [] })
+  const [people, setPeople] = useState<AdminUser[]>([])
+  const [principals, setPrincipals] = useState<ServicePrincipal[]>([])
+  const [dialogError, setDialogError] = useState('')
+  const opening = useRef(0)
+  const [renaming, setRenaming] = useState('')
+  const [newName, setNewName] = useState('')
+  const [deleting, setDeleting] = useState('')
+
+  async function load() {
+    try {
+      setGroups((await api.listGroups()).groups)
+      setListError('')
+    } catch (e: unknown) {
+      setListError(`Could not load the groups: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+
+  useEffect(() => { load() }, [])
+
+  const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
+
+  async function create(e: FormEvent) {
+    e.preventDefault()
+    setActionError('')
+    setBusy(true)
+    try {
+      await api.createGroup(name)
+      setName('')
+    } catch (err: unknown) {
+      setActionError(message(err))
+    } finally {
+      setBusy(false)
+      await load()
+    }
+  }
+
+  function openMembers(g: Group) {
+    const ticket = ++opening.current
+    setDialogError('')
+    setMembersOf(g.name)
+    setDraft({ users: [...g.users], service_principals: [...g.service_principals] })
+    api.listUsers().then(r => { if (ticket === opening.current) setPeople(r.users) })
+      .catch((e: unknown) => { if (ticket === opening.current) setDialogError(`Could not load the people: ${message(e)}`) })
+    api.listPrincipals().then(r => { if (ticket === opening.current) setPrincipals(r.principals) })
+      .catch((e: unknown) => { if (ticket === opening.current) setDialogError(`Could not load the service principals: ${message(e)}`) })
+  }
+
+  function closeDialogs() {
+    opening.current++
+    setMembersOf('')
+    setRenaming('')
+    setDeleting('')
+    setDialogError('')
+  }
+
+  function toggle(list: 'users' | 'service_principals', member: string) {
+    setDraft(d => ({ ...d, [list]: d[list].includes(member) ? d[list].filter(n => n !== member) : [...d[list], member] }))
+  }
+
+  async function run(action: () => Promise<unknown>) {
+    setDialogError('')
+    setBusy(true)
+    try {
+      await action()
+      closeDialogs()
+    } catch (e: unknown) {
+      setDialogError(message(e))
+    } finally {
+      setBusy(false)
+      await load()
+    }
+  }
+
+  const memberCount = (g: Group) => g.users.length + g.service_principals.length
+
+  return (
+    <div className="max-w-5xl mx-auto">
+      <h1 className="text-2xl font-bold mb-2">Groups</h1>
+      <p className="text-sm text-gray-600 mb-6">
+        A group holds people and service principals. Grant a restricted collection to a group with <strong>Access</strong> on
+        the Collections page, and its members may use it while they are in the group. Changes apply to everyone's next
+        request.
+      </p>
+      {listError && <p role="alert" className="text-red-600 text-sm mb-4">{listError}</p>}
+
+      <form onSubmit={create} className="flex flex-wrap items-end gap-3 mb-6">
+        <label className="text-sm text-gray-700">
+          Name
+          <input id="new-group-name" value={name} onChange={e => setName(e.target.value)} autoComplete="off"
+            className="mt-1 block border border-gray-300 rounded px-3 py-2 text-sm" required />
+        </label>
+        <button type="submit" disabled={busy || !name}
+          className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700 disabled:opacity-50">Create group</button>
+        <p className="text-xs text-gray-500 basis-full">
+          3-32 characters: lowercase letters, digits, '.', '_' or '-'; a name no other group has.
+        </p>
+      </form>
+
+      {actionError && <p role="alert" className="text-red-600 text-sm mb-4">{actionError}</p>}
+
+      {groups.length === 0 && !listError && <p className="text-sm text-gray-500">No groups yet.</p>}
+
+      {groups.length > 0 && (
+        <table className="w-full text-sm border-collapse">
+          <thead>
+            <tr className="border-b border-gray-200 text-left text-gray-600">
+              <th className="py-2 pr-4">Name</th>
+              <th className="py-2 pr-4">People</th>
+              <th className="py-2 pr-4">Service principals</th>
+              <th className="py-2"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {groups.map(g => (
+              <tr key={g.name} data-group={g.name} className="border-b border-gray-100">
+                <td className="py-2 pr-4 font-medium">{g.name}</td>
+                <td className="py-2 pr-4">{g.users.join(', ') || '—'}</td>
+                <td className="py-2 pr-4">{g.service_principals.join(', ') || '—'}</td>
+                <td className="py-2 space-x-3 whitespace-nowrap">
+                  <button disabled={busy} onClick={() => openMembers(g)} className="text-blue-600 hover:underline disabled:opacity-50">Members</button>
+                  <button disabled={busy} onClick={() => { setDialogError(''); setNewName(g.name); setRenaming(g.name) }} className="text-blue-600 hover:underline disabled:opacity-50">Rename</button>
+                  <button disabled={busy} onClick={() => { setDialogError(''); setDeleting(g.name) }} className="text-red-500 hover:underline disabled:opacity-50">Delete</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      {membersOf && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
+          <div role="dialog" aria-label={`Members of ${membersOf}`} className="bg-white rounded-xl p-6 w-96 shadow-xl max-h-[80vh] overflow-y-auto">
+            <h2 className="font-semibold mb-3">Members of {membersOf}</h2>
+            <div className="space-y-3 mb-4">
+              <fieldset>
+                <legend className="text-xs text-gray-500 mb-1">People</legend>
+                {people.map(u => (
+                  <label key={u.username} className="flex items-center gap-2 text-sm">
+                    <input type="checkbox" checked={draft.users.includes(u.username)} onChange={() => toggle('users', u.username)} />
+                    {u.username}{u.enabled ? '' : ' (disabled)'}
+                  </label>
+                ))}
+              </fieldset>
+              <fieldset>
+                <legend className="text-xs text-gray-500 mb-1">Service principals</legend>
+                {principals.length === 0 && <p className="text-xs text-gray-400">None</p>}
+                {principals.map(p => (
+                  <label key={p.name} className="flex items-center gap-2 text-sm">
+                    <input type="checkbox" checked={draft.service_principals.includes(p.name)} onChange={() => toggle('service_principals', p.name)} />
+                    {p.name}{p.enabled ? '' : ' (disabled)'}
+                  </label>
+                ))}
+              </fieldset>
+            </div>
+            {dialogError && <p role="alert" className="text-red-600 text-sm mb-4">{dialogError}</p>}
+            <div className="flex justify-end gap-2">
+              <button onClick={closeDialogs} className="text-sm text-gray-500">Cancel</button>
+              <button disabled={busy} onClick={() => run(() => api.setGroupMembers(membersOf, draft.users, draft.service_principals))}
+                className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700 disabled:opacity-40">Save</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {renaming && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
+          <div role="dialog" aria-label={`Rename ${renaming}`} className="bg-white rounded-xl p-6 w-96 shadow-xl">
+            <h2 className="font-semibold mb-3">Rename {renaming}</h2>
+            <p className="text-sm text-gray-600 mb-3">Its members and the collections granted to it stay.</p>
+            <input aria-label="New name" value={newName} onChange={e => setNewName(e.target.value)} autoComplete="off"
+              className="border rounded px-3 py-2 text-sm w-full mb-4" />
+            {dialogError && <p role="alert" className="text-red-600 text-sm mb-4">{dialogError}</p>}
+            <div className="flex justify-end gap-2">
+              <button onClick={closeDialogs} className="text-sm text-gray-500">Cancel</button>
+              <button disabled={busy || !newName} onClick={() => run(() => api.renameGroup(renaming, newName))}
+                className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700 disabled:opacity-40">Rename</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {deleting && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
+          <div role="dialog" aria-label={`Delete ${deleting}`} className="bg-white rounded-xl p-6 w-96 shadow-xl">
+            <h2 className="font-semibold text-red-600 mb-3">Delete group {deleting}?</h2>
+            <p className="text-sm text-gray-600 mb-4">
+              Its members lose what the group gave them: every collection grant to {deleting} is removed. A collection
+              granted only to this group stays restricted (AI Engineers and any other grants).
+              {(() => { const g = groups.find(x => x.name === deleting); return g ? ` It has ${memberCount(g)} ${memberCount(g) === 1 ? 'member' : 'members'}.` : '' })()}
+            </p>
+            {dialogError && <p role="alert" className="text-red-600 text-sm mb-4">{dialogError}</p>}
+            <div className="flex justify-end gap-2">
+              <button onClick={closeDialogs} className="text-sm text-gray-500">Cancel</button>
+              <button disabled={busy} onClick={() => run(() => api.deleteGroup(deleting))}
+                className="bg-red-600 text-white px-4 py-2 rounded text-sm hover:bg-red-700 disabled:opacity-40">Delete</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+```
+
 ### ui/src/pages/AuditPage.tsx
 
 ```typescript
@@ -27648,6 +29007,7 @@ import { api, AuditFilters, AuditPage as AuditPageData, AuditRecord, auditCsvUrl
 
 // The names the API records (api/services/audit.py ALL_ACTIONS), for the filter.
 const ACTIONS = [
+  'admin.group.create', 'admin.group.delete', 'admin.group.members', 'admin.group.rename',
   'admin.key.issue', 'admin.key.revoke', 'admin.mfa.policy', 'admin.principal.create', 'admin.principal.disable',
   'admin.principal.enable', 'admin.principal.set-role', 'admin.user.create', 'admin.user.disable',
   'admin.user.enable', 'admin.user.reset-mfa', 'admin.user.reset-password', 'admin.user.set-role', 'audit.download',
@@ -28162,6 +29522,8 @@ mode and a non-boolean `RAG_LAN_MODE`. Only in a `--lan` run does it check the r
 for (localhost, 127.0.0.1 and the test names; another `Host` gets 421, #664),
 TLS versions and HTTP/2, the single loopback binding, the `Secure` cookie, the origin rule over HTTPS,
 a `Server` header with no nginx version (`server_tokens off`),
+`lan_mode` in the user answer and an unencrypted export refused `400 ENCRYPTION_REQUIRED` (#676),
+a default export completing as a key export whose key file and encrypted package download over HTTPS (#676),
 the API's refusal in one-off containers (`docker compose run --rm
 --no-deps`, no ports) and nginx's login rate limit (logins sent without
 waiting until one is refused `429 LOGIN_RATE_LIMITED`, #577); it also prints
@@ -28891,13 +30253,14 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `ui_ingest_check.py` | the checks of suite 22, one per subcommand, on the host, and its cleanup (#641) |
 | `23_llm_split.sh` | the build and answer models (#671), full runs only: with `BUILD_LLM_MODEL` set to a small model, preparation and gold standard use it and query uses the answer model |
 | `llm_split.py` | helper for suite 23, run in the API container: pulls the small model, runs the three tasks through the services' code and prints the models Ollama reports answering each (#671) |
-| `24_query_only.sh` | §2.6 and §10.11 — query-only mode (#670): the overlay resolved without starting it; registers `../tests/test_query_only.py`; the start-up refusal of a non-boolean `RAG_QUERY_ONLY`; the loader's refusal on a full instance; with `stack.sh run --query-only`, build and export, `stack.sh query-only-mode`, then the load, the refusals, access and Q&A on the query-only instance |
+| `24_query_only.sh` | §2.6 and §10.11 — query-only mode (#670): the overlay resolved without starting it; registers `../tests/test_query_only.py`; the start-up refusal of a non-boolean `RAG_QUERY_ONLY`; the loader's refusal on a full instance; with `stack.sh run --query-only`, build and export, `stack.sh query-only-mode`, then the load, the refusals, access and Q&A on the query-only instance, and a key package loaded with its key file on standard input and refused `KEY_FILE_REQUIRED` without it (#676) |
 | `query_only_config.py` | host-side, standard library: `docker-compose.yml` with and without `docker-compose.query-only.yml` as `docker compose config` resolves them; only the api's `RAG_QUERY_ONLY` may differ (#670) |
-| `../tests/test_query_only.py` | API image, no network (also on the host): `RAG_QUERY_ONLY` parsing, the refused and kept routes, the refusals through the app and their order, `query_only` in the user answers, the loader (usage, refusals, lock, passphrase, results `success`/`refused`/`failed`/`interrupted`, the Ctrl-C handler) and the access of a collection it creates (#670) |
+| `../tests/test_query_only.py` | API image, no network (also on the host): `RAG_QUERY_ONLY` parsing, the refused and kept routes, the refusals through the app and their order, `query_only` in the user answers, `lan_mode` in the user answers (#676), the loader (usage, refusals, lock, passphrase, a key package's key file on standard input with `KEY_FILE_REQUIRED` and `KEY_FILE_INVALID` (#676), results `success`/`refused`/`failed`/`interrupted`, the Ctrl-C handler) and the access of a collection it creates (#670) |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
 | `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
 | `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530); the nginx tag in SPECIFICATIONS.md's compose copy and 11.3 image list matches docker-compose.yml (#665), registered by infrastructure |
 | `../tests/test_upgrade_backup.py` | host-only: the README's 1.1.0 → 1.2.0 upgrade blocks, run as written under bash, `zsh -c` and interactive zsh with comments off, against stub `docker`, `git` and `curl`; the stub docker accepts only mounts inside its temp directory and only the README's two container commands: no block holds a `#` comment line; the backup skips a missing volume (a wrong prefix) and counts only existing volumes' archives, and writes each copy to a `.tmp` file that replaces the archive only once `gzip -t` passes, so a failed or corrupt copy prints `backup FAILED` and keeps an earlier archive; the rollback is gated on `git checkout v1.1.0` and checks every archive (`gzip -t`, `tar tzf`) and volume before it empties any, and a failed restore stops before `compose up`; alpine is pinned by version and digest; git ignores `backups/` (#679, #693), registered by infrastructure |
+| `../tests/test_backup_scripts.py` | runs from the host, standard library plus the docker CLI: `scripts/backup.sh` and `scripts/restore.sh` (#848) on throwaway volumes of a random project of their own (`rd848t<hex>`, with compose's labels, removed afterwards), run from a scratch git checkout with their own `HOME`: a backup then a restore gives back every file, folder, link, mode and owner; every volume gets its own key, and no two keys match over two runs; the backup folder (0700) holds only `.tgz.age` archives and `.key` files (0600), with no unencrypted archive and no key in the output; a missing volume is skipped and a running container of the project is stopped, not removed; a wrong key, a missing key file and a damaged or cut archive change nothing and stop nothing, and a wrong key or a Docker error in the check shows what age or Docker said; an extraction that fails after the check (a damaged copy fed by a docker wrapper) leaves the volume unchanged, its root's mode and owner included; a Docker error in the key step is shown, with no line holding a secret key; the prefix and location refusals, and the checkout named in another case refused where the filesystem ignores case; the age image pins (the README's alpine, an exact `age` package), its tag following the whole Dockerfile (a stub docker: a new digest or an added instruction gives a new tag, a comment or a blank line doesn't, #852, #856; with no `sha256sum` the same tag from `shasum`, and with neither a refusal before any build), a volume holding an interrupted restore's `.rag-docker-restore.*` folder backed up without it, the folder left in place, and restored without it (#856), and `*.key` in `.gitignore`. Skipped, with a message, only when the docker CLI is missing; it builds the age image (`scripts/age`) if this machine doesn't have it, which needs the network. Registered by infrastructure |
 | `../tests/test_version_agreement.py` | host-only: the first-party version strings agree with each other, not with a fixed version: `ui/package.json`, the root versions in `ui/package-lock.json`, `mcp/mcpapp.py`, the two `service.version` defaults in `api/services/telemetry.py` and `RAG_OTEL_SERVICE_VERSION` in `docker-compose.telemetry.yml` and `docker-compose.telemetry.verify.yml` (#605, #656), registered by infrastructure |
 | `../tests/test_ui_dependencies.py` | host-only: the copy of `ui/package.json` embedded in `IMPLEMENTATION.md` (`### ui/package.json`) is the file, exactly, so a UI dependency bump that misses the copy fails (#532), registered by infrastructure |
 | `../tests/test_tailwind_output.py` | runs from the host, standard library plus the docker CLI: the built UI CSS keeps what the Tailwind 4 migration relies on (RD-157, #773): the `prose` and `prose-sm` rules, `relative`, `hover` on every device with no `@media (hover: hover)`, and the `@source` globs with automatic detection off (a sentinel `.jsx` file under `ui/src/` is scanned, a sentinel `.md` file is not). It builds a scratch copy of `ui/` with `npm ci --ignore-scripts` from the lock file and `vite build` in a throwaway container of the image `ui/Dockerfile` builds with (its `builder` stage), not on the host (#826), so it needs the network unless the image and the npm cache are present, and is skipped, with a message, only when the docker CLI is missing (a docker or build failure fails it); a second class reads `ui/src/index.css`, `NavBar.tsx` and `ui/Dockerfile` directly, and checks that the builder image is an image reference with a tag or a digest (a `--platform` flag, a digest pin and a registry with a port are accepted; a token starting with `-` is refused before it reaches `docker run`); a third checks, with a stub in place of docker, that a build step that times out has its named container removed (#841). Registered by infrastructure |
@@ -28906,7 +30269,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_package_refusals.py` | controlled import checks 1 and 2, collection-name and `chunks.jsonl` record refusals, registered by suite 15 |
 | `../tests/test_transfer_paths.py` | controlled transfer and tuning route regressions through the app, registered by suite 15 |
 | `../tests/test_retrieve_script.py` | controlled `retrieve.py` defaults, flags and exit codes against a stub API, registered by suite 15 |
-| `../tests/test_distribution.py` | `package.sh`, `package-offline.sh` and `install-offline.sh` with stubbed `docker`, and the image list, on the host, registered by suite 15 |
+| `../tests/test_distribution.py` | `package.sh`, `package-offline.sh` and `install-offline.sh` with stubbed `docker`, and the image list, on the host, registered by suite 15; the offline bundle also saves the backup scripts' age image, built from the bundle's own `scripts/age` when missing, and a failed build saves nothing (#852) |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types, the Import page's corpus preparation rules download (#615), the page controls of #400 (see "UI control browser checks") and, last, the login page against nginx's real login rate limit (#577) |
 | `14_reindex.sh` | exact-record reindex: a host check that the embedded sources match the real files (`../tests/test_reindex_preservation.py`), 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
 | `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures, canonical local session IDs and exact successful-creation ownership. Verifier collection names deliberately lie outside the parent prefix-sweep namespace. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves a durable exact-name fixture receipt/directory before standalone exit; inspection must confirm terminal writer state before exact-name cleanup |
@@ -29104,6 +30467,20 @@ encrypted path everywhere: the listing (header check only), the import refusals 
 passphrase travels as a function argument to the worker thread and is never put in a job
 record; the request models hold it as `SecretStr`.
 
+Since #676 the module also writes and reads files for a new X25519 key: `generate_identity`,
+the key file in age's identity layout (`identity_file`, `parse_identity`), the `X25519` stanza
+on both sides, and `header_kind`, which tells a key package from a passphrase one by its header
+alone. Export encrypts to a new key by default and writes `<package>.key` (0600) beside the
+package; import and the query-only loader choose the secret by the header (`KEY_FILE_REQUIRED`,
+`KEY_FILE_INVALID`, `KEY_FILE_NOT_EXPECTED`). `test_export_encryption.py` runs the 68 testkit vectors that
+carry an X25519 key and an independent X25519 decryption, and checks the key build, the key
+file, the export choices (LAN mode's `ENCRYPTION_REQUIRED`), the import refusals and that no key
+reaches a job record, log or response. Since #860 its `SameSecondNames` tests check that exports
+of one collection whose names would be the same get distinct names (`-2`, `-3`) and keep every
+file, that a name still taken by a key file or given earlier in the process isn't given again,
+that a name taken during the build fails the export and leaves that file, the fallback where
+hard links aren't supported, and that the build fails when no name is free.
+
 `scripts/tests/test_export_encryption.py`, run by `05_transfer.sh` in the API image with no
 network, checks the module against the vendored C2SP CCTV vectors
 (`scripts/tests/fixtures/age-testkit`, with their source in `SOURCE`) and an independent
@@ -29143,11 +30520,20 @@ Suite 05's live checks run through the proxy on the verify stack, with fixtures 
   keeps an unrecorded one;
 - an End User is refused `403`.
 
+The same file covers a key export's key file (#676): its name rule, a full download of the key
+deleting the key only, a package download leaving the key, expiry deleting both, an unrecorded
+key file and a restricted collection's key answering `404 PACKAGE_NOT_FOUND`. Suite 05's block
+"a key export (#676)" then checks on the verify stack that a default export is a key export with
+`<package>.key` at mode 600 and no plain archive in `./exports` while it runs, that two exports
+have different keys, that import without the key is refused `400 KEY_FILE_REQUIRED`, that the key's
+full download deletes the key and keeps the package, and that import with the key file's text
+completes.
+
 ## Transfer page polling and failure checks
 
 `browser/transfer_page.js`, registered in `06_ui.sh` through `ui_criteria.js`, renders the
 Transfer page with every API call stubbed in the browser and the page's 2 s poll delay cut to
-20 ms (#382). Twenty-three cases: for each half, a failed poll (a proxy 502) is shown and retried
+20 ms (#382). Twenty-seven cases: for each half, a failed poll (a proxy 502) is shown and retried
 with the button still busy and cleared by the next good poll; 30 failures in a row stop polling,
 show the last error and enable the button again, and a new start clears the message; a poll in
 flight when the page is left schedules no further poll. An export start answered after the page
@@ -29156,9 +30542,13 @@ is left starts no polling. A 409 `SOURCE_INDEX_INVALID`, 503 or 404 from `/tune`
 longer selected is ignored. A failed export shows its `error_code`, and a failed package list
 is shown without the empty-folder hint until a good Refresh. Three cases cover encryption (#27):
 an export passphrase holds Export until it has 12 characters and matches its confirmation, is
-sent only when the box is checked, and both fields clear once the export starts; an encrypted
+sent only when "Passphrase" is chosen, and both fields clear once the export starts; an encrypted
 package is labelled, asks for its passphrase, sends it and clears it, and a plain package sends
-none. Four cases cover downloading a package (#677):
+none. Five cases cover the key export (#676): the three choices with a new key first and chosen,
+"Not encrypted" sending `encryption: "none"`, no "Not encrypted" in LAN mode, Download key
+offered before the package's Download with the store-apart warning and gone once the key is
+downloaded, and a key package asking for its key file, read in the browser and sent as `key`;
+the key is never shown as text. Four cases cover downloading a package (#677):
 - a finished export offers a Download link to its package with "Expires" in local time, and none
   when it has no expiry;
 - the package list says when a package exported here expires, and its Download link follows the
@@ -31323,10 +32713,19 @@ MATRIX = (
     # Two-step verification (#607): a 404 for no such account, a 422 for no value.
     ("POST", "/auth/users/vfy-no-such-user/reset-mfa", None, "engineer"),
     ("POST", "/auth/mfa/policy", {}, "engineer"),
+    # Groups for collection access (#784): a list, a 422 for no name, or a 404
+    # for a group that doesn't exist; nothing changes.
+    ("GET", "/auth/groups", None, "engineer"),
+    ("POST", "/auth/groups", {}, "engineer"),
+    ("POST", "/auth/groups/vfy-no-such-group/rename", {"name": "vfy-no-such-other"}, "engineer"),
+    ("PUT", "/auth/groups/vfy-no-such-group/members", {}, "engineer"),
+    ("POST", "/auth/groups/vfy-no-such-group/delete", None, "engineer"),
 )
 # Routes an API key can't use whatever its role (S5 of PR 3): every account,
-# principal and key route, logout and the password change; and the audit log (#29).
-KEY_REFUSED = ("/auth/users", "/auth/service-principals", "/auth/logout", "/auth/password", "/audit", "/auth/mfa")
+# principal and key route, logout and the password change; the audit log (#29);
+# and groups (#784).
+KEY_REFUSED = ("/auth/users", "/auth/service-principals", "/auth/logout", "/auth/password", "/audit", "/auth/mfa",
+               "/auth/groups")
 # And per-collection access (#606), by its path's end.
 KEY_REFUSED_SUFFIX = "/access"
 SESSION_ROUTES = (("GET", "/auth/me", None), ("POST", "/auth/logout", None), ("POST", "/auth/password", {}))
@@ -31651,7 +33050,8 @@ def check_login_logout(operator_ok):
     body = json.loads(raw)
     expect(status == 200 and body == {"username": "vfy-developer", "role": "developer", "must_change_password": False,
                                       "kind": "user", "mfa_enrolled": False, "mfa_required": False,
-                                      "mfa_enrollment_required": False, "query_only": False},
+                                      "mfa_enrollment_required": False, "query_only": False,
+                                      "lan_mode": False},
            "GET /auth/me answered {} {}".format(status, body))
     status, _, _ = code("POST", "/auth/logout", token=token)
     expect(status == 200, "logout answered {}".format(status))
@@ -32198,11 +33598,13 @@ def check_collection_access(operator_ok):
     and a Developer key can't see or use it until granted, and the access routes
     refuse a key. Changes and refusals are in the audit log. In the Prepare
     area, a document the granted Developer imports into it is hidden from a
-    Developer without access (#788)."""
+    Developer without access (#788). Granted to a group, the collection
+    reaches a Developer not granted directly while it is a member, and no
+    longer once removed (#784)."""
     expect(operator_ok, "creates accounts, a service principal and a collection, so it runs only on the verify project")
     admin = role_token("engineer")
     name = "VfyAccess" + secrets.token_hex(4)
-    users, principal = [], None
+    users, principal, group = [], None, None
     document, document_owner = None, None
     try:
         status, raw, _ = code("POST", "/collections", {"name": name}, token=admin)
@@ -32239,7 +33641,8 @@ def check_collection_access(operator_ok):
 
         status, raw, _ = code("PUT", "/collections/{}/access".format(name),
                               {"restricted": True, "users": [dev], "service_principals": [principal]}, token=admin)
-        expect(status == 200 and json.loads(raw) == {"restricted": True, "users": [dev], "service_principals": [principal]},
+        expect(status == 200 and json.loads(raw) == {"restricted": True, "users": [dev], "service_principals": [principal],
+                                                     "groups": []},
                "granting answered {} {}".format(status, raw[:200]))
         for who in ("Developer", "key"):
             expect(listed(who), "{} doesn't see the collection once granted".format(who))
@@ -32275,6 +33678,35 @@ def check_collection_access(operator_ok):
         status, raw, _ = code("GET", "/prepare/documents/" + document, token=other_token)
         expect((status, error_code(raw)) == (404, "DOCUMENT_NOT_FOUND"),
                "a Developer without access reading the document answered {} {}".format(status, error_code(raw)))
+        callers["Other"] = {"token": other_token}
+        # Groups (#784): a Developer not granted directly reaches the collection
+        # through a group, and no longer once removed from it.
+        group = "vfy-g-" + secrets.token_hex(4)
+        status, raw, _ = code("POST", "/auth/groups", {"name": group}, token=admin)
+        expect(status == 201, "creating group {} answered {} {}".format(group, status, error_code(raw)))
+        status, raw, _ = code("PUT", "/auth/groups/{}/members".format(group), {"users": [other]}, token=admin)
+        expect(status == 200, "adding the Developer to {} answered {} {}".format(group, status, error_code(raw)))
+        expect(not listed("Other"), "a group not granted the collection gave the Developer access")
+        status, raw, _ = code("PUT", "/collections/{}/access".format(name),
+                              {"restricted": True, "users": [dev], "service_principals": [principal], "groups": [group]},
+                              token=admin)
+        expect(status == 200 and json.loads(raw).get("groups") == [group],
+               "granting the group answered {} {}".format(status, raw[:200]))
+        expect(listed("Other"), "the Developer doesn't see the collection granted to its group")
+        got = answer("Other", "GET", "/ingest/config/" + name)
+        expect(got[0] == 200, "Developer: the collection granted to its group answered {}".format(got))
+        got = answer("key", "GET", "/auth/groups")
+        expect(got == (403, "KEY_NOT_ALLOWED"), "a key listing groups answered {}".format(got))
+        status, raw, _ = code("PUT", "/auth/groups/{}/members".format(group), {}, token=admin)
+        expect(status == 200, "emptying {} answered {} {}".format(group, status, error_code(raw)))
+        expect(not listed("Other"), "the Developer still sees the collection after leaving the group")
+        status, raw, _ = code("POST", "/auth/groups/{}/delete".format(group), token=admin)
+        expect(status == 200 and json.loads(raw).get("collections") == [name],
+               "deleting {} answered {} {}".format(group, status, raw[:200]))
+        group = None
+        status, raw, _ = code("GET", "/collections/{}/access".format(name), token=admin)
+        expect(json.loads(raw) == {"restricted": True, "users": [dev], "service_principals": [principal], "groups": []},
+               "after the group's delete the access is {}".format(raw[:200]))
         got = answer("key", "PUT", "/collections/{}/access".format(name), {"restricted": False})
         expect(got == (403, "KEY_NOT_ALLOWED"), "a key changing access answered {}".format(got))
         got = answer("key", "GET", "/collections/{}/access".format(name))
@@ -32285,16 +33717,20 @@ def check_collection_access(operator_ok):
             status, raw, _ = code("GET", query, token=admin)
             expect(status == 200, "GET /audit answered {}".format(status))
             return [r for r in json.loads(raw)["records"] if all(r.get(k) == v for k, v in match.items())]
-        # The newest record is the key's refused change below; this is the Engineer's grant.
+        # The newest records are the key's refused change below and the group's
+        # grant (#784); the oldest is the Engineer's first grant.
         change = audited("collection.access", result="success")
-        expect(change and change[0]["details"].get("added") == {"users": [dev], "service_principals": [principal]},
-               "the change's audit record is {}".format(change[:1]))
+        expect(change and change[-1]["details"].get("added") == {"users": [dev], "service_principals": [principal],
+                                                                 "groups": []},
+               "the change's audit record is {}".format(change[-1:]))
         refused = audited("query", actor=user)
         expect(refused and refused[0]["result"] == "refused" and refused[0]["details"].get("reason") == "collection_access",
                "the refused query's audit record is {}".format(refused[:1]))
         expect(audited("collection.access.refused", actor=principal),
                "no collection.access.refused record for the key's settings read")
     finally:
+        if group:
+            code("POST", "/auth/groups/{}/delete".format(group), token=admin)
         if document:
             code("DELETE", "/prepare/documents/" + document, token=document_owner)
         code("DELETE", "/collections/{}?confirm=true".format(name), token=admin)
@@ -34360,8 +35796,6 @@ async function prepareCase(page, c, out) {
 ### scripts/verify/job_lists.py
 
 The job lists on the verify project (#617), run by `02_ingest.sh` with `--operator`.
-
-```python
 """Running and recent job lists on the verify project (#617). Host-side,
 standard library, Python 3.9+. Run by 02_ingest.sh:
 
@@ -34481,7 +35915,7 @@ def main(argv):
         expect(everyone[key_id]["owner"] == {"name": principal, "kind": "service"},
                "the Engineer sees the key's job owned by {}".format(everyone[key_id]["owner"]))
 
-        status, raw, _ = code("POST", "/export", {"collection": name}, token=dev)
+        status, raw, _ = code("POST", "/export", {"collection": name, "encryption": "none"}, token=dev)
         expect(status == 202, "the export answered {} {}".format(status, error_code(raw)))
         export_id = json.loads(raw)["job_id"]
         expect(export_id in listed("/export/jobs", token=dev), "the running or ended export isn't listed")
@@ -34631,6 +36065,10 @@ lan origin
 check "a same-origin change over HTTPS is accepted, another origin's refused 403 CROSS_ORIGIN_REFUSED" $?
 lan server-tokens
 check "nginx sends no version: the Server header is plain nginx on an API answer and on its own 421 page (#555)" $?
+lan export
+check "LAN mode refuses an unencrypted export 400 ENCRYPTION_REQUIRED, and the user answer says lan_mode (#676)" $?
+lan export-key
+check "LAN mode: a default export is a key export, and its key file and encrypted package download over HTTPS (reviewer, #676)" $?
 lan refusals
 check "the API refuses LAN mode with one line when AUTH_COOKIE_SECURE is false or no Engineer exists" $?
 lan rate-limit
@@ -34764,7 +36202,7 @@ if __name__ == "__main__":
 ```python
 """LAN mode on the verify project (#26). Host-side, standard library, Python 3.9+.
 
-    python3 lan_stack.py https|hosts|tls|bindings|cookie|origin|server-tokens|refusals|rate-limit|address
+    python3 lan_stack.py https|hosts|tls|bindings|cookie|origin|server-tokens|export|export-key|refusals|rate-limit|address
 
 Run by 18_lan.sh in a `stack.sh run --lan`, which brings the verify project up
 in LAN mode with TLS on 127.0.0.1:<verify port> only, copies the certificate
@@ -34788,6 +36226,14 @@ printing what failed:
   server-tokens
             the Server header is exactly "nginx" on an API answer and on
             nginx's own 421 page, whose body names no version either (#555)
+  export    LAN mode exports only encrypted packages (#676): the user answer
+            says lan_mode, and POST /export with encryption "none" is refused
+            400 ENCRYPTION_REQUIRED before anything else is checked
+  export-key
+            a default export (no encryption named) of a new, empty collection
+            completes as a key export in LAN mode; its key file and its
+            age-encrypted package each download over HTTPS, and the key's
+            download leaves the job saying key_on_server false (reviewer, #676)
   refusals  a one-off api container of the LAN configuration (no ports, the
             running project untouched) refuses to start, with one line, when
             AUTH_COOKIE_SECURE is false and when its account store is empty
@@ -34809,6 +36255,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import auth_setup  # noqa: E402
@@ -35012,6 +36459,72 @@ def check_origin():
     assert status == 401, "the session still works after logout ({})".format(status)
 
 
+def check_export():
+    token, _ = login()
+    cookie = "{}={}".format(auth_setup.COOKIE, token)
+    status, body, _ = request("GET", "/auth/me", headers={"Cookie": cookie})
+    assert status == 200 and (body or {}).get("lan_mode") is True, \
+        "GET /auth/me answered {} with lan_mode {!r}".format(status, (body or {}).get("lan_mode"))
+    status, body, _ = request("POST", "/export", {"collection": "VfyLanNoSuch", "encryption": "none"},
+                              {"Cookie": cookie, "Origin": origin()})
+    code = ((body or {}).get("error") or {}).get("code")
+    assert (status, code) == (400, "ENCRYPTION_REQUIRED"), "an unencrypted export got {} {}".format(status, code)
+
+
+def download(path, cookie):
+    """(status, raw body) of GET /api<path> over verified TLS."""
+    conn = http.client.HTTPSConnection("localhost", port(), context=context(), timeout=120)
+    try:
+        conn.request("GET", "/api" + path, headers={"Cookie": cookie})
+        response = conn.getresponse()
+        return response.status, response.read()
+    finally:
+        conn.close()
+
+
+def check_export_key():
+    """Reviewer (#676): a key export completes in LAN mode, and its key and
+    package download over HTTPS. The downloads delete both files."""
+    token, _ = login()
+    cookie = "{}={}".format(auth_setup.COOKIE, token)
+    headers = {"Cookie": cookie, "Origin": origin()}
+    name = "VfyLanKey" + secrets.token_hex(3)
+    status, _, _ = request("POST", "/collections", {"name": name}, headers)
+    assert status == 201, "creating {} answered {}".format(name, status)
+    try:
+        status, body, _ = request("POST", "/export", {"collection": name}, headers)
+        assert status == 202, "the default export answered {} {}".format(status, body)
+        job = "/export/job/" + body["job_id"]
+        deadline = time.time() + 300
+        while True:
+            status, body, _ = request("GET", job, headers={"Cookie": cookie})
+            if status == 200 and body["status"] in ("completed", "failed"):
+                break
+            assert time.time() < deadline, "the export is still {} after 300 s".format((body or {}).get("status"))
+            time.sleep(1)
+        package, key = body["filename"], body["key_filename"]
+        assert (body["status"], body["encryption"], body["key_on_server"]) == ("completed", "key", True), \
+            "the export ended {} {} key_on_server {} ({})".format(body["status"], body["encryption"],
+                                                                 body["key_on_server"], body.get("error_code"))
+        assert package and package.endswith(".tar.gz.age") and key == package + ".key", \
+            "package {!r}, key file {!r}".format(package, key)
+        status, raw = download("/packages/" + key, cookie)
+        lines = raw.decode("ascii", "replace").splitlines()
+        secret = [line for line in lines if line.startswith("AGE-SECRET-KEY-1")]
+        assert status == 200 and len(secret) == 1, \
+            "the key file answered {} with {} secret key line(s)".format(status, len(secret))
+        status, body, _ = request("GET", job, headers={"Cookie": cookie})
+        assert status == 200 and body["key_on_server"] is False, \
+            "after the key's download the job says key_on_server {!r}".format((body or {}).get("key_on_server"))
+        status, raw = download("/packages/" + package, cookie)
+        assert status == 200 and raw.startswith(b"age-encryption.org/v1\n-> X25519 "), \
+            "the package answered {} starting {!r}".format(status, raw[:32])
+        assert b"scrypt" not in raw.split(b"\n---", 1)[0], "the package's header has an scrypt stanza"
+    finally:
+        request("DELETE", "/collections/{}?confirm=true".format(name), headers=headers)
+        request("POST", "/auth/logout", headers=headers)
+
+
 def one_off(*env):
     """A one-off api container of the LAN configuration: (exit status, its output lines)."""
     args = ["docker", "compose", "run", "--rm", "--no-deps", "-T"]
@@ -35064,7 +36577,7 @@ def check_address():
 
 CHECKS = {"https": check_https, "hosts": check_hosts, "tls": check_tls, "bindings": check_bindings,
           "cookie": check_cookie, "origin": check_origin, "server-tokens": check_server_tokens,
-          "refusals": check_refusals,
+          "export": check_export, "export-key": check_export_key, "refusals": check_refusals,
           "rate-limit": check_rate_limit, "address": check_address}
 
 
@@ -35167,7 +36680,7 @@ curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixe
   -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$FIX/policies.txt" > /tmp/vfy_qo.json
 job=$(python3 -c "import json;print(json.load(open('/tmp/vfy_qo.json'))['job_id'])" 2>/dev/null)
 check_eq "the collection is ingested" "$(wait_for_job "/ingest/job/$job" 900)" "completed"
-api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_qo.json
+api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_qo.json
 ejob=$(jfield "['job_id']" < /tmp/vfy_qo.json)
 check_eq "the collection is exported" "$(wait_for_job "/export/job/$ejob" 1800)" "completed"
 pkg=$(api_get "/export/job/$ejob" | jfield "['filename']")
@@ -35267,10 +36780,32 @@ sys.exit(0 if r.get('answer', '').strip() and r.get('citations') else 1)"
   check "an End User asks a question on the loaded collection and gets an answer with citations" $? "$(head -c 300 /tmp/vfy_qo.json)"
 fi
 
+# The default export, encrypted to a new key (#676).
 api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_qo.json
 ejob=$(jfield "['job_id']" < /tmp/vfy_qo.json)
 check_eq "export keeps working in query-only mode" "$(wait_for_job "/export/job/$ejob" 1800)" "completed"
 check_eq "the package list keeps working" "$(api_code "$API/packages")" "200"
+
+section "Load a key package with its key file (#676)"
+kpkg=$(api_get "/export/job/$ejob" | jfield "['filename']")
+kkey=$(api_get "/export/job/$ejob" | jfield "['key_filename']")
+check_eq "the default export is encrypted with a new key" "$(api_get "/export/job/$ejob" | jfield "['encryption']")" "key"
+loader -- "$kpkg"
+rc=$?
+[ "$rc" = 1 ] && grep -q "KEY_FILE_REQUIRED" "$OUT"
+check "the loader refuses a key package with no key on standard input (exit 1, KEY_FILE_REQUIRED)" $? "exit $rc: $(tail -2 "$OUT")"
+check_eq "the refusal is an operator.load audit record" "$(last_load)" "refused KEY_FILE_REQUIRED $kpkg"
+check_eq "the key file downloads" "$(curl -s -o /tmp/vfy_qo_key.txt -m 120 -w '%{http_code}' "$API/packages/$kkey")" "200"
+_rag_require_lock_owner
+(cd "$REPO_ROOT" && docker compose exec -T api python -m loader "$kpkg" --on-conflict rename) \
+  </tmp/vfy_qo_key.txt >"$OUT" 2>&1
+rc=$?
+check_eq "the loader loads the key package with its key file on standard input (exit 0)" "$rc" "0"
+grep -q "AGE-SECRET-KEY" "$OUT"
+[ "$?" = 1 ]
+check "the loader never prints the key" $?
+rm -f /tmp/vfy_qo_key.txt
+curl -s -o /dev/null -m 600 "$API/packages/$kpkg"
 
 summary
 ```
@@ -36081,6 +37616,9 @@ KEPT = {
     ("POST", "/auth/service-principals/{name}/keys/{key_id}/revoke"),
     ("POST", "/query"), ("POST", "/export"), ("GET", "/packages/{filename}"),
     ("PUT", "/collections/{name}/access"),
+    # Groups for collection access (#784): /auth routes, like account administration.
+    ("POST", "/auth/groups"), ("POST", "/auth/groups/{name}/rename"), ("PUT", "/auth/groups/{name}/members"),
+    ("POST", "/auth/groups/{name}/delete"),
 }
 
 
@@ -36303,6 +37841,17 @@ class AppTests(Folders):
             self.assertIs(self.client.get("/auth/me", headers=self.session("user")).json()["query_only"], False)
         self.assertNotIn("query_only", self.client.get("/auth/status").json())
 
+    def test_user_answers_carry_lan_mode(self):
+        """LAN mode (#26) is in every user answer, so the Transfer page can hide
+        the unencrypted export (#676)."""
+        with patch.object(settings, "rag_lan_mode", True):
+            response = self.client.post("/auth/login", json={"username": "user", "password": self.passwords["user"]},
+                                        headers={"Origin": ORIGIN})
+            self.assertIs(response.json()["lan_mode"], True)
+            self.assertIs(self.client.get("/auth/me", headers=self.session("user")).json()["lan_mode"], True)
+        self.assertIs(self.client.get("/auth/me", headers=self.session("user")).json()["lan_mode"], False)
+        self.assertNotIn("lan_mode", self.client.get("/auth/status").json())
+
 
 # ── S4: the loader ───────────────────────────────────────────────────────────
 
@@ -36322,10 +37871,11 @@ class LoaderTests(Folders):
         return name
 
     def fake_run(self, status="completed", **fields):
-        def run(job_id, filename, on_conflict, passphrase=None):
+        def run(job_id, filename, on_conflict, passphrase=None, identity=None):
             job = importer._jobs[job_id]
             self.calls.append({"job": dict(job), "filename": filename, "on_conflict": on_conflict,
-                               "passphrase": passphrase, "lock_held": self.lock_is_held()})
+                               "passphrase": passphrase, "identity": identity,
+                               "lock_held": self.lock_is_held()})
             job.update({"status": status, **fields})
         return patch.object(importer, "_run", run)
 
@@ -36436,6 +37986,47 @@ class LoaderTests(Folders):
         self.assertEqual(code, 1)
         self.assertIn("PASSPHRASE_REQUIRED", err)
         self.assertEqual(len(self.calls), 1)
+
+    def key_package(self, name="ragpkg-vfy-3.tar.gz.age"):
+        """A package encrypted to a new key (#676), and the key file's text."""
+        from datetime import datetime, timezone
+        from services import age_stream
+        identity = age_stream.generate_identity()
+        with open(self.root / "exports" / name, "wb") as fh:
+            enc = age_stream.Encryptor(fh, recipient=identity.public_bytes)
+            enc.write(b"not read: the import run is replaced")
+            enc.close()
+        return name, identity, age_stream.identity_file(identity, datetime.now(timezone.utc), name)
+
+    def test_a_key_package_reads_its_key_file_from_stdin(self):
+        name, identity, text = self.key_package()
+        with self.fake_run(collection="K", original_collection="K", chunks_written=1):
+            code, err = self.main([name], stdin=text)
+        self.assertEqual(code, 0, err)
+        call = self.calls[0]
+        self.assertIsNone(call["passphrase"])
+        self.assertEqual(call["identity"].public_bytes, identity.public_bytes)
+        self.assertEqual(call["job"]["encryption"], "key")
+        line = identity.encode()
+        self.assertNotIn(line, err)
+        self.assertNotIn(line, (self.root / "audit" / "audit.jsonl").read_text())
+        details = self.records("operator.load")[-1]["details"]
+        self.assertEqual((details["encrypted"], details["encryption"]), (True, "key"))
+
+    def test_a_key_package_without_a_valid_key_is_refused_before_the_load(self):
+        name, identity, text = self.key_package()
+        for stdin, code_name in (("", "KEY_FILE_REQUIRED"), ("\n# just a comment\n", "KEY_FILE_INVALID"),
+                                 ("correct horse battery staple\n", "KEY_FILE_INVALID"),
+                                 ("x" * 5000, "KEY_FILE_INVALID")):
+            with self.subTest(code=code_name, stdin=stdin[:12]), self.fake_run():
+                code, err = self.main([name], stdin=stdin)
+                self.assertEqual(code, 1, err)
+                self.assertIn(code_name, err)
+                record = self.records("operator.load")[-1]
+                self.assertEqual((record["result"], record["details"]["code"],
+                                  record["details"]["encryption"]), ("refused", code_name, "key"))
+        self.assertEqual(self.calls, [])
+        self.assertNotIn(identity.encode(), (self.root / "audit" / "audit.jsonl").read_text())
 
     def test_progress_lines(self):
         name = self.package()
@@ -37099,7 +38690,7 @@ class PolicyTests(unittest.TestCase):
         counts = {}
         for access in policy.ACCESS.values():
             counts[access] = counts.get(access, 0) + 1
-        self.assertEqual(counts, {"public": 4, "session": 3, "mfa": 5, "end_user": 3, "developer": 37, "engineer": 30})
+        self.assertEqual(counts, {"public": 4, "session": 3, "mfa": 5, "end_user": 3, "developer": 37, "engineer": 35})
         self.assertEqual(policy.ACCESS[("GET", "/health")], "public")
         self.assertEqual(policy.ACCESS[("GET", "/health/details")], "developer")   # #750
         self.assertEqual(policy.ACCESS[("DELETE", "/collections/{name}")], "engineer")
@@ -37131,6 +38722,12 @@ class PolicyTests(unittest.TestCase):
             ("POST", "/auth/service-principals/{name}/enable"), ("POST", "/auth/service-principals/{name}/keys"),
             ("POST", "/auth/service-principals/{name}/keys/{key_id}/revoke")})
         self.assertEqual(set(principals.values()), {"engineer"})
+        # Groups for collection access (#784): the Engineer's; a group is deleted with a POST.
+        groups = {key: access for key, access in policy.ACCESS.items() if key[1].startswith("/auth/groups")}
+        self.assertEqual(groups, {("GET", "/auth/groups"): "engineer", ("POST", "/auth/groups"): "engineer",
+                                  ("POST", "/auth/groups/{name}/rename"): "engineer",
+                                  ("PUT", "/auth/groups/{name}/members"): "engineer",
+                                  ("POST", "/auth/groups/{name}/delete"): "engineer"})
         # Two-step verification (#607): the code step is public like the login;
         # the user's own routes are any session's; the switch is the Engineer's.
         own = {key: access for key, access in policy.ACCESS.items() if key[1].startswith("/auth/mfa")}
@@ -37141,10 +38738,11 @@ class PolicyTests(unittest.TestCase):
 
     def test_keys_cannot_reach_administration_or_the_session_routes(self):
         # S5 of PR 3: every account, principal and key route, logout and the
-        # password change, the audit log (#29) and per-collection access (#606);
-        # GET /auth/me stays open to a key.
+        # password change, the audit log (#29), per-collection access (#606) and
+        # groups (#784); GET /auth/me stays open to a key.
         admin = {path for _, path in policy.ACCESS
-                 if path.startswith(("/auth/users", "/auth/service-principals", "/auth/mfa"))}
+                 if path.startswith(("/auth/users", "/auth/service-principals", "/auth/mfa", "/auth/groups"))}
+        self.assertTrue({"/auth/groups", "/auth/groups/{name}/members"} <= admin)
         self.assertEqual(policy.HUMAN_ONLY, admin | {"/auth/logout", "/auth/password", "/audit", "/audit.csv",
                                                      "/collections/{name}/access"})
         self.assertNotIn("/auth/me", policy.HUMAN_ONLY)
@@ -37360,6 +38958,7 @@ class RouteTests(StoreTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"username": "eng", "role": "engineer", "must_change_password": True,
                                            "query_only": False,      # #670
+                                           "lan_mode": False,        # #676
                                            "mfa_enrolled": False, "mfa_required": False,
                                            "mfa_enrollment_required": False})
         cookie = response.headers["set-cookie"]
@@ -38020,12 +39619,18 @@ class KeyMiddlewareTests(KeyTestCase):
                                    ("POST", "/auth/service-principals/svc/enable", None),
                                    ("POST", "/auth/service-principals/svc/keys", {}),
                                    ("POST", "/auth/service-principals/svc/keys/abc/revoke", None),
+                                   ("GET", "/auth/groups", None),
+                                   ("POST", "/auth/groups", {"name": "minted"}),
+                                   ("POST", "/auth/groups/minted/rename", {"name": "other"}),
+                                   ("PUT", "/auth/groups/minted/members", {"users": ["dev"]}),
+                                   ("POST", "/auth/groups/minted/delete", None),
                                    ("POST", "/auth/logout", None),
                                    ("POST", "/auth/password", {"current_password": "x", "new_password": "y" * 12})):
             with self.subTest(route=f"{method} {path}"):
                 response = self.client.request(method, path, json=body, headers=headers)
                 self.assertEqual((response.status_code, self.code(response)), (403, "KEY_NOT_ALLOWED"))
         self.assertIsNone(store.get_user("minted"))
+        self.assertEqual(store.list_groups(), [])
         self.assertEqual(len(store.get_principal("svc").keys), 1)
         # Engineer-level data routes stay open to an engineer key.
         self.assertNotIn(self.client.get("/metrics/latency", headers=headers).status_code, (401, 403))
@@ -38035,7 +39640,8 @@ class KeyMiddlewareTests(KeyTestCase):
         response = self.client.get("/auth/me", headers=self.bearer(key))
         self.assertEqual(response.json(), {"username": "svc", "role": "end_user", "must_change_password": False,
                                            "kind": "service", "mfa_enrolled": False, "mfa_required": False,
-                                           "mfa_enrollment_required": False, "query_only": False})
+                                           "mfa_enrollment_required": False, "query_only": False,
+                                           "lan_mode": False})
         headers, _ = self.session("dev")
         self.assertEqual(self.client.get("/auth/me", headers=headers).json()["kind"], "user")
 
@@ -39105,7 +40711,8 @@ class ImplementationCopyTests(unittest.TestCase):
                      "api/auth/keys.py", "ui/src/pages/ServiceKeysPage.tsx", "api/config.py", "proxy/nginx.conf",
                      "scripts/verify/17_auth.sh", "scripts/verify/auth_setup.py", "scripts/verify/auth_stack.py",
                      "scripts/verify/auth_headers.py", "api/auth/mfa.py", "ui/src/pages/AccountPage.tsx",
-                     "api/auth/access.py", "scripts/tests/test_collection_access.py"):
+                     "api/auth/access.py", "scripts/tests/test_collection_access.py",
+                     "ui/src/pages/GroupsPage.tsx"):
             with self.subTest(name=name):
                 header = "### " + name + "\n\n```"
                 start = document.index("\n", document.index(header) + len(header)) + 1
@@ -40897,12 +42504,15 @@ class StoreTests(AccessTestCase):
     def test_a_version_3_store_gains_the_tables_and_every_collection_stays_open(self):
         path = store.db_path()
         conn = sqlite3.connect(path)
-        conn.executescript("DROP TABLE collection_grants; DROP TABLE restricted_collections; PRAGMA user_version = 3;")
+        conn.executescript("DROP TABLE collection_grants; DROP TABLE restricted_collections; "
+                           "DROP TABLE collection_group_grants; DROP TABLE group_members; DROP TABLE groups; "
+                           "PRAGMA user_version = 3;")
         conn.close()
         store._ready.clear()
         self.assertTrue(store.has_access(store.get_user("user").id, "end_user", SECRET))
         version = sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0]
-        self.assertEqual(version, 4)
+        self.assertEqual(version, 5)
+        self.assertEqual(store.list_groups(), [])
         self.assertEqual(store.get_user("dev").role, "developer")       # rows kept
 
     def test_the_rule(self):
@@ -40994,16 +42604,18 @@ class AccessRouteTests(AccessTestCase):
 
     def test_read_and_set(self):
         answer = self.client.get(f"/collections/{SECRET.lower()}/access", headers=self.as_("eng"))
-        self.assertEqual(answer.json(), {"restricted": True, "users": ["dev"], "service_principals": ["svc"]})
+        self.assertEqual(answer.json(), {"restricted": True, "users": ["dev"], "service_principals": ["svc"],
+                                         "groups": []})
         self.assertEqual(self.client.get(f"/collections/{OPEN}/access", headers=self.as_("eng")).json(),
-                         {"restricted": False, "users": [], "service_principals": []})
+                         {"restricted": False, "users": [], "service_principals": [], "groups": []})
         self.refused(self.client.get("/collections/Nowhere/access", headers=self.as_("eng")))
         answer = self.put(SECRET, {"restricted": True, "users": ["DEV2", "user"], "service_principals": []})
-        self.assertEqual(answer.json(), {"restricted": True, "users": ["dev2", "user"], "service_principals": []})
+        self.assertEqual(answer.json(), {"restricted": True, "users": ["dev2", "user"], "service_principals": [],
+                                         "groups": []})
         item = self.records("collection.access")[-1]
         self.assertEqual((item["actor"], item["collection"], item["result"]), ("eng", SECRET, "success"))
-        self.assertEqual(item["details"]["added"], {"users": ["dev2", "user"], "service_principals": []})
-        self.assertEqual(item["details"]["removed"], {"users": ["dev"], "service_principals": ["svc"]})
+        self.assertEqual(item["details"]["added"], {"users": ["dev2", "user"], "service_principals": [], "groups": []})
+        self.assertEqual(item["details"]["removed"], {"users": ["dev"], "service_principals": ["svc"], "groups": []})
         self.assertEqual((item["details"]["restricted_before"], item["details"]["restricted_after"]), (True, True))
 
     def test_refused_changes_change_nothing(self):
@@ -41765,6 +43377,375 @@ class PrepareAreaTests(AccessTestCase):
                                  ("refused", SECRET, "collection_access"), item)
 
 
+class GroupTestCase(AccessTestCase):
+    """Groups for collection access (#784): AccessTestCase, plus a group
+    `team` holding `dev2` and the principal `svc2`, neither granted SECRET
+    directly."""
+
+    def setUp(self):
+        super().setUp()
+        store.create_group("team")
+        store.set_group_members("team", ["dev2"], ["svc2"])
+
+    def group_call(self, method, path, body=None, who="eng"):
+        return self.client.request(method, "/auth/groups" + path, json=body, headers=self.as_(who))
+
+    def error(self, answer):
+        return answer.status_code, answer.json()["error"]["code"]
+
+
+class GroupRuleTests(GroupTestCase):
+    def test_a_version_4_store_gains_the_group_tables_and_keeps_its_grants(self):
+        path = store.db_path()
+        conn = sqlite3.connect(path)
+        conn.executescript("DROP TABLE collection_group_grants; DROP TABLE group_members; DROP TABLE groups; "
+                           "PRAGMA user_version = 4;")
+        conn.close()
+        store._ready.clear()
+        self.assertEqual(store.collection_access(SECRET), store.CollectionAccess(True, ("dev",), ("svc",)))
+        self.assertEqual(sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0], 5)
+        self.assertEqual(store.list_groups(), [])
+        self.assertFalse(store.has_access(store.get_user("dev2").id, "developer", SECRET))
+
+    def test_a_member_reaches_a_collection_granted_to_the_group(self):
+        dev2 = store.get_user("dev2")
+        self.assertFalse(store.has_access(dev2.id, "developer", SECRET))
+        self.put(SECRET, {"restricted": True, "users": ["dev"], "groups": ["TEAM"]})
+        self.assertEqual(store.collection_access(SECRET), store.CollectionAccess(True, ("dev",), (), ("team",)))
+        self.assertTrue(store.has_access(dev2.id, "developer", SECRET))
+        self.assertTrue(store.has_access(store.get_user("dev").id, "developer", SECRET))     # direct grant
+        self.assertFalse(store.has_access(store.get_user("user").id, "end_user", SECRET))     # not a member
+        self.assertIn(SECRET, self.names("dev2"))
+        self.assertIn(SECRET, self.names("svc2"))                                            # a key, as its principal
+        self.assertNotIn(SECRET, self.names("user"))
+        answer = self.client.post("/query", json={"question": "What?", "collection": SECRET},
+                                  headers=self.as_("user"))
+        self.refused(answer)
+
+    def test_the_restricted_listing_counts_members(self):
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        ids = store.restricted_collections()[SECRET]
+        self.assertEqual(ids, frozenset({store.get_user("dev2").id, store.get_principal("svc2").id}))
+
+    def test_a_membership_or_grant_change_applies_to_the_next_request(self):
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        headers = self.as_("dev2")                                   # one session throughout
+        listed = lambda: [c["name"] for c in self.client.get("/collections", headers=headers).json()["collections"]]
+        self.assertIn(SECRET, listed())
+        store.set_group_members("team", [], ["svc2"])
+        self.assertNotIn(SECRET, listed())
+        store.set_group_members("team", ["dev2"], [])
+        self.assertIn(SECRET, listed())
+        self.put(SECRET, {"restricted": True, "users": ["dev"]})        # the group's grant removed
+        self.assertNotIn(SECRET, listed())
+
+    def test_deleting_the_group_keeps_the_collection_restricted(self):
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        self.assertEqual(store.delete_group("team")[0], [SECRET])
+        self.assertEqual(store.collection_access(SECRET), store.CollectionAccess(True, (), (), ()))
+        self.assertFalse(store.has_access(store.get_user("dev2").id, "developer", SECRET))
+        self.assertEqual(self.names("user"), [OPEN])
+        store.create_group("team")                                   # a new group of the same name gets nothing
+        self.assertEqual(store.collection_access(SECRET).groups, ())
+
+    def test_a_disabled_member_stays_and_a_demoted_engineer_is_bound(self):
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        store.set_enabled("dev2", False)
+        store.set_enabled("dev2", True)
+        self.assertEqual(store.get_group("team").users, ("dev2",))
+        self.assertTrue(store.has_access(store.get_user("dev2").id, "developer", SECRET))
+        store.create_user("boss", "engineer", passwords.generate_password(), must_change_password=False)
+        boss = store.get_user("boss")
+        self.assertTrue(store.has_access(boss.id, "engineer", SECRET))
+        store.set_role("boss", "developer")
+        self.assertFalse(store.has_access(boss.id, "developer", SECRET))
+        store.set_group_members("team", ["boss"], [])
+        self.assertTrue(store.has_access(boss.id, "developer", SECRET))
+
+    def test_a_rename_keeps_members_and_grants(self):
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        group = store.rename_group("team", "crew")
+        self.assertEqual((group.name, group.users, group.service_principals), ("crew", ("dev2",), ("svc2",)))
+        self.assertEqual(store.collection_access(SECRET).groups, ("crew",))
+        self.assertTrue(store.has_access(store.get_user("dev2").id, "developer", SECRET))
+        self.assertEqual(store.rename_group("crew", "crew").name, "crew")       # its own name: no change
+
+    def test_a_collection_delete_drops_its_group_grants(self):
+        async def delete(name):
+            self.collections.discard(name)
+            return 1
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        with patch.object(wc, "delete_collection_when_idle", delete):
+            self.assertEqual(self.client.delete(f"/collections/{SECRET}?confirm=true",
+                                                headers=self.as_("eng")).status_code, 200)
+        conn = sqlite3.connect(store.db_path())
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM collection_group_grants WHERE collection = ?",
+                                      (SECRET,)).fetchone()[0], 0)
+        conn.close()
+        self.assertEqual(store.collection_access(SECRET), store.CollectionAccess(False))
+        self.assertEqual(store.get_group("team").users, ("dev2",))              # the group itself stays
+
+    def test_opening_drops_the_group_grants(self):
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        self.put(SECRET, {"restricted": False})
+        self.put(SECRET, {"restricted": True})
+        self.assertEqual(store.collection_access(SECRET).groups, ())
+
+    def test_a_job_owner_reaches_through_a_group(self):
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        self.assertTrue(store.owner_has_access({"name": "dev2", "kind": "user"}, SECRET))
+        self.assertTrue(store.owner_has_access({"name": "svc2", "kind": "service"}, SECRET))
+        self.assertFalse(store.owner_has_access({"name": "user", "kind": "user"}, SECRET))
+        self.assertFalse(importer._refused({"name": "dev2", "kind": "user"}, SECRET))
+        self.assertTrue(importer._refused({"name": "user", "kind": "user"}, SECRET))
+
+
+class GroupAccessRouteTests(GroupTestCase):
+    def test_read_and_set_with_groups(self):
+        answer = self.put(SECRET, {"restricted": True, "users": ["dev"], "groups": ["team"]})
+        self.assertEqual(answer.json(), {"restricted": True, "users": ["dev"], "service_principals": [],
+                                         "groups": ["team"]})
+        self.assertEqual(self.client.get(f"/collections/{SECRET}/access", headers=self.as_("eng")).json(),
+                         answer.json())
+        item = self.records("collection.access")[-1]
+        self.assertEqual(item["details"]["added"], {"users": [], "service_principals": [], "groups": ["team"]})
+        self.assertEqual(item["details"]["removed"], {"users": [], "service_principals": ["svc"], "groups": []})
+        self.put(SECRET, {"restricted": True, "users": ["dev"]})            # a v1.3.0 body: no group
+        item = self.records("collection.access")[-1]
+        self.assertEqual(item["details"]["removed"], {"users": [], "service_principals": [], "groups": ["team"]})
+        self.assertEqual(store.collection_access(SECRET).groups, ())
+
+    def test_an_unknown_group_or_groups_on_an_open_collection_change_nothing(self):
+        before = store.collection_access(SECRET)
+        for body in ({"restricted": True, "groups": ["nobody"]}, {"restricted": True, "groups": ["dev"]},
+                     {"restricted": False, "groups": ["team"]}, {"restricted": True, "groups": ["x" * 65]}):
+            with self.subTest(body=body):
+                self.assertEqual(self.error(self.put(SECRET, body)), (422, "INVALID_PARAMETER"))
+        self.assertEqual(store.collection_access(SECRET), before)
+
+
+class GroupRouteTests(GroupTestCase):
+    def test_engineers_in_a_session_only(self):
+        store.create_principal("boss", "engineer")
+        key = store.issue_key("boss")[1]
+        for method, path, body in (("GET", "", None), ("POST", "", {"name": "new"}),
+                                   ("POST", "/team/rename", {"name": "crew"}),
+                                   ("PUT", "/team/members", {"users": []}), ("POST", "/team/delete", None)):
+            with self.subTest(route=f"{method} {path}"):
+                self.assertEqual(self.error(self.group_call(method, path, body, who="dev")), (403, "FORBIDDEN"))
+                answer = self.client.request(method, "/auth/groups" + path, json=body,
+                                             headers={"Authorization": "Bearer " + key})
+                self.assertEqual(self.error(answer), (403, "KEY_NOT_ALLOWED"))
+        self.assertEqual(store.get_group("team").users, ("dev2",))
+
+    def test_create_list_rename_members_delete(self):
+        answer = self.group_call("POST", "", {"name": "Legal.Team"})
+        self.assertEqual(answer.status_code, 201, answer.text)
+        self.assertEqual({k: v for k, v in answer.json()["group"].items() if k != "created_at"},
+                         {"name": "legal.team", "users": [], "service_principals": []})
+        self.assertRegex(answer.json()["group"]["created_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        listed = self.group_call("GET", "").json()["groups"]
+        self.assertEqual([g["name"] for g in listed], ["legal.team", "team"])
+        self.assertEqual((listed[1]["users"], listed[1]["service_principals"]), (["dev2"], ["svc2"]))
+        answer = self.group_call("PUT", "/legal.team/members", {"users": ["DEV", "user"], "service_principals": ["svc"]})
+        self.assertEqual((answer.json()["group"]["users"], answer.json()["group"]["service_principals"]),
+                         (["dev", "user"], ["svc"]))
+        answer = self.group_call("PUT", "/legal.team/members", {"users": ["dev"]})
+        self.assertEqual((answer.json()["group"]["users"], answer.json()["group"]["service_principals"]),
+                         (["dev"], []))
+        answer = self.group_call("POST", "/legal.team/rename", {"name": "Legal"})
+        self.assertEqual(answer.json()["group"]["name"], "legal")
+        self.put(SECRET, {"restricted": True, "groups": ["legal", "team"]})
+        self.put(OPEN, {"restricted": True, "groups": ["legal"]})
+        answer = self.group_call("POST", "/legal/delete")
+        self.assertEqual(answer.json(), {"name": "legal", "collections": [OPEN, SECRET]})
+        self.assertEqual(store.collection_access(SECRET).groups, ("team",))
+        self.assertEqual(store.collection_access(OPEN), store.CollectionAccess(True, (), (), ()))
+        self.assertEqual([g["name"] for g in self.group_call("GET", "").json()["groups"]], ["team"])
+
+    def test_refusals(self):
+        cases = [
+            ("POST", "", {"name": "x"}, (422, "INVALID_GROUP_NAME")),
+            ("POST", "", {"name": "a" * 300}, (422, "INVALID_GROUP_NAME")),
+            ("POST", "", {"name": "TEAM"}, (409, "GROUP_EXISTS")),
+            ("POST", "", {}, (422, "INVALID_PARAMETER")),
+            ("POST", "/nobody/rename", {"name": "crew"}, (404, "GROUP_NOT_FOUND")),
+            ("POST", "/no%20such/rename", {"name": "crew"}, (404, "GROUP_NOT_FOUND")),
+            ("POST", "/team/rename", {"name": "!!"}, (422, "INVALID_GROUP_NAME")),
+            ("PUT", "/nobody/members", {"users": []}, (404, "GROUP_NOT_FOUND")),
+            ("PUT", "/team/members", {"users": ["nobody"]}, (422, "INVALID_PARAMETER")),
+            ("PUT", "/team/members", {"users": ["svc"]}, (422, "INVALID_PARAMETER")),
+            ("PUT", "/team/members", {"service_principals": ["dev"]}, (422, "INVALID_PARAMETER")),
+            ("PUT", "/team/members", {"groups": ["team"]}, (422, "INVALID_PARAMETER")),
+            ("POST", "/nobody/delete", None, (404, "GROUP_NOT_FOUND")),
+        ]
+        store.create_group("crew")
+        cases.append(("POST", "/team/rename", {"name": "crew"}, (409, "GROUP_EXISTS")))
+        for method, path, body, expected in cases:
+            with self.subTest(route=f"{method} {path}", body=body):
+                self.assertEqual(self.error(self.group_call(method, path, body)), expected)
+        group = store.get_group("team")
+        self.assertEqual((group.name, group.users, group.service_principals), ("team", ("dev2",), ("svc2",)))
+
+    def test_the_audit_records(self):
+        self.group_call("POST", "", {"name": "crew"})
+        self.group_call("PUT", "/crew/members", {"users": ["dev", "user"], "service_principals": ["svc"]})
+        self.group_call("PUT", "/crew/members", {"users": ["dev2"]})
+        self.group_call("POST", "/crew/rename", {"name": "squad"})
+        self.put(SECRET, {"restricted": True, "groups": ["squad"]})
+        self.group_call("POST", "/squad/delete")
+        self.group_call("POST", "", {"name": "team"})                      # refused: exists
+        records = [r for r in self.records() if r["action"].startswith("admin.group.")]
+        self.assertEqual([(r["action"], r["target"], r["result"]) for r in records], [
+            ("admin.group.create", "crew", "success"), ("admin.group.members", "crew", "success"),
+            ("admin.group.members", "crew", "success"), ("admin.group.rename", "crew", "success"),
+            ("admin.group.delete", "squad", "success"), ("admin.group.create", "team", "refused")])
+        self.assertEqual(records[1]["details"]["added"], {"users": ["dev", "user"], "service_principals": ["svc"]})
+        self.assertEqual(records[2]["details"]["added"], {"users": ["dev2"], "service_principals": []})
+        self.assertEqual(records[2]["details"]["removed"], {"users": ["dev", "user"], "service_principals": ["svc"]})
+        self.assertEqual(records[3]["details"]["name"], "squad")
+        self.assertEqual(records[4]["details"]["collections"], [SECRET])
+        self.assertEqual(records[4]["details"]["removed"], {"users": ["dev2"], "service_principals": []})   # #854
+        self.assertEqual(records[5]["details"]["code"], "GROUP_EXISTS")
+        self.assertEqual(self.records("admin.group.list"), [])
+        self.assertIn("admin.group.delete", audit.ALL_ACTIONS)
+
+
+class GroupCopyTests(GroupTestCase):
+    """Copies and imports carry group grants under the same rules as account
+    grants (#788, #792)."""
+
+    def test_a_copy_takes_the_group_grants(self):
+        self.put(SECRET, {"restricted": True, "users": ["dev"], "groups": ["team"]})
+        store.copy_collection_access(SECRET, "Secret_ab12cd34")
+        self.assertEqual(store.collection_access("Secret_ab12cd34"),
+                         store.CollectionAccess(True, ("dev",), (), ("team",)))
+        importer._start_access({"name": "dev", "kind": "user"}, SECRET, "Secret_cd34ef56")
+        self.assertEqual(store.collection_access("Secret_cd34ef56").groups, ("team",))
+        store.set_group_members("team", [], [])                    # a membership change reaches the copy
+        self.assertFalse(store.has_access(store.get_user("dev2").id, "developer", "Secret_ab12cd34"))
+
+    def test_narrowing_intersects_accounts_and_groups_on_their_own(self):
+        store.create_group("crew")
+        store.set_group_members("crew", ["dev2"], [])
+        self.put(SECRET, {"restricted": True, "users": ["dev", "dev2"], "groups": ["team", "crew"]})
+        self.put(STAGING, {"restricted": True, "users": ["dev"], "groups": ["team"]})
+        store.copy_collection_access(STAGING, NESTED, access.scope(STAGING)[1:])
+        self.assertEqual(store.collection_access(NESTED), store.CollectionAccess(True, ("dev",), (), ("team",)))
+        # dev2 is granted directly in SECRET but only through a group in STAGING: never wider, so no own grant.
+        self.put(STAGING, {"restricted": True, "groups": ["crew"]})
+        store.copy_collection_access(STAGING, NESTED, access.scope(STAGING)[1:])
+        self.assertEqual(store.collection_access(NESTED), store.CollectionAccess(True, (), (), ("crew",)))
+
+    def test_a_copy_needs_the_group_grant_of_every_collection_in_its_chain(self):
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        self.assertTrue(access.allowed(store.authenticate_key(self.key2), STAGING) is False)   # the copy's own state
+        self.put(STAGING, {"restricted": True, "groups": ["team"]})
+        self.assertTrue(access.allowed(store.authenticate_key(self.key2), STAGING))
+        self.put(SECRET, {"restricted": True})                     # narrowing the target reaches the copy
+        self.assertFalse(access.allowed(store.authenticate_key(self.key2), STAGING))
+        self.assertNotIn(STAGING, self.names("svc2"))
+
+    def test_put_back_restores_group_grants_and_leaves_out_a_deleted_group(self):
+        self.put(SECRET, {"restricted": True, "users": ["dev"], "groups": ["team"]})
+        previous, written = store.restrict_to(SECRET, store.get_user("dev2").id)
+        self.assertEqual(written, store.CollectionAccess(True, ("dev2",), (), ()))
+        self.assertTrue(store.put_back(SECRET, written, previous))
+        self.assertEqual(store.collection_access(SECRET), previous)
+        previous, written = store.restrict_to(SECRET, None)
+        store.delete_group("team")
+        self.assertTrue(store.put_back(SECRET, written, previous))
+        self.assertEqual(store.collection_access(SECRET), store.CollectionAccess(True, ("dev",), (), ()))
+        store.create_group("crew")
+        self.put(SECRET, {"restricted": True, "groups": ["crew"]})
+        self.assertFalse(store.put_back(SECRET, written, previous))          # not the state it wrote: kept
+        self.assertEqual(store.collection_access(SECRET).groups, ("crew",))
+
+    def test_put_back_matches_a_group_by_identity(self):
+        # #854: a group is put back only if it is the same group, by id and
+        # creation time, not by name; SQLite may reuse a deleted group's id.
+        old_id = store.get_group("team").id                           # the only group: the highest id
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        previous, written = store.restrict_to(SECRET, None)
+        store.delete_group("team")
+        store.create_group("team")
+        self.assertEqual(store.get_group("team").id, old_id)            # the id is reused
+        self.assertTrue(store.put_back(SECRET, written, previous))
+        self.assertEqual(store.collection_access(SECRET), store.CollectionAccess(True, (), (), ()))
+        store.create_group("crew")                                      # now the highest id
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        old_id = store.get_group("team").id
+        previous, written = store.restrict_to(SECRET, None)
+        store.delete_group("team")
+        store.create_group("team")
+        self.assertNotEqual(store.get_group("team").id, old_id)         # a new id
+        self.assertTrue(store.put_back(SECRET, written, previous))
+        self.assertEqual(store.collection_access(SECRET).groups, ())
+        self.put(SECRET, {"restricted": True, "groups": ["crew"]})     # a renamed group is the same group
+        previous, written = store.restrict_to(SECRET, None)
+        store.rename_group("crew", "squad")
+        self.assertTrue(store.put_back(SECRET, written, previous))
+        self.assertEqual(store.collection_access(SECRET).groups, ("squad",))
+        previous, written = store.restrict_to(SECRET, None)             # a state with names but no identities
+        self.assertTrue(store.put_back(SECRET, written, store.CollectionAccess(True, (), (), ("squad",))))
+        self.assertEqual(store.collection_access(SECRET).groups, ())
+
+    def test_a_new_collection_starts_with_no_group(self):
+        self.put(SECRET, {"restricted": True, "groups": ["team"]})
+        store.restrict_to("Brandnew", store.get_user("dev2").id)
+        self.assertEqual(store.collection_access("Brandnew"), store.CollectionAccess(True, ("dev2",), (), ()))
+
+
+class GroupRecoveryTests(GroupTestCase):
+    """A staging or recovery copy made by collection_recovery carries its
+    target's group grants as its own state, and discarding the copy drops
+    them (#784 with #606, #788, #792)."""
+
+    class Client:
+        class collections:
+            @staticmethod
+            def exists(name):
+                return False
+
+            @staticmethod
+            def delete(name):
+                pass
+
+    def test_begin_copies_group_grants_and_discard_drops_them(self):
+        from services import collection_recovery
+        self.put(SECRET, {"restricted": True, "users": ["dev"], "groups": ["team"]})
+        record = collection_recovery.begin(SECRET, "import", self.Client)
+        copy = record["staging"]
+        self.assertEqual(store.collection_access(copy), store.CollectionAccess(True, ("dev",), (), ("team",)))
+        self.assertTrue(store.has_access(store.get_user("dev2").id, "developer", copy))    # through the group
+        kept = collection_recovery.begin(SECRET, "tune", self.Client)["staging"]
+        collection_recovery.discard(record, self.Client)
+        conn = sqlite3.connect(store.db_path())
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM collection_group_grants WHERE collection = ?",
+                                      (copy,)).fetchone()[0], 0)
+        conn.close()
+        self.assertFalse(store.collection_access(copy).restricted)
+        # Deleting the group removes its grant on the kept copy too, which stays restricted.
+        self.assertEqual(store.delete_group("team")[0], sorted([SECRET, kept]))
+        self.assertEqual(store.collection_access(kept), store.CollectionAccess(True, ("dev",), (), ()))
+        self.assertFalse(store.has_access(store.get_user("dev2").id, "developer", kept))
+
+    def test_begin_on_a_copy_intersects_the_group_grants_of_its_chain(self):
+        from services import collection_recovery
+        store.create_group("crew")
+        store.set_group_members("crew", ["dev2"], [])
+        self.put(SECRET, {"restricted": True, "groups": ["team", "crew"]})
+        self.put(STAGING, {"restricted": True, "groups": ["team"]})
+        record = collection_recovery.begin(STAGING, "tune", self.Client)
+        self.assertEqual(store.collection_access(record["staging"]), store.CollectionAccess(True, (), (), ("team",)))
+        self.put(STAGING, {"restricted": False})                   # the copy open: the original decides
+        record = collection_recovery.begin(STAGING, "tune", self.Client)
+        self.assertEqual(store.collection_access(record["staging"]).groups, ("crew", "team"))
+        self.assertTrue(access.allowed(store.authenticate_key(self.key2), record["staging"]))
+        store.set_group_members("team", ["dev2"], [])               # svc2 leaves: the chain refuses its key
+        self.assertFalse(access.allowed(store.authenticate_key(self.key2), record["staging"]))
+
+
 if __name__ == "__main__":
     unittest.main()
 ```
@@ -41951,10 +43932,10 @@ class RecordTests(DownloadTestCase):
                 package_retention.record_export("ragpkg-new.tar.gz", NOW)
         self.assertEqual(record.read_text(), '{"packages": "wrong shape"}')
 
-    def run_export(self, record=None):
+    def run_export(self, record=None, key_filename=None):
         result = {"filename": "ragpkg-open1-x.tar.gz", "size_bytes": 1, "chunk_count": 1,
                   "source_document_count": 0, "fidelity": "chunks-only", "models_bundled": False,
-                  "retrieve_script": True, "warnings": []}
+                  "retrieve_script": True, "warnings": [], "key_filename": key_filename}
         exporter._jobs["j677"] = {"job_id": "j677", "status": "queued", "collection": "Open1",
                                   "chunks_written": 0, "filename": None, "warnings": [], "error": None}
         self.addCleanup(exporter._jobs.pop, "j677", None)
@@ -42060,7 +44041,7 @@ class RecordTests(DownloadTestCase):
         self.assertIn("'ragpkg-x/../y.tar.gz'", logs.output[0])
 
     def test_an_export_whose_record_fails_still_completes_and_says_so(self):
-        def broken(*_):
+        def broken(*_args, **_kwargs):
             raise OSError("disk full")
         with self.assertLogs("services.exporter", "ERROR"):
             job = self.run_export(record=broken)
@@ -42068,6 +44049,48 @@ class RecordTests(DownloadTestCase):
         self.assertTrue(any("expiry could not be recorded" in w for w in job["warnings"]))
         answer = self.client.get("/export/job/j677", headers=self.as_("eng"))
         self.assertIsNone(answer.json()["expires_at"])
+
+    # #860: a key export's package and key file are recorded in one write.
+    def test_a_key_export_is_recorded_in_one_write(self):
+        key = "ragpkg-open1-x.tar.gz.age.key"
+        with patch.object(package_retention, "_write", wraps=package_retention._write) as write:
+            package_retention.record_export("ragpkg-open1-x.tar.gz.age", NOW, "Open1", key_filename=key)
+        self.assertEqual(write.call_count, 1)
+        entries = json.loads((self.root / "uploads" / "exported_packages.json").read_text())["packages"]
+        self.assertEqual(entries["ragpkg-open1-x.tar.gz.age"], entries[key])
+        self.assertEqual(entries[key]["collection"], "Open1")
+
+    def test_a_failed_write_records_neither_the_package_nor_its_key(self):
+        with patch.object(package_retention, "_write", side_effect=OSError("disk full")), \
+                self.assertRaises(OSError):
+            package_retention.record_export("ragpkg-open1-x.tar.gz.age", NOW, "Open1",
+                                            key_filename="ragpkg-open1-x.tar.gz.age.key")
+        self.assertFalse(package_retention.recorded("ragpkg-open1-x.tar.gz.age"))
+        self.assertFalse(package_retention.recorded("ragpkg-open1-x.tar.gz.age.key"))
+
+    def test_a_key_export_job_records_both_in_one_call(self):
+        calls = []
+
+        def record(*args, **kwargs):
+            calls.append((args, kwargs))
+        job = self.run_export(record=record, key_filename="ragpkg-open1-x.tar.gz.age.key")
+        self.assertEqual(job["status"], "completed")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0][0], "ragpkg-open1-x.tar.gz")
+        self.assertEqual(calls[0][1], {"key_filename": "ragpkg-open1-x.tar.gz.age.key"})
+
+    # Reviewer test (rag-pr-review, #860): a key export whose record fails
+    # completes, records neither file and warns about both by name.
+    def test_a_key_export_whose_record_fails_records_neither_and_warns_about_both(self):
+        def broken(*_args, **_kwargs):
+            raise OSError("disk full")
+        with self.assertLogs("services.exporter", "ERROR"):
+            job = self.run_export(record=broken, key_filename="ragpkg-open1-x.tar.gz.age.key")
+        self.assertEqual(job["status"], "completed")
+        self.assertTrue(any("package and its key file could not be recorded" in w for w in job["warnings"]),
+                        job["warnings"])
+        self.assertFalse(package_retention.recorded("ragpkg-open1-x.tar.gz"))
+        self.assertFalse(package_retention.recorded("ragpkg-open1-x.tar.gz.age.key"))
 
 
 class ListingTests(DownloadTestCase):
@@ -42343,6 +44366,126 @@ class EncryptedAccessTests(DownloadTestCase):
         answer = self.get(path.name, who="user")
         self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (403, "FORBIDDEN"))
         self.assertTrue(path.exists())
+
+
+class KeyFileTests(DownloadTestCase):
+    """A key export's key file (#676): `<package>.key`, recorded with the
+    package, downloaded once on its own, expired with it, under its access."""
+
+    def setUp(self):
+        super().setUp()
+        status = self.client.put(f"/collections/{SECRET}/access", headers=self.as_("eng"),
+                                 json={"restricted": True, "users": ["dev"], "service_principals": []}).status_code
+        self.assertEqual(status, 200)
+
+    write_encrypted = EncryptedAccessTests.write_encrypted
+    listed = EncryptedAccessTests.listed
+
+    def write_pair(self, stem="ragpkg-k-20261120T000000Z-0123abcd", collection="Open1", hours_ago=0):
+        package = self.write_encrypted(stem + ".tar.gz.age", collection=None, recorded=False)
+        key = self.exports / (package.name + ".key")
+        key.write_text("# public key: age1x\nAGE-SECRET-KEY-1XYZ\n")
+        key.chmod(0o600)
+        when = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+        package_retention.record_export(package.name, when, collection)
+        package_retention.record_export(key.name, when, collection)
+        return package, key
+
+    def test_the_name_rule_admits_a_key_file_only_after_tar_gz_age(self):
+        for name, ok in (("ragpkg-a.tar.gz.age.key", True), ("ragpkg-a.tar.gz.key", False),
+                         ("ragpkg-a.key", False), ("ragpkg-a.tar.gz.age.key.key", False),
+                         ("ragpkg-a.tar.gz.age.keys", False)):
+            with self.subTest(name=name):
+                self.assertEqual(package_retention.valid_name(name), ok)
+                self.assertEqual(package_retention.is_key_name(name), ok)
+        self.assertFalse(package_retention.is_key_name("ragpkg-a.tar.gz.age"))
+
+    def test_a_complete_key_download_deletes_the_key_only(self):
+        package, key = self.write_pair()
+        data = key.read_bytes()
+        answer = self.get(key.name, who="dev2")
+        self.assertEqual(answer.status_code, 200, answer.text)
+        self.assertEqual(answer.content, data)
+        self.assertEqual(answer.headers["cache-control"], "no-store")
+        self.assertFalse(key.exists())
+        self.assertTrue(package.exists())
+        self.assertFalse(package_retention.recorded(key.name))
+        self.assertTrue(package_retention.recorded(package.name))
+        deleted = self.records("package.delete")[-1]
+        self.assertEqual(deleted["details"], {"file": key.name, "reason": "downloaded"})
+        self.assertFalse(self.listed("dev2")[package.name]["key_on_server"])
+        again = self.get(key.name, who="dev2")
+        self.assertEqual((again.status_code, again.json()["error"]["code"]), (404, "PACKAGE_NOT_FOUND"))
+
+    def test_a_package_download_leaves_its_key(self):
+        package, key = self.write_pair()
+        self.assertTrue(self.listed("dev2")[package.name]["key_on_server"])
+        self.assertEqual(self.get(package.name, who="dev2").status_code, 200)
+        self.assertFalse(package.exists())
+        self.assertTrue(key.exists())
+        self.assertTrue(package_retention.recorded(key.name))
+        self.assertEqual(self.get(key.name, who="dev2").status_code, 200)
+        self.assertFalse(key.exists())
+
+    def test_expiry_deletes_both(self):
+        package, key = self.write_pair(hours_ago=25)
+        deleted = package_retention.sweep()
+        self.assertEqual(sorted(deleted), sorted([package.name, key.name]))
+        self.assertFalse(package.exists() or key.exists())
+        package, key = self.write_pair(stem="ragpkg-k2-20261120T000000Z-0123abcd", hours_ago=25)
+        self.assertEqual(self.get(package.name, who="dev2").status_code, 200)
+        self.assertEqual(package_retention.sweep(), [key.name])
+
+    def test_a_key_file_not_exported_here_is_not_served(self):
+        key = self.exports / "ragpkg-copied.tar.gz.age.key"
+        key.write_text("AGE-SECRET-KEY-1XYZ\n")
+        for who in ("dev", "eng"):
+            answer = self.get(key.name, who=who)
+            self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (404, "PACKAGE_NOT_FOUND"))
+        self.assertTrue(key.exists())
+
+    def test_a_restricted_collections_key_answers_as_missing(self):
+        package, key = self.write_pair(collection=SECRET)
+        answer = self.get(key.name, who="dev2")
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (404, "PACKAGE_NOT_FOUND"))
+        self.assertTrue(key.exists())
+        refused = [r for r in self.records("package.download") if r["actor"] == "dev2"][-1]
+        self.assertEqual((refused["collection"], refused["details"]["code"]), (SECRET, "PACKAGE_NOT_FOUND"))
+        self.assertEqual(self.get(key.name, who="dev").status_code, 200)
+        self.assertFalse(key.exists())
+
+    def test_key_files_are_not_listed_as_packages(self):
+        package, key = self.write_pair()
+        self.assertEqual(sorted(self.listed("eng")), [package.name])
+
+    def test_an_end_user_never_reaches_a_key(self):
+        _package, key = self.write_pair()
+        self.assertEqual(self.get(key.name, who="user").status_code, 403)
+        self.assertTrue(key.exists())
+
+    def test_a_key_follows_a_groups_grant(self):
+        # Reviewer (#676 with #784): the key file's access is the package's, so a
+        # collection granted through a group reaches its members only, and a
+        # membership change applies to the next download.
+        store.create_group("team")
+        store.set_group_members("team", ["dev2"], [])
+        status = self.client.put(f"/collections/{SECRET}/access", headers=self.as_("eng"),
+                                 json={"restricted": True, "users": [], "service_principals": [],
+                                       "groups": ["team"]}).status_code
+        self.assertEqual(status, 200)
+        package, key = self.write_pair(collection=SECRET)
+        answer = self.get(key.name, who="dev")
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (404, "PACKAGE_NOT_FOUND"))
+        self.assertTrue(key.exists())
+        self.assertTrue(self.listed("dev2")[package.name]["key_on_server"])
+        store.set_group_members("team", [], [])
+        answer = self.get(key.name, who="dev2")
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (404, "PACKAGE_NOT_FOUND"))
+        self.assertTrue(key.exists())
+        store.set_group_members("team", ["dev2"], [])
+        self.assertEqual(self.get(key.name, who="dev2").status_code, 200)
+        self.assertFalse(key.exists())
+        self.assertTrue(package.exists())
 
 
 class DeletionRecordTests(DownloadTestCase):
@@ -43691,12 +45834,12 @@ def check(name, ok, detail=""):
     if not ok: fails.append(name)
 
 # E5 — filename (§4.1)
-NAME_RE = re.compile(r"^ragpkg-([a-z0-9]+(?:-[a-z0-9]+)*)-(\d{8}T\d{6}Z)-([0-9a-f]{8})\.tar\.gz(?:\.age)?$")
+NAME_RE = re.compile(r"^ragpkg-([a-z0-9]+(?:-[a-z0-9]+)*)-(\d{8}T\d{6}Z)-([0-9a-f]{8})(?:-([1-9][0-9]*))?\.tar\.gz(?:\.age)?$")
 m = NAME_RE.match(archive.name)
 check("E5 filename matches the §4.1 pattern", m is not None, archive.name)
 if not m:
     sys.exit(1)
-slug, ts, id8 = m.groups()
+slug, ts, id8, _n = m.groups()   # -<n>: a same-second export (#860)
 
 with tempfile.TemporaryDirectory() as td:
     source = archive
@@ -43907,6 +46050,8 @@ python3 "$REPO_ROOT/scripts/tests/test_weaviate_pin.py"
 check "the Weaviate pin is the same everywhere and Dependabot leaves it alone (#530)" $?
 python3 "$REPO_ROOT/scripts/tests/test_upgrade_backup.py"
 check "the README's 1.1.0 backup and rollback commands check before they write, and pin alpine (#679)" $?
+python3 "$REPO_ROOT/scripts/tests/test_backup_scripts.py"
+check "the backup and restore scripts encrypt each volume with its own key and refuse a wrong key before emptying anything (#848)" $?
 python3 "$REPO_ROOT/scripts/tests/test_version_agreement.py"
 check "the first-party version strings name the same release (#605)" $?
 python3 "$REPO_ROOT/scripts/tests/test_ci_workflow.py"
@@ -47029,7 +49174,7 @@ api_post "/ingest/config" "{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\
 api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":6,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
 
 # ── export ───────────────────────────────────────────────────────────────────
-api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_exp.json
+api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_exp.json
 ejob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_exp.json'))['job_id'])")
 estatus=$(wait_for_job "/export/job/$ejob" 1800)
 check_eq "export completes" "$estatus" "completed"
@@ -47201,7 +49346,7 @@ e30_collections create > /tmp/vfy_e30_setup.txt 2>&1
 check "E30: mismatch fixtures created on the verify project" $? "$(tail -1 /tmp/vfy_e30_setup.txt)"
 for e30c in "$E30_DRIFT" "$E30_NAMED" "$E30_NONE"; do
   before=$(ls -A "$EXPORTS" | sort)
-  api_post "/export" "{\"collection\":\"$e30c\",\"include_models\":true}" > /tmp/vfy_e30_exp.json
+  api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$e30c\",\"include_models\":true}" > /tmp/vfy_e30_exp.json
   e30job=$(jfield "['job_id']" < /tmp/vfy_e30_exp.json)
   e30status=$(wait_for_job "/export/job/$e30job" 600)
   e30err=$(api_get "/export/job/$e30job" | jfield "['error']")
@@ -47511,7 +49656,7 @@ check "E29: the refusal doesn't echo the outside path or its contents" $?
 read -r e29stat e29name <<<"$(python3 -c "
 import json; d=json.load(open('/tmp/vfy_e29job.json')); print(d['status'], d.get('collection') or '-')")"
 if [ "$e29stat" = "completed" ] && [ "$e29name" != "-" ]; then
-  api_post "/export" "{\"collection\":\"$e29name\",\"include_models\":false}" > /tmp/vfy_e29exp.json
+  api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$e29name\",\"include_models\":false}" > /tmp/vfy_e29exp.json
   wait_for_job "/export/job/$(jfield "['job_id']" < /tmp/vfy_e29exp.json)" 1800 >/dev/null
 fi
 check_eq "E29: a refused rename import creates no collection" "$(collection_names)" "$names_before"
@@ -47587,7 +49732,7 @@ import json; d=json.load(open('/tmp/vfy_e29job.json')); print(d['status'], d.get
 done
 
 # The valid in-directory source still round-trips after the refusals.
-api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_e29exp.json
+api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_e29exp.json
 e29job=$(jfield "['job_id']" < /tmp/vfy_e29exp.json)
 check_eq "E29: the collection still exports after refused imports" \
   "$(wait_for_job "/export/job/$e29job" 1800)" "completed"
@@ -47638,7 +49783,7 @@ ENDPY
 for mode in abs link; do
   plant "$mode"
   check "E29: planted a $mode source entry on disk" $?
-  api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_e29exp.json
+  api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_e29exp.json
   check_eq "E29: export refuses an on-disk $mode source entry" \
     "$(wait_for_job "/export/job/$(jfield "['job_id']" < /tmp/vfy_e29exp.json)" 1800)" "failed"
   leak=$(no_sentinel_in_exports); check "E29: ... and archives no outside bytes ($mode)" $? "$leak"
@@ -47792,7 +49937,7 @@ rjob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_replace.json'))['j
 rstatus=$(wait_for_job "/import/job/$rjob" 1800)
 check_eq "replace completes after verified final writes" "$rstatus" "completed"
 check_eq "replace reports confirmed target objects" "$(api_get "/import/job/$rjob" | jfield "['chunks_written']")" "$chunks_before"
-api_post "/export" "{\"collection\":\"$C\"}" > /tmp/vfy_replace_exp.json
+api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$C\"}" > /tmp/vfy_replace_exp.json
 rejob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_replace_exp.json'))['job_id'])")
 wait_for_job "/export/job/$rejob" 1800 >/dev/null
 RPKG=$(api_get "/export/job/$rejob" | jfield "['filename']")
@@ -47800,7 +49945,7 @@ RPKG=$(api_get "/export/job/$rejob" | jfield "['filename']")
 check "replace fidelity compares an independent re-export" $?
 
 # ── import is lossless ───────────────────────────────────────────────────────
-api_post "/export" "{\"collection\":\"$iname\"}" > /tmp/vfy_exp2.json
+api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$iname\"}" > /tmp/vfy_exp2.json
 ejob2=$(python3 -c "import json;print(json.load(open('/tmp/vfy_exp2.json'))['job_id'])")
 wait_for_job "/export/job/$ejob2" 1800 >/dev/null
 PKG2=$(api_get "/export/job/$ejob2" | jfield "['filename']")
@@ -48205,7 +50350,7 @@ ENDPY
   check "a 30,000-chunk collection is built for the interrupted export" $? \
     "$(grep -E 'Error' /tmp/vfy_xrestart_prepare.log | tail -1)"
   builds_before=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/uploads/export-* 2>/dev/null' | sort)
-  api_post "/export" "{\"collection\":\"$XR\",\"include_models\":false}" > /tmp/vfy_xrestart_start.json
+  api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$XR\",\"include_models\":false}" > /tmp/vfy_xrestart_start.json
   xjob=$(jfield "['job_id']" < /tmp/vfy_xrestart_start.json)
   state=""
   for _ in $(seq 1 600); do
@@ -48264,7 +50409,7 @@ ENDPY
   # An import killed part-way reads `failed` with INTERRUPTED (#309): the same
   # collection, exported whole, dropped and imported back. The startup sweep
   # removes the half-built collection the killed import leaves.
-  api_post "/export" "{\"collection\":\"$XR\",\"include_models\":false}" > /tmp/vfy_irestart_export.json
+  api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$XR\",\"include_models\":false}" > /tmp/vfy_irestart_export.json
   xpkg_job=$(jfield "['job_id']" < /tmp/vfy_irestart_export.json)
   xpkg_status=$(wait_for_job "/export/job/$xpkg_job" 1800)
   xpkg=$(api_get "/export/job/$xpkg_job" | jfield "['filename']")
@@ -48332,7 +50477,7 @@ check_eq "#372: the upload completes" \
 api_get "/tune/$SC" > /tmp/vfy_sp_tune.json
 check_eq "#372: '$SC' finds the originals uploaded as '$SL' (re-chunk offered)" \
   "$(jfield "['can_rechunk']" < /tmp/vfy_sp_tune.json)" "True"
-api_post "/export" "{\"collection\":\"$SC\",\"include_models\":false}" > /tmp/vfy_sp_exp.json
+api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$SC\",\"include_models\":false}" > /tmp/vfy_sp_exp.json
 spjob=$(jfield "['job_id']" < /tmp/vfy_sp_exp.json)
 check_eq "#372: the export of '$SC' completes" "$(wait_for_job "/export/job/$spjob" 1800)" "completed"
 api_get "/export/job/$spjob" > /tmp/vfy_sp_expjob.json
@@ -48371,7 +50516,7 @@ r = [r for r in json.load(sys.stdin)['records'] if r['details'].get('file') == s
 sys.exit(0 if r and eval(sys.argv[2], {'r': r[0]}) else 1)" "$2" "$3"
 }
 
-api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_dl_exp.json
+api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_dl_exp.json
 djob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_dl_exp.json'))['job_id'])")
 check_eq "#677: an export to download completes" "$(wait_for_job "/export/job/$djob" 1800)" "completed"
 DPKG=$(api_get "/export/job/$djob" | jfield "['filename']")
@@ -48419,6 +50564,198 @@ check_eq "#677: an End User is refused GET /packages/{filename}" \
 retention exists "$NPKG"
 check "#677: ... and the package stays" $?
 retention remove "$NPKG"
+
+# ── a key export: encrypted by default, a new key each time (#676) ───────────
+# A default export writes <package>.tar.gz.age and <package>.key (0600) and
+# never a plain archive; each export has its own key; import needs the key
+# file's text; a full download of the key deletes the key and keeps the package.
+key_export() {   # key_export <outfile>: start a default export, print its job id
+  api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > "$1"
+  python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['job_id'])" "$1"
+}
+kjob=$(key_export /tmp/vfy_key_exp.json)
+check_eq "#676: a default export completes" "$(wait_for_job "/export/job/$kjob" 1800)" "completed"
+api_get "/export/job/$kjob" > /tmp/vfy_key_job.json
+KPKG=$(jfield "['filename']" < /tmp/vfy_key_job.json)
+KKEY=$(jfield "['key_filename']" < /tmp/vfy_key_job.json)
+check_eq "#676: ... encrypted with a new key" "$(jfield "['encryption']" < /tmp/vfy_key_job.json)" "key"
+check_eq "#676: ... its key file is <package>.key" "$KKEY" "$KPKG.key"
+check_eq "#676: ./exports holds exactly the package and its key file for it" \
+  "$(ls -A "$EXPORTS" | grep -F "${KPKG%.tar.gz.age}" | sort | tr '\n' ' ')" "$KPKG $KKEY "
+check_eq "#676: the key file's mode is 600" \
+  "$(cd "$REPO_ROOT" && docker compose exec -T api stat -c %a "/app/exports/$KKEY" | tr -d '\r')" "600"
+kpub=$(cd "$REPO_ROOT" && docker compose exec -T api grep '^# public key: ' "/app/exports/$KKEY" | tr -d '\r')
+
+# Two key builds of one collection in the same second (#860), run in the API
+# container with the build's clock fixed to a past second no export uses: the
+# second gets `-2` (RAG_EXPORT_SPECIFICATIONS.md §4.1) and all four files are
+# kept. The collision is forced: two real builds of one collection can differ
+# in <id8> (chunks.jsonl's key order follows Weaviate's, #863), so both builds
+# are given the first build's plain stem through a wrapped package_stem. Only
+# these builds are patched; export output is unchanged. Every file the builds open for writing in ./exports is recorded through
+# Python's `open` audit event, so "no unencrypted archive" is checked on each
+# write instead of by sampling the folder (#860): only the encrypted package's
+# and the key's temporaries are written, and each package is an age file.
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$C") > /tmp/vfy_same_second.txt 2>&1 <<'ENDPY'
+import hashlib, os, sys
+sys.path.insert(0, "/app")
+from datetime import datetime, timezone
+from unittest.mock import patch
+from services import age_stream, packager
+
+exports = packager.exports_dir()
+root = os.path.abspath(exports)
+writes, recording = [], [False]
+WRITE = os.O_WRONLY | os.O_RDWR | os.O_CREAT
+
+
+def hook(event, args):
+    if recording[0] and event == "open" and isinstance(args[0], str) and isinstance(args[2], int) \
+            and args[2] & WRITE and os.path.dirname(os.path.abspath(args[0])) == root:
+        writes.append(os.path.basename(args[0]))
+
+
+def check(ok, name, detail=""):
+    print(f"{0 if ok else 1}|{name}|{detail}".replace("\n", " "))
+
+
+def digest(name):
+    return hashlib.sha256((exports / name).read_bytes()).hexdigest()
+
+
+real_stem, stems = packager.package_stem, []
+
+
+def forced_stem(collection, when, id8):
+    # Every build gets the first build's <id8>, so the second's plain stem is taken.
+    stems.append(real_stem(collection, when, stems[0].rsplit("-", 1)[1] if stems else id8))
+    return stems[-1]
+
+
+sys.addaudithook(hook)
+built = []
+try:
+    with patch.object(packager, "_now", return_value=datetime(2001, 1, 1, tzinfo=timezone.utc)), \
+         patch.object(packager, "package_stem", forced_stem):
+        recording[0] = True
+        built.append(packager.build(sys.argv[1], key=True))
+        kept = {built[0][k]: digest(built[0][k]) for k in ("filename", "key_filename")}
+        built.append(packager.build(sys.argv[1], key=True))
+        recording[0] = False
+    first, second = built
+    stem = first["filename"][:-len(age_stream.ENCRYPTED_SUFFIX)]
+    check(second["filename"] == stem + "-2" + age_stream.ENCRYPTED_SUFFIX,
+          "#860: two exports of one collection in the same second get distinct names, the second -2",
+          f'{first["filename"]} / {second["filename"]}')
+    check(len(stems) == 2 and stems == [stem, stem],
+          "#860: ... the second build was given the first build's name, which was taken", " / ".join(stems))
+    check(all(digest(n) == d for n, d in kept.items()),
+          "#860: ... and the first build's package and key file are unchanged", " ".join(kept))
+    names = [r[k] for r in built for k in ("filename", "key_filename")]
+    check(all((exports / n).is_file() for n in names),
+          "#860: ... and both packages and both key files are kept", " ".join(names))
+    texts = [(exports / r["key_filename"]).read_text() for r in built]
+    publics = [next(l for l in t.splitlines() if l.startswith("# public key: ")) for t in texts]
+    check(publics[0] != publics[1] and all(r["filename"] in t for r, t in zip(built, texts)),
+          "#860: ... each key file holds its own key and names its own package", " / ".join(publics))
+    temps = {f".{n}.partial" for n in names}
+    check(bool(writes) and set(writes) <= temps,
+          "#676: a key build writes only the package's and the key's temporaries in ./exports",
+          " ".join(writes))
+    check(not any(w.endswith(".tar.gz") or w.endswith(".tar.gz.partial") for w in writes),
+          "#676: ... and never an unencrypted archive", " ".join(writes))
+    heads = []
+    for r in built:
+        with (exports / r["filename"]).open("rb") as fh:
+            heads.append(fh.read(len(age_stream.VERSION_LINE)))
+    check(all(h == age_stream.VERSION_LINE for h in heads),
+          "#676: ... and each placed package is an age file", repr(heads))
+finally:
+    for r in built:
+        for k in ("filename", "key_filename"):
+            if r.get(k):
+                (exports / r[k]).unlink(missing_ok=True)
+ENDPY
+[ "$(grep -c '^[01]|' /tmp/vfy_same_second.txt)" = "8" ]
+check "#860: the same-second check ran all eight of its checks" $? "$(tail -5 /tmp/vfy_same_second.txt | tr '\n' ' ')"
+while IFS='|' read -r rc name detail; do
+  check "$name" "$rc" "$detail"
+done < <(grep '^[01]|' /tmp/vfy_same_second.txt)
+
+kjob2=$(key_export /tmp/vfy_key_exp2.json)
+check_eq "#676: a second default export completes" "$(wait_for_job "/export/job/$kjob2" 1800)" "completed"
+api_get "/export/job/$kjob2" > /tmp/vfy_key_job2.json
+KPKG2=$(jfield "['filename']" < /tmp/vfy_key_job2.json); KKEY2=$(jfield "['key_filename']" < /tmp/vfy_key_job2.json)
+check_eq "#676: the two exports are two packages (different names)" "$([ "$KPKG2" != "$KPKG" ] && echo different || echo "same: $KPKG")" "different"
+kpub2=$(cd "$REPO_ROOT" && docker compose exec -T api grep '^# public key: ' "/app/exports/$KKEY2" | tr -d '\r')
+[ -n "$kpub" ] && [ -n "$kpub2" ] && [ "$kpub" != "$kpub2" ]
+check "#676: each export has its own key" $? "$kpub / $kpub2"
+
+code=$(post_code "/import" "{\"filename\":\"$KPKG\",\"on_conflict\":\"rename\"}" /tmp/vfy_key_nokey.json)
+check_eq "#676: import without the key is refused 400" "$code" "400"
+check_eq "#676: ... KEY_FILE_REQUIRED" "$(jfield "['error']['code']" < /tmp/vfy_key_nokey.json)" "KEY_FILE_REQUIRED"
+
+kcode=$(curl -s -o /tmp/vfy_key.txt -m 120 -w '%{http_code}' "$API/packages/$KKEY")
+check_eq "#676: GET /packages/<package>.key downloads the key file" "$kcode" "200"
+grep -q '^AGE-SECRET-KEY-1' /tmp/vfy_key.txt
+check "#676: ... an age key file" $?
+[ ! -e "$EXPORTS/$KKEY" ] && [ -e "$EXPORTS/$KPKG" ]
+check "#676: the key's full download deletes the key and keeps the package" $?
+api_get "/packages" | python3 -c "
+import json, sys
+p = next(p for p in json.load(sys.stdin)['packages'] if p['filename'] == sys.argv[1])
+sys.exit(0 if p['encryption'] == 'key' and p['key_on_server'] is False else 1)" "$KPKG"
+check "#676: GET /packages says the package is a key package whose key is no longer on the server" $?
+
+python3 - "$KPKG" /tmp/vfy_key.txt > /tmp/vfy_key_import_body.json <<'ENDPY'
+import json, sys
+print(json.dumps({"filename": sys.argv[1], "on_conflict": "rename", "key": open(sys.argv[2]).read()}))
+ENDPY
+api_post "/import" "@/tmp/vfy_key_import_body.json" > /tmp/vfy_key_imp.json
+kimp=$(jfield "['job_id']" < /tmp/vfy_key_imp.json)
+check_eq "#676: import with the key file completes" "$(wait_for_job "/import/job/$kimp" 1800)" "completed"
+kcoll=$(api_get "/import/job/$kimp" | jfield "['collection']")
+[ -n "$kcoll" ] && [ "$kcoll" != "None" ] && drop_collection "$kcoll"
+# A wrong key (reviewer, #676): the first package's key on the second package
+# fails the job DECRYPT_FAILED (reason key), names no key, and touches nothing.
+state_before=$(enc_state)
+ksum() { python3 -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$EXPORTS/$KPKG2"; }
+ksum_before=$(ksum)
+python3 - "$KPKG2" /tmp/vfy_key.txt > /tmp/vfy_key_wrong_body.json <<'ENDPY'
+import json, sys
+print(json.dumps({"filename": sys.argv[1], "on_conflict": "replace", "key": open(sys.argv[2]).read()}))
+ENDPY
+api_post "/import" "@/tmp/vfy_key_wrong_body.json" > /tmp/vfy_key_wrong.json
+kwjob=$(jfield "['job_id']" < /tmp/vfy_key_wrong.json)
+wait_for_job "/import/job/$kwjob" 900 >/dev/null
+api_get "/import/job/$kwjob" > /tmp/vfy_key_wrong_job.json
+python3 - /tmp/vfy_key_wrong_job.json > /tmp/vfy_key_wrong.txt 2>&1 <<'ENDPY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(d["status"], d["error_code"], d["error_detail"], d.get("encryption"))
+sys.exit(0 if d["status"] == "failed" and d["error_code"] == "DECRYPT_FAILED"
+         and d["error_detail"] == {"reason": "key"} and d.get("encryption") == "key"
+         and "AGE-SECRET-KEY" not in json.dumps(d) else 1)
+ENDPY
+check "#676: a wrong key fails the import DECRYPT_FAILED (reason key) and the job names no key" $? "$(tail -1 /tmp/vfy_key_wrong.txt)"
+[ "$(enc_state)" = "$state_before" ] && [ "$(ksum)" = "$ksum_before" ]
+check "#676: ... and touches nothing: collections, their counts and the package file unchanged" $?
+rm -f /tmp/vfy_key_wrong_body.json
+
+# The package's full download leaves its key (reviewer, #676): each file is
+# deleted by its own download, so downloading the package first never loses the key.
+check_eq "#676: the second package downloads" "$(curl -s -o /dev/null -m 600 -w '%{http_code}' "$API/packages/$KPKG2")" "200"
+[ ! -e "$EXPORTS/$KPKG2" ] && [ -e "$EXPORTS/$KKEY2" ]
+check "#676: the package's full download deletes the package and keeps its key file" $?
+check_eq "#676: ... and the export job still says its key is on the server" \
+  "$(api_get "/export/job/$kjob2" | jfield "['key_on_server']")" "True"
+check_eq "#676: the key file still downloads after its package" \
+  "$(curl -s -o /dev/null -m 120 -w '%{http_code}' "$API/packages/$KKEY2")" "200"
+[ ! -e "$EXPORTS/$KKEY2" ]
+check "#676: ... and its full download deletes it" $?
+rm -f /tmp/vfy_key.txt /tmp/vfy_key_import_body.json
+# A full download deletes each remaining file (#677, #676): that is the clean-up.
+curl -s -o /dev/null -m 600 "$API/packages/$KPKG"
 
 # ── verified recovery across an API restart (#43, #44; opt-in: restarts the API) ──
 RP="${PREFIX}BatchRecovery"
@@ -48527,7 +50864,7 @@ check_eq "the suite's collection is ingested" \
 chunks=$(count_of "$C")
 api_post "/ingest/config" "{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\",\"chunk_size\":150,\"min_chunk_size\":40}" >/dev/null
 api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":6,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
-api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_p_exp.json
+api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_p_exp.json
 check_eq "... and exported" \
   "$(wait_for_job "/export/job/$(jfield "['job_id']" < /tmp/vfy_p_exp.json)" 1800)" "completed"
 PKG=$(api_get "/export/job/$(jfield "['job_id']" < /tmp/vfy_p_exp.json)" | jfield "['filename']")
@@ -50156,8 +52493,8 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     for (const p of ['/qa', '/collections', '/health', '/qa']) {
       await s.page.goto(BASE + p, { waitUntil: 'networkidle2' }); await sleep(500);
     }
-    const pages = (await readNav(s.page).catch(() => ({ pages: [] }))).pages;  // the Engineer's 12: Q&A and the menus' 11 (#616, Prepare #638)
-    r.check('the session survives navigation and reloads', pages.length === 12, JSON.stringify(pages));
+    const pages = (await readNav(s.page).catch(() => ({ pages: [] }))).pages;  // the Engineer's 13: Q&A and the menus' 12 (#616, Prepare #638, Groups #784)
+    r.check('the session survives navigation and reloads', pages.length === 13, JSON.stringify(pages));
     await chooseFromMenu(s.page, 'account', 'Log out').catch(() => {});
     await s.page.waitForFunction(() => location.pathname === '/login', { timeout: 10000 }).catch(() => {});
     const me = await s.page.evaluate(async () => (await fetch('/api/auth/me')).status);
@@ -50259,7 +52596,7 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     const s = await session(browser, BASE, 'engineer');
     await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' }); await sleep(1500);
     const links = (await readNav(s.page).catch(() => ({ pages: [] }))).pages;  // through the menus (#616)
-    for (const want of ['Q&A', 'Import', 'Prepare', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health', 'Users', 'Service keys', 'Audit']) {
+    for (const want of ['Q&A', 'Import', 'Prepare', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health', 'Users', 'Service keys', 'Groups', 'Audit']) {
       r.check(`Engineer nav includes ${want}`, links.includes(want), JSON.stringify(links));
     }
     await s.ctx.close();
@@ -52492,7 +54829,8 @@ echo "No internet on the target? Use: bash package-offline.sh"
 ### package-offline.sh
 
 Self-contained bundle (~4.6 GB) for an air-gapped target: source plus
-`docker save` of all five images plus the Ollama model weights.
+`docker save` of all five images and the backup scripts' age image (#852) plus
+the Ollama model weights.
 
 ```bash
 #!/usr/bin/env bash
@@ -52507,7 +54845,9 @@ Self-contained bundle (~4.6 GB) for an air-gapped target: source plus
 #   * the source tree: the files git tracks in the current commit (HEAD),
 #     built with `git archive`, exactly as package.sh does. Untracked and
 #     ignored files and uncommitted changes are left out (#384).
-#   * all five Docker images, pre-built (docker save)
+#   * all five Docker images, pre-built (docker save), and the age image that
+#     scripts/backup.sh and scripts/restore.sh run in (#852), so backups work
+#     on the target with no network
 #   * the Ollama model weights (by default llama3.1:8b + nomic-embed-text; a
 #     different build or answer LLM too, #671), the whole model volume: a model
 #     left in it, such as phi3.5 from before 1.2.1, is carried too
@@ -52603,8 +54943,15 @@ echo "==> Copying source (tracked files of the current commit)"
 # root and the user cannot drop files into ./ingest-inbox.
 git archive --format=tar HEAD | ( cd "$STAGE/rag-docker" && tar xf - )
 
+# The age image, tagged from the bundle's own scripts/age/Dockerfile (the copy
+# just archived), so the backup scripts on the target find it and never build.
+# It is built here if this machine doesn't have it (this needs the network).
+echo "==> Checking the age image for scripts/backup.sh and scripts/restore.sh"
+. "$STAGE/rag-docker/scripts/backup-common.sh"
+rb_image
+
 echo "==> Saving images (this is the slow part)"
-docker save "${IMAGES[@]}" | gzip > "$STAGE/rag-docker/offline/images.tar.gz"
+docker save "${IMAGES[@]}" "$RB_IMAGE" | gzip > "$STAGE/rag-docker/offline/images.tar.gz"
 
 if [ "$TELEMETRY" = 1 ]; then
   echo "==> Saving optional pinned collector (Python 3.11+ required)"
@@ -52792,6 +55139,9 @@ class PackageArchiveTests(unittest.TestCase):
         for name in ('entrypoint.sh', 'models.sh', 'compose-models.sh'):
             write(self.repo / 'ollama' / name, (ROOT / 'ollama' / name).read_text())
         write(self.repo / 'install-offline.sh', '#!/usr/bin/env bash\necho install\n', 0o755)
+        # package-offline.sh tags and saves the age image of the backup scripts (#852).
+        for name in ('scripts/backup-common.sh', 'scripts/age/Dockerfile'):
+            write(self.repo / name, (ROOT / name).read_text())
         write(self.repo / 'README.md', COMMITTED_README)
         write(self.repo / 'ingest-inbox' / '.gitkeep', '')
         write(self.repo / 'exports' / '.gitkeep', '')
@@ -54254,7 +56604,7 @@ with tempfile.TemporaryDirectory(prefix='owned-import-session-') as directory:
                 session={'session_id':sid,'collection':collection,'status':'completed','pairs_total':1,'pairs_completed':1,'pairs':[{'pair_id':'p_owned','question':'Inert question','answer':'Original exported answer','contexts':['Owned inert evaluation context'],'ground_truth':'Inert truth','source_file':'inert.txt','chunk_index':0,'status':'approved'}]}
                 await asyncio.to_thread(gs.store_session,session)
                 print('PASS owned real collection, supplied-vector object and synthetic evaluation session created',flush=True)
-                start=await client.post('/export',json={'collection':collection,'include_models':False});assert start.status_code==202,start.text
+                start=await client.post('/export',json={'collection':collection,'include_models':False,'encryption':'none'});assert start.status_code==202,start.text
                 jobs.append((exporter,start.json()['job_id']))
                 exported=await completed(client,'/export/job/'+start.json()['job_id']);archive=root/'exports'/exported['filename'];digest=await asyncio.to_thread(file_digest,archive)
                 retained=await asyncio.to_thread(archive_session,archive,sid);assert retained['pairs'][0]['answer']=='Original exported answer'
@@ -54288,7 +56638,7 @@ with tempfile.TemporaryDirectory(prefix='owned-import-session-') as directory:
                 reload=await asyncio.to_thread(subprocess.run,[sys.executable,'-c',code,str(root/'uploads'),*identities],text=True,capture_output=True,check=True)
                 fresh=json.loads(reload.stdout);assert [row['collection'] for row in fresh]==[collection,*targets];assert fresh[0]['pairs'][0]['answer']=='Newer acknowledged human answer';assert all(row['imported_from']['session_id']==sid for row in fresh[1:])
                 print('PASS fresh independent API process restores all three session identities, newer original review and imported provenance',flush=True)
-                start=await client.post('/export',json={'collection':targets[0],'include_models':False});assert start.status_code==202,start.text
+                start=await client.post('/export',json={'collection':targets[0],'include_models':False,'encryption':'none'});assert start.status_code==202,start.text
                 jobs.append((exporter,start.json()['job_id']))
                 reexported=await completed(client,'/export/job/'+start.json()['job_id'])
                 imported_sid=mappings[0]['session_id'];retained=await asyncio.to_thread(archive_session,root/'exports'/reexported['filename'],imported_sid)
@@ -57744,8 +60094,11 @@ const SEALED = 'ragpkg-vfytransfera-20261021-0000-abcd1234.tar.gz.age';
 const BROKEN = 'ragpkg-vfytransfera-20261021-0000-ffff0000.tar.gz.age';
 const packagesBody = { packages: [
   { filename: PACKAGE, size_bytes: 2048, collection: A, chunk_count: 3, fidelity: 'with-sources', created_at: null, readable: true, encrypted: false },
-  { filename: SEALED, size_bytes: 2100, collection: null, chunk_count: null, fidelity: null, created_at: null, readable: true, encrypted: true },
+  { filename: SEALED, size_bytes: 2100, collection: null, chunk_count: null, fidelity: null, created_at: null, readable: true, encrypted: true, encryption: 'passphrase' },
 ] };
+// A package encrypted to its own key (#676), its key file still on the server.
+const KEYED = 'ragpkg-vfytransfera-20261021-0000-cccc1111.tar.gz.age';
+const keyedPackage = { filename: KEYED, size_bytes: 2200, collection: null, chunk_count: null, fidelity: null, created_at: null, readable: true, encrypted: true, encryption: 'key', key_on_server: true };
 const tuneBody = name => ({ collection: name, fidelity: 'with-sources', source_document_count: 2, can_rechunk: true, can_reembed: true, can_reindex: true, note: '' });
 const json = (status, body) => ({ status, body: JSON.stringify(body) });
 const apiError = (status, code, msg) => json(status, { error: { code, message: msg, detail: null } });
@@ -57762,7 +60115,7 @@ const HALVES = {
             done: importJob('completed', { collection: A, chunks_written: 3, fidelity: 'with-sources' }) },
 };
 
-async function fixture(browser, base, { hold = [] } = {}) {
+async function fixture(browser, base, { hold = [], lanMode = false } = {}) {
   const ctx = await browser.createBrowserContext();
   const page = await ctx.newPage();
   const errors = [];
@@ -57795,6 +60148,17 @@ async function fixture(browser, base, { hold = [] } = {}) {
   }, fixed);
   // The engineer, as GET /api/auth/me answers it, without a backend (#25).
   await stubAuth(page, 'engineer');
+  if (lanMode) {
+    // The same engineer, with LAN mode on in the user answer (#676).
+    await page.evaluateOnNewDocument(() => {
+      const inner = window.fetch.bind(window);
+      window.fetch = (input, init) => {
+        const path = new URL(typeof input === 'string' ? input : input.url, location.href).pathname;
+        if (path === '/api/auth/me') return Promise.resolve(new Response(JSON.stringify({ username: 'vfy-engineer', role: 'engineer', must_change_password: false, lan_mode: true }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+        return inner(input, init);
+      };
+    });
+  }
   await page.goto(base + '/transfer', { waitUntil: 'domcontentloaded' });
   await page.waitForFunction(() => document.querySelectorAll('select option').length > 0 && document.body.innerText.includes('Export a collection'));
   return { ctx, page, errors };
@@ -57851,13 +60215,16 @@ const stopped = half => `Stopped checking ${HALVES[half].progress} after 30 fail
 
 async function sleep(ms) { await new Promise(r => setTimeout(r, ms)); }
 
-// Encryption controls (#27).
+// Encryption controls (#27, #676): three radio choices.
 const passwords = page => page.evaluate(() => [...document.querySelectorAll('input[type=password]')].map(i => i.value));
 const typePassword = (page, index, value) => setValue(page, `() => document.querySelectorAll('input[type=password]')[${index}]`, value);
-const checkEncrypt = page => page.evaluate(() => {
-  const label = [...document.querySelectorAll('label')].find(l => l.textContent.includes('Encrypt with a passphrase'));
-  if (!label) return false; label.querySelector('input[type=checkbox]').click(); return true;
-});
+const encryptionChoices = page => page.evaluate(() => [...document.querySelectorAll('input[type=radio][name=encryption]')]
+  .map(i => ({ value: i.value, checked: i.checked, label: i.closest('label').querySelector(':scope > div > div').textContent })));
+const chooseEncryption = (page, value) => page.evaluate(v => {
+  const input = document.querySelector(`input[type=radio][name=encryption][value=${v}]`);
+  if (!input) return false; input.click(); return true;
+}, value);
+const checkEncrypt = page => chooseEncryption(page, 'passphrase');
 const sentBody = (page, path) => page.evaluate(p => {
   const r = window.transferFixture.requests.filter(x => x.path === p && x.method === 'POST').pop();
   return r && r.body ? JSON.parse(r.body) : null;
@@ -57960,8 +60327,8 @@ async function runTransferPageTests(browser, base, reporter) {
   }, { hold: ['GET /api/packages'] }]);
 
   cases.push(['export encryption: the passphrase rules hold Export, a valid matching pair sends it, and the fields clear (#27)', async page => {
-    assert.deepEqual(await passwords(page), [], 'passphrase fields shown before the box is checked');
-    assert.equal(await checkEncrypt(page), true, 'no "Encrypt with a passphrase" checkbox');
+    assert.deepEqual(await passwords(page), [], 'passphrase fields shown before "Passphrase" is chosen');
+    assert.equal(await checkEncrypt(page), true, 'no "Passphrase" choice');
     await page.waitForFunction(() => document.querySelectorAll('input[type=password]').length === 2);
     await waitText(page, 'The passphrase needs at least 12 characters.');
     assert.equal((await button(page, 'export')).disabled, true, 'Export enabled with no passphrase');
@@ -57977,14 +60344,14 @@ async function runTransferPageTests(browser, base, reporter) {
     await expectButton(page, 'export', false);
     assert.equal(await click(page, 'Export'), true, 'no Export button');
     await pending(page, '/api/export', 'POST');
-    assert.deepEqual(await sentBody(page, '/api/export'), { collection: A, include_models: false, passphrase: 'correct horse battery' });
+    assert.deepEqual(await sentBody(page, '/api/export'), { collection: A, include_models: false, encryption: 'passphrase', passphrase: 'correct horse battery' });
     await release(page, '/api/export', HALVES.export.started, 'POST');
     await page.waitForFunction(() => [...document.querySelectorAll('input[type=password]')].every(i => i.value === ''));
     await release(page, HALVES.export.poll, exportJob('completed', { chunks_written: 3, filename: 'ragpkg-vfy.tar.gz.age', size_bytes: 4096, fidelity: 'with-sources', models_bundled: false, retrieve_script: true, encrypted: true }));
     await waitText(page, 'with-sources, encrypted');
   }]);
   cases.push(['export encryption: the bounds count characters, 1025 holds Export, and a refused start keeps the fields (#27)', async page => {
-    assert.equal(await checkEncrypt(page), true, 'no "Encrypt with a passphrase" checkbox');
+    assert.equal(await checkEncrypt(page), true, 'no "Passphrase" choice');
     await page.waitForFunction(() => document.querySelectorAll('input[type=password]').length === 2);
     const lock = '\u{1F512}';   // one character, two UTF-16 units
     await typePassword(page, 0, lock.repeat(11));
@@ -58009,10 +60376,71 @@ async function runTransferPageTests(browser, base, reporter) {
     assert.deepEqual(await passwords(page), ['a'.repeat(1024), 'a'.repeat(1024)], 'the fields were cleared after a refused start');
     await expectButton(page, 'export', false);
   }]);
-  cases.push(['export encryption: an unchecked box sends no passphrase (#27)', async page => {
+  cases.push(['export encryption: three choices, a new key first and chosen; the default sends encryption "key" and no passphrase (#676)', async page => {
+    const choices = await encryptionChoices(page);
+    assert.deepEqual(choices.map(c => [c.value, c.label, c.checked]),
+      [['key', 'New key (recommended)', true], ['passphrase', 'Passphrase', false], ['none', 'Not encrypted', false]]);
+    assert.deepEqual(await passwords(page), [], 'passphrase fields shown for a key export');
     await start(page, 'export');
-    assert.deepEqual(await sentBody(page, '/api/export'), { collection: A, include_models: false });
+    assert.deepEqual(await sentBody(page, '/api/export'), { collection: A, include_models: false, encryption: 'key' });
   }]);
+  cases.push(['export encryption: "Not encrypted" sends encryption "none" (#676)', async page => {
+    assert.equal(await chooseEncryption(page, 'none'), true, 'no "Not encrypted" choice');
+    await start(page, 'export');
+    assert.deepEqual(await sentBody(page, '/api/export'), { collection: A, include_models: false, encryption: 'none' });
+  }]);
+  cases.push(['export encryption: in LAN mode "Not encrypted" isn\'t offered (#676)', async page => {
+    await waitText(page, 'In LAN mode every export is encrypted.');
+    const choices = await encryptionChoices(page);
+    assert.deepEqual(choices.map(c => c.value), ['key', 'passphrase']);
+    await start(page, 'export');
+    assert.deepEqual(await sentBody(page, '/api/export'), { collection: A, include_models: false, encryption: 'key' });
+  }, { lanMode: true }]);
+  cases.push(['export: a finished key export offers Download key first, with the store-apart warning, and never shows the key (#676)', async page => {
+    await startAndPoll(page, 'export');
+    const done = JSON.parse(HALVES.export.done.body);
+    const name = 'ragpkg-vfy.tar.gz.age';
+    await release(page, HALVES.export.poll, json(200, { ...done, filename: name, encrypted: true, encryption: 'key', key_filename: name + '.key', key_on_server: true }));
+    await waitText(page, 'Download the key first.');
+    await waitText(page, 'Store it apart from the package');
+    await waitText(page, 'encrypted with a key');
+    const links = await page.evaluate(() => [...document.querySelectorAll('a')].filter(a => ['Download key', 'Download'].includes(a.textContent.trim()))
+      .map(a => ({ label: a.textContent.trim(), href: a.getAttribute('href'), download: a.hasAttribute('download') })));
+    assert.deepEqual(links.slice(0, 2), [
+      { label: 'Download key', href: '/api/packages/' + name + '.key', download: true },
+      { label: 'Download', href: '/api/packages/' + name, download: true }]);
+    assert.ok(!(await text(page)).includes('AGE-SECRET-KEY'), 'the key is shown as text');
+    // After the click the page re-reads the export until the key is gone.
+    await page.evaluate(() => document.addEventListener('click', e => e.preventDefault(), true));
+    await page.evaluate(() => [...document.querySelectorAll('a')].find(a => a.textContent.trim() === 'Download key').click());
+    await release(page, HALVES.export.poll, json(200, { ...done, filename: name, encrypted: true, encryption: 'key', key_filename: name + '.key', key_on_server: false }));
+    await waitText(page, 'Key downloaded and deleted from ./exports.');
+    assert.ok(!(await page.evaluate(() => [...document.querySelectorAll('a')].some(a => a.textContent.trim() === 'Download key'))), 'Download key still offered');
+  }]);
+  cases.push(['import encryption: a key package is labelled, asks for its key file, reads it in the browser and sends its text as key (#676)', async page => {
+    await release(page, '/api/packages', json(200, { packages: [...packagesBody.packages, keyedPackage] }));
+    await page.waitForFunction(n => [...document.querySelectorAll('option')].some(o => o.value === n), { timeout: 5000 }, KEYED);
+    const label = await page.evaluate(n => [...document.querySelectorAll('option')].find(o => o.value === n).textContent, KEYED);
+    assert.ok(label.includes('encrypted with a key, key on the server'), label);
+    await selectPackage(page, KEYED);
+    await waitText(page, 'This package is encrypted with its own key.');
+    assert.deepEqual(await passwords(page), [], 'a passphrase field for a key package');
+    assert.equal((await button(page, 'import')).disabled, true, 'Import enabled without a key file');
+    const keyText = '# public key: age1vfy\nAGE-SECRET-KEY-1VFYNOTAREALKEY\n';
+    await page.evaluate(t => {
+      const input = document.querySelector('input[type=file]');
+      const files = new DataTransfer();
+      files.items.add(new File([t], 'vfy.key'));
+      input.files = files.files;
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    }, keyText);
+    await waitText(page, 'Chosen: vfy.key.');
+    await expectButton(page, 'import', false);
+    assert.equal(await click(page, 'Import'), true, 'no Import button');
+    await pending(page, '/api/import', 'POST');
+    assert.deepEqual(await sentBody(page, '/api/import'), { filename: KEYED, on_conflict: 'abort', key: keyText });
+    assert.ok(!(await text(page)).includes('AGE-SECRET-KEY'), 'the key is shown as text');
+  }, { hold: ['GET /api/packages'] }]);
   cases.push(['import encryption: an encrypted package is labelled, asks for its passphrase and sends it; a plain one sends none (#27)', async page => {
     const label = await page.evaluate(n => [...document.querySelectorAll('option')].find(o => o.value === n)?.textContent || '', SEALED);
     assert.ok(label.includes('encrypted') && !label.includes('null'), label);
@@ -58697,11 +61125,13 @@ const CITATIONS = [
   { source_file: 'beta.txt', chunk_index: 0, score: null, excerpt: 'Second excerpt.' },
 ];
 // Answers for the pages a case may pass through; a case adds or overrides routes.
-const OPEN = { restricted: false, users: [], service_principals: [] };
+const OPEN = { restricted: false, users: [], service_principals: [], groups: [] };
 const base = (extra = {}) => ({
   'GET /api/collections': json(200, { collections: COLS }),
   // Each collection's access on the Collections page (#606): open unless a case says otherwise.
   'GET /api/collections/*': json(200, OPEN),
+  // The groups the Access dialog offers (#784): none unless a case says otherwise.
+  'GET /api/auth/groups': json(200, { groups: [] }),
   'GET /api/retrieval/config/*': call => json(200, retrievalConfig(call.path.split('/').pop())),
   'GET /api/packages': json(200, { packages: [] }),
   'GET /api/tune/*': call => json(200, { collection: call.path.split('/').pop(), fidelity: 'with-sources', source_document_count: 2, can_rechunk: true, can_reembed: true, can_reindex: true, note: '' }),
@@ -58783,7 +61213,7 @@ function collectionsCases() {
       await waitFor(s.page, () => !document.querySelector('.fixed.inset-0'), 'the dialog to close');
       const puts = callsTo(s, 'PUT', '/api/collections/' + B + '/access');
       assert.equal(puts.length, 2);
-      assert.deepEqual(puts[1].body, { restricted: true, users: ['vfy-developer'], service_principals: ['vfy-svc'] });
+      assert.deepEqual(puts[1].body, { restricted: true, users: ['vfy-developer'], service_principals: ['vfy-svc'], groups: [] });
       await waitText(s.page, 'Restricted (2)');
     } },
     { name: 'Access (#606): when the dialog cannot read the state, the choice stays unknown and Save is disabled', open: open({
@@ -58829,7 +61259,7 @@ function collectionsCases() {
         const puts = s.calls.filter(call => call.method === 'PUT');
         assert.equal(puts.length, 1);
         assert.equal(puts[0].path, '/api/collections/' + B + '/access');
-        assert.deepEqual(puts[0].body, { restricted: true, users: ['vfy-developer'], service_principals: [] });
+        assert.deepEqual(puts[0].body, { restricted: true, users: ['vfy-developer'], service_principals: [], groups: [] });
       } };
     })(),
     (() => {
@@ -58897,6 +61327,40 @@ function collectionsCases() {
         assert.equal(principalsReads, 2);
       } };
     })(),
+    { name: 'Access (#784): groups are offered with their member counts, counted in the column, and a ticked group is sent', open: open({
+      ['GET /api/collections/' + A + '/access']: json(200, { restricted: true, users: ['vfy-developer'], service_principals: [], groups: ['vfy-team'] }),
+      'GET /api/auth/users': json(200, { users: [] }),
+      'GET /api/auth/service-principals': json(200, { principals: [] }),
+      'GET /api/auth/groups': json(200, { groups: [
+        { name: 'vfy-solo', created_at: '2026-01-02T12:00:00Z', users: ['vfy-developer'], service_principals: [] },
+        { name: 'vfy-team', created_at: '2026-01-02T12:00:00Z', users: ['vfy-developer', 'vfy-off'], service_principals: ['vfy-svc'] },
+      ] }),
+      'PUT /api/collections/*': call => json(200, call.body),
+    }), async run(s) {
+      await waitText(s.page, 'Restricted (2)');
+      await (await s.page.$$('tbody button'))[0].click();   // row A: Access
+      await waitText(s.page, 'Access to ' + A);
+      await waitText(s.page, 'vfy-solo (1 member)');
+      await waitText(s.page, 'vfy-team (3 members)');
+      const groups = () => s.page.evaluate(() => [...[...document.querySelectorAll('.fixed fieldset')][2].querySelectorAll('input[type=checkbox]')].map(b => b.checked));
+      assert.deepEqual(await groups(), [false, true]);
+      await (await s.page.$$('.fixed fieldset'))[2].$$('input[type=checkbox]').then(b => b[0].click());
+      assert.deepEqual(await groups(), [true, true]);
+      await press(s.page, 'Save');
+      await waitFor(s.page, () => !document.querySelector('.fixed.inset-0'), 'the dialog to close');
+      const puts = callsTo(s, 'PUT', '/api/collections/' + A + '/access');
+      assert.deepEqual(puts.map(c => c.body), [{ restricted: true, users: ['vfy-developer'], service_principals: [], groups: ['vfy-team', 'vfy-solo'] }]);
+      await waitText(s.page, 'Restricted (3)');
+    } },
+    { name: 'Access (#784): a failed groups read shows its message in the dialog', open: open({
+      'GET /api/auth/users': json(200, { users: [] }),
+      'GET /api/auth/service-principals': json(200, { principals: [] }),
+      'GET /api/auth/groups': apiError(500, 'INTERNAL_ERROR', 'Synthetic groups failure.'),
+    }), async run(s) {
+      await waitText(s.page, A);
+      await (await s.page.$$('tbody button'))[0].click();
+      await waitText(s.page, 'Could not load the groups: Synthetic groups failure.');
+    } },
     { name: 'New Collection modal starts with HNSW, Cosine and the three HNSW sliders at their defaults and bounds', open: open(), async run(s) {
       await waitText(s.page, A);
       await press(s.page, '+ New Collection');
@@ -59092,7 +61556,7 @@ function navigationCases() {
 function navMenuCases() {
   const DATA = { key: 'data', label: 'Data', entries: ['Import', 'Prepare', 'Transfer'] };
   const TUNE = { key: 'tune', label: 'Tune', entries: ['Chunking', 'Retrieval', 'Gold Standard'] };
-  const ADMIN = { key: 'admin', label: 'Admin', entries: ['Collections', 'Users', 'Service keys', 'Audit', 'Health'] };
+  const ADMIN = { key: 'admin', label: 'Admin', entries: ['Collections', 'Users', 'Service keys', 'Groups', 'Audit', 'Health'] };
   const account = (username, badge) => ({ key: 'account', label: `${username} ${badge}`, entries: ['Account', 'Change password', 'Log out'] });
   const want = {
     end_user: [account('vfy-end-user', 'End User')],
@@ -59363,7 +61827,7 @@ function usersCases() {
   return [
     { name: 'Engineer\'s Admin menu has Users, which opens the Users page', open: { role: 'engineer', path: '/qa', routes: usersApi() }, async run(s) {
       await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
-      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Prepare', 'Transfer', 'Chunking', 'Retrieval', 'Gold Standard', 'Collections', 'Users', 'Service keys', 'Audit', 'Health']);
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Prepare', 'Transfer', 'Chunking', 'Retrieval', 'Gold Standard', 'Collections', 'Users', 'Service keys', 'Groups', 'Audit', 'Health']);
       await chooseFromMenu(s.page, 'admin', 'Users');
       await waitPath(s.page, '/users');
       await waitText(s.page, 'vfy-developer');
@@ -60017,10 +62481,10 @@ function auditCases() {
     return routes;
   };
   return [
-    { name: 'Engineer\'s Admin menu has Audit after Service keys, which opens the page', open: { role: 'engineer', path: '/qa', routes: auditApi() }, async run(s) {
+    { name: 'Engineer\'s Admin menu has Audit after Groups, which opens the page', open: { role: 'engineer', path: '/qa', routes: auditApi() }, async run(s) {
       await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
       const admin = (await readNav(s.page)).menus.find(m => m.key === 'admin').entries;
-      assert.equal(admin.indexOf('Audit'), admin.indexOf('Service keys') + 1);
+      assert.equal(admin.indexOf('Audit'), admin.indexOf('Groups') + 1);
       await chooseFromMenu(s.page, 'admin', 'Audit');
       await waitPath(s.page, '/audit');
       await waitText(s.page, 'nightly (key keyid0000001)');
@@ -60261,7 +62725,7 @@ function queryOnlyCases() {
     { name: 'Query-only Engineer: the nav shows the Query-only tag and Q&A, Transfer and the Admin pages, without Import, Prepare, Chunking, Retrieval or Gold Standard', open: qo('engineer', '/qa'), async run(s) {
       await ready(s.page);
       assert.equal(await tag(s.page), 'Query-only');
-      assert.deepEqual(await nav(s.page), ['Q&A', 'Transfer', 'Collections', 'Users', 'Service keys', 'Audit', 'Health']);
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Transfer', 'Collections', 'Users', 'Service keys', 'Groups', 'Audit', 'Health']);
     } },
     { name: 'Query-only Developer: the nav shows the tag, Q&A and Transfer, and no Tune menu', open: qo('developer', '/qa'), async run(s) {
       await ready(s.page);
@@ -60308,8 +62772,108 @@ function queryOnlyCases() {
       await waitText(s.page, A);
       await ready(s.page);
       assert.equal(await tag(s.page), null);
-      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Prepare', 'Transfer', 'Chunking', 'Retrieval', 'Gold Standard', 'Collections', 'Users', 'Service keys', 'Audit', 'Health']);
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Prepare', 'Transfer', 'Chunking', 'Retrieval', 'Gold Standard', 'Collections', 'Users', 'Service keys', 'Groups', 'Audit', 'Health']);
       assert.equal(await s.page.evaluate(() => [...document.querySelectorAll('main button')].some(b => b.textContent.trim() === '+ New Collection')), true);
+    } },
+  ];
+}
+
+// The Groups page (#784): Engineers manage groups for collection access. The
+// API is stubbed with a small in-memory list.
+function groupsCases() {
+  const group = (name, users = [], service_principals = []) => ({ name, created_at: '2026-10-01T12:00:00Z', users, service_principals });
+  const person = name => ({ username: name, role: 'developer', enabled: name !== 'vfy-off', must_change_password: false, created_at: '2026-01-02T12:00:00Z' });
+  const groupsApi = (extra = {}) => {
+    const list = [group('vfy-team', ['vfy-developer'], ['vfy-svc'])];
+    const find = call => list.find(g => g.name === decodeURIComponent(call.path.split('/')[4]));
+    return base({
+      'GET /api/auth/groups': () => json(200, { groups: JSON.parse(JSON.stringify(list)) }),
+      'GET /api/auth/users': json(200, { users: [person('vfy-developer'), person('vfy-off')] }),
+      'GET /api/auth/service-principals': json(200, { principals: [{ name: 'vfy-svc', role: 'end_user', enabled: true, created_at: '2026-01-02T12:00:00Z', keys: [] }] }),
+      'POST /api/auth/groups': call => {
+        if (list.some(g => g.name === call.body.name.toLowerCase())) return apiError(409, 'GROUP_EXISTS', `A group named '${call.body.name.toLowerCase()}' already exists.`);
+        const g = group(call.body.name.toLowerCase());
+        list.push(g);
+        return json(201, { group: g });
+      },
+      'POST /api/auth/groups/*': call => {
+        const g = find(call), action = call.path.split('/')[5];
+        if (!g) return apiError(404, 'GROUP_NOT_FOUND', 'There is no group.');
+        if (action === 'rename') { g.name = call.body.name.toLowerCase(); return json(200, { group: g }); }
+        list.splice(list.indexOf(g), 1);
+        return json(200, { name: g.name, collections: [A] });
+      },
+      'PUT /api/auth/groups/*': call => {
+        const g = find(call);
+        g.users = [...call.body.users].sort(); g.service_principals = [...call.body.service_principals].sort();
+        return json(200, { group: g });
+      },
+      ...extra,
+    });
+  };
+  const open = (extra = {}) => ({ role: 'engineer', path: '/groups', routes: groupsApi(extra) });
+  const rowButton = (page, name, label) => page.evaluate((n, l) => {
+    const b = [...document.querySelectorAll(`tr[data-group="${n}"] button`)].find(x => x.textContent.trim() === l);
+    if (!b) return false; b.click(); return true;
+  }, name, label);
+  return [
+    { name: 'Engineer\'s Admin menu has Groups after Service keys, which opens the page', open: { role: 'engineer', path: '/qa', routes: groupsApi() }, async run(s) {
+      await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
+      const admin = (await readNav(s.page)).menus.find(m => m.key === 'admin').entries;
+      assert.equal(admin.indexOf('Groups'), admin.indexOf('Service keys') + 1);
+      await chooseFromMenu(s.page, 'admin', 'Groups');
+      await waitPath(s.page, '/groups');
+      await waitText(s.page, 'vfy-team');
+    } },
+    ...['developer', 'end_user'].map(role => ({ name: `${role === 'developer' ? 'Developer' : 'End User'} has no Groups link and is sent from /groups to Q&A`, open: { role, path: '/groups', routes: base() }, async run(s) {
+      await waitText(s.page, 'Ask a Question');
+      await waitPath(s.page, '/qa');
+      assert.equal((await nav(s.page)).includes('Groups'), false);
+      assert.equal(callsTo(s, 'GET', '/api/auth/groups').length, 0);
+    } })),
+    { name: 'Groups page: create (a refused name shows the message), members, rename and delete (asks first)', open: open(), async run(s) {
+      await waitText(s.page, 'vfy-team');
+      const row = await s.page.evaluate(() => [...document.querySelector('tr[data-group="vfy-team"]').cells].slice(0, 3).map(c => c.textContent.trim()));
+      assert.deepEqual(row, ['vfy-team', 'vfy-developer', 'vfy-svc']);
+      await fill(s.page, '#new-group-name', 'VFY-Team');
+      await press(s.page, 'Create group');
+      await waitText(s.page, "A group named 'vfy-team' already exists.");
+      await fill(s.page, '#new-group-name', 'vfy-legal');
+      await press(s.page, 'Create group');
+      await waitFor(s.page, () => !!document.querySelector('tr[data-group="vfy-legal"]'), 'the new group');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/groups').map(c => c.body), [{ name: 'VFY-Team' }, { name: 'vfy-legal' }]);
+      assert.equal(await rowButton(s.page, 'vfy-legal', 'Members'), true);
+      await waitText(s.page, 'Members of vfy-legal');
+      await waitText(s.page, 'vfy-off (disabled)');
+      const boxes = await s.page.$$('.fixed input[type=checkbox]');
+      await boxes[1].click();   // vfy-off
+      await boxes[2].click();   // vfy-svc
+      await press(s.page, 'Save');
+      await waitFor(s.page, () => !document.querySelector('.fixed.inset-0'), 'the dialog to close');
+      assert.deepEqual(callsTo(s, 'PUT', '/api/auth/groups/vfy-legal/members').map(c => c.body), [{ users: ['vfy-off'], service_principals: ['vfy-svc'] }]);
+      assert.equal(await rowButton(s.page, 'vfy-legal', 'Rename'), true);
+      await waitText(s.page, 'Rename vfy-legal');
+      await fill(s.page, '.fixed input', 'vfy-counsel');
+      await press(s.page, 'Rename', '.fixed button');
+      await waitFor(s.page, () => !!document.querySelector('tr[data-group="vfy-counsel"]'), 'the renamed group');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/groups/vfy-legal/rename').map(c => c.body), [{ name: 'vfy-counsel' }]);
+      assert.equal(await rowButton(s.page, 'vfy-counsel', 'Delete'), true);
+      await waitText(s.page, 'Delete group vfy-counsel?');
+      await waitText(s.page, 'stays restricted');
+      assert.equal(callsTo(s, 'POST', '/api/auth/groups/vfy-counsel/delete').length, 0);   // asked first
+      await press(s.page, 'Delete', '.fixed button');
+      await waitFor(s.page, () => !document.querySelector('tr[data-group="vfy-counsel"]'), 'the group to go');
+      assert.equal(callsTo(s, 'POST', '/api/auth/groups/vfy-counsel/delete').length, 1);
+    } },
+    { name: 'Groups page: a refused rename keeps the dialog open with the message', open: open({
+      'POST /api/auth/groups/*': apiError(409, 'GROUP_EXISTS', "A group named 'vfy-x' already exists."),
+    }), async run(s) {
+      await waitText(s.page, 'vfy-team');
+      assert.equal(await rowButton(s.page, 'vfy-team', 'Rename'), true);
+      await fill(s.page, '.fixed input', 'vfy-x');
+      await press(s.page, 'Rename', '.fixed button');
+      await waitText(s.page, "A group named 'vfy-x' already exists.");
+      assert.equal(await modalOpen(s.page), true);
     } },
   ];
 }
@@ -60324,6 +62888,7 @@ async function runUiControlTests(browser, baseUrl, reporter) {
   await run('Users page: Engineers manage accounts (#25)', usersCases());
   await run('Two-step verification: account page, login code, forced set-up, Users page (#607)', mfaCases());
   await run('Service keys page: Engineers manage service principals and keys (#25)', serviceKeysCases());
+  await run('Groups page: Engineers manage groups for collection access (#784)', groupsCases());
   await run('Audit page: Engineers read the audit log (#29)', auditCases());
   await run('Prepare page: list, preview, upload, jobs, deletes and import (#638)', prepareCases());
   await run('Q&A input, citations toggle, answer display and End User view (#400)', qaCases());
@@ -60595,7 +63160,7 @@ function transferCases() {
       await waitFor(s.page, () => window.__forms !== undefined, 'page');
       await new Promise(r => setTimeout(r, 300));
       const posts = callsTo(s, 'POST', '/api/export');
-      assert.deepEqual(posts.map(c => c.body), [{ collection: A, include_models: false }, { collection: A, include_models: true }]);
+      assert.deepEqual(posts.map(c => c.body), [{ collection: A, include_models: false, encryption: 'key' }, { collection: A, include_models: true, encryption: 'key' }]);
     } },
     (() => {
       let phase = 'running';
@@ -61016,7 +63581,7 @@ def run(api, collection, exports, repo_root):
         loaded = request('/retrieval/config/' + collection)
         expect('legacy ef: the Retrieval page can still load the saved settings',
                loaded['ef'] == 10000 and loaded['top_k'] == 7, loaded)
-        job = wait('/export/job/' + request('/export', {'collection': collection,
+        job = wait('/export/job/' + request('/export', {'collection': collection, 'encryption': 'none',
                                                         'include_models': False})['job_id'])
         expect('legacy ef: export completes', job['status'] == 'completed', job)
         package = exports / job['filename']
@@ -61078,7 +63643,7 @@ def run(api, collection, exports, repo_root):
                                ([], ['not a JSON object'])]:
             write_saved(value)
             before = listing()
-            job = wait('/export/job/' + request('/export', {'collection': collection,
+            job = wait('/export/job/' + request('/export', {'collection': collection, 'encryption': 'none',
                                                             'include_models': False})['job_id'])
             error = job.get('error') or ''
             expect(f'invalid saved settings {value!r}: export fails', job['status'] == 'failed', job)
@@ -61213,7 +63778,7 @@ class Config:
     endpoint: str = field(default="", repr=False)
     headers: dict = field(default_factory=dict, repr=False)
     service: str = "rag-api"
-    version: str = "1.3.0"
+    version: str = "1.3.1"
     environment: str = "development"
     traces: bool = True
     logs: bool = True
@@ -61314,7 +63879,7 @@ class Config:
         if batch > queue:
             raise TelemetryConfigError("RAG_OTEL_BATCH_SIZE exceeds RAG_OTEL_QUEUE_SIZE")
         return cls(True, endpoint.rstrip("/"), headers,
-                   identifier("SERVICE_NAME", "rag-api"), identifier("SERVICE_VERSION", "1.3.0"),
+                   identifier("SERVICE_NAME", "rag-api"), identifier("SERVICE_VERSION", "1.3.1"),
                    identifier("ENVIRONMENT", "development"),
                    boolean("TRACES", True), boolean("LOGS", True), boolean("METRICS", True),
                    number("SAMPLE_RATIO", 1, 0, 1, False), queue, batch,
@@ -61332,7 +63897,7 @@ ENUMS = {
 SPAN_NAMES = frozenset("rag." + v for v in ENUMS["rag.operation"])
 
 # Explicit code-owned vocabulary. Raw URL/path values never enter this schema.
-ROUTES = frozenset(('DELETE /collections/{name}', 'DELETE /prepare/documents/{document_id}', 'DELETE /prepare/documents/{document_id}/prepared', 'GET /audit', 'GET /audit.csv', 'GET /auth/me', 'GET /auth/mfa', 'GET /auth/service-principals', 'GET /auth/status', 'GET /auth/users', 'GET /collections', 'GET /collections/{name}/access', 'GET /export/job/{job_id}', 'GET /export/jobs', 'GET /goldstandard/diagnostics', 'GET /goldstandard/download/{filename}', 'GET /goldstandard/session/{session_id}', 'GET /goldstandard/sessions', 'GET /health', 'GET /health/details', 'GET /help/transfer', 'GET /import/job/{job_id}', 'GET /import/jobs', 'GET /ingest/config/{collection}', 'GET /ingest/job/{job_id}', 'GET /ingest/jobs', 'GET /metrics/latency', 'GET /packages', 'GET /packages/{filename}', 'GET /prepare/documents', 'GET /prepare/documents/{document_id}', 'GET /prepare/documents/{document_id}/prepared', 'GET /prepare/documents/{document_id}/raw', 'GET /prepare/job/{job_id}', 'GET /prepare/jobs', 'GET /retrieval/config/{collection}', 'GET /tune/job/{job_id}', 'GET /tune/{collection}', 'PATCH /goldstandard/session/{session_id}/pair/{pair_id}', 'POST /auth/login', 'POST /auth/login/mfa', 'POST /auth/logout', 'POST /auth/mfa/disable', 'POST /auth/mfa/enroll', 'POST /auth/mfa/enroll/confirm', 'POST /auth/mfa/policy', 'POST /auth/mfa/recovery-codes', 'POST /auth/password', 'POST /auth/service-principals', 'POST /auth/service-principals/{name}/disable', 'POST /auth/service-principals/{name}/enable', 'POST /auth/service-principals/{name}/keys', 'POST /auth/service-principals/{name}/keys/{key_id}/revoke', 'POST /auth/service-principals/{name}/role', 'POST /auth/users', 'POST /auth/users/{username}/disable', 'POST /auth/users/{username}/enable', 'POST /auth/users/{username}/reset-mfa', 'POST /auth/users/{username}/reset-password', 'POST /auth/users/{username}/role', 'POST /collections', 'POST /export', 'POST /goldstandard/generate', 'POST /goldstandard/regenerate', 'POST /goldstandard/save', 'POST /import', 'POST /ingest/config', 'POST /ingest/upload', 'POST /prepare/import', 'POST /prepare/job/{job_id}/cancel', 'POST /prepare/jobs', 'POST /prepare/upload', 'POST /query', 'POST /retrieval/config', 'POST /tune/rechunk', 'POST /tune/reembed', 'POST /tune/reindex', 'PUT /collections/{name}/access'))
+ROUTES = frozenset(('DELETE /collections/{name}', 'DELETE /prepare/documents/{document_id}', 'DELETE /prepare/documents/{document_id}/prepared', 'GET /audit', 'GET /audit.csv', 'GET /auth/groups', 'GET /auth/me', 'GET /auth/mfa', 'GET /auth/service-principals', 'GET /auth/status', 'GET /auth/users', 'GET /collections', 'GET /collections/{name}/access', 'GET /export/job/{job_id}', 'GET /export/jobs', 'GET /goldstandard/diagnostics', 'GET /goldstandard/download/{filename}', 'GET /goldstandard/session/{session_id}', 'GET /goldstandard/sessions', 'GET /health', 'GET /health/details', 'GET /help/transfer', 'GET /import/job/{job_id}', 'GET /import/jobs', 'GET /ingest/config/{collection}', 'GET /ingest/job/{job_id}', 'GET /ingest/jobs', 'GET /metrics/latency', 'GET /packages', 'GET /packages/{filename}', 'GET /prepare/documents', 'GET /prepare/documents/{document_id}', 'GET /prepare/documents/{document_id}/prepared', 'GET /prepare/documents/{document_id}/raw', 'GET /prepare/job/{job_id}', 'GET /prepare/jobs', 'GET /retrieval/config/{collection}', 'GET /tune/job/{job_id}', 'GET /tune/{collection}', 'PATCH /goldstandard/session/{session_id}/pair/{pair_id}', 'POST /auth/groups', 'POST /auth/groups/{name}/delete', 'POST /auth/groups/{name}/rename', 'POST /auth/login', 'POST /auth/login/mfa', 'POST /auth/logout', 'POST /auth/mfa/disable', 'POST /auth/mfa/enroll', 'POST /auth/mfa/enroll/confirm', 'POST /auth/mfa/policy', 'POST /auth/mfa/recovery-codes', 'POST /auth/password', 'POST /auth/service-principals', 'POST /auth/service-principals/{name}/disable', 'POST /auth/service-principals/{name}/enable', 'POST /auth/service-principals/{name}/keys', 'POST /auth/service-principals/{name}/keys/{key_id}/revoke', 'POST /auth/service-principals/{name}/role', 'POST /auth/users', 'POST /auth/users/{username}/disable', 'POST /auth/users/{username}/enable', 'POST /auth/users/{username}/reset-mfa', 'POST /auth/users/{username}/reset-password', 'POST /auth/users/{username}/role', 'POST /collections', 'POST /export', 'POST /goldstandard/generate', 'POST /goldstandard/regenerate', 'POST /goldstandard/save', 'POST /import', 'POST /ingest/config', 'POST /ingest/upload', 'POST /prepare/import', 'POST /prepare/job/{job_id}/cancel', 'POST /prepare/jobs', 'POST /prepare/upload', 'POST /query', 'POST /retrieval/config', 'POST /tune/rechunk', 'POST /tune/reembed', 'POST /tune/reindex', 'PUT /auth/groups/{name}/members', 'PUT /collections/{name}/access'))
 ENUMS.update({"http.route": ROUTES | {"unmatched"},
               "rag.tuning_operation": frozenset(("rechunk", "reembed", "reindex")),
               "http.status_class": frozenset(("1xx", "2xx", "3xx", "4xx", "5xx"))})
@@ -62583,7 +65148,7 @@ class TelemetryTests(unittest.TestCase):
                 self.assertNotIn(SECRET.encode(), body)
             traces = ExportTraceServiceRequest.FromString(by_path['/v1/traces'])
             resource = {a.key: a.value.string_value for a in traces.resource_spans[0].resource.attributes}
-            self.assertEqual(resource, {'service.name':'rag-api', 'service.version':'1.3.0', 'deployment.environment.name':'development'})
+            self.assertEqual(resource, {'service.name':'rag-api', 'service.version':'1.3.1', 'deployment.environment.name':'development'})
             span = traces.resource_spans[0].scope_spans[0].spans[0]
             self.assertEqual(span.name, 'rag.operation')
             self.assertFalse(span.events);self.assertFalse(span.links);self.assertFalse(span.status.message)
@@ -62673,7 +65238,7 @@ class TelemetryTests(unittest.TestCase):
                 processor = runtime._providers[0]._multi_log_record_processor._log_record_processors[0]._batch_processor
                 self.assertEqual(len(processor._queue), 2)
                 for queued in processor._queue:
-                    self.assertEqual(dict(queued.resource.attributes), {'service.name':'rag-api', 'service.version':'1.3.0', 'deployment.environment.name':'development'})
+                    self.assertEqual(dict(queued.resource.attributes), {'service.name':'rag-api', 'service.version':'1.3.1', 'deployment.environment.name':'development'})
                     self.assertFalse(queued.resource.schema_url)
                     self.assertEqual(queued.instrumentation_scope.name, 'rag.telemetry')
                     self.assertFalse(queued.instrumentation_scope.version)
@@ -66073,6 +68638,9 @@ class Packager(unittest.TestCase):
                 # resolved from the compose settings by models.sh and compose-models.sh (#671).
                 (root/'ollama').mkdir()
                 for name in ('entrypoint.sh','models.sh','compose-models.sh'):shutil.copy(ROOT/'ollama'/name,root/'ollama'/name)
+                # It also tags and saves the backup scripts' age image (#852).
+                (root/'scripts/age').mkdir()
+                for name in ('backup-common.sh','age/Dockerfile'):shutil.copy(ROOT/'scripts'/name,root/'scripts'/name)
                 (root/'scripts/collector_offline.py').write_text("from pathlib import Path\nimport sys\nPath(sys.argv[2],'collector.tar').touch()\n")
                 stub=root/'bin/docker'
                 stub.write_text("""#!/usr/bin/env python3
@@ -66471,7 +69039,7 @@ services:
     environment:
       RAG_OTEL_ENABLED: "${RAG_VERIFY_OTEL_ENABLED:-true}"
       RAG_OTEL_PROTOCOL: http/protobuf
-      RAG_OTEL_SERVICE_VERSION: "1.3.0"
+      RAG_OTEL_SERVICE_VERSION: "1.3.1"
       RAG_OTEL_QUEUE_SIZE: "256"
       RAG_OTEL_BATCH_SIZE: "64"
       RAG_OTEL_ENDPOINT: http://otel-collector:4318
@@ -66525,7 +69093,9 @@ volumes:
 #   * the source tree: the files git tracks in the current commit (HEAD),
 #     built with `git archive`, exactly as package.sh does. Untracked and
 #     ignored files and uncommitted changes are left out (#384).
-#   * all five Docker images, pre-built (docker save)
+#   * all five Docker images, pre-built (docker save), and the age image that
+#     scripts/backup.sh and scripts/restore.sh run in (#852), so backups work
+#     on the target with no network
 #   * the Ollama model weights (by default llama3.1:8b + nomic-embed-text; a
 #     different build or answer LLM too, #671), the whole model volume: a model
 #     left in it, such as phi3.5 from before 1.2.1, is carried too
@@ -66621,8 +69191,15 @@ echo "==> Copying source (tracked files of the current commit)"
 # root and the user cannot drop files into ./ingest-inbox.
 git archive --format=tar HEAD | ( cd "$STAGE/rag-docker" && tar xf - )
 
+# The age image, tagged from the bundle's own scripts/age/Dockerfile (the copy
+# just archived), so the backup scripts on the target find it and never build.
+# It is built here if this machine doesn't have it (this needs the network).
+echo "==> Checking the age image for scripts/backup.sh and scripts/restore.sh"
+. "$STAGE/rag-docker/scripts/backup-common.sh"
+rb_image
+
 echo "==> Saving images (this is the slow part)"
-docker save "${IMAGES[@]}" | gzip > "$STAGE/rag-docker/offline/images.tar.gz"
+docker save "${IMAGES[@]}" "$RB_IMAGE" | gzip > "$STAGE/rag-docker/offline/images.tar.gz"
 
 if [ "$TELEMETRY" = 1 ]; then
   echo "==> Saving optional pinned collector (Python 3.11+ required)"

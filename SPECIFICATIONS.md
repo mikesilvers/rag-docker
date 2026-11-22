@@ -395,13 +395,17 @@ controls, and keeps the Collections page's list and Access without "+ New Collec
 - Refusals, before the package is read: `NOT_QUERY_ONLY` (the instance isn't query-only), `LOAD_IN_PROGRESS` (another
   load holds `loader.lock` in `UPLOAD_DIR`, a non-blocking exclusive `flock` held for the whole load),
   `PACKAGE_NOT_FOUND` (not a regular file in `./exports`), `PASSPHRASE_REQUIRED` (an encrypted package and an empty
-  passphrase).
+  passphrase), `KEY_FILE_REQUIRED` (a key package and no key on standard input) and `KEY_FILE_INVALID` (what was given isn't an
+  age key file, or is longer than 4096 characters) (#676).
 - It runs the import code of `POST /import` (`services/importer.py`) in its own process, so every check of §6.2 and
   §6.3 of `RAG_EXPORT_SPECIFICATIONS.md` applies, the embedding model and dimensions included (#390), bundled models
   are installed and the sidecars restored. Its job record stays in its own memory; the API's job lists don't show it.
   Under the lock and before the load it runs the import's sweep of an interrupted import, as the API does at start-up.
-- An encrypted package's passphrase is read from the terminal without echo, or as the first line of standard input
-  when that isn't a terminal; never an argument, never printed or recorded.
+- An encrypted package's age header says which secret opens it (#676). A key package's key is read from the terminal
+  without echo (the `AGE-SECRET-KEY-1...` line), or as the whole of standard input, the key file itself, when that
+  isn't a terminal. A passphrase package's passphrase is read from the terminal without echo, or as the first line of
+  standard input. Neither is ever an argument, printed or recorded; the `operator.load` record's details add
+  `encryption` (`key` or `passphrase`).
 - Every collection it creates starts restricted with no grants (Engineers only, until one opens or grants it): a
   `rename`, or a package of a staging or recovery copy whose base exists here, too. It never copies another
   collection's state (maintainer, 2026-11-18). `replace` keeps the target's state; a failed load puts back the state
@@ -1595,7 +1599,7 @@ one may. The role of a request is the one stored for its user at that moment, ne
 | any session, after a due password change (also one with a two-step set-up due) | `GET /auth/mfa`, `POST /auth/mfa/enroll`, `POST /auth/mfa/enroll/confirm`, `POST /auth/mfa/recovery-codes`, `POST /auth/mfa/disable` |
 | `end_user` | `GET /collections`, `POST /query`, `GET /retrieval/config/{collection}` |
 | `developer` | `GET /health/details`; `POST /collections`; `POST /ingest/upload`, `GET /ingest/job/{job_id}`, `GET /ingest/jobs`, `GET /ingest/config/{collection}`, `POST /ingest/config`; `POST /retrieval/config`; `POST /goldstandard/generate`, `GET /goldstandard/session/{session_id}`, `GET /goldstandard/sessions`, `PATCH /goldstandard/session/{session_id}/pair/{pair_id}`, `POST /goldstandard/regenerate`, `POST /goldstandard/save`, `GET /goldstandard/download/{filename}`; `POST /export`, `GET /export/job/{job_id}`, `GET /export/jobs`, `POST /import`, `GET /import/job/{job_id}`, `GET /import/jobs`, `GET /packages`, `GET /packages/{filename}` (#677), `GET /help/transfer`; `GET /tune/{collection}`; document preparation (§3.1.11): `POST /prepare/upload`, `GET /prepare/documents`, `GET /prepare/documents/{document_id}`, `GET /prepare/documents/{document_id}/raw`, `GET /prepare/documents/{document_id}/prepared`, `DELETE /prepare/documents/{document_id}`, `DELETE /prepare/documents/{document_id}/prepared`, `POST /prepare/jobs`, `GET /prepare/jobs`, `GET /prepare/job/{job_id}`, `POST /prepare/job/{job_id}/cancel`, `POST /prepare/import` |
-| `engineer` | `DELETE /collections/{name}`; per-collection access (#606, browser sessions only): `GET /collections/{name}/access`, `PUT /collections/{name}/access`; `POST /tune/rechunk`, `POST /tune/reembed`, `POST /tune/reindex`, `GET /tune/job/{job_id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; FastAPI's `GET /docs`, `GET /docs/oauth2-redirect`, `GET /redoc`, `GET /openapi.json`; account administration: `GET /auth/users`, `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `POST /auth/users/{username}/role`, `POST /auth/users/{username}/disable`, `POST /auth/users/{username}/enable`, `POST /auth/users/{username}/reset-mfa`, `POST /auth/mfa/policy`; service principals and keys: `GET /auth/service-principals`, `POST /auth/service-principals`, `POST /auth/service-principals/{name}/role`, `POST /auth/service-principals/{name}/disable`, `POST /auth/service-principals/{name}/enable`, `POST /auth/service-principals/{name}/keys`, `POST /auth/service-principals/{name}/keys/{key_id}/revoke`; the audit log (§3.1.9): `GET /audit`, `GET /audit.csv` |
+| `engineer` | `DELETE /collections/{name}`; per-collection access (#606, browser sessions only): `GET /collections/{name}/access`, `PUT /collections/{name}/access`; `POST /tune/rechunk`, `POST /tune/reembed`, `POST /tune/reindex`, `GET /tune/job/{job_id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; FastAPI's `GET /docs`, `GET /docs/oauth2-redirect`, `GET /redoc`, `GET /openapi.json`; account administration: `GET /auth/users`, `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `POST /auth/users/{username}/role`, `POST /auth/users/{username}/disable`, `POST /auth/users/{username}/enable`, `POST /auth/users/{username}/reset-mfa`, `POST /auth/mfa/policy`; service principals and keys: `GET /auth/service-principals`, `POST /auth/service-principals`, `POST /auth/service-principals/{name}/role`, `POST /auth/service-principals/{name}/disable`, `POST /auth/service-principals/{name}/enable`, `POST /auth/service-principals/{name}/keys`, `POST /auth/service-principals/{name}/keys/{key_id}/revoke`; groups for collection access (#784, browser sessions only): `GET /auth/groups`, `POST /auth/groups`, `POST /auth/groups/{name}/rename`, `PUT /auth/groups/{name}/members`, `POST /auth/groups/{name}/delete`; the audit log (§3.1.9): `GET /audit`, `GET /audit.csv` |
 
 The matrix is one table in `api/auth/policy.py`. A route without an entry is refused for everyone (`403
 FORBIDDEN`), and a registered check fails when a route lacks an entry or an entry names no route. Jobs and
@@ -1721,8 +1725,9 @@ enabled. The account routes stay for people: `GET /auth/users` lists no principa
 
 **Per-collection access** (#606). A collection is *open* or *restricted*. A restricted collection may be used
 only by Engineers and the accounts granted it: people and service principals (a key acts as its principal, so all
-of a principal's keys share its grants). Grants are per account; there are no groups. A granted account does on the
-collection everything its role allows; an ungranted one can do nothing with it. Engineers reach every collection.
+of a principal's keys share its grants), directly or as a member of a group granted it (**Groups**, below, #784). A
+granted account does on the collection everything its role allows; an ungranted one can do nothing with it. Engineers
+reach every collection.
 The state is in `auth.db` (schema version 4, tables `restricted_collections` and `collection_grants`, keyed by the
 stored collection name): a store from before #606 gains the empty tables on first open, so every existing
 collection stays open. A staging or recovery collection of a rebuild or import (`<target>__tuning_<token>`,
@@ -1794,11 +1799,44 @@ disabled or its role changes; an Engineer demoted to a lower role is then bound 
 
 | Route | Request | Success |
 |---|---|---|
-| `GET /collections/{name}/access` | | `200 {"restricted", "users", "service_principals"}`, names sorted. No such collection: `404 COLLECTION_NOT_FOUND`; Weaviate unavailable: `503 SERVICE_UNAVAILABLE` |
-| `PUT /collections/{name}/access` | `{"restricted", "users": [...], "service_principals": [...]}` (lists default `[]`, no other field) | The whole state at once, in one transaction; answers as the GET. `restricted: false` opens it and deletes its grants (names with it are `422 INVALID_PARAMETER`); `restricted: true` grants exactly the people in `users` and the principals in `service_principals` (lowercased; disabled accounts allowed; none means Engineers only). An unknown name, or one of the other kind, is `422 INVALID_PARAMETER` and changes nothing. One `collection.access` audit record with `restricted_before`, `restricted_after`, `added` and `removed`, and one API log line |
+| `GET /collections/{name}/access` | | `200 {"restricted", "users", "service_principals", "groups"}`, names sorted. No such collection: `404 COLLECTION_NOT_FOUND`; Weaviate unavailable: `503 SERVICE_UNAVAILABLE` |
+| `PUT /collections/{name}/access` | `{"restricted", "users": [...], "service_principals": [...], "groups": [...]}` (lists default `[]`, no other field; a body without `groups` grants no group) | The whole state at once, in one transaction; answers as the GET. `restricted: false` opens it and deletes its grants (names with it are `422 INVALID_PARAMETER`); `restricted: true` grants exactly the people in `users`, the principals in `service_principals` and the groups in `groups` (lowercased; disabled accounts allowed; none means Engineers only). An unknown name, one of the other kind, or a group that doesn't exist is `422 INVALID_PARAMETER` and changes nothing. One `collection.access` audit record with `restricted_before`, `restricted_after`, `added` and `removed` (each `{users, service_principals, groups}`), and one API log line |
 
 Both are Engineers' routes for a browser session only: a key gets `403 KEY_NOT_ALLOWED`, so a leaked key can't open a
 collection to another principal. The Collections page (§7.8) manages them.
+
+**Groups** (#784). Engineers make groups of people and service principals and grant restricted collections to them
+(`groups` in `PUT /collections/{name}/access`). A member may use a collection while both the group's grant and their
+membership hold. The state is in `auth.db` (schema version 5, tables `groups`, `group_members` and
+`collection_group_grants`); a store from before gains the empty tables on first open, so nothing changes on upgrade.
+A group name follows the username rule (3-32 characters: lowercase letters, digits, `.`, `_`, `-`; stored
+lowercased) in its own namespace; members are people and service principals of any role, enabled or disabled (a
+disabled account stays a member); a group can't be a member. Members and grants name the group's id, so a rename
+keeps them. Deleting a group removes its members and every collection grant to it in one transaction; a collection
+granted only to it stays restricted (Engineers and any other grants), so a delete never opens anything. Deleting,
+opening or discarding a collection drops its group grants with its other state. Every change applies to each
+session's and key's next request, as a grant does. A copy (an import under a new name, a staging or recovery copy)
+takes its source's group grants with its account grants; across a chain it keeps an account or a group only when
+every restricted collection in the chain grants that same account directly or that same group, so it is never wider
+than any of them, and a group grant stays a group grant (a membership change reaches the copy too). A failed create
+or import puts group grants back like account grants; a group is matched by its identity, not its name, so a group
+deleted since is left out even when another of the same name has been made, and a group renamed since is put back.
+A new collection starts with no group. Groups don't change roles, and the operator command has no group commands
+(Engineers reach every collection).
+
+| Route | Request | Success |
+|---|---|---|
+| `GET /auth/groups` | | `200 {"groups": [{"name", "created_at", "users", "service_principals"}, ...]}`, groups and names sorted |
+| `POST /auth/groups` | `{"name"}` | `201 {"group"}`, with no members |
+| `POST /auth/groups/{name}/rename` | `{"name"}` (the new name) | `200 {"group"}`; its own name changes nothing |
+| `PUT /auth/groups/{name}/members` | `{"users": [...], "service_principals": [...]}` (lists default `[]`, at most 1000 names of at most 64 characters, no other field) | `200 {"group"}`: the members are exactly those named |
+| `POST /auth/groups/{name}/delete` | | `200 {"name", "collections"}`: the collections whose grant to it was removed, sorted |
+
+All five are Engineers' routes for a browser session only (`403 KEY_NOT_ALLOWED` for a key); nothing under `/auth`
+uses DELETE. Refusals: a new name that breaks the rule `422 INVALID_GROUP_NAME`; a name another group has `409
+GROUP_EXISTS`; a group in the path that doesn't exist `404 GROUP_NOT_FOUND`; a member that is no person (in
+`users`) or no service principal (in `service_principals`) `422 INVALID_PARAMETER`, changing nothing. Each change
+and refusal is one API log line and an audit record (§3.1.9). The Groups page (§7.18) manages them.
 
 **Two-step verification** (#607). TOTP with an authenticator app; no SMS and no external service, so it works
 offline. Service keys are unchanged: they have no second factor and get `403 KEY_NOT_ALLOWED` on every `/auth/mfa`
@@ -1911,7 +1949,7 @@ built yet; it is to include this folder.
 `collection.create`, `collection.delete`; per-collection access (#606): `collection.access` (`restricted_before`,
 `restricted_after`, `added`, `removed`), `collection.access.refused` (a refused collection on a route with no action
 of its own); `ingest`, `ingest.config`; `retrieval.config`; `export`, `import`; export packages (#677):
-`package.download` (each `GET` or `HEAD` of `/packages/{filename}`, `details.file`; `details.completed` for a `GET`,
+`package.download` (each `GET` or `HEAD` of `/packages/{filename}`, a key file's included (#676), `details.file`; `details.completed` for a `GET`,
 `details.head: true` for a `HEAD`) and `package.delete`
 (each deletion of a package, `details.file` and `details.reason` `downloaded`, with the downloading caller as actor,
 or `expired`, actor `system`; written directly, not by a request);
@@ -1922,7 +1960,11 @@ code attempt that reaches a live challenge, never counted in a window: actor the
 `recovery`; a request with no live challenge writes nothing; the password step before it is `auth.login` with
 `details.mfa` `required`), `auth.mfa.enroll`, `auth.mfa.recovery-codes`, `auth.mfa.disable`;
 `admin.principal.create`, `admin.principal.set-role`, `admin.principal.disable`, `admin.principal.enable`,
-`admin.key.issue`, `admin.key.revoke`; `audit.view`, `audit.download`; `operator.bootstrap`, `operator.create-user`,
+`admin.key.issue`, `admin.key.revoke`; groups for collection access (#784): `admin.group.create`,
+`admin.group.rename` (`target` the old name, `details.name` the new), `admin.group.members` (`added` and `removed`,
+each `{users, service_principals}`), `admin.group.delete` (`details.collections`: those whose grant to it was
+removed; `details.removed`: the members it removed, `{users, service_principals}`); `audit.view`,
+`audit.download`; `operator.bootstrap`, `operator.create-user`,
 `operator.reset-password`, `operator.set-role`, `operator.disable`, `operator.enable`, `operator.reset-mfa` (`python -m auth`; not `list`,
 not usage errors); `operator.load` (`python -m loader`, §2.6; not usage errors); `system.start` (each API start, after the job records are loaded, with `question_text_logged`,
 `max_bytes` and `keep`); document preparation (§3.1.11): `prepare.upload` (names, count, bytes), `prepare.start`
@@ -1951,7 +1993,8 @@ this feature get no end record.
 **Details.** `query`: `retrieval_mode`, `top_k`, `alpha`, `response_format`, `include_citations`, and `question`
 only when `AUDIT_LOG_QUESTIONS=true` (exactly `true` or `false`, default `false`; anything else stops the API);
 never the answer. `ingest`: `files` (names), `file_count`, `total_bytes`. `export`: `include_models`, `encrypted`,
-and at the end `package` and `fidelity`. `import`: `package`, `on_conflict`, `encrypted`; the end record's
+`encryption` (`key`, `passphrase` or `none`, #676), and at the end `package` and `fidelity`. `import`: `package`,
+`on_conflict`, `encrypted`, `encryption` (by the secret sent, never the secret); the end record's
 `collection` is the one imported into. `tune.*`: `operation`. `goldstandard.save` and `goldstandard.download`:
 `file` (and `session_id` for save). Admin actions: `role` for creates and role changes, `key_id` (and `expires_at`
 on issue) for keys. Audit reads: the filters given. Operator actions: `role` where given, `code` when refused.
@@ -2217,6 +2260,10 @@ Standard error codes:
 | `FILE_NOT_FOUND` | 404 | Requested download file does not exist |
 | `PACKAGE_NOT_FOUND` | 404 | `GET /packages/{filename}`: no such package in `./exports`, a name outside the rule, or one the caller may not see (#677) |
 | `PACKAGE_BUSY` | 409 | `GET /packages/{filename}`: an import of the package runs or another download of it is in progress (#677) |
+| `ENCRYPTION_REQUIRED` | 400 | `POST /export` with `encryption: "none"` in LAN mode (#676) |
+| `KEY_FILE_REQUIRED` | 400 | `POST /import` of a package encrypted with a key, sent without `key` (#676) |
+| `KEY_FILE_INVALID` | 400 | `POST /import` with a `key` that isn't the text of an age X25519 key file (#676) |
+| `KEY_FILE_NOT_EXPECTED` | 400 | `POST /import` with a `key` for an unencrypted package (#676) |
 | `EXPORTS_FOLDER_INVALID` | 409 | Gold-standard save or download refused: `goldstandard_exports` in `UPLOAD_DIR` is a file or a symbolic link, not a directory; move or rename it |
 | `PAIR_NOT_FOUND` | 404 | pair_id not found within the given session |
 | `SESSION_BUSY` | 409 | Operation not allowed while session is still generating |
@@ -2238,9 +2285,12 @@ Standard error codes:
 | `LAST_ENGINEER` | 409 | The change would demote or disable the last enabled engineer |
 | `SELF_RESET_REFUSED` | 409 | An engineer's reset of their own password; they use `POST /auth/password` |
 | `KEY_INVALID` | 401 | An `Authorization` header that isn't one valid `Bearer` key: unknown, malformed, expired, revoked or of a disabled principal |
-| `KEY_NOT_ALLOWED` | 403 | An API key on account, principal or key administration, logout, password change or the audit log |
+| `KEY_NOT_ALLOWED` | 403 | An API key on account, principal, key or group administration, logout, password change or the audit log |
 | `PRINCIPAL_EXISTS` | 409 | `POST /auth/service-principals`: a person or principal already has the name |
 | `PRINCIPAL_NOT_FOUND` | 404 | No service principal has the name in the path |
+| `INVALID_GROUP_NAME` | 422 | `POST /auth/groups` or `POST /auth/groups/{name}/rename`: the new name breaks the rule; the message states it |
+| `GROUP_EXISTS` | 409 | `POST /auth/groups` or `POST /auth/groups/{name}/rename`: a group already has the name |
+| `GROUP_NOT_FOUND` | 404 | No group has the name in the path |
 | `KEY_NOT_FOUND` | 404 | The principal has no key with the id in the path |
 
 ---
@@ -2331,7 +2381,7 @@ Long-running, so it follows the same job-and-poll shape as `/ingest/upload`.
 
 **Request body:**
 ```json
-{ "collection": "Policies", "include_models": false }
+{ "collection": "Policies", "include_models": false, "encryption": "key" }
 ```
 
 `include_models: true` bundles the embedding model and the answer LLM (never the build LLM) into the package
@@ -2339,17 +2389,27 @@ Long-running, so it follows the same job-and-poll shape as `/ingest/upload`.
 The job reports `models_bundled` — what the package actually carries, which is
 `false` with an explanation in `warnings` if the request could not be honoured.
 
-An optional `passphrase` (12 to 1024 characters, any characters) writes the
-package encrypted, as `<stem>.tar.gz.age`: an age v1 file with one scrypt
-(passphrase) recipient, work factor 18, streamed in 64 KiB chunks so no
-unencrypted archive is written and the package is never held in memory
-(`RAG_EXPORT_SPECIFICATIONS.md` §4.6; #27). Without it the export is unencrypted,
-as before. The passphrase is never stored in the job record, logged, attached to
-telemetry or returned; the job reports `encrypted`.
+`encryption` says how the package is encrypted (#676):
+
+- `"key"`, the default: the package is written as `<stem>.tar.gz.age`, an age v1 file with one `X25519` recipient, a
+  key generated for this package alone. Its secret key is written once, to the key file `<stem>.tar.gz.age.key` beside
+  the package, mode 0600, in age's identity file layout (`# created:`, `# public key: age1...`, a comment naming the
+  package and saying to store the key apart, then the `AGE-SECRET-KEY-1...` line), so `age -d -i` opens it. The key
+  file is written first and both are renamed into place only once both are written; a failed export leaves neither.
+- `"passphrase"`, with a `passphrase` (12 to 1024 characters, any characters): an age v1 file with one scrypt
+  (passphrase) recipient, work factor 18 (#27).
+- `"none"`: an unencrypted `<stem>.tar.gz`. Refused **400 `ENCRYPTION_REQUIRED`** in LAN mode (`RAG_LAN_MODE=true`),
+  before the collection is checked and before any job.
+
+Left out, `encryption` is `"passphrase"` when the request has a `passphrase` and `"key"` when it doesn't. Either kind
+is streamed in 64 KiB chunks, so no unencrypted archive is written and the package is never held in memory
+(`RAG_EXPORT_SPECIFICATIONS.md` §4.6). The passphrase and the key are never stored in the job record, logged,
+attached to telemetry or returned (the key file and its download excepted); the job reports `encrypted`,
+`encryption` and, for a key export, `key_filename`, and its status `key_on_server` (`GET /export/job/{job_id}` below).
 
 - **422 `INVALID_PARAMETER`** for a `passphrase` shorter than 12 or longer than
-  1024 characters, or one with no UTF-8 form (a lone surrogate). No job is created, and the response does not contain the
-  passphrase.
+  1024 characters, or one with no UTF-8 form (a lone surrogate), for `"passphrase"` without a passphrase, and for a
+  passphrase with `"key"` or `"none"`. No job is created, and the response does not contain the passphrase.
 
 **Response 202:**
 ```json
@@ -2399,17 +2459,25 @@ GET /export/job/{job_id}
   "status": "completed",
   "collection": "Policies",
   "chunks_written": 1842,
-  "filename": "ragpkg-policies-20260918T153127Z-c5c39e72.tar.gz",
+  "filename": "ragpkg-policies-20260918T153127Z-c5c39e72.tar.gz.age",
   "size_bytes": 22273,
   "source_document_count": 37,
   "fidelity": "with-sources",
   "models_bundled": false,
   "retrieve_script": true,
-  "encrypted": false,
+  "encrypted": true,
+  "encryption": "key",
+  "key_filename": "ragpkg-policies-20260918T153127Z-c5c39e72.tar.gz.age.key",
+  "key_on_server": true,
   "warnings": [],
   "error": null
 }
 ```
+
+`encryption` is `key`, `passphrase` or `none` (a record from before #676 reads
+`passphrase` when `encrypted` is true, else `none`). A key export names its key
+file in `key_filename`, never its contents, and `key_on_server` is true while
+that file is still in `./exports`; `GET /export/jobs` entries carry both (#676).
 
 `status` is `queued`, `running`, `completed` or `failed`; an export waiting for its
 collection's writer guard reads `queued` (#509). On failure `error`
@@ -2449,8 +2517,9 @@ follows the job-and-poll pattern.
 could destroy a collection the caller did not mean to touch. It is one of
 `abort`, `rename` or `replace` (spec §6.4).
 
-`passphrase` is required for an encrypted package, one whose name ends in
-`.tar.gz.age`, and refused for any other (#27). It is not checked for length
+An encrypted package, one whose name ends in `.tar.gz.age`, takes the secret its age header names (#676). A key
+package takes `key`, the text of its key file (at most 4096 characters), which is never stored, logged, attached to
+telemetry or returned. A passphrase package takes `passphrase` (#27), which is not checked for length
 here; one with no UTF-8 form (a lone surrogate) is refused `422
 INVALID_PARAMETER`, as on export. The job decrypts the package as a stream while unpacking it, and every
 check from the manifest on reads the decrypted files; it is never stored in the
@@ -2459,17 +2528,21 @@ job record, logged, attached to telemetry or returned. The job reports
 
 **Response 202:** `{ "job_id": "...", "status": "queued", "filename": "..." }`
 
-- **400 `PASSPHRASE_REQUIRED`** for a `.tar.gz.age` package sent without a
-  passphrase, and **400 `PASSPHRASE_NOT_EXPECTED`** for a passphrase sent with any
-  other package. Both are decided by the filename, before any job exists, and
-  change nothing; `detail` is `{"filename": "<as sent>"}`.
+- **400 `KEY_FILE_REQUIRED`** for a key package sent without `key`, a passphrase alone included, and **400 `KEY_FILE_INVALID`**
+  for a `key` that isn't the text of an age X25519 key file (#676).
+- **400 `PASSPHRASE_REQUIRED`** for a passphrase package sent without a
+  passphrase, a key alone included, or a `.tar.gz.age` whose header can't be read sent with no secret; with either
+  secret, that one's job fails at check 1. **400 `PASSPHRASE_NOT_EXPECTED`** and **400 `KEY_FILE_NOT_EXPECTED`** for a
+  secret sent with an unencrypted package. All are decided by the filename and the header alone (no scrypt or X25519
+  work), before any job exists, and change nothing; `detail` is `{"filename": "<as sent>"}`.
+- **422 `INVALID_PARAMETER`** for both `key` and `passphrase`.
 
 **409 `IMPORT_IN_PROGRESS`** if the same package file is already being imported:
 the file's name in `./exports` is compared, so `x.tar.gz`, `./x.tar.gz` and
 `a/../x.tar.gz` are one file (#391).
 
 Everything else — unreadable archive, a wrong passphrase or a damaged encrypted
-package (`DECRYPT_FAILED`, with `error_detail.reason` `passphrase`, `header`,
+package (`DECRYPT_FAILED`, with `error_detail.reason` `key`, `passphrase`, `header`,
 `payload` or `work_factor`, the last for a scrypt work factor above 20 (a decimal of any length), refused before any key derivation; a work factor not written as a decimal without a sign or leading zero is a malformed header, `PACKAGE_UNREADABLE` (#549); a file cut inside the payload nonce is `payload`; nothing is touched), bad digest, embedding mismatch, name
 collision, a target being deleted (`COLLECTION_DELETING`, §3.1.2), another import
 into the same target collection (`IMPORT_IN_PROGRESS`) — is reported through the
@@ -2686,10 +2759,13 @@ field for a `completed` job while its package is still recorded.
 
 Encrypted packages (`ragpkg-*.tar.gz.age`, #27) are listed too, with
 `encrypted: true` and `collection`, `chunk_count`, `fidelity` and `created_at`
-null: their manifest can't be read without the passphrase, and no plaintext
+null: their manifest can't be read without the passphrase or key, and no plaintext
 metadata is kept beside them. Their `readable` says whether the file starts with a
-valid age passphrase header; the listing never needs the passphrase and never runs
-scrypt. A file that can't be read or parsed is listed `readable: false` and never
+valid age passphrase or X25519 header, and `encryption` which of the two it is
+(`"passphrase"` or `"key"`, null when the header can't be read; `"none"` for a
+`.tar.gz`); the listing never needs a secret and never runs scrypt or X25519
+(#676). `key_on_server` is true while a key package's key file
+(`<filename>.key`) is in `./exports`. Key files themselves are not listed. A file that can't be read or parsed is listed `readable: false` and never
 fails the listing of the others.
 
 A file that cannot be read as a package is still listed, with `readable: false`
@@ -2726,8 +2802,16 @@ Downloads one package from `./exports` (#677), for the Developer role and above
 (people and service keys).
 
 - **Which file.** `filename` is `ragpkg-` followed by letters, digits, `.`, `_`
-  or `-`, ending in `.tar.gz` or `.tar.gz.age`, naming a regular file in the
-  exports folder (never a link). Anything else answers `404 PACKAGE_NOT_FOUND`.
+  or `-`, ending in `.tar.gz`, `.tar.gz.age` or `.tar.gz.age.key` (a key
+  package's key file, #676), naming a regular file in the exports folder (never a
+  link). Anything else answers `404 PACKAGE_NOT_FOUND`.
+- **Key files (#676).** A key file is served only when this instance exported it
+  (it is recorded with its package, with the same finish time and collection);
+  any other answers `404 PACKAGE_NOT_FOUND`. Its access is its package's: the
+  collection recorded with it. It is downloaded, deleted after a complete
+  download and expired by its own name, exactly as a package is, so a package's
+  complete download never deletes its key file, a key file's never deletes its
+  package, and `EXPORT_RETENTION_HOURS` deletes whichever of the two is still there.
 - **Access.** The listing's rule (§3.1.8): a package `GET /packages` hides from
   the caller answers `404 PACKAGE_NOT_FOUND` too, and the refusal is audited
   (`details.reason` `collection_access`, with the package's collection). An
@@ -3187,6 +3271,7 @@ Developer also Data and Tune, an Engineer also Admin.
 | Admin | Collections | ✓ | — | — |
 | Admin | Users | ✓ | — | — |
 | Admin | Service keys | ✓ | — | — |
+| Admin | Groups | ✓ | — | — |
 | Admin | Audit | ✓ | — | — |
 | Admin | Health | ✓ | — | — |
 | Account (labelled with the username and role badge) | Account | ✓ | ✓ | ✓ |
@@ -3414,7 +3499,7 @@ A retained session can be loaded/refreshed by its session ID, including when its
 - "New Collection" button → modal with fields: name, index type, distance metric, HNSW params.
 - A refused create (for example `409 COLLECTION_EXISTS`, a 422 or a 503) keeps the modal open and shows the API's message inside it, as an alert. The message clears on Cancel, when the modal is opened again, or when a create succeeds (#379).
 - Delete button per row → confirmation modal with collection name typed to confirm. Calls `DELETE /collections/{name}?confirm=true`.
-- Access (#606): the dialog reads the state when it opens; until that read succeeds the choice is unknown and Save is disabled, and a read answering after the Engineer changed something doesn't overwrite the change. An "Access" column shows "Open", "Restricted (n)" (n grants) or "—" when `GET /collections/{name}/access` failed for that row. An "Access" button per row opens a dialog: Open or Restricted, and when restricted the people (`GET /auth/users`) and service principals (`GET /auth/service-principals`) as checkboxes, disabled ones marked. Save calls `PUT /collections/{name}/access`; a refused save keeps the dialog open with the API's message as an alert.
+- Access (#606): the dialog reads the state when it opens; until that read succeeds the choice is unknown and Save is disabled, and a read answering after the Engineer changed something doesn't overwrite the change. An "Access" column shows "Open", "Restricted (n)" (n grants: people, service principals and groups) or "—" when `GET /collections/{name}/access` failed for that row. An "Access" button per row opens a dialog: Open or Restricted, and when restricted the people (`GET /auth/users`), service principals (`GET /auth/service-principals`) and groups (`GET /auth/groups`, #784; each "name (n members)", "None" when there are none) as checkboxes, disabled accounts marked. The three lists are read when the dialog opens, numbered with the opening, so an earlier opening's late answer or error never reaches it; a failed groups read says "Could not load the groups:" with the reason. Save calls `PUT /collections/{name}/access`; a refused save keeps the dialog open with the API's message as an alert.
 - A refused delete keeps the modal open and shows the API's message inside it, as an alert: for `409 COLLECTION_BUSY`, for example, "An ingest job is running for this collection (…)". The collection stays listed; the message clears on Cancel, when the modal is opened again, or when a delete succeeds.
 
 ### 7.9 Health Dashboard Page
@@ -3448,25 +3533,41 @@ A retained session can be loaded/refreshed by its session ID, including when its
   to the selected collection; a late answer for another one is ignored.
 - "Include the models" checkbox, labelled with the ~2.3 GB cost and when it is
   needed.
-- "Encrypt with a passphrase" checkbox (#27). Checked, it shows a passphrase field
-  and a confirmation field; Export stays disabled, with a hint naming the unmet
-  rule, until the passphrase has 12 to 1024 characters and both fields match. The
-  passphrase is sent only when the box is checked, is kept only in the page's
-  state, and both fields are cleared once the export has started.
+- "Encryption", three choices in this order (#676): **New key (recommended)**, chosen
+  by default; **Passphrase**; **Not encrypted**, which isn't offered in LAN mode
+  (the user answer's `lan_mode`), where the page says every export is encrypted.
+  The choice is sent as `encryption`.
+- **Passphrase** (#27) shows a passphrase field and a confirmation field; Export
+  stays disabled, with a hint naming the unmet rule, until the passphrase has 12
+  to 1024 characters and both fields match. The passphrase is sent only with
+  **Passphrase**, is kept only in the page's state, and both fields are cleared
+  once the export has started.
 - Progress while the job runs, then the filename, size, fidelity, whether it is
-  encrypted, whether models were bundled and whether `retrieve.py` was generated. Warnings from the job are
+  encrypted with a key or a passphrase, whether models were bundled and whether `retrieve.py` was generated. Warnings from the job are
   shown in full. A failed export shows its `error_code` (for example
   `EMBEDDING_MISMATCH`) before the error, as the import half does.
+- A finished key export shows, before the package's Download, a warning to store
+  the key apart from the package (anyone with both can read it; it can be
+  downloaded once and can't be recovered) and **Download key**, a link to
+  `GET /packages/<key_filename>`. After the click the page re-reads the export
+  every 3 s, for at most 10 minutes, and once `key_on_server` is false it says the
+  key was downloaded and deleted instead of offering it. The key's text is never
+  fetched or shown by the page (#676).
 
 **Import elements:**
 
 - Package selector listing `GET /packages`, each entry showing the collection,
-  chunk count, fidelity and size, or "encrypted" and the size for an encrypted
-  package. Unreadable files are listed too, marked as such, so nothing silently
+  chunk count, fidelity and size, or for an encrypted package "encrypted with a
+  key" and whether its key is on the server, or "encrypted with a passphrase",
+  and the size (#676). Unreadable files are listed too, marked as such, so nothing silently
   disappears.
-- A passphrase field when the selected package is encrypted (#27); Import stays
-  disabled until it is filled. The passphrase is sent only for an encrypted
-  package and the field is cleared once the import has started. A failed `GET /packages` shows "Could not
+- A key file input when the selected package is encrypted with a key (#676): the
+  browser reads the chosen file and sends its text as `key`; the text is cleared
+  once the import has started or another package is selected. A passphrase
+  field when the selected package is encrypted with a passphrase, or encrypted
+  with a header that can't be read (#27). Import stays disabled until the needed
+  secret is given. The passphrase is sent only for such a package and the field
+  is cleared once the import has started. A failed `GET /packages` shows "Could not
   list the packages in ./exports:" with the reason, instead of the empty-folder
   hint; the last list loaded stays, and the next good load clears the message.
 - `on_conflict` radio group — `abort`, `rename`, `replace` — each with its
@@ -3638,6 +3739,23 @@ The Import page shows a link "Prepare documents first" to `/prepare` beside the 
 - An error shows the API's message as an alert. The secret and the codes are kept only in the page's memory, never
   in browser storage.
 
+### 7.18 Groups Page (#784)
+
+**Route:** `/groups`  
+**Roles:** Engineer only (others are sent to `/qa`); in the Admin menu after Service keys, also in query-only mode
+
+- A short explanation: a group holds people and service principals; a restricted collection granted to it (Access
+  on the Collections page) is usable by its members; changes apply to the next request.
+- A form with the name and "Create group"; the name rule is shown under it.
+- A table of the groups from `GET /auth/groups`: name, people, service principals, and per row "Members", "Rename"
+  and "Delete". "Members" opens a dialog with the people (`GET /auth/users`) and service principals (`GET
+  /auth/service-principals`) as checkboxes, disabled ones marked, and Save (`PUT /auth/groups/{name}/members`).
+  "Rename" opens a dialog with the new name (`POST /auth/groups/{name}/rename`). "Delete" asks first, saying that
+  every collection grant to the group is removed and a collection granted only to it stays restricted (`POST
+  /auth/groups/{name}/delete`).
+- A refused action shows the API's message as an alert, inside the dialog when one is open; a list that can't be
+  loaded says "Could not load the groups:" with the reason.
+
 ## 8. Configuration Defaults and Constraints
 
 The table gives API request bounds; narrower UI sliders are presentation choices. Internal import/rebuild preserves positive stored HNSW construction/connections settings and stored `ef=-1` (dynamic) or positive values beyond new-request limits. Index/distance enums and numeric type validation still apply; no clamping or migration is performed.
@@ -3674,7 +3792,7 @@ Optional telemetry (#282) is configured by API container environment settings, n
 | `RAG_OTEL_HEADERS_FILE` | none | Mounted JSON regular file with `Authorization` and/or `X-Api-Key`; at most 8 KiB, 2 KiB per value; requires an HTTPS endpoint |
 | `RAG_OTEL_CA_FILE` | none (bundled roots) | Mounted PEM CA bundle (a regular file); at most 1 MiB; must load as a CA bundle; replaces the bundled roots; requires an HTTPS endpoint (#356) |
 | `RAG_OTEL_SERVICE_NAME` | `rag-api` | 1–64 ASCII letters, digits, `.`, `_` or `-`, starting with a letter or digit |
-| `RAG_OTEL_SERVICE_VERSION` | `1.3.0` | As `RAG_OTEL_SERVICE_NAME` |
+| `RAG_OTEL_SERVICE_VERSION` | `1.3.1` | As `RAG_OTEL_SERVICE_NAME` |
 | `RAG_OTEL_ENVIRONMENT` | `development` | As `RAG_OTEL_SERVICE_NAME` |
 | `RAG_OTEL_TRACES`, `RAG_OTEL_LOGS`, `RAG_OTEL_METRICS` | `true` | Exact `true` or `false` |
 | `RAG_OTEL_SAMPLE_RATIO` | `1.0` | Finite 0–1 |
@@ -3737,6 +3855,11 @@ rag-docker/
 ├── package.sh                  # Source-only zip (~1.3 MB; target needs internet)
 ├── package-offline.sh          # Self-contained bundle (~4.6 GB; no network needed)
 ├── install-offline.sh          # Installs from that bundle on an air-gapped Mac
+├── scripts/
+│   ├── backup.sh               # Encrypted volume backup, a new age key per volume (#848)
+│   ├── restore.sh              # Restores it; checks every archive with its key first (#848)
+│   ├── backup-common.sh        # Shared by the two: volumes, prefix, the age image
+│   └── age/Dockerfile          # The age image: pinned alpine plus a pinned age package
 ├── docker-compose.lan.yml      # LAN mode, opt-in (#26)
 ├── proxy/
 │   ├── nginx.conf              # Default server: HTTP, container port 80
@@ -3787,7 +3910,7 @@ rag-docker/
 │   │   ├── retrieval_config.py  # Per-collection retrieval settings (atomic JSON)
 │   │   ├── settings_store.py    # Shared serialized settings publication
 │   │   ├── packager.py          # Package format: naming, digests, manifest, reader
-│   │   ├── age_stream.py        # Streaming age passphrase encryption of packages (#27)
+│   │   ├── age_stream.py        # Streaming age encryption of packages: a new X25519 key (#676) or a passphrase (#27)
 │   │   ├── exporter.py          # Export job lifecycle and the per-collection guard
 │   │   ├── jobstore.py          # Job records that survive an API restart
 │   │   ├── audit.py             # The audit log: records, rotation, reading, the request middleware (#29)
@@ -3842,6 +3965,7 @@ rag-docker/
 │   │   │   ├── HealthPage.tsx
 │   │   │   ├── UsersPage.tsx          # Engineers manage accounts (#25)
 │   │   │   ├── ServiceKeysPage.tsx    # Engineers manage service principals and keys (#25)
+│   │   │   ├── GroupsPage.tsx         # Engineers manage groups for collection access (#784)
 │   │   │   └── AuditPage.tsx          # Engineers read the audit log (#29)
 │   │   ├── components/
 │   │   │   ├── NavBar.tsx
@@ -4520,6 +4644,10 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       *Evidence: `scripts/tests/test_package_download.py` (suite 05): the route's bytes, headers and refusals, deletion only of a recorded package, an interrupted download driven directly, the record, the sweep and its 15-minute interval, a real API start-up sweeping an expired package, an invalid setting stopping the API, the import claim under the shared lock, and the audit records; suite 05's live checks through the proxy (a full download deletes, an interrupted one keeps, the sweep deletes a recorded package and keeps one copied in, an End User is refused); `browser/transfer_page.js` (suite 06): the Download links, "Expires" in local time and the page catching up after a download.*
 - [x] Packages exported here are tied to their collection and the deleting download is hardened (#794): each export records its collection in `exported_packages.json`, and an entry written before #794 (a bare finish time) is still read, with no collection; an encrypted package exported here follows its recorded collection's access rule in `GET /packages` and `GET /packages/{filename}` (Weaviate not answering counts as the collection existing), and one recorded with no collection is listed and served to Engineers only; `GET /packages/{filename}` is for the Developer role and above, people and service keys alike; a cookie-authenticated `GET /packages/{filename}` whose `Sec-Fetch-Site` is present and neither `same-origin` nor `none` is refused `403 CROSS_ORIGIN_REFUSED`, while `HEAD`, service keys and requests without the header aren't checked; `HEAD` writes `package.download` with `details.head: true` and no `completed`; recorded names outside the download rule are ignored, never deleted, and logged once per process (#798); a deletion is audited and the sweep goes on when the record can't be rewritten; an import claim or download slot is released when its request is cancelled during the claim.
       *Evidence: `scripts/tests/test_package_download.py` (host and suite 05): `RecordTests` (the record's shape, entries before #794, wrongly typed entries, names outside the rule logged once), `EncryptedAccessTests` (restricted, open, no recorded collection, copied in, a collection gone, Weaviate failing, an End User), `DeletionRecordTests`, `SameOriginTests` (the `Sec-Fetch-Site` cases, `HEAD`, service keys, the listing), `HeadRecordTests` and `CancelledClaimTests`; suite 17's `matrix` and `key-matrix` checks (the `GET /packages/{filename}` row for every role and key) and `origin` check (the `Sec-Fetch-Site` cases through the proxy) in `scripts/verify/auth_stack.py`.*
+- [x] Exports are encrypted by default, each with a new key (#676): `POST /export` takes `encryption` (`key`, the default; `passphrase`, implied by a passphrase alone; `none`, refused `400 ENCRYPTION_REQUIRED` in LAN mode, before anything else); a key export writes `<stem>.tar.gz.age`, an age file with one `X25519` recipient generated for it, and `<stem>.tar.gz.age.key` (0600, age's identity file layout) beside it, with no unencrypted archive written and neither file left by a failed export; the key is never in a job record, log, audit record, telemetry or response; the package and its key file are recorded with one finish time and each is deleted by its own complete download, while expiry deletes both; `GET /packages/<package>.key` serves a recorded key file under its package's access, and an unrecorded one answers `404`; `GET /packages` lists `encryption` and `key_on_server` and no key files; `POST /import` takes the key file's text as `key` and refuses `KEY_FILE_REQUIRED`, `KEY_FILE_INVALID`, `KEY_FILE_NOT_EXPECTED` and `PASSPHRASE_REQUIRED` by the package's header before any job, and a wrong key fails the job `DECRYPT_FAILED` (`reason` `key`) touching nothing; the loader reads a key package's key file on standard input or a hidden prompt; the user answer carries `lan_mode`, and the Transfer page offers the three choices (no "Not encrypted" in LAN mode), **Download key** first and a key file input on import; packages exported before 1.3.1 import as before.
+      *Evidence: `scripts/tests/test_export_encryption.py` (the 68 C2SP CCTV vectors with an X25519 key, an independent X25519 decryption from the age specification, `X25519Keys`, `KeyExports`, `KeyApi`, `KeyImportJob`), `test_package_download.py` (`KeyFileTests`), `test_query_only.py` (`lan_mode` in the user answers, the loader's key path), host and suites 05 and 24; suite 05's block "a key export (#676)", suite 18's `lan_stack.py export` in a `--lan` run, suite 24's key package load, and `browser/transfer_page.js` (suite 06).*
+- [x] Two exports of one collection whose package names would be the same (the same `<id8>` in the same second) get distinct names (#860): the later one is `-2`, then `-3` (RAG_EXPORT_SPECIFICATIONS.md §4.1); both packages and both key files are kept, the package and key file are put in place without replacing any file in `./exports`, and a name taken after it was chosen fails the export and leaves that file as it was.
+      *Evidence: `SameSecondNames` in `scripts/tests/test_export_encryption.py` (host and suite 05): same-second key and passphrase exports at a fixed clock, a name still taken by a key file, a name given earlier in the process, a name taken during the build, the fallback without hard links and no free name; suite 05's same-second check: two key builds in the API container, forced to one name, get `-2` and keep all four files.*
 - [x] `GET /ingest/config` returns `is_default: true` for a collection with no saved config; `is_default: false` after saving one.
 - [x] `GET /retrieval/config/{collection}` answers 200 with the defaults and `is_default: true`, and logs a warning naming the collection, when the saved file can't be read, isn't JSON, holds JSON that isn't an object, has a field the response can't carry (a wrong type, a fractional or nested `top_k`, a `NaN` or infinite `alpha`) or holds the response-only key `is_default`; missing fields are filled from the defaults, and coercible and out-of-range values are still served as saved (#439, #477).
       *Evidence: `RetrievalConfigFileTests` in `scripts/tests/test_api_paths.py`, in the built API image with `--network none` (suite 01, through `16_api_paths.sh`), sends each saved file through the app; its non-object, wrong-type and fractional or nested checks fail on the code before #439, and its non-finite `alpha` and `is_default` checks fail on the code before #477.*
@@ -4550,6 +4678,12 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   *Evidence: `scripts/tests/test_ingest_errors.py` (suite 02, the undecodable-name ZIP, an unexpected `ValueError`, and an upload with no supported file), `scripts/tests/test_transfer_paths.py` (suite 15, the three already-running answers, a plain `RuntimeError` from each start, and the help templates that can't render) and `scripts/tests/test_error_envelope.py` (suite 01, a help `RuntimeError` logged, not sent). The new checks fail on the code before #657.*
 - [x] `package.sh` and `package-offline.sh` archives hold exactly the files git tracks in the current commit (`HEAD`), with no untracked or ignored file and no uncommitted change, and both scripts refuse to run unless their directory is the top level of a git checkout (§11.2, #384).
   *Evidence: `scripts/tests/test_package_archives.py`, run on the host by suite 01 as the check `Distribution archives hold only the tracked files of HEAD (#384)`, runs both scripts in a scratch git repository with `docker` stubbed: untracked and ignored files and an uncommitted edit stay out of the zip and the offline bundle, executable bits are kept, both scripts refuse in an extracted copy and in a subdirectory of a checkout before calling docker, and a checkout reached through a symlink is not refused. The scratch repository and both scripts read no system or global git config, checked with a global config whose failing hook and `export-ignore` attributes would otherwise break or change the result (#447).*
+- [x] `package-offline.sh` saves the age image of `scripts/backup.sh` and `scripts/restore.sh` with the five images, tagged by the same `rb_image` from the bundle's own `scripts/age/Dockerfile` (the copy archived from `HEAD`) and built from that Dockerfile when this machine doesn't have it, so backups work on an install that was never online; a failed build stops the script before anything is saved; `install-offline.sh`'s existing `docker load` loads it (§11.3, #852).
+  *Evidence: `scripts/tests/test_distribution.py`, with `docker` stubbed: `test_the_bundle_holds_the_source_images_and_weights` (the save list holds the five images and the age image, and each is inspected first), `test_a_missing_age_image_is_built_from_the_bundles_source` (built once from the staged `scripts/age`, then saved) and `test_a_failed_age_image_build_stops_before_anything_is_saved`.*
+- [x] `scripts/backup.sh` backs up every named volume except `ollama_models` (`weaviate_data`, `ingest_uploads`, `rag_sources`, `rag_preparation`, `auth_data`, `lan_certs`), skipping a missing one with a message (#848). Each volume is streamed through `tar` and `age` in a container of the age image (`scripts/age/Dockerfile`: the README's alpine pin, version and digest, and an exact `age` package version; tagged `rag-docker-age:<age version>-<first 12 hex digits of the SHA-256 of the Dockerfile's instruction lines, comments and blank lines left out>`, so a change of any instruction builds a new image, #852, #856) with no network and no log driver, encrypted to a new X25519 key pair of its own, into `<volume>-<timestamp>.tgz.age` beside its secret key `<volume>-<timestamp>.key`; nothing unencrypted is written, the key is never printed, and each archive is decrypted and read back before it is kept. The prefix is `--prefix`, `COMPOSE_PROJECT_NAME` or the checkout folder's name, refused when no volume has it (listing the projects that have rag-docker volumes) or when it isn't a compose project name, and confirmed on the terminal with each volume's entry count; `--yes` needs `--prefix`, and without a terminal the script refuses. The backup goes in a new folder `<prefix>-<UTC timestamp>` (0700, files 0600) under `~/rag-docker-backups` or `--dir`; a folder inside the checkout is refused unless under `backups/`, also when the path names the checkout in another case on a case-insensitive filesystem (the folders are compared as files, #852). A hidden top-level `.rag-docker-restore.*` folder, which an interrupted restore leaves in a volume, is not archived or counted (#856). When a key cannot be made, what age or Docker said is shown after `backup FAILED` (#852). The project's running containers are stopped, never removed. `.gitignore` lists `*.key`.
+  *Evidence: `scripts/tests/test_backup_scripts.py`, run on the host by suite 01 with the docker CLI on throwaway volumes of its own random project (removed afterwards), from a scratch checkout with its own `HOME`: the backup folder holds only the archives (`age-encryption.org/v1`, an X25519 stanza) and keys, with their modes, and no gzip or tar stream; six keys over two runs all differ; a missing `lan_certs` is skipped and a running container of the project is stopped, not removed; the prefix and location refusals, and the checkout named in another case refused (where the filesystem ignores case); a Docker error in the key step shown, with no line holding a secret key; a volume holding such a folder is backed up without it, the folder left in place, and restored without it; the image pins, the tag following the whole Dockerfile (a stub docker: a new digest or an added instruction gives a new tag, a comment or a blank line doesn't, #856), and `*.key` in `.gitignore`.*
+- [x] `scripts/restore.sh` takes each archive with its key file, and first decrypts every archive with its key and reads it to its end: a missing key file or argument, a wrong key, or a damaged or cut archive is refused with `Nothing was stopped, emptied or restored.`, as is a volume that doesn't exist; only then, after confirmation, does it stop the project's running containers and replace each volume's contents, decrypting while streaming into a staging folder in the volume that is swapped in only once the extraction has succeeded, so a failed extraction leaves the volume unchanged (#848, #852). A staging folder left by an interrupted restore is removed by the next restore (#856). A failed check shows what age or Docker said (#852).
+  *Evidence: `scripts/tests/test_backup_scripts.py` (suite 01): a backup then a restore of five volumes gives back every file, folder, link, mode, owner and digest; a wrong key, a missing key file, a damaged and a cut archive each leave the volume unchanged and the project's container running, and a wrong key or a Docker error in the check shows what age or Docker said; an extraction that fails after the check (a damaged copy fed to it by a docker wrapper) leaves the volume unchanged, the volume root's mode and owner included.*
 - [x] Every pull request to `develop` or `main` runs the verification suite in CI (#24): `.github/workflows/verify.yml` on `ubuntu-latest`, with `RAG_SKIP_SLOW=1`, on the disposable verify project (`stack.sh up`, `all.sh`, `stack.sh down`, never `RAG_VERIFY_LIVE`). It always uploads the compose logs as an artifact and caches the Ollama models under a key built from the model names `ollama/entrypoint.sh` pulls. It runs with `contents: read` only and no secrets, and pins every action, all GitHub's own, to a full commit SHA. The README shows its status badge.
   *Evidence: `scripts/tests/test_ci_workflow.py`, run on the host by suite 01 as the check `the CI workflow runs the verify suite on every pull request (#24)`, checks the trigger, permissions, pins, step order, the always-run logs, upload and teardown, the cache key and save conditions, the badge and the embedded copies; it fails on the code before #24. The workflow's own run on the #24 pull request is its first execution.*
 
@@ -4667,6 +4801,20 @@ Two-step verification (#607). These are ticked once the tests reviewer's full `s
   import (#792), and the matrix rows (suite 17); the Collections page's Access cases in
   `scripts/verify/browser/ui_controls.js` (suite 06), including a late answer for an earlier opening (#788), an
   earlier opening's failed read and its late lists of people and service principals (#792).*
+- [x] Groups for collection access (#784): Engineers create, rename and delete groups and set their members (people
+  and service principals) in browser sessions only; a collection granted to a group is listed and usable by its
+  members while the grant and the membership hold, and by no one else; a change applies to the next request;
+  deleting a group removes its grants and never opens a collection, and its audit record names the collections whose
+  grant was removed (`details.collections`) and the members it removed (`details.removed`, #857); a rename keeps
+  members and grants; a deleted collection drops its group grants; copies, imports and failed creates carry group
+  grants under the account rules (narrowest across a chain, never wider), and a failed create or import puts a group
+  grant back only to the same group, matched on its id and `created_at`, never on its name (#857); every change and refusal is audited; the Collections page's Access dialog offers groups and the Groups page manages them.
+  *Evidence: `scripts/tests/test_collection_access.py` `GroupRuleTests`, `GroupAccessRouteTests`,
+  `GroupRouteTests` (its `test_the_audit_records` checks the delete record's `details.collections` and
+  `details.removed`), `GroupCopyTests` (its `test_put_back_matches_a_group_by_identity`: a reused id or name is not the same group, a
+  renamed group is, #857) (suite 17), which fail on the code before #784; `test_auth.py` and
+  `test_query_only.py` for the routes' policy; `auth_stack.py collection-access` (its group case) and the matrix
+  rows (suite 17); `scripts/verify/browser/ui_controls.js` Access (#784) and Groups page cases (suite 06).*
 
 ### 10.7 Audit log (#29)
 
@@ -4884,7 +5032,7 @@ stale backend leaves the VM unreachable and the daemon never comes up.
 | | `package.sh` | `package-offline.sh` |
 |---|---|---|
 | Archive | ~1.3 MB zip | ~7.7 GB tar |
-| Contains | source only | source + all 5 images + model weights |
+| Contains | source only | source + all 5 images + the backup scripts' age image + model weights |
 | Target needs internet | **yes** (~11–13 GB downloaded) | **no** |
 | Docker disk on target | 20 GB | ~15 GB (no build cache needed) |
 
@@ -4908,7 +5056,7 @@ rag-docker/
 ├── <the files git tracks in HEAD, as package.sh>
 ├── install-offline.sh
 └── offline/
-    ├── images.tar.gz            # docker save of all 5 images (~2.5 GB)
+    ├── images.tar.gz            # docker save of all 5 images and the age image of scripts/backup.sh (#852) (~2.5 GB)
     └── ollama_models.tar.gz     # the LLMs (llama3.1:8b by default) + nomic-embed-text (~5.2 GB)
 ```
 

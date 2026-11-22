@@ -177,10 +177,10 @@ class RecordTests(DownloadTestCase):
                 package_retention.record_export("ragpkg-new.tar.gz", NOW)
         self.assertEqual(record.read_text(), '{"packages": "wrong shape"}')
 
-    def run_export(self, record=None):
+    def run_export(self, record=None, key_filename=None):
         result = {"filename": "ragpkg-open1-x.tar.gz", "size_bytes": 1, "chunk_count": 1,
                   "source_document_count": 0, "fidelity": "chunks-only", "models_bundled": False,
-                  "retrieve_script": True, "warnings": []}
+                  "retrieve_script": True, "warnings": [], "key_filename": key_filename}
         exporter._jobs["j677"] = {"job_id": "j677", "status": "queued", "collection": "Open1",
                                   "chunks_written": 0, "filename": None, "warnings": [], "error": None}
         self.addCleanup(exporter._jobs.pop, "j677", None)
@@ -286,7 +286,7 @@ class RecordTests(DownloadTestCase):
         self.assertIn("'ragpkg-x/../y.tar.gz'", logs.output[0])
 
     def test_an_export_whose_record_fails_still_completes_and_says_so(self):
-        def broken(*_):
+        def broken(*_args, **_kwargs):
             raise OSError("disk full")
         with self.assertLogs("services.exporter", "ERROR"):
             job = self.run_export(record=broken)
@@ -294,6 +294,48 @@ class RecordTests(DownloadTestCase):
         self.assertTrue(any("expiry could not be recorded" in w for w in job["warnings"]))
         answer = self.client.get("/export/job/j677", headers=self.as_("eng"))
         self.assertIsNone(answer.json()["expires_at"])
+
+    # #860: a key export's package and key file are recorded in one write.
+    def test_a_key_export_is_recorded_in_one_write(self):
+        key = "ragpkg-open1-x.tar.gz.age.key"
+        with patch.object(package_retention, "_write", wraps=package_retention._write) as write:
+            package_retention.record_export("ragpkg-open1-x.tar.gz.age", NOW, "Open1", key_filename=key)
+        self.assertEqual(write.call_count, 1)
+        entries = json.loads((self.root / "uploads" / "exported_packages.json").read_text())["packages"]
+        self.assertEqual(entries["ragpkg-open1-x.tar.gz.age"], entries[key])
+        self.assertEqual(entries[key]["collection"], "Open1")
+
+    def test_a_failed_write_records_neither_the_package_nor_its_key(self):
+        with patch.object(package_retention, "_write", side_effect=OSError("disk full")), \
+                self.assertRaises(OSError):
+            package_retention.record_export("ragpkg-open1-x.tar.gz.age", NOW, "Open1",
+                                            key_filename="ragpkg-open1-x.tar.gz.age.key")
+        self.assertFalse(package_retention.recorded("ragpkg-open1-x.tar.gz.age"))
+        self.assertFalse(package_retention.recorded("ragpkg-open1-x.tar.gz.age.key"))
+
+    def test_a_key_export_job_records_both_in_one_call(self):
+        calls = []
+
+        def record(*args, **kwargs):
+            calls.append((args, kwargs))
+        job = self.run_export(record=record, key_filename="ragpkg-open1-x.tar.gz.age.key")
+        self.assertEqual(job["status"], "completed")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0][0], "ragpkg-open1-x.tar.gz")
+        self.assertEqual(calls[0][1], {"key_filename": "ragpkg-open1-x.tar.gz.age.key"})
+
+    # Reviewer test (rag-pr-review, #860): a key export whose record fails
+    # completes, records neither file and warns about both by name.
+    def test_a_key_export_whose_record_fails_records_neither_and_warns_about_both(self):
+        def broken(*_args, **_kwargs):
+            raise OSError("disk full")
+        with self.assertLogs("services.exporter", "ERROR"):
+            job = self.run_export(record=broken, key_filename="ragpkg-open1-x.tar.gz.age.key")
+        self.assertEqual(job["status"], "completed")
+        self.assertTrue(any("package and its key file could not be recorded" in w for w in job["warnings"]),
+                        job["warnings"])
+        self.assertFalse(package_retention.recorded("ragpkg-open1-x.tar.gz"))
+        self.assertFalse(package_retention.recorded("ragpkg-open1-x.tar.gz.age.key"))
 
 
 class ListingTests(DownloadTestCase):
@@ -569,6 +611,126 @@ class EncryptedAccessTests(DownloadTestCase):
         answer = self.get(path.name, who="user")
         self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (403, "FORBIDDEN"))
         self.assertTrue(path.exists())
+
+
+class KeyFileTests(DownloadTestCase):
+    """A key export's key file (#676): `<package>.key`, recorded with the
+    package, downloaded once on its own, expired with it, under its access."""
+
+    def setUp(self):
+        super().setUp()
+        status = self.client.put(f"/collections/{SECRET}/access", headers=self.as_("eng"),
+                                 json={"restricted": True, "users": ["dev"], "service_principals": []}).status_code
+        self.assertEqual(status, 200)
+
+    write_encrypted = EncryptedAccessTests.write_encrypted
+    listed = EncryptedAccessTests.listed
+
+    def write_pair(self, stem="ragpkg-k-20261120T000000Z-0123abcd", collection="Open1", hours_ago=0):
+        package = self.write_encrypted(stem + ".tar.gz.age", collection=None, recorded=False)
+        key = self.exports / (package.name + ".key")
+        key.write_text("# public key: age1x\nAGE-SECRET-KEY-1XYZ\n")
+        key.chmod(0o600)
+        when = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+        package_retention.record_export(package.name, when, collection)
+        package_retention.record_export(key.name, when, collection)
+        return package, key
+
+    def test_the_name_rule_admits_a_key_file_only_after_tar_gz_age(self):
+        for name, ok in (("ragpkg-a.tar.gz.age.key", True), ("ragpkg-a.tar.gz.key", False),
+                         ("ragpkg-a.key", False), ("ragpkg-a.tar.gz.age.key.key", False),
+                         ("ragpkg-a.tar.gz.age.keys", False)):
+            with self.subTest(name=name):
+                self.assertEqual(package_retention.valid_name(name), ok)
+                self.assertEqual(package_retention.is_key_name(name), ok)
+        self.assertFalse(package_retention.is_key_name("ragpkg-a.tar.gz.age"))
+
+    def test_a_complete_key_download_deletes_the_key_only(self):
+        package, key = self.write_pair()
+        data = key.read_bytes()
+        answer = self.get(key.name, who="dev2")
+        self.assertEqual(answer.status_code, 200, answer.text)
+        self.assertEqual(answer.content, data)
+        self.assertEqual(answer.headers["cache-control"], "no-store")
+        self.assertFalse(key.exists())
+        self.assertTrue(package.exists())
+        self.assertFalse(package_retention.recorded(key.name))
+        self.assertTrue(package_retention.recorded(package.name))
+        deleted = self.records("package.delete")[-1]
+        self.assertEqual(deleted["details"], {"file": key.name, "reason": "downloaded"})
+        self.assertFalse(self.listed("dev2")[package.name]["key_on_server"])
+        again = self.get(key.name, who="dev2")
+        self.assertEqual((again.status_code, again.json()["error"]["code"]), (404, "PACKAGE_NOT_FOUND"))
+
+    def test_a_package_download_leaves_its_key(self):
+        package, key = self.write_pair()
+        self.assertTrue(self.listed("dev2")[package.name]["key_on_server"])
+        self.assertEqual(self.get(package.name, who="dev2").status_code, 200)
+        self.assertFalse(package.exists())
+        self.assertTrue(key.exists())
+        self.assertTrue(package_retention.recorded(key.name))
+        self.assertEqual(self.get(key.name, who="dev2").status_code, 200)
+        self.assertFalse(key.exists())
+
+    def test_expiry_deletes_both(self):
+        package, key = self.write_pair(hours_ago=25)
+        deleted = package_retention.sweep()
+        self.assertEqual(sorted(deleted), sorted([package.name, key.name]))
+        self.assertFalse(package.exists() or key.exists())
+        package, key = self.write_pair(stem="ragpkg-k2-20261120T000000Z-0123abcd", hours_ago=25)
+        self.assertEqual(self.get(package.name, who="dev2").status_code, 200)
+        self.assertEqual(package_retention.sweep(), [key.name])
+
+    def test_a_key_file_not_exported_here_is_not_served(self):
+        key = self.exports / "ragpkg-copied.tar.gz.age.key"
+        key.write_text("AGE-SECRET-KEY-1XYZ\n")
+        for who in ("dev", "eng"):
+            answer = self.get(key.name, who=who)
+            self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (404, "PACKAGE_NOT_FOUND"))
+        self.assertTrue(key.exists())
+
+    def test_a_restricted_collections_key_answers_as_missing(self):
+        package, key = self.write_pair(collection=SECRET)
+        answer = self.get(key.name, who="dev2")
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (404, "PACKAGE_NOT_FOUND"))
+        self.assertTrue(key.exists())
+        refused = [r for r in self.records("package.download") if r["actor"] == "dev2"][-1]
+        self.assertEqual((refused["collection"], refused["details"]["code"]), (SECRET, "PACKAGE_NOT_FOUND"))
+        self.assertEqual(self.get(key.name, who="dev").status_code, 200)
+        self.assertFalse(key.exists())
+
+    def test_key_files_are_not_listed_as_packages(self):
+        package, key = self.write_pair()
+        self.assertEqual(sorted(self.listed("eng")), [package.name])
+
+    def test_an_end_user_never_reaches_a_key(self):
+        _package, key = self.write_pair()
+        self.assertEqual(self.get(key.name, who="user").status_code, 403)
+        self.assertTrue(key.exists())
+
+    def test_a_key_follows_a_groups_grant(self):
+        # Reviewer (#676 with #784): the key file's access is the package's, so a
+        # collection granted through a group reaches its members only, and a
+        # membership change applies to the next download.
+        store.create_group("team")
+        store.set_group_members("team", ["dev2"], [])
+        status = self.client.put(f"/collections/{SECRET}/access", headers=self.as_("eng"),
+                                 json={"restricted": True, "users": [], "service_principals": [],
+                                       "groups": ["team"]}).status_code
+        self.assertEqual(status, 200)
+        package, key = self.write_pair(collection=SECRET)
+        answer = self.get(key.name, who="dev")
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (404, "PACKAGE_NOT_FOUND"))
+        self.assertTrue(key.exists())
+        self.assertTrue(self.listed("dev2")[package.name]["key_on_server"])
+        store.set_group_members("team", [], [])
+        answer = self.get(key.name, who="dev2")
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (404, "PACKAGE_NOT_FOUND"))
+        self.assertTrue(key.exists())
+        store.set_group_members("team", ["dev2"], [])
+        self.assertEqual(self.get(key.name, who="dev2").status_code, 200)
+        self.assertFalse(key.exists())
+        self.assertTrue(package.exists())
 
 
 class DeletionRecordTests(DownloadTestCase):

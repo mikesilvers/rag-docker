@@ -26,7 +26,7 @@ tune it there.
 | Gold-standard sessions | exported; invalidated on re-chunk | confirmed |
 | Duplicate documents | content-addressed, stored once per collection | **decided here** (§2.2) |
 | Sessions of a replaced collection | retained, marked orphaned, count reported | **decided here** (§8, rule 4) |
-| Encryption | optional, by passphrase, age v1 format (§4.6) | maintainer decision on #27 |
+| Encryption | on by default with a new X25519 key per package and a key file; a passphrase as the alternative; off only on request and never in LAN mode; age v1 format (§4.6) | maintainer decisions on #27 and #676 |
 
 ### Out of scope
 
@@ -181,17 +181,28 @@ saved settings are defaults, not a constraint.
 ### 4.1 Filename (normative)
 
 ```
-ragpkg-<collection-slug>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz
-ragpkg-<collection-slug>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz.age    (encrypted, §4.6)
+ragpkg-<collection-slug>-<YYYYMMDDTHHMMSSZ>-<id8>[-<n>].tar.gz
+ragpkg-<collection-slug>-<YYYYMMDDTHHMMSSZ>-<id8>[-<n>].tar.gz.age    (encrypted, §4.6)
+ragpkg-<collection-slug>-<YYYYMMDDTHHMMSSZ>-<id8>[-<n>].tar.gz.age.key  (its key file, for a key package, §4.6)
 ```
 
 - `<collection-slug>`: stored collection name, lowercased, each run of characters
   outside `[a-z0-9]` replaced by `-`, leading/trailing `-` trimmed.
 - `<YYYYMMDDTHHMMSSZ>`: UTC, basic ISO 8601, no separators.
 - `<id8>`: first 8 lowercase hex of the manifest digest (§4.4).
+- `-<n>` (#860): absent unless the name without it is taken. Two exports of one
+  collection with the same content that start in the same second have the same
+  name without it; the later one gets `-<n>`, the smallest `<n>` from 2 whose
+  name is free, so both packages and both key files are kept. A name is taken
+  when a file of it (`.tar.gz`, `.tar.gz.age` or `.tar.gz.age.key`, or the
+  temporary `.<file>.partial` of one) is in the exports folder, as any kind of
+  entry, or when the running API has already given it to an export. A package
+  and its key file are put in place by a step that never replaces an existing
+  file: if the name has been taken meanwhile, the export fails and the existing
+  file is left as it is.
 
 The archive MUST expand to a single directory of the same name minus `.tar.gz`
-(minus `.tar.gz.age` for an encrypted package, once decrypted).
+(minus `.tar.gz.age` for an encrypted package, once decrypted), `-<n>` included.
 
 **The filename is a label, never an input.** The slug is lossy: it lowercases a
 name Weaviate capitalised, and two distinct collections can slug identically.
@@ -326,13 +337,30 @@ One JSON object per line:
 - Vectors are JSON numbers. A packed float32 sidecar was measured at only ~12%
   smaller after gzip and is rejected (`RAG_EXPORT_ANALYSIS.md` §6).
 
-### 4.6 Encryption (#27)
+### 4.6 Encryption (#27, #676)
 
-A package exported with a passphrase is encrypted. Its plaintext is exactly the
-`.tar.gz` byte stream §4.1 to §4.5 describe; the file is an age v1 file
-(https://c2sp.org/age), binary (not armored), with exactly one `scrypt`
-(passphrase) recipient stanza, named `<stem>.tar.gz.age`. `age -d` opens it with
-the same passphrase.
+A package is encrypted unless it was exported with `encryption: "none"`. Its
+plaintext is exactly the `.tar.gz` byte stream §4.1 to §4.5 describe; the file is
+an age v1 file (https://c2sp.org/age), binary (not armored), named
+`<stem>.tar.gz.age`, with exactly one recipient stanza of one of two kinds:
+
+- **A new key** (the default, #676): one `X25519` stanza, to a key pair generated
+  for this package alone. The secret key is written once, to the key file
+  `<stem>.tar.gz.age.key` beside the package, mode 0600, in age's identity file
+  layout: `# created: <UTC>`, `# public key: age1...`, a comment naming the package
+  and saying to store the key apart from it, then the `AGE-SECRET-KEY-1...` line
+  (Bech32, BIP 173). `age -d -i <key file>` opens the package. The key file is
+  written as `.<stem>.tar.gz.age.key.partial` and renamed before the package is,
+  and a failed export removes both; the start-up sweep removes such partial key
+  files too. The key file follows the package download and expiry rules on its own
+  (SPECIFICATIONS.md, `GET /packages/{filename}`). Import takes the key file's
+  text (`key`, at most 4096 characters), which must hold exactly one
+  `AGE-SECRET-KEY-1...` line besides blank and `#` lines; a post-quantum key is
+  refused. Decryption tries the X25519 stanzas in order, skips other types,
+  refuses a scrypt stanza beside them and a malformed or all-zero-secret stanza as
+  a header failure, and fails `DECRYPT_FAILED` (`reason` `key`) when none opens.
+- **A passphrase** (#27): one `scrypt` stanza. `age -d` opens it with the same
+  passphrase. The rules below are for this kind.
 
 - **Encryption.** A random 16-byte file key, a random 16-byte scrypt salt, work
   factor (log2 N) 18 with r=8 and p=1 (age's default), the file key wrapped with
@@ -466,10 +494,13 @@ Developer can take every document out of a collection.
 and `{"job_id": "..."}`. `GET /export/job/{job_id}` reports progress and, on
 completion, the written filename.
 
-- An optional `passphrase` (12 to 1024 characters) writes the package encrypted
-  (§4.6); one outside those bounds is refused `422 INVALID_PARAMETER` before any
-  job, without being echoed. The job reports `encrypted` and never holds the
-  passphrase (#27).
+- `encryption` (#676): `"key"` (the default), `"passphrase"` with a `passphrase`
+  (12 to 1024 characters; one outside those bounds is refused `422
+  INVALID_PARAMETER` before any job, without being echoed), or `"none"`, refused
+  `400 ENCRYPTION_REQUIRED` in LAN mode. Left out, a request with a passphrase is a
+  passphrase export (#27) and one without is a key export (§4.6). The job reports
+  `encrypted`, `encryption` and a key export's `key_filename`, and never holds the
+  passphrase or the key.
 
 - Export of a collection that does not exist fails immediately with
   `COLLECTION_NOT_FOUND`, before any job is created.
@@ -522,11 +553,16 @@ completion, the written filename.
 `POST /import` with `{"filename": "<name in ./exports>", "on_conflict": "..."}`
 → `202` + `job_id`.
 
-A package whose filename ends in `.tar.gz.age` is encrypted and needs
-`"passphrase"`: without one, the request is refused `400 PASSPHRASE_REQUIRED`;
-a passphrase sent for any other package is refused `400
-PASSPHRASE_NOT_EXPECTED`. Both are decided by the filename before any job is
-created (#27). The job reports `encrypted` and never holds the passphrase.
+A package whose filename ends in `.tar.gz.age` is encrypted, and its age header
+says which secret it needs (#676). A key package needs `"key"`, its key file's
+text: without one the request is refused `400 KEY_FILE_REQUIRED`, and a `key` that
+isn't an age key file `400 KEY_FILE_INVALID`. A passphrase package needs
+`"passphrase"`: without one the request is refused `400 PASSPHRASE_REQUIRED`, as
+is an encrypted file whose header can't be read and that comes with no secret. A
+secret sent for any other package is refused `400 PASSPHRASE_NOT_EXPECTED` or
+`400 KEY_FILE_NOT_EXPECTED`. All are decided by the filename and the header before any
+job is created (#27). The job reports `encrypted` and `encryption` and never holds
+the passphrase or the key.
 
 Checks run in this order and stop at the first failure:
 
@@ -987,13 +1023,15 @@ Every package contains one, generated from the manifest so it cannot drift:
 - exact import steps for this package
 - how to run `retrieve.py`, or why it is absent
 - the embedding-model requirement, stated as a prerequisite
-- the encryption section (`partials/encryption.md`, #27): a package is encrypted
-  only when exported with a passphrase, as `.tar.gz.age`, which import and
-  `age -d` open with it; the passphrase can't be recovered and should travel
-  separately; a `.tar.gz` package is **not encrypted** and may contain sensitive
-  documents; decrypted or imported contents are plaintext again
-- the file as delivered, and for an encrypted package the `passphrase` in the
-  import request
+- the encryption section (`partials/encryption.md`, #27, #676): a `.tar.gz.age`
+  package opens with its own key file (the default) or its passphrase, through
+  import or `age -d`; neither can be recovered, and the key file or passphrase
+  travels and is stored apart from the package; a `.tar.gz` package is **not
+  encrypted** and may contain sensitive documents; decrypted or imported contents
+  are plaintext again
+- a line on how this package opens (its key file and `age -d -i`, its passphrase,
+  or not encrypted), the file as delivered, and for an encrypted package the `key`
+  or `passphrase` in the import request
 
 ---
 
@@ -1029,11 +1067,15 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | Code | Meaning |
 |---|---|
 | `PACKAGE_UNREADABLE` | missing or not a readable archive, or a `.tar.gz.age` file that is not an age passphrase file |
-| `DECRYPT_FAILED` | an encrypted package could not be decrypted: wrong passphrase, damaged or truncated data, or a work factor above 20; `error_detail.reason` is `passphrase`, `header`, `payload` or `work_factor`; nothing is touched (#27) |
+| `DECRYPT_FAILED` | an encrypted package could not be decrypted: wrong key or passphrase, damaged or truncated data, or a work factor above 20; `error_detail.reason` is `key`, `passphrase`, `header`, `payload` or `work_factor`; nothing is touched (#27, #676) |
 | `PACKAGE_TOO_MANY_MEMBERS` | the package holds more than `max_package_members` entries (100,000 by default), directories included, implied ones too; `detail` `{"limit": <cap>}`; nothing is imported (§6.2 check 1, #317) |
 | `PACKAGE_TOO_LARGE` | the package's members add up to more than `max_package_expanded_bytes` (16 GiB by default); `detail` `{"limit": <cap>, "member": <name>}`; nothing is imported (§6.2 check 1, #317) |
 | `PASSPHRASE_REQUIRED` | HTTP 400 from `POST /import`: a `.tar.gz.age` package without a passphrase; no job (#27) |
 | `PASSPHRASE_NOT_EXPECTED` | HTTP 400 from `POST /import`: a passphrase for a package that is not encrypted; no job (#27) |
+| `KEY_FILE_REQUIRED` | HTTP 400 from `POST /import`: a key package without `key`; no job (#676) |
+| `KEY_FILE_INVALID` | HTTP 400 from `POST /import`: a `key` that isn't an age X25519 key file; no job (#676) |
+| `KEY_FILE_NOT_EXPECTED` | HTTP 400 from `POST /import`: a `key` for a package that is not encrypted; no job (#676) |
+| `ENCRYPTION_REQUIRED` | HTTP 400 from `POST /export`: `encryption: "none"` in LAN mode; no job (#676) |
 | `PACKAGE_FORMAT_UNSUPPORTED` | `package_format` newer than this instance |
 | `PACKAGE_CORRUPT` | digest mismatch, a manifest `files` key outside the package (check 3), invalid retained sources or a chunk naming a source the package lacks (check 3a), or invalid evaluation-session metadata (check 4a); names the file |
 | `EMBEDDING_MISMATCH` | model or dimensions differ; names both |
@@ -1114,12 +1156,13 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E41 | A package of more than `max_package_members` entries, directories included, fails `PACKAGE_TOO_MANY_MEMBERS`, folders implied by member paths counting once each (a directory member's own folder as its entry; a name with a `..` component is refused `PACKAGE_UNREADABLE` before its folders are counted), and one whose members add up to more than `max_package_expanded_bytes` fails `PACKAGE_TOO_LARGE`, each with its message and `detail`, for `.tar.gz` and `.tar.gz.age` packages alike; a package exactly at a cap imports; a member with a negative size is refused `PACKAGE_UNREADABLE` before its size is counted, and a sparse file (old GNU type `S`, PAX sparse 0.0, 0.1 or 1.0) is refused `PACKAGE_UNREADABLE`; a `.tar.gz` refusal extracts nothing and reads no header after the refusing member, a `.tar.gz.age` refusal leaves at most the cap's bytes, and the job creates no collection and leaves no work directory (#317), by `test_package_limits.py` with caps of 1 MiB and 20 entries set through the environment |
 | E42 | A package's `manifest.json` records `answer_llm` and `build_llm` as `{"model": <name>}`, with `llm` the same as `answer_llm`, at `package_format` 1; with a build model that differs from the answer model, `include_models: true` bundles the embedding and answer models only (#671), by `test_retrieval_import.py` and `validate_package.py` on a real export |
 | E43 | Import checks and installs only this instance's answer model: a build model that differs, absent or not, is neither checked, installed nor noted (#671), by `test_retrieval_import.py` |
+| E44 | A default export is a key export (#676): `<stem>.tar.gz.age` with one `X25519` stanza and `<stem>.tar.gz.age.key` (0600, age's identity layout) beside it, a new key every time, no plaintext archive and nothing left by a failure; the package opens with the key file through import and an independent decryption, every vendored CCTV vector with an X25519 key behaves as its `expect:` says, `KEY_FILE_REQUIRED`, `KEY_FILE_INVALID`, `KEY_FILE_NOT_EXPECTED` and `ENCRYPTION_REQUIRED` refuse before any job, a wrong key fails `DECRYPT_FAILED` (`reason` `key`) touching nothing, and the key file is downloaded once and expired on its own, by `test_export_encryption.py`, `test_package_download.py`, `test_query_only.py` and suites 05, 18 and 24 |
+| E45 | Two exports of one collection whose names would be the same (the same `<id8>` in the same second) get distinct names, the later one `-2`, then `-3` (§4.1, #860): both packages and both key files are kept, no export replaces a file in `./exports`, and a name taken after it was chosen fails the export and leaves that file, by `test_export_encryption.py` (`SameSecondNames`) and suite 05's same-second check |
 
 ---
 
 ## 14. Deferred
 
-Incremental export, signing, key-pair (non-passphrase) encryption, encryption on
-by default (a follow-up for LAN access, #26), corpus merging, cross-vector-store
+Incremental export, signing, post-quantum (hybrid) recipients, corpus merging, cross-vector-store
 migration, gold-standard remapping after re-chunk, and HTTP transport as an
 alternative to the mounted directory.

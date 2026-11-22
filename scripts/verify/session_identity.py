@@ -94,7 +94,7 @@ with tempfile.TemporaryDirectory(prefix='owned-import-session-') as directory:
                 session={'session_id':sid,'collection':collection,'status':'completed','pairs_total':1,'pairs_completed':1,'pairs':[{'pair_id':'p_owned','question':'Inert question','answer':'Original exported answer','contexts':['Owned inert evaluation context'],'ground_truth':'Inert truth','source_file':'inert.txt','chunk_index':0,'status':'approved'}]}
                 await asyncio.to_thread(gs.store_session,session)
                 print('PASS owned real collection, supplied-vector object and synthetic evaluation session created',flush=True)
-                start=await client.post('/export',json={'collection':collection,'include_models':False});assert start.status_code==202,start.text
+                start=await client.post('/export',json={'collection':collection,'include_models':False,'encryption':'none'});assert start.status_code==202,start.text
                 jobs.append((exporter,start.json()['job_id']))
                 exported=await completed(client,'/export/job/'+start.json()['job_id']);archive=root/'exports'/exported['filename'];digest=await asyncio.to_thread(file_digest,archive)
                 retained=await asyncio.to_thread(archive_session,archive,sid);assert retained['pairs'][0]['answer']=='Original exported answer'
@@ -128,7 +128,7 @@ with tempfile.TemporaryDirectory(prefix='owned-import-session-') as directory:
                 reload=await asyncio.to_thread(subprocess.run,[sys.executable,'-c',code,str(root/'uploads'),*identities],text=True,capture_output=True,check=True)
                 fresh=json.loads(reload.stdout);assert [row['collection'] for row in fresh]==[collection,*targets];assert fresh[0]['pairs'][0]['answer']=='Newer acknowledged human answer';assert all(row['imported_from']['session_id']==sid for row in fresh[1:])
                 print('PASS fresh independent API process restores all three session identities, newer original review and imported provenance',flush=True)
-                start=await client.post('/export',json={'collection':targets[0],'include_models':False});assert start.status_code==202,start.text
+                start=await client.post('/export',json={'collection':targets[0],'include_models':False,'encryption':'none'});assert start.status_code==202,start.text
                 jobs.append((exporter,start.json()['job_id']))
                 reexported=await completed(client,'/export/job/'+start.json()['job_id'])
                 imported_sid=mappings[0]['session_id'];retained=await asyncio.to_thread(archive_session,root/'exports'/reexported['filename'],imported_sid)

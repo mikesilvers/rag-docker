@@ -1,9 +1,10 @@
 """Per-collection access (#606): who may use which collection.
 
 A collection is open, or restricted to the accounts granted it (people or
-service principals; a key acts as its principal). Engineers reach every
-collection. The state is in the store (store.py, schema 4); this module holds
-the rule and the check the routes call.
+service principals; a key acts as its principal), directly or through a group
+granted it (#784: store.has_access and store.restricted_collections answer for
+both). Engineers reach every collection. The state is in the store (store.py,
+schema 5); this module holds the rule and the check the routes call.
 
 A refused caller gets the answer the route gives a collection, session, job or
 file that doesn't exist, so a restricted collection's name isn't confirmed. The

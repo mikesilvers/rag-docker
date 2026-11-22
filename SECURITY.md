@@ -90,7 +90,8 @@ request but `/health` and the login (#25).
   appended to `audit/audit.jsonl` in the `ingest_uploads` volume (mode 0600,
   rotated by size, nothing edits or deletes a record), with the server-side
   actor, role, key id, client address and result. It never records a
-  password, session cookie, API key, passphrase, answer or document text, and
+  password, session cookie, API key, passphrase, export key, answer or
+  document text, and
   records a query's question text only when the operator sets
   `AUDIT_LOG_QUESTIONS=true`. Only AI Engineers' browser sessions can read it;
   API keys can't. A record that can't be written doesn't stop the action; it
@@ -102,6 +103,13 @@ request but `/health` and the login (#25).
   clients apart (see LAN mode above). It guards against mistakes and
   after-the-fact questions, not against someone with access to the Docker
   host, who can edit the files. See README "Audit log".
+- **Export encryption (#676).** An export package is encrypted by default
+  with age, to a new X25519 key made for that package alone, or with a
+  passphrase instead. An unencrypted package is written only when it is asked
+  for, and LAN mode refuses that (`ENCRYPTION_REQUIRED`). The key goes only to
+  the key file `<package>.key`, written beside the package with mode 0600; it
+  is never logged, audited or put in a job record. A full download of the key
+  file deletes it, as a full download of the package deletes the package.
 - **Accepted hosts (#664).** The proxy answers only for `localhost` and
   `127.0.0.1`, at any port, plus, in LAN mode, the names in its certificate.
   Any other Host gets `421 Misdirected Request` from nginx before the UI or

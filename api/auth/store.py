@@ -26,6 +26,13 @@ Per-collection access (#606, schema 4): a collection named in
 `collection_grants` (people or service principals) and Engineers may use it;
 any other collection is open to every account its role allows. Names are the
 canonical (stored) collection names. The rule itself is in access.py.
+
+Groups for collection access (#784, schema 5): Engineers make groups
+(`groups`) of people and service principals (`group_members`), and a
+restricted collection can be granted to a group (`collection_group_grants`) as
+well as to accounts. A member may use it while both the grant and their
+membership hold. Members and grants name the group's id, so a rename keeps
+them; deleting a group removes both, and never opens a collection.
 """
 from __future__ import annotations
 
@@ -37,7 +44,7 @@ import sqlite3
 import time
 from collections.abc import Iterable
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from config import settings
@@ -56,7 +63,7 @@ KEY_DAYS_DEFAULT = 90            # a key's lifetime when none is given (Q23) ...
 KEY_DAYS_MAX = 365               # ... and the longest allowed
 _DAY_S = 86400
 NO_PASSWORD = "!"                # a principal's password hash: never verifies
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 MFA_PENDING_S = 10 * 60          # a started set-up must be confirmed within 10 minutes
 MFA_CHALLENGE_S = 5 * 60         # the code must follow the password within 5 minutes ...
 MFA_CHALLENGE_TRIES = 5          # ... with at most 5 codes per challenge
@@ -142,6 +149,25 @@ CREATE TABLE IF NOT EXISTS collection_grants (
     granted_at REAL NOT NULL,
     PRIMARY KEY (collection, user_id)
 );
+CREATE TABLE IF NOT EXISTS groups (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS group_members (
+    group_id INTEGER NOT NULL REFERENCES groups(id),
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    added_at REAL NOT NULL,
+    PRIMARY KEY (group_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS group_members_user ON group_members(user_id);
+CREATE TABLE IF NOT EXISTS collection_group_grants (
+    collection TEXT NOT NULL,
+    group_id INTEGER NOT NULL REFERENCES groups(id),
+    granted_at REAL NOT NULL,
+    PRIMARY KEY (collection, group_id)
+);
+CREATE INDEX IF NOT EXISTS collection_group_grants_group ON collection_group_grants(group_id);
 """
 
 _ready: set[str] = set()
@@ -155,7 +181,9 @@ class Refused(Exception):
     NOT_A_USER, REFUSED for the bootstrap rules, or one of the MFA codes
     (MFA_ALREADY_ENROLLED, MFA_ENROLLMENT_NOT_STARTED, MFA_CODE_INCORRECT,
     MFA_NOT_ENROLLED, MFA_REQUIRED, MFA_ENROLL_FIRST), or UNKNOWN_ACCOUNT for a
-    collection grant naming no such account (#606)."""
+    collection grant naming no such account (#606), or for groups (#784)
+    GROUP_EXISTS, GROUP_NOT_FOUND, and UNKNOWN_GROUP for a collection grant
+    naming no such group."""
 
     def __init__(self, message: str, code: str = "REFUSED"):
         super().__init__(message)
@@ -256,9 +284,10 @@ def _connect(write: bool = False):
 
 
 def _migrate(conn) -> None:
-    """Version 2 (PR 3): users.kind. Versions 3 (#607) and 4 (#606) only add
-    tables, which _SCHEMA creates; version 4 leaves every existing collection
-    open, since none is named in restricted_collections. In a write transaction, so the API and the operator
+    """Version 2 (PR 3): users.kind. Versions 3 (#607), 4 (#606) and 5 (#784)
+    only add tables, which _SCHEMA creates; version 4 leaves every existing collection
+    open, since none is named in restricted_collections, and version 5 adds no
+    group, so no state changes. In a write transaction, so the API and the operator
     command can't both add the column."""
     conn.execute("BEGIN IMMEDIATE")
     columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
@@ -841,6 +870,10 @@ class CollectionAccess:
     restricted: bool
     users: tuple[str, ...] = ()
     service_principals: tuple[str, ...] = ()
+    groups: tuple[str, ...] = ()                 # #784
+    # Each granted group's identity, (id, created_at), in the order of `groups`,
+    # for put_back (#854): a name can be reused, and so can an id. Not compared.
+    group_ids: tuple[tuple[int, float], ...] = field(default=(), compare=False, repr=False)
 
 
 def _access(conn, collection: str) -> CollectionAccess:
@@ -848,8 +881,13 @@ def _access(conn, collection: str) -> CollectionAccess:
         return CollectionAccess(False)
     rows = conn.execute("SELECT u.username, u.kind FROM collection_grants g JOIN users u ON u.id = g.user_id "
                         "WHERE g.collection = ? ORDER BY u.username", (collection,)).fetchall()
+    groups = conn.execute("SELECT gr.id, gr.created_at, gr.name FROM collection_group_grants gg "
+                          "JOIN groups gr ON gr.id = gg.group_id WHERE gg.collection = ? ORDER BY gr.name",
+                          (collection,)).fetchall()
     return CollectionAccess(True, tuple(r["username"] for r in rows if r["kind"] == "user"),
-                            tuple(r["username"] for r in rows if r["kind"] == "service"))
+                            tuple(r["username"] for r in rows if r["kind"] == "service"),
+                            tuple(r["name"] for r in groups),
+                            tuple((r["id"], r["created_at"]) for r in groups))
 
 
 def collection_access(collection: str) -> CollectionAccess:
@@ -859,10 +897,15 @@ def collection_access(collection: str) -> CollectionAccess:
 
 
 def restricted_collections() -> dict[str, frozenset[int]]:
-    """Every restricted collection and the ids of the accounts granted it."""
+    """Every restricted collection and the ids of the accounts that may use
+    it: granted directly, or a member of a group granted it (#784)."""
     with _connect() as conn:
         found = {row["collection"]: set() for row in conn.execute("SELECT collection FROM restricted_collections")}
         for row in conn.execute("SELECT collection, user_id FROM collection_grants"):
+            if row["collection"] in found:
+                found[row["collection"]].add(row["user_id"])
+        for row in conn.execute("SELECT gg.collection, m.user_id FROM collection_group_grants gg "
+                                "JOIN group_members m ON m.group_id = gg.group_id"):
             if row["collection"] in found:
                 found[row["collection"]].add(row["user_id"])
     return {name: frozenset(ids) for name, ids in found.items()}
@@ -870,15 +913,19 @@ def restricted_collections() -> dict[str, frozenset[int]]:
 
 def has_access(user_id: int, role: str, collection: str) -> bool:
     """An Engineer reaches every collection; anyone else an open one, or a
-    restricted one they are granted. Read on every call, so a change applies to
-    the next request."""
+    restricted one they are granted, directly or through a group (#784). Read
+    on every call, so a change applies to the next request."""
     if role == "engineer":
         return True
     collection = _canonical(collection)
     with _connect() as conn:
         if conn.execute("SELECT 1 FROM restricted_collections WHERE collection = ?", (collection,)).fetchone() is None:
             return True
-        return conn.execute("SELECT 1 FROM collection_grants WHERE collection = ? AND user_id = ?",
+        if conn.execute("SELECT 1 FROM collection_grants WHERE collection = ? AND user_id = ?",
+                        (collection, user_id)).fetchone() is not None:
+            return True
+        return conn.execute("SELECT 1 FROM collection_group_grants gg JOIN group_members m "
+                            "ON m.group_id = gg.group_id WHERE gg.collection = ? AND m.user_id = ? LIMIT 1",
                             (collection, user_id)).fetchone() is not None
 
 
@@ -920,30 +967,45 @@ def _grant_ids(conn, names, kind: str) -> list[int]:
     return ids
 
 
-def _restrict(conn, collection: str, user_ids) -> None:
+def _group_ids(conn, names) -> list[int]:
+    ids = []
+    for name in names:
+        row = conn.execute("SELECT id FROM groups WHERE name = ?", (str(name).strip().lower(),)).fetchone()
+        if row is None:
+            raise Refused(f"no group is named {name!r}", "UNKNOWN_GROUP")
+        ids.append(row["id"])
+    return ids
+
+
+def _restrict(conn, collection: str, user_ids, group_ids=()) -> None:
     now = _now()
     conn.execute("INSERT OR IGNORE INTO restricted_collections (collection, restricted_at) VALUES (?, ?)",
                  (collection, now))
     conn.execute("DELETE FROM collection_grants WHERE collection = ?", (collection,))
     conn.executemany("INSERT INTO collection_grants (collection, user_id, granted_at) VALUES (?, ?, ?)",
                      [(collection, user_id, now) for user_id in dict.fromkeys(user_ids)])
+    conn.execute("DELETE FROM collection_group_grants WHERE collection = ?", (collection,))
+    conn.executemany("INSERT INTO collection_group_grants (collection, group_id, granted_at) VALUES (?, ?, ?)",
+                     [(collection, group_id, now) for group_id in dict.fromkeys(group_ids)])
 
 
 def _open(conn, collection: str) -> None:
     conn.execute("DELETE FROM collection_grants WHERE collection = ?", (collection,))
+    conn.execute("DELETE FROM collection_group_grants WHERE collection = ?", (collection,))
     conn.execute("DELETE FROM restricted_collections WHERE collection = ?", (collection,))
 
 
-def set_collection_access(collection: str, restricted: bool, users=(), service_principals=()):
+def set_collection_access(collection: str, restricted: bool, users=(), service_principals=(), groups=()):
     """An Engineer's change (PUT /collections/{name}/access): the whole state
     at once. Returns (before, after). An unknown name refuses the whole change
-    (UNKNOWN_ACCOUNT); disabled accounts may be granted."""
+    (UNKNOWN_ACCOUNT, or UNKNOWN_GROUP for a group, #784); disabled accounts may
+    be granted."""
     collection = _canonical(collection)
     with _connect(write=True) as conn:
         before = _access(conn, collection)
         if restricted:
             ids = _grant_ids(conn, users, "user") + _grant_ids(conn, service_principals, "service")
-            _restrict(conn, collection, ids)
+            _restrict(conn, collection, ids, _group_ids(conn, groups))
         else:
             _open(conn, collection)
         return before, _access(conn, collection)
@@ -951,7 +1013,8 @@ def set_collection_access(collection: str, restricted: bool, users=(), service_p
 
 def restrict_to(collection: str, user_id: int | None) -> tuple[CollectionAccess, CollectionAccess]:
     """A new collection: restricted, granted only to its creator (none when
-    None). Returns (the state it replaced, the state written), for put_back."""
+    None), with no group. Returns (the state it replaced, the state written),
+    for put_back."""
     collection = _canonical(collection)
     with _connect(write=True) as conn:
         before = _access(conn, collection)
@@ -968,32 +1031,41 @@ def _no_store() -> bool:
 
 
 def _grant_set(conn, collection: str):
-    """None for an open collection; otherwise the ids of the accounts granted it."""
+    """None for an open collection; otherwise the ids of the accounts granted
+    it and the ids of the groups granted it (#784)."""
     if conn.execute("SELECT 1 FROM restricted_collections WHERE collection = ?", (collection,)).fetchone() is None:
         return None
-    return [row["user_id"] for row in
-            conn.execute("SELECT user_id FROM collection_grants WHERE collection = ?", (collection,))]
+    users = [row["user_id"] for row in
+             conn.execute("SELECT user_id FROM collection_grants WHERE collection = ?", (collection,))]
+    groups = [row["group_id"] for row in
+              conn.execute("SELECT group_id FROM collection_group_grants WHERE collection = ?", (collection,))]
+    return users, groups
 
 
 def copy_collection_access(source: str, target: str,
                            narrowed_by: Iterable[str] = ()) -> tuple[CollectionAccess, CollectionAccess]:
     """The target takes the source's state: open stays open, restricted copies
-    its grants. With `narrowed_by` (the collections a staging or recovery copy
-    was made from, its chain after itself, #788, #792), it takes the narrowest
-    of them all: restricted when any is, to the accounts granted every
-    restricted one. Returns (the target's state it replaced, the state
-    written)."""
+    its grants, to accounts and to groups (#784). With `narrowed_by` (the
+    collections a staging or recovery copy was made from, its chain after
+    itself, #788, #792), it takes the narrowest of them all: restricted when
+    any is, to the accounts granted directly every restricted one and the
+    groups granted every one, each intersected on its own, so it is never
+    wider than any of them and a group grant stays one. Returns (the target's
+    state it replaced, the state written)."""
     source, target = _canonical(source), _canonical(target)
     if _no_store():
         return CollectionAccess(False), CollectionAccess(False)
     with _connect(write=True) as conn:
         before = _access(conn, target)
         sets = [_grant_set(conn, source)] + [_grant_set(conn, _canonical(n)) for n in narrowed_by]
-        restricted = [ids for ids in sets if ids is not None]
+        restricted = [grants for grants in sets if grants is not None]
         if not restricted:
             _open(conn, target)
         else:
-            _restrict(conn, target, [i for i in restricted[0] if all(i in ids for ids in restricted[1:])])
+            first_users, first_groups = restricted[0]
+            _restrict(conn, target,
+                      [i for i in first_users if all(i in users for users, _ in restricted[1:])],
+                      [g for g in first_groups if all(g in groups for _, groups in restricted[1:])])
         return before, _access(conn, target)
 
 
@@ -1002,7 +1074,12 @@ def put_back(collection: str, expected: CollectionAccess, previous: CollectionAc
     `previous`, but only while it is still `expected`, the state the failed
     create wrote. A concurrent create or import that wrote its own state since
     keeps it, so a failure never takes another's grants nor opens a collection.
-    One transaction. True when it put the state back."""
+    An account or group in `previous` that no longer exists is left out
+    (narrower, never wider). A group is matched by its identity, its id and
+    creation time, not its name (#854): one deleted since is left out even when
+    another has been made under its name or with its reused id, and one renamed
+    since is the same group; a state with no group identities puts back no
+    group. One transaction. True when it put the state back."""
     collection = _canonical(collection)
     with _connect(write=True) as conn:
         if _access(conn, collection) != expected:
@@ -1016,7 +1093,13 @@ def put_back(collection: str, expected: CollectionAccess, previous: CollectionAc
                 row = conn.execute("SELECT id FROM users WHERE username = ? AND kind = ?", (name, kind)).fetchone()
                 if row is not None:
                     ids.append(row["id"])
-        _restrict(conn, collection, ids)
+        group_ids = []
+        for group_id, created_at in previous.group_ids:
+            row = conn.execute("SELECT id FROM groups WHERE id = ? AND created_at = ?",
+                               (group_id, created_at)).fetchone()
+            if row is not None:
+                group_ids.append(row["id"])
+        _restrict(conn, collection, ids, group_ids)
         return True
 
 
@@ -1026,3 +1109,93 @@ def drop_collection_access(collection: str) -> None:
         return
     with _connect(write=True) as conn:
         _open(conn, _canonical(collection))
+
+
+# ── groups for collection access (#784) ──────────────────────────────────────
+
+@dataclass(frozen=True)
+class Group:
+    id: int
+    name: str
+    created_at: float
+    users: tuple[str, ...] = ()
+    service_principals: tuple[str, ...] = ()
+
+
+def _group(conn, row) -> Group:
+    members = conn.execute("SELECT u.username, u.kind FROM group_members m JOIN users u ON u.id = m.user_id "
+                           "WHERE m.group_id = ? ORDER BY u.username", (row["id"],)).fetchall()
+    return Group(row["id"], row["name"], row["created_at"],
+                 tuple(m["username"] for m in members if m["kind"] == "user"),
+                 tuple(m["username"] for m in members if m["kind"] == "service"))
+
+
+def _existing_group(conn, name: str):
+    row = conn.execute("SELECT * FROM groups WHERE name = ?", (name,)).fetchone()
+    if row is None:
+        raise Refused(f"there is no group {name!r}", "GROUP_NOT_FOUND")
+    return row
+
+
+def list_groups() -> list[Group]:
+    with _connect() as conn:
+        return [_group(conn, row) for row in conn.execute("SELECT * FROM groups ORDER BY name")]
+
+
+def get_group(name: str) -> Group:
+    """The group (GROUP_NOT_FOUND when there is none). `name` is the stored form."""
+    with _connect() as conn:
+        return _group(conn, _existing_group(conn, name))
+
+
+def create_group(name: str) -> Group:
+    """A new group with no members. `name` is the stored form (the router
+    checks the rule)."""
+    with _connect(write=True) as conn:
+        if conn.execute("SELECT 1 FROM groups WHERE name = ?", (name,)).fetchone() is not None:
+            raise Refused(f"a group named {name!r} already exists", "GROUP_EXISTS")
+        conn.execute("INSERT INTO groups (name, created_at) VALUES (?, ?)", (name, _now()))
+        return _group(conn, _existing_group(conn, name))
+
+
+def rename_group(name: str, new: str) -> Group:
+    """Members and grants name the group's id, so they stay. Renaming to its
+    own name changes nothing."""
+    with _connect(write=True) as conn:
+        row = _existing_group(conn, name)
+        if new != name:
+            if conn.execute("SELECT 1 FROM groups WHERE name = ?", (new,)).fetchone() is not None:
+                raise Refused(f"a group named {new!r} already exists", "GROUP_EXISTS")
+            conn.execute("UPDATE groups SET name = ? WHERE id = ?", (new, row["id"]))
+        return _group(conn, _existing_group(conn, new))
+
+
+def set_group_members(name: str, users=(), service_principals=()) -> tuple[Group, Group]:
+    """The whole member list at once. An unknown name refuses the whole change
+    (UNKNOWN_ACCOUNT); disabled accounts may be members. Returns (before, after)."""
+    with _connect(write=True) as conn:
+        row = _existing_group(conn, name)
+        before = _group(conn, row)
+        ids = _grant_ids(conn, users, "user") + _grant_ids(conn, service_principals, "service")
+        now = _now()
+        conn.execute("DELETE FROM group_members WHERE group_id = ?", (row["id"],))
+        conn.executemany("INSERT INTO group_members (group_id, user_id, added_at) VALUES (?, ?, ?)",
+                         [(row["id"], user_id, now) for user_id in dict.fromkeys(ids)])
+        return before, _group(conn, row)
+
+
+def delete_group(name: str) -> tuple[list[str], Group]:
+    """The group, its members and every collection grant to it, in one
+    transaction. A collection restricted only through it stays restricted.
+    Returns the collections whose grant was removed, sorted, and the group as
+    it was, with the members the delete removed (#854)."""
+    with _connect(write=True) as conn:
+        row = _existing_group(conn, name)
+        group = _group(conn, row)
+        collections = sorted(r["collection"] for r in
+                             conn.execute("SELECT collection FROM collection_group_grants WHERE group_id = ?",
+                                          (row["id"],)))
+        conn.execute("DELETE FROM collection_group_grants WHERE group_id = ?", (row["id"],))
+        conn.execute("DELETE FROM group_members WHERE group_id = ?", (row["id"],))
+        conn.execute("DELETE FROM groups WHERE id = ?", (row["id"],))
+        return collections, group

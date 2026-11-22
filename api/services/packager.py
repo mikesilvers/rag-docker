@@ -9,6 +9,7 @@ Format reference: RAG_EXPORT_SPECIFICATIONS.md §4.
 from __future__ import annotations
 from services import telemetry
 
+import errno
 import fnmatch
 import hashlib
 import json
@@ -19,6 +20,7 @@ import shutil
 import stat
 import tarfile
 import tempfile
+import threading
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterator
@@ -61,8 +63,9 @@ def exports_dir() -> Path:
 # Staging is now `{UPLOAD_DIR}/export-*`, swept with the other work directories
 # there (#549); `.build-*` is staging left here by earlier versions.
 _BUILD_DIR = ".build-*"
-# An encrypted export is written as `.<stem>.tar.gz.age.partial` (#27).
-_PARTIAL_ARCHIVES = (".*.tar.gz.partial", ".*.tar.gz.age.partial")
+# An encrypted export is written as `.<stem>.tar.gz.age.partial` (#27), and a
+# key export's key file as `.<stem>.tar.gz.age.key.partial` (#676).
+_PARTIAL_ARCHIVES = (".*.tar.gz.partial", ".*.tar.gz.age.partial", ".*.tar.gz.age.key.partial")
 
 
 def remove_leftover(entry: Path, *, directory: bool = False,
@@ -129,6 +132,72 @@ def timestamp(when: datetime) -> str:
 
 def package_stem(collection: str, when: datetime, id8: str) -> str:
     return f"ragpkg-{slug(collection)}-{timestamp(when)}-{id8}"
+
+
+def _now() -> datetime:
+    """The build's clock: the one place it is read, so a test can fix it."""
+    return datetime.now(timezone.utc)
+
+
+# Two exports of one collection with the same content that start in the same
+# second have the same plain stem. The second gets `-2` (then `-3`, ...), so
+# both packages and both key files are kept (#860, spec §4.1).
+MAX_NAME_SUFFIX = 1000
+_names_lock = threading.Lock()
+# Stems this process has given to an export: never given twice, even once the
+# files are downloaded and deleted.
+_given: set[str] = set()
+_DELIVERED = (".tar.gz", age_stream.ENCRYPTED_SUFFIX, age_stream.ENCRYPTED_SUFFIX + ".key")
+# No hard links in the folder: placement checks and renames under the lock.
+_NO_LINKS = {errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EMLINK, errno.ENOSYS, errno.EXDEV}
+
+
+def _stem_taken(out_dir: Path, stem: str) -> bool:
+    """Whether any file of `stem`, or its temporary, is in the folder (a link counts)."""
+    return any(os.path.lexists(out_dir / name)
+               for suffix in _DELIVERED
+               for name in (stem + suffix, f".{stem}{suffix}.partial"))
+
+
+def reserve_stem(out_dir: Path, collection: str, when: datetime, id8: str) -> str:
+    """The package's stem: the plain one when it is free, else the first free
+    `-<n>` from 2 (#860). Chosen and reserved under one lock."""
+    base = package_stem(collection, when, id8)
+    with _names_lock:
+        for n in range(1, MAX_NAME_SUFFIX + 1):
+            stem = base if n == 1 else f"{base}-{n}"
+            if stem not in _given and not _stem_taken(out_dir, stem):
+                _given.add(stem)
+                return stem
+    raise RuntimeError(f"No free package name for {base} up to -{MAX_NAME_SUFFIX}: "
+                       "delete old packages from ./exports and export again.")
+
+
+def _taken(final: Path) -> FileExistsError:
+    return FileExistsError(errno.EEXIST, f"{final.name} is already in the exports folder; it was "
+                           "left as it is and this export wasn't put in place", str(final))
+
+
+def _place(tmp: Path, final: Path) -> None:
+    """Move `tmp` to `final`, never replacing an existing entry (#860)."""
+    try:
+        os.link(tmp, final)
+    except FileExistsError:
+        raise _taken(final) from None
+    except OSError as exc:
+        if exc.errno not in _NO_LINKS:
+            raise
+        # Every export chooses and places names under this lock.
+        with _names_lock:
+            if os.path.lexists(final):
+                raise _taken(final) from None
+            os.rename(tmp, final)
+        return
+    try:
+        os.unlink(tmp)
+    except BaseException:
+        final.unlink(missing_ok=True)
+        raise
 
 
 # ── Digests ───────────────────────────────────────────────────────────────────
@@ -336,6 +405,21 @@ def _fidelity_note(fidelity: str) -> str:
             "work; re-chunking does not.")
 
 
+def _encryption_note(encryption: str, filename: str) -> str:
+    """The package README's line on how this package opens (#27, #676)."""
+    if encryption == "key":
+        return (f"This package is encrypted with its own key, in `{filename}.key`, written "
+                "beside it when it was exported. Open it with "
+                f"`age -d -i {filename}.key {filename}`, or import it with the key file (the "
+                "Transfer page, or the key file's text sent as `key`, for example built with "
+                f"`jq -n --rawfile key {filename}.key`). Store the key apart from the package: "
+                "anyone with both can read it.")
+    if encryption == "passphrase":
+        return ("This package is encrypted with the passphrase it was exported with; import "
+                "it with that passphrase, or open it with `age -d`.")
+    return "This package is not encrypted."
+
+
 def _retrieve_section(has_script: bool, cfg: dict, collection: str) -> str:
     if not has_script:
         return ("`retrieve.py` is **not** included in this package, because the "
@@ -360,23 +444,25 @@ def _add_members(tar: tarfile.TarFile, stage: Path, stem: str) -> None:
             tar.add(stage / entry, arcname=f"{stem}/{entry}")
 
 
-def _write_archive(stage: Path, stem: str, dest: Path, passphrase: str | None = None) -> None:
+def _write_archive(stage: Path, stem: str, dest: Path, passphrase: str | None = None,
+                   recipient: bytes | None = None) -> None:
     """Archive the staged package as `<stem>/`, with manifest.json first (#383).
 
     The directory entry, then the manifest, then everything else in the sorted
     order `tar.add(stage, arcname=stem)` gives, so the listing can stop reading
     at the manifest instead of decompressing chunks.jsonl to reach it.
 
-    With a passphrase the same tar.gz stream goes through the age encryptor on
-    its way to `dest` (#27): no plaintext archive is written, and only one
-    64 KiB chunk is held at a time, so a package of several GB streams.
+    With a passphrase (#27) or an X25519 recipient (#676) the same tar.gz stream
+    goes through the age encryptor on its way to `dest`: no plaintext archive is
+    written, and only one 64 KiB chunk is held at a time, so a package of
+    several GB streams.
     """
-    if passphrase is None:
+    if passphrase is None and recipient is None:
         with tarfile.open(dest, "w:gz") as tar:
             _add_members(tar, stage, stem)
         return
     with dest.open("wb") as fh:
-        encryptor = age_stream.Encryptor(fh, passphrase)
+        encryptor = age_stream.Encryptor(fh, passphrase, recipient=recipient)
         with tarfile.open(fileobj=encryptor, mode="w|gz") as tar:
             _add_members(tar, stage, stem)
         # Writes the final chunk; an exception above skips it, and build()
@@ -390,6 +476,7 @@ def build(
     include_models: bool = False,
     progress: Callable[[int], None] | None = None,
     passphrase: str | None = None,
+    key: bool = False,
 ) -> dict:
     """Write one package and return a summary. Blocking; run it in a thread.
 
@@ -398,9 +485,14 @@ def build(
     the manifest digest. Manifest last is what makes <id8> derivable.
 
     With a passphrase the package is written encrypted, as `<stem>.tar.gz.age`
-    (#27). The passphrase is used, never stored or logged.
+    (#27). The passphrase is used, never stored or logged. With `key` it is
+    encrypted to a new X25519 key instead (#676), whose secret goes only to the
+    key file `<filename>.key` (0600) beside it.
     """
-    created = datetime.now(timezone.utc)
+    if key and passphrase is not None:
+        raise ValueError("a package takes a passphrase or a key, not both")
+    encryption = "key" if key else "passphrase" if passphrase is not None else "none"
+    created = _now()
     created_at = created.strftime("%Y-%m-%dT%H:%M:%SZ")
     out_dir = exports_dir()
     warnings: list[str] = []
@@ -413,6 +505,8 @@ def build(
     upload.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(dir=upload, prefix="export-"))
     tmp_archive: Path | None = None
+    tmp_key: Path | None = None
+    placed_key: Path | None = None
     try:
         b = _Builder(stage)
 
@@ -592,9 +686,10 @@ def build(
         id8 = sha256_file(manifest_path)[:8]
 
         # 7. the generated pair, which embed <id8>
-        stem = package_stem(collection, created, id8)
+        # A name no other export has, never replacing a file (#860).
+        stem = reserve_stem(out_dir, collection, created, id8)
         # The README and retrieve.py name the file as delivered (#27).
-        filename = f"{stem}{age_stream.ENCRYPTED_SUFFIX if passphrase is not None else '.tar.gz'}"
+        filename = f"{stem}{age_stream.ENCRYPTED_SUFFIX if encryption != 'none' else '.tar.gz'}"
 
         if has_saved_retrieval:
             (stage / "retrieve.py").write_text(_render_retrieve(collection, retrieval_cfg, {
@@ -617,18 +712,34 @@ def build(
             "CREATED_AT": created_at,
             "ID8": id8,
             "PACKAGE_FILENAME": filename,
-            "IMPORT_PASSPHRASE": (', "passphrase": "<the passphrase>"'
-                                  if passphrase is not None else ""),
+            "IMPORT_SECRET": {"passphrase": ', "passphrase": "<the passphrase>"',
+                              "key": ', "key": "<the key file\'s text>"'}.get(encryption, ""),
+            "ENCRYPTION_NOTE": _encryption_note(encryption, filename),
             "RETRIEVE_SECTION": _retrieve_section(has_saved_retrieval, retrieval_cfg, collection),
         }))
 
         # 8. archive under a temporary name, then rename, so a partial file is
         #    never mistaken for a package.
         tmp_archive = out_dir / f".{filename}.partial"
-        _write_archive(stage, stem, tmp_archive, passphrase)
+        identity = age_stream.generate_identity() if encryption == "key" else None
+        _write_archive(stage, stem, tmp_archive, passphrase,
+                       identity.public_bytes if identity is not None else None)
+        key_filename = None
+        if identity is not None:
+            # The key file first, 0600 from its creation (#676); the package is
+            # put in place only once its key is. Neither replaces a file (#860):
+            # `placed_key` is set only once this build has placed it.
+            key_filename = filename + ".key"
+            tmp_key = out_dir / f".{key_filename}.partial"
+            _write_key_file(tmp_key, age_stream.identity_file(identity, created, filename))
+            identity = None
+            _place(tmp_key, out_dir / key_filename)
+            placed_key = out_dir / key_filename
+            tmp_key = None
         final = out_dir / filename
-        tmp_archive.replace(final)
+        _place(tmp_archive, final)
         tmp_archive = None
+        placed_key = None
 
         return {
             "filename": filename,
@@ -639,13 +750,27 @@ def build(
             "models_bundled": models_bundled,
             "retrieve_script": has_saved_retrieval,
             "id8": id8,
-            "encrypted": passphrase is not None,
+            "encrypted": encryption != "none",
+            "encryption": encryption,
+            "key_filename": key_filename,
             "warnings": warnings,
         }
     finally:
         shutil.rmtree(stage, ignore_errors=True)
-        if tmp_archive is not None:
-            tmp_archive.unlink(missing_ok=True)
+        # A failed build leaves neither the package nor its key (#676).
+        for leftover in (tmp_archive, tmp_key, placed_key):
+            if leftover is not None:
+                leftover.unlink(missing_ok=True)
+
+
+def _write_key_file(path: Path, text: str) -> None:
+    """Create `path` with mode 0600 (the umask can only narrow it), never
+    following a link and never over an existing file, and write `text` (#676)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(fd, "w", encoding="ascii") as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
 
 
 # ── Reading a package back ────────────────────────────────────────────────────
@@ -891,11 +1016,12 @@ def _safe_extract_stream(tar: tarfile.TarFile, dest: Path, name: str) -> None:
 
 
 # Why an encrypted package could not be decrypted, for `error_detail.reason`.
-_DECRYPT_REASONS = {"work_factor": "work_factor", "passphrase": "passphrase",
+_DECRYPT_REASONS = {"work_factor": "work_factor", "passphrase": "passphrase", "key": "key",
                     "hmac": "header", "payload": "payload", "nonce": "payload"}
 
 
-def _extract_encrypted(archive: Path, dest: Path, passphrase: str) -> None:
+def _extract_encrypted(archive: Path, dest: Path, passphrase: str | None,
+                       identity: "age_stream.Identity | None" = None) -> None:
     """Check 1 for a `.tar.gz.age` package: decrypt it as a stream into the tar
     reader, then authenticate the rest of the file to its end (#27).
 
@@ -904,31 +1030,36 @@ def _extract_encrypted(archive: Path, dest: Path, passphrase: str) -> None:
     """
     try:
         with archive.open("rb") as fh:
-            decryptor = age_stream.open_decrypt(fh, passphrase)
+            if identity is not None:
+                decryptor = age_stream.open_decrypt(fh, identity=identity)
+            else:
+                decryptor = age_stream.open_decrypt(fh, passphrase)
             with tarfile.open(fileobj=decryptor, mode="r|gz") as tar:
                 _safe_extract_stream(tar, dest, archive.name)
             # tarfile stops at the end-of-archive blocks; the final chunk, and
             # anything after it, still has to be authenticated.
             decryptor.drain()
     except age_stream.AgeError as exc:
-        if exc.kind in ("header", "recipient"):
+        if exc.kind in ("header", "recipient", "identity"):
             raise PackageError(
                 "PACKAGE_UNREADABLE",
-                f"'{archive.name}' is not a passphrase-encrypted age file.",
+                f"'{archive.name}' is not "
+                f"{'a key-encrypted' if identity is not None else 'a passphrase-encrypted'} age file.",
                 {"reason": str(exc)}) from None
         raise PackageError(
             "DECRYPT_FAILED",
-            f"'{archive.name}' could not be decrypted: the passphrase is wrong or "
-            "the file is damaged.",
+            f"'{archive.name}' could not be decrypted: the "
+            f"{'key' if identity is not None else 'passphrase'} is wrong or the file is damaged.",
             {"reason": _DECRYPT_REASONS[exc.kind]}) from None
 
 
 @telemetry.traced("rag.package")
-def open_package(archive: Path, dest: Path, passphrase: str | None = None) -> tuple[Path, dict]:
+def open_package(archive: Path, dest: Path, passphrase: str | None = None,
+                 identity: "age_stream.Identity | None" = None) -> tuple[Path, dict]:
     """Checks 1 and 2 of spec §6.2: readable archive, understood format.
 
-    A `.tar.gz.age` package is decrypted with `passphrase` as it is unpacked
-    (#27); everything from check 2 on reads the decrypted files, as for an
+    A `.tar.gz.age` package is decrypted with `passphrase` (#27), or with the
+    X25519 `identity` of its key file (#676), as it is unpacked; everything from check 2 on reads the decrypted files, as for an
     unencrypted package. Returns (package root directory, manifest).
     """
     if not archive.is_file():
@@ -937,7 +1068,8 @@ def open_package(archive: Path, dest: Path, passphrase: str | None = None) -> tu
     encrypted = age_stream.is_encrypted_name(archive.name)
     try:
         if encrypted:
-            _extract_encrypted(archive, dest, passphrase or "")
+            _extract_encrypted(archive, dest, None if identity is not None else passphrase or "",
+                               identity)
         else:
             with tarfile.open(archive, "r:gz") as tar:
                 _safe_extract(tar, dest, archive.name)

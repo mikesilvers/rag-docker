@@ -27,6 +27,7 @@ import asyncio
 import json
 import logging
 import os
+import stat
 import re
 import shutil
 import tempfile
@@ -71,8 +72,9 @@ _NAME_OK = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 
 
 class PassphraseError(Exception):
-    """A passphrase missing for an encrypted package, or given for one that is
-    not encrypted (#27). Raised before any job exists; `code` is the API code."""
+    """A passphrase or key missing for an encrypted package, given for one that
+    is not encrypted or that takes the other, or a key that isn't one (#27,
+    #676). Raised before any job exists; `code` is the API code."""
 
     def __init__(self, code: str, message: str):
         super().__init__(message)
@@ -897,7 +899,8 @@ def _start_access(owner, source: str, target: str, operator: bool = False):
 
 
 @telemetry.traced("rag.import")
-def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = None) -> None:
+def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = None,
+         identity: "age_stream.Identity | None" = None) -> None:
     job = _jobs[job_id]
     job["status"] = "running"
     work = Path(tempfile.mkdtemp(prefix="import-", dir=settings.upload_dir))
@@ -922,7 +925,9 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
 
     try:
         archive = packager.exports_dir() / Path(filename).name
-        pkg, manifest = packager.open_package(archive, work, passphrase)  # checks 1, 2
+        # checks 1, 2; an identity (#676) only when there is one, so the call is otherwise as before
+        pkg, manifest = (packager.open_package(archive, work, passphrase, identity=identity)
+                         if identity is not None else packager.open_package(archive, work, passphrase))
         packager.verify_digests(pkg, manifest)                      # check 3
         _validate_package_sources(pkg, manifest)
         _check_embedding(manifest)                                  # check 4
@@ -1097,29 +1102,72 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
         _release_targets(job_id)
 
 
+def package_kind(name: str) -> str | None:
+    """`age_stream.header_kind` of a package in ./exports: "passphrase", "key",
+    or None when it is missing, not a regular file, or not a header either
+    takes. Reads the header only: no scrypt or X25519 work (#676)."""
+    try:
+        fd = os.open(packager.exports_dir() / Path(name).name,
+                     os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return None
+    with os.fdopen(fd, "rb") as fh:
+        try:
+            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                return None
+        except OSError:
+            return None
+        return age_stream.header_kind(fh)
+
+
 async def start_import_job(filename: str, on_conflict: str, passphrase: str | None = None,
-                           owner: dict | None = None) -> str:
+                           owner: dict | None = None, *, key: str | None = None) -> str:
     """Register the job and run the import off the event loop.
 
-    An encrypted package is known by its name (`.tar.gz.age`, #27), so a missing
-    or unexpected passphrase is refused here, before any job or guard. The
-    passphrase reaches the worker as an argument only, never the job record.
+    An encrypted package is known by its name (`.tar.gz.age`, #27), and whether
+    a passphrase or its key file opens it by its age header (#676), so a missing,
+    unexpected or invalid secret is refused here, before any job or guard. An
+    unreadable header takes either secret, and the job reports why it can't be
+    read. The secret reaches the worker as an argument only, never the job record.
     """
-    key = _package_key(filename)
-    encrypted = age_stream.is_encrypted_name(key)
-    if encrypted and passphrase is None:
-        raise PassphraseError("PASSPHRASE_REQUIRED",
-                              f"'{key}' is encrypted. Send its passphrase to import it.")
+    name = _package_key(filename)
+    encrypted = age_stream.is_encrypted_name(name)
     if not encrypted and passphrase is not None:
         raise PassphraseError("PASSPHRASE_NOT_EXPECTED",
-                              f"'{key}' is not encrypted, so it takes no passphrase. "
+                              f"'{name}' is not encrypted, so it takes no passphrase. "
                               "Anyone with the file can read it.")
+    if not encrypted and key is not None:
+        raise PassphraseError("KEY_FILE_NOT_EXPECTED",
+                              f"'{name}' is not encrypted, so it takes no key. "
+                              "Anyone with the file can read it.")
+    identity = None
+    if encrypted:
+        kind = await asyncio.to_thread(package_kind, name)
+        if kind == "key" and key is None:
+            raise PassphraseError("KEY_FILE_REQUIRED",
+                                  f"'{name}' is encrypted with a key. Send its key file to import it.")
+        if kind == "passphrase" and passphrase is None:
+            raise PassphraseError("PASSPHRASE_REQUIRED",
+                                  f"'{name}' is encrypted with a passphrase. Send its passphrase to import it.")
+        if kind is None and passphrase is None and key is None:
+            raise PassphraseError("PASSPHRASE_REQUIRED",
+                                  f"'{name}' is encrypted. Send its passphrase to import it.")
+        if key is not None:
+            try:
+                identity = age_stream.parse_identity(key)
+            except age_stream.AgeError:
+                raise PassphraseError("KEY_FILE_INVALID",
+                                      "The key isn't the text of an age key file "
+                                      "(one AGE-SECRET-KEY-1... line).") from None
+            passphrase = None
+    encryption = "key" if identity is not None else "passphrase" if passphrase is not None else "none"
+    key = None                         # the key's text is not kept past here
     job_id = str(uuid.uuid4())[:8]
     # Off the event loop: the claim waits while a sweep holds the retention lock
     # (#677). A cancellation while it runs still releases it (#794).
     from services import package_retention
-    await package_retention.run_claim(lambda: _claim_package(key, filename),
-                                      lambda _: _release_package(key))
+    await package_retention.run_claim(lambda: _claim_package(name, filename),
+                                      lambda _: _release_package(name))
 
     # The first write is durable, so it runs off the event loop (#309). A start
     # cancelled meanwhile releases its guard; the store removes the record.
@@ -1140,11 +1188,16 @@ async def start_import_job(filename: str, on_conflict: str, passphrase: str | No
             "error_code": None,
             "error_detail": None,
             "encrypted": encrypted,
+            "encryption": encryption,
             "owner": owner,                     # who started it, for the job lists (#617)
         })
     except BaseException:
-        _release_package(key)
+        _release_package(name)
         raise
-    asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, filename, on_conflict,
-                                          passphrase))
+    if identity is not None:
+        asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, filename, on_conflict,
+                                              None, identity))
+    else:
+        asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, filename, on_conflict,
+                                              passphrase))
     return job_id

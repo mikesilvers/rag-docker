@@ -18,8 +18,11 @@ const SEALED = 'ragpkg-vfytransfera-20261021-0000-abcd1234.tar.gz.age';
 const BROKEN = 'ragpkg-vfytransfera-20261021-0000-ffff0000.tar.gz.age';
 const packagesBody = { packages: [
   { filename: PACKAGE, size_bytes: 2048, collection: A, chunk_count: 3, fidelity: 'with-sources', created_at: null, readable: true, encrypted: false },
-  { filename: SEALED, size_bytes: 2100, collection: null, chunk_count: null, fidelity: null, created_at: null, readable: true, encrypted: true },
+  { filename: SEALED, size_bytes: 2100, collection: null, chunk_count: null, fidelity: null, created_at: null, readable: true, encrypted: true, encryption: 'passphrase' },
 ] };
+// A package encrypted to its own key (#676), its key file still on the server.
+const KEYED = 'ragpkg-vfytransfera-20261021-0000-cccc1111.tar.gz.age';
+const keyedPackage = { filename: KEYED, size_bytes: 2200, collection: null, chunk_count: null, fidelity: null, created_at: null, readable: true, encrypted: true, encryption: 'key', key_on_server: true };
 const tuneBody = name => ({ collection: name, fidelity: 'with-sources', source_document_count: 2, can_rechunk: true, can_reembed: true, can_reindex: true, note: '' });
 const json = (status, body) => ({ status, body: JSON.stringify(body) });
 const apiError = (status, code, msg) => json(status, { error: { code, message: msg, detail: null } });
@@ -36,7 +39,7 @@ const HALVES = {
             done: importJob('completed', { collection: A, chunks_written: 3, fidelity: 'with-sources' }) },
 };
 
-async function fixture(browser, base, { hold = [] } = {}) {
+async function fixture(browser, base, { hold = [], lanMode = false } = {}) {
   const ctx = await browser.createBrowserContext();
   const page = await ctx.newPage();
   const errors = [];
@@ -69,6 +72,17 @@ async function fixture(browser, base, { hold = [] } = {}) {
   }, fixed);
   // The engineer, as GET /api/auth/me answers it, without a backend (#25).
   await stubAuth(page, 'engineer');
+  if (lanMode) {
+    // The same engineer, with LAN mode on in the user answer (#676).
+    await page.evaluateOnNewDocument(() => {
+      const inner = window.fetch.bind(window);
+      window.fetch = (input, init) => {
+        const path = new URL(typeof input === 'string' ? input : input.url, location.href).pathname;
+        if (path === '/api/auth/me') return Promise.resolve(new Response(JSON.stringify({ username: 'vfy-engineer', role: 'engineer', must_change_password: false, lan_mode: true }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+        return inner(input, init);
+      };
+    });
+  }
   await page.goto(base + '/transfer', { waitUntil: 'domcontentloaded' });
   await page.waitForFunction(() => document.querySelectorAll('select option').length > 0 && document.body.innerText.includes('Export a collection'));
   return { ctx, page, errors };
@@ -125,13 +139,16 @@ const stopped = half => `Stopped checking ${HALVES[half].progress} after 30 fail
 
 async function sleep(ms) { await new Promise(r => setTimeout(r, ms)); }
 
-// Encryption controls (#27).
+// Encryption controls (#27, #676): three radio choices.
 const passwords = page => page.evaluate(() => [...document.querySelectorAll('input[type=password]')].map(i => i.value));
 const typePassword = (page, index, value) => setValue(page, `() => document.querySelectorAll('input[type=password]')[${index}]`, value);
-const checkEncrypt = page => page.evaluate(() => {
-  const label = [...document.querySelectorAll('label')].find(l => l.textContent.includes('Encrypt with a passphrase'));
-  if (!label) return false; label.querySelector('input[type=checkbox]').click(); return true;
-});
+const encryptionChoices = page => page.evaluate(() => [...document.querySelectorAll('input[type=radio][name=encryption]')]
+  .map(i => ({ value: i.value, checked: i.checked, label: i.closest('label').querySelector(':scope > div > div').textContent })));
+const chooseEncryption = (page, value) => page.evaluate(v => {
+  const input = document.querySelector(`input[type=radio][name=encryption][value=${v}]`);
+  if (!input) return false; input.click(); return true;
+}, value);
+const checkEncrypt = page => chooseEncryption(page, 'passphrase');
 const sentBody = (page, path) => page.evaluate(p => {
   const r = window.transferFixture.requests.filter(x => x.path === p && x.method === 'POST').pop();
   return r && r.body ? JSON.parse(r.body) : null;
@@ -234,8 +251,8 @@ async function runTransferPageTests(browser, base, reporter) {
   }, { hold: ['GET /api/packages'] }]);
 
   cases.push(['export encryption: the passphrase rules hold Export, a valid matching pair sends it, and the fields clear (#27)', async page => {
-    assert.deepEqual(await passwords(page), [], 'passphrase fields shown before the box is checked');
-    assert.equal(await checkEncrypt(page), true, 'no "Encrypt with a passphrase" checkbox');
+    assert.deepEqual(await passwords(page), [], 'passphrase fields shown before "Passphrase" is chosen');
+    assert.equal(await checkEncrypt(page), true, 'no "Passphrase" choice');
     await page.waitForFunction(() => document.querySelectorAll('input[type=password]').length === 2);
     await waitText(page, 'The passphrase needs at least 12 characters.');
     assert.equal((await button(page, 'export')).disabled, true, 'Export enabled with no passphrase');
@@ -251,14 +268,14 @@ async function runTransferPageTests(browser, base, reporter) {
     await expectButton(page, 'export', false);
     assert.equal(await click(page, 'Export'), true, 'no Export button');
     await pending(page, '/api/export', 'POST');
-    assert.deepEqual(await sentBody(page, '/api/export'), { collection: A, include_models: false, passphrase: 'correct horse battery' });
+    assert.deepEqual(await sentBody(page, '/api/export'), { collection: A, include_models: false, encryption: 'passphrase', passphrase: 'correct horse battery' });
     await release(page, '/api/export', HALVES.export.started, 'POST');
     await page.waitForFunction(() => [...document.querySelectorAll('input[type=password]')].every(i => i.value === ''));
     await release(page, HALVES.export.poll, exportJob('completed', { chunks_written: 3, filename: 'ragpkg-vfy.tar.gz.age', size_bytes: 4096, fidelity: 'with-sources', models_bundled: false, retrieve_script: true, encrypted: true }));
     await waitText(page, 'with-sources, encrypted');
   }]);
   cases.push(['export encryption: the bounds count characters, 1025 holds Export, and a refused start keeps the fields (#27)', async page => {
-    assert.equal(await checkEncrypt(page), true, 'no "Encrypt with a passphrase" checkbox');
+    assert.equal(await checkEncrypt(page), true, 'no "Passphrase" choice');
     await page.waitForFunction(() => document.querySelectorAll('input[type=password]').length === 2);
     const lock = '\u{1F512}';   // one character, two UTF-16 units
     await typePassword(page, 0, lock.repeat(11));
@@ -283,10 +300,71 @@ async function runTransferPageTests(browser, base, reporter) {
     assert.deepEqual(await passwords(page), ['a'.repeat(1024), 'a'.repeat(1024)], 'the fields were cleared after a refused start');
     await expectButton(page, 'export', false);
   }]);
-  cases.push(['export encryption: an unchecked box sends no passphrase (#27)', async page => {
+  cases.push(['export encryption: three choices, a new key first and chosen; the default sends encryption "key" and no passphrase (#676)', async page => {
+    const choices = await encryptionChoices(page);
+    assert.deepEqual(choices.map(c => [c.value, c.label, c.checked]),
+      [['key', 'New key (recommended)', true], ['passphrase', 'Passphrase', false], ['none', 'Not encrypted', false]]);
+    assert.deepEqual(await passwords(page), [], 'passphrase fields shown for a key export');
     await start(page, 'export');
-    assert.deepEqual(await sentBody(page, '/api/export'), { collection: A, include_models: false });
+    assert.deepEqual(await sentBody(page, '/api/export'), { collection: A, include_models: false, encryption: 'key' });
   }]);
+  cases.push(['export encryption: "Not encrypted" sends encryption "none" (#676)', async page => {
+    assert.equal(await chooseEncryption(page, 'none'), true, 'no "Not encrypted" choice');
+    await start(page, 'export');
+    assert.deepEqual(await sentBody(page, '/api/export'), { collection: A, include_models: false, encryption: 'none' });
+  }]);
+  cases.push(['export encryption: in LAN mode "Not encrypted" isn\'t offered (#676)', async page => {
+    await waitText(page, 'In LAN mode every export is encrypted.');
+    const choices = await encryptionChoices(page);
+    assert.deepEqual(choices.map(c => c.value), ['key', 'passphrase']);
+    await start(page, 'export');
+    assert.deepEqual(await sentBody(page, '/api/export'), { collection: A, include_models: false, encryption: 'key' });
+  }, { lanMode: true }]);
+  cases.push(['export: a finished key export offers Download key first, with the store-apart warning, and never shows the key (#676)', async page => {
+    await startAndPoll(page, 'export');
+    const done = JSON.parse(HALVES.export.done.body);
+    const name = 'ragpkg-vfy.tar.gz.age';
+    await release(page, HALVES.export.poll, json(200, { ...done, filename: name, encrypted: true, encryption: 'key', key_filename: name + '.key', key_on_server: true }));
+    await waitText(page, 'Download the key first.');
+    await waitText(page, 'Store it apart from the package');
+    await waitText(page, 'encrypted with a key');
+    const links = await page.evaluate(() => [...document.querySelectorAll('a')].filter(a => ['Download key', 'Download'].includes(a.textContent.trim()))
+      .map(a => ({ label: a.textContent.trim(), href: a.getAttribute('href'), download: a.hasAttribute('download') })));
+    assert.deepEqual(links.slice(0, 2), [
+      { label: 'Download key', href: '/api/packages/' + name + '.key', download: true },
+      { label: 'Download', href: '/api/packages/' + name, download: true }]);
+    assert.ok(!(await text(page)).includes('AGE-SECRET-KEY'), 'the key is shown as text');
+    // After the click the page re-reads the export until the key is gone.
+    await page.evaluate(() => document.addEventListener('click', e => e.preventDefault(), true));
+    await page.evaluate(() => [...document.querySelectorAll('a')].find(a => a.textContent.trim() === 'Download key').click());
+    await release(page, HALVES.export.poll, json(200, { ...done, filename: name, encrypted: true, encryption: 'key', key_filename: name + '.key', key_on_server: false }));
+    await waitText(page, 'Key downloaded and deleted from ./exports.');
+    assert.ok(!(await page.evaluate(() => [...document.querySelectorAll('a')].some(a => a.textContent.trim() === 'Download key'))), 'Download key still offered');
+  }]);
+  cases.push(['import encryption: a key package is labelled, asks for its key file, reads it in the browser and sends its text as key (#676)', async page => {
+    await release(page, '/api/packages', json(200, { packages: [...packagesBody.packages, keyedPackage] }));
+    await page.waitForFunction(n => [...document.querySelectorAll('option')].some(o => o.value === n), { timeout: 5000 }, KEYED);
+    const label = await page.evaluate(n => [...document.querySelectorAll('option')].find(o => o.value === n).textContent, KEYED);
+    assert.ok(label.includes('encrypted with a key, key on the server'), label);
+    await selectPackage(page, KEYED);
+    await waitText(page, 'This package is encrypted with its own key.');
+    assert.deepEqual(await passwords(page), [], 'a passphrase field for a key package');
+    assert.equal((await button(page, 'import')).disabled, true, 'Import enabled without a key file');
+    const keyText = '# public key: age1vfy\nAGE-SECRET-KEY-1VFYNOTAREALKEY\n';
+    await page.evaluate(t => {
+      const input = document.querySelector('input[type=file]');
+      const files = new DataTransfer();
+      files.items.add(new File([t], 'vfy.key'));
+      input.files = files.files;
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    }, keyText);
+    await waitText(page, 'Chosen: vfy.key.');
+    await expectButton(page, 'import', false);
+    assert.equal(await click(page, 'Import'), true, 'no Import button');
+    await pending(page, '/api/import', 'POST');
+    assert.deepEqual(await sentBody(page, '/api/import'), { filename: KEYED, on_conflict: 'abort', key: keyText });
+    assert.ok(!(await text(page)).includes('AGE-SECRET-KEY'), 'the key is shown as text');
+  }, { hold: ['GET /api/packages'] }]);
   cases.push(['import encryption: an encrypted package is labelled, asks for its passphrase and sends it; a plain one sends none (#27)', async page => {
     const label = await page.evaluate(n => [...document.querySelectorAll('option')].find(o => o.value === n)?.textContent || '', SEALED);
     assert.ok(label.includes('encrypted') && !label.includes('null'), label);

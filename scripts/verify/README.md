@@ -277,6 +277,8 @@ mode and a non-boolean `RAG_LAN_MODE`. Only in a `--lan` run does it check the r
 for (localhost, 127.0.0.1 and the test names; another `Host` gets 421, #664),
 TLS versions and HTTP/2, the single loopback binding, the `Secure` cookie, the origin rule over HTTPS,
 a `Server` header with no nginx version (`server_tokens off`),
+`lan_mode` in the user answer and an unencrypted export refused `400 ENCRYPTION_REQUIRED` (#676),
+a default export completing as a key export whose key file and encrypted package download over HTTPS (#676),
 the API's refusal in one-off containers (`docker compose run --rm
 --no-deps`, no ports) and nginx's login rate limit (logins sent without
 waiting until one is refused `429 LOGIN_RATE_LIMITED`, #577); it also prints
@@ -1006,13 +1008,14 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `ui_ingest_check.py` | the checks of suite 22, one per subcommand, on the host, and its cleanup (#641) |
 | `23_llm_split.sh` | the build and answer models (#671), full runs only: with `BUILD_LLM_MODEL` set to a small model, preparation and gold standard use it and query uses the answer model |
 | `llm_split.py` | helper for suite 23, run in the API container: pulls the small model, runs the three tasks through the services' code and prints the models Ollama reports answering each (#671) |
-| `24_query_only.sh` | §2.6 and §10.11 — query-only mode (#670): the overlay resolved without starting it; registers `../tests/test_query_only.py`; the start-up refusal of a non-boolean `RAG_QUERY_ONLY`; the loader's refusal on a full instance; with `stack.sh run --query-only`, build and export, `stack.sh query-only-mode`, then the load, the refusals, access and Q&A on the query-only instance |
+| `24_query_only.sh` | §2.6 and §10.11 — query-only mode (#670): the overlay resolved without starting it; registers `../tests/test_query_only.py`; the start-up refusal of a non-boolean `RAG_QUERY_ONLY`; the loader's refusal on a full instance; with `stack.sh run --query-only`, build and export, `stack.sh query-only-mode`, then the load, the refusals, access and Q&A on the query-only instance, and a key package loaded with its key file on standard input and refused `KEY_FILE_REQUIRED` without it (#676) |
 | `query_only_config.py` | host-side, standard library: `docker-compose.yml` with and without `docker-compose.query-only.yml` as `docker compose config` resolves them; only the api's `RAG_QUERY_ONLY` may differ (#670) |
-| `../tests/test_query_only.py` | API image, no network (also on the host): `RAG_QUERY_ONLY` parsing, the refused and kept routes, the refusals through the app and their order, `query_only` in the user answers, the loader (usage, refusals, lock, passphrase, results `success`/`refused`/`failed`/`interrupted`, the Ctrl-C handler) and the access of a collection it creates (#670) |
+| `../tests/test_query_only.py` | API image, no network (also on the host): `RAG_QUERY_ONLY` parsing, the refused and kept routes, the refusals through the app and their order, `query_only` in the user answers, `lan_mode` in the user answers (#676), the loader (usage, refusals, lock, passphrase, a key package's key file on standard input with `KEY_FILE_REQUIRED` and `KEY_FILE_INVALID` (#676), results `success`/`refused`/`failed`/`interrupted`, the Ctrl-C handler) and the access of a collection it creates (#670) |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
 | `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
 | `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530); the nginx tag in SPECIFICATIONS.md's compose copy and 11.3 image list matches docker-compose.yml (#665), registered by infrastructure |
 | `../tests/test_upgrade_backup.py` | host-only: the README's 1.1.0 → 1.2.0 upgrade blocks, run as written under bash, `zsh -c` and interactive zsh with comments off, against stub `docker`, `git` and `curl`; the stub docker accepts only mounts inside its temp directory and only the README's two container commands: no block holds a `#` comment line; the backup skips a missing volume (a wrong prefix) and counts only existing volumes' archives, and writes each copy to a `.tmp` file that replaces the archive only once `gzip -t` passes, so a failed or corrupt copy prints `backup FAILED` and keeps an earlier archive; the rollback is gated on `git checkout v1.1.0` and checks every archive (`gzip -t`, `tar tzf`) and volume before it empties any, and a failed restore stops before `compose up`; alpine is pinned by version and digest; git ignores `backups/` (#679, #693), registered by infrastructure |
+| `../tests/test_backup_scripts.py` | runs from the host, standard library plus the docker CLI: `scripts/backup.sh` and `scripts/restore.sh` (#848) on throwaway volumes of a random project of their own (`rd848t<hex>`, with compose's labels, removed afterwards), run from a scratch git checkout with their own `HOME`: a backup then a restore gives back every file, folder, link, mode and owner; every volume gets its own key, and no two keys match over two runs; the backup folder (0700) holds only `.tgz.age` archives and `.key` files (0600), with no unencrypted archive and no key in the output; a missing volume is skipped and a running container of the project is stopped, not removed; a wrong key, a missing key file and a damaged or cut archive change nothing and stop nothing, and a wrong key or a Docker error in the check shows what age or Docker said; an extraction that fails after the check (a damaged copy fed by a docker wrapper) leaves the volume unchanged, its root's mode and owner included; a Docker error in the key step is shown, with no line holding a secret key; the prefix and location refusals, and the checkout named in another case refused where the filesystem ignores case; the age image pins (the README's alpine, an exact `age` package), its tag following the whole Dockerfile (a stub docker: a new digest or an added instruction gives a new tag, a comment or a blank line doesn't, #852, #856; with no `sha256sum` the same tag from `shasum`, and with neither a refusal before any build), a volume holding an interrupted restore's `.rag-docker-restore.*` folder backed up without it, the folder left in place, and restored without it (#856), and `*.key` in `.gitignore`. Skipped, with a message, only when the docker CLI is missing; it builds the age image (`scripts/age`) if this machine doesn't have it, which needs the network. Registered by infrastructure |
 | `../tests/test_version_agreement.py` | host-only: the first-party version strings agree with each other, not with a fixed version: `ui/package.json`, the root versions in `ui/package-lock.json`, `mcp/mcpapp.py`, the two `service.version` defaults in `api/services/telemetry.py` and `RAG_OTEL_SERVICE_VERSION` in `docker-compose.telemetry.yml` and `docker-compose.telemetry.verify.yml` (#605, #656), registered by infrastructure |
 | `../tests/test_ui_dependencies.py` | host-only: the copy of `ui/package.json` embedded in `IMPLEMENTATION.md` (`### ui/package.json`) is the file, exactly, so a UI dependency bump that misses the copy fails (#532), registered by infrastructure |
 | `../tests/test_tailwind_output.py` | runs from the host, standard library plus the docker CLI: the built UI CSS keeps what the Tailwind 4 migration relies on (RD-157, #773): the `prose` and `prose-sm` rules, `relative`, `hover` on every device with no `@media (hover: hover)`, and the `@source` globs with automatic detection off (a sentinel `.jsx` file under `ui/src/` is scanned, a sentinel `.md` file is not). It builds a scratch copy of `ui/` with `npm ci --ignore-scripts` from the lock file and `vite build` in a throwaway container of the image `ui/Dockerfile` builds with (its `builder` stage), not on the host (#826), so it needs the network unless the image and the npm cache are present, and is skipped, with a message, only when the docker CLI is missing (a docker or build failure fails it); a second class reads `ui/src/index.css`, `NavBar.tsx` and `ui/Dockerfile` directly, and checks that the builder image is an image reference with a tag or a digest (a `--platform` flag, a digest pin and a registry with a port are accepted; a token starting with `-` is refused before it reaches `docker run`); a third checks, with a stub in place of docker, that a build step that times out has its named container removed (#841). Registered by infrastructure |
@@ -1021,7 +1024,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_package_refusals.py` | controlled import checks 1 and 2, collection-name and `chunks.jsonl` record refusals, registered by suite 15 |
 | `../tests/test_transfer_paths.py` | controlled transfer and tuning route regressions through the app, registered by suite 15 |
 | `../tests/test_retrieve_script.py` | controlled `retrieve.py` defaults, flags and exit codes against a stub API, registered by suite 15 |
-| `../tests/test_distribution.py` | `package.sh`, `package-offline.sh` and `install-offline.sh` with stubbed `docker`, and the image list, on the host, registered by suite 15 |
+| `../tests/test_distribution.py` | `package.sh`, `package-offline.sh` and `install-offline.sh` with stubbed `docker`, and the image list, on the host, registered by suite 15; the offline bundle also saves the backup scripts' age image, built from the bundle's own `scripts/age` when missing, and a failed build saves nothing (#852) |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types, the Import page's corpus preparation rules download (#615), the page controls of #400 (see "UI control browser checks") and, last, the login page against nginx's real login rate limit (#577) |
 | `14_reindex.sh` | exact-record reindex: a host check that the embedded sources match the real files (`../tests/test_reindex_preservation.py`), 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
 | `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures, canonical local session IDs and exact successful-creation ownership. Verifier collection names deliberately lie outside the parent prefix-sweep namespace. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves a durable exact-name fixture receipt/directory before standalone exit; inspection must confirm terminal writer state before exact-name cleanup |
@@ -1219,6 +1222,20 @@ encrypted path everywhere: the listing (header check only), the import refusals 
 passphrase travels as a function argument to the worker thread and is never put in a job
 record; the request models hold it as `SecretStr`.
 
+Since #676 the module also writes and reads files for a new X25519 key: `generate_identity`,
+the key file in age's identity layout (`identity_file`, `parse_identity`), the `X25519` stanza
+on both sides, and `header_kind`, which tells a key package from a passphrase one by its header
+alone. Export encrypts to a new key by default and writes `<package>.key` (0600) beside the
+package; import and the query-only loader choose the secret by the header (`KEY_FILE_REQUIRED`,
+`KEY_FILE_INVALID`, `KEY_FILE_NOT_EXPECTED`). `test_export_encryption.py` runs the 68 testkit vectors that
+carry an X25519 key and an independent X25519 decryption, and checks the key build, the key
+file, the export choices (LAN mode's `ENCRYPTION_REQUIRED`), the import refusals and that no key
+reaches a job record, log or response. Since #860 its `SameSecondNames` tests check that exports
+of one collection whose names would be the same get distinct names (`-2`, `-3`) and keep every
+file, that a name still taken by a key file or given earlier in the process isn't given again,
+that a name taken during the build fails the export and leaves that file, the fallback where
+hard links aren't supported, and that the build fails when no name is free.
+
 `scripts/tests/test_export_encryption.py`, run by `05_transfer.sh` in the API image with no
 network, checks the module against the vendored C2SP CCTV vectors
 (`scripts/tests/fixtures/age-testkit`, with their source in `SOURCE`) and an independent
@@ -1258,11 +1275,20 @@ Suite 05's live checks run through the proxy on the verify stack, with fixtures 
   keeps an unrecorded one;
 - an End User is refused `403`.
 
+The same file covers a key export's key file (#676): its name rule, a full download of the key
+deleting the key only, a package download leaving the key, expiry deleting both, an unrecorded
+key file and a restricted collection's key answering `404 PACKAGE_NOT_FOUND`. Suite 05's block
+"a key export (#676)" then checks on the verify stack that a default export is a key export with
+`<package>.key` at mode 600 and no plain archive in `./exports` while it runs, that two exports
+have different keys, that import without the key is refused `400 KEY_FILE_REQUIRED`, that the key's
+full download deletes the key and keeps the package, and that import with the key file's text
+completes.
+
 ## Transfer page polling and failure checks
 
 `browser/transfer_page.js`, registered in `06_ui.sh` through `ui_criteria.js`, renders the
 Transfer page with every API call stubbed in the browser and the page's 2 s poll delay cut to
-20 ms (#382). Twenty-three cases: for each half, a failed poll (a proxy 502) is shown and retried
+20 ms (#382). Twenty-seven cases: for each half, a failed poll (a proxy 502) is shown and retried
 with the button still busy and cleared by the next good poll; 30 failures in a row stop polling,
 show the last error and enable the button again, and a new start clears the message; a poll in
 flight when the page is left schedules no further poll. An export start answered after the page
@@ -1271,9 +1297,13 @@ is left starts no polling. A 409 `SOURCE_INDEX_INVALID`, 503 or 404 from `/tune`
 longer selected is ignored. A failed export shows its `error_code`, and a failed package list
 is shown without the empty-folder hint until a good Refresh. Three cases cover encryption (#27):
 an export passphrase holds Export until it has 12 characters and matches its confirmation, is
-sent only when the box is checked, and both fields clear once the export starts; an encrypted
+sent only when "Passphrase" is chosen, and both fields clear once the export starts; an encrypted
 package is labelled, asks for its passphrase, sends it and clears it, and a plain package sends
-none. Four cases cover downloading a package (#677):
+none. Five cases cover the key export (#676): the three choices with a new key first and chosen,
+"Not encrypted" sending `encryption: "none"`, no "Not encrypted" in LAN mode, Download key
+offered before the package's Download with the store-apart warning and gone once the key is
+downloaded, and a key package asking for its key file, read in the browser and sent as `key`;
+the key is never shown as text. Four cases cover downloading a package (#677):
 - a finished export offers a Download link to its package with "Expires" in local time, and none
   when it has no expiry;
 - the package list says when a package exported here expires, and its Download link follows the

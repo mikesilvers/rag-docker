@@ -18,11 +18,13 @@ the default, so the file runs in seconds.
 """
 import asyncio
 import base64
+import errno
 import hashlib
 import io
 import json
 import logging
 import os
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -32,6 +34,7 @@ import unittest
 import uuid
 import zlib
 from contextlib import ExitStack
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -58,7 +61,8 @@ CHUNK = age_stream.CHUNK
 STEM = "ragpkg-corpus-20261027T000000Z-0123abcd"
 # The testkit's outcomes, and the AgeError kinds that mean each.
 OUTCOME = {"header": "header failure", "work_factor": "header failure",
-           "recipient": "no match", "passphrase": "no match", "nonce": "header failure",
+           "recipient": "no match", "passphrase": "no match", "key": "no match",
+           "identity": "no match", "nonce": "header failure",
            "hmac": "HMAC failure", "payload": "payload failure"}
 
 
@@ -353,6 +357,174 @@ def records(count=3, width=4):
              "source_sha256": None} for i in range(count)]
 
 
+_BECH32_TEST = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+
+def bech32_data(text):
+    """Bech32 (BIP 173) data bytes of `text`, written here from the BIP, with no
+    code from age_stream; the checksum is verified."""
+    text = text.lower()
+    hrp, rest = text[:text.rfind("1")], text[text.rfind("1") + 1:]
+    values = [_BECH32_TEST.index(c) for c in rest]
+    chk = 1
+    for v in [ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp] + values:
+        top, chk = chk >> 25, (chk & 0x1FFFFFF) << 5 ^ v
+        for i, g in enumerate((0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3)):
+            chk ^= g if (top >> i) & 1 else 0
+    assert chk == 1, "bad checksum"
+    bits = "".join(format(v, "05b") for v in values[:-6])
+    return hrp, bytes(int(bits[i:i + 8], 2) for i in range(0, len(bits) - len(bits) % 8, 8))
+
+
+def independent_x25519_decrypt(blob, key_line):
+    """The age v1 X25519 format, decrypted straight from the specification with
+    no code from age_stream (#676)."""
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+    from cryptography.hazmat.primitives import serialization
+    hrp, raw = bech32_data(key_line)
+    assert hrp == "age-secret-key-" and len(raw) == 32
+    private = X25519PrivateKey.from_private_bytes(raw)
+    ours = private.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    header_end = blob.index(b"\n---") + 4
+    lines = blob[:header_end].split(b"\n")
+    assert lines[0] == b"age-encryption.org/v1", lines[0]
+    args = lines[1].split(b" ")
+    assert args[:2] == [b"->", b"X25519"] and len(args) == 3, args
+    share = base64.b64decode(args[2] + b"=")
+    body = base64.b64decode(lines[2] + b"=")
+    secret = private.exchange(X25519PublicKey.from_public_bytes(share))
+    wrap = HKDF(hashes.SHA256(), 32, share + ours, b"age-encryption.org/v1/X25519").derive(secret)
+    file_key = ChaCha20Poly1305(wrap).decrypt(bytes(12), body, None)
+    hmac_key = HKDF(hashes.SHA256(), 32, None, b"header").derive(file_key)
+    mac_end = blob.index(b"\n", header_end)
+    check = crypto_hmac.HMAC(hmac_key, hashes.SHA256())
+    check.update(blob[:header_end])
+    check.verify(base64.b64decode(blob[header_end + 1:mac_end] + b"="))
+    nonce = blob[mac_end + 1:mac_end + 17]
+    aead = ChaCha20Poly1305(HKDF(hashes.SHA256(), 32, nonce, b"payload").derive(file_key))
+    payload = blob[mac_end + 17:]
+    chunks = [payload[i:i + CHUNK + 16] for i in range(0, len(payload), CHUNK + 16)] or [b""]
+    return b"".join(aead.decrypt(n.to_bytes(11, "big") + (b"\x01" if n == len(chunks) - 1 else b"\x00"), c, None)
+                    for n, c in enumerate(chunks))
+
+
+def x25519_identities(path):
+    """The `identity:` lines of a vector that are X25519 keys (a vector can
+    list a post-quantum one too)."""
+    head = path.read_bytes().partition(b"\n\n")[0].decode()
+    return [line[len("identity: "):] for line in head.splitlines()
+            if line.startswith("identity: AGE-SECRET-KEY-1")]
+
+
+def key_encrypt(data, identity):
+    out = io.BytesIO()
+    enc = age_stream.Encryptor(out, recipient=identity.public_bytes)
+    enc.write(data)
+    enc.close()
+    return out.getvalue()
+
+
+class X25519Keys(unittest.TestCase):
+    """A new X25519 key per package (#676): the testkit, an independent
+    decryption, the key file and its parser."""
+
+    def test_x25519_vectors(self):
+        seen = 0
+        for name, meta, _p, body in vectors():
+            keys = x25519_identities(VECTORS / name)
+            if not keys:
+                continue
+            seen += 1
+            with self.subTest(vector=name):
+                released, outcome = bytearray(), "success"
+                try:
+                    read_all(age_stream.open_decrypt(io.BytesIO(body),
+                                                     identity=age_stream.parse_identity(keys[0])), released)
+                except age_stream.AgeError as exc:
+                    outcome = OUTCOME[exc.kind]
+                self.assertEqual(outcome, meta["expect"])
+                if "payload" in meta:
+                    self.assertEqual(hashlib.sha256(released).hexdigest(), meta["payload"])
+        self.assertEqual(seen, 68)
+
+    def test_round_trips_through_both_decryptions(self):
+        identity = age_stream.generate_identity()
+        line = identity.encode()
+        for size in RoundTrip.SIZES:
+            data = os.urandom(size)
+            with self.subTest(size=size):
+                blob = key_encrypt(data, identity)
+                self.assertEqual(age_stream.open_decrypt(io.BytesIO(blob), identity=identity).read(), data)
+                self.assertEqual(independent_x25519_decrypt(blob, line), data)
+
+    def test_each_identity_is_new_and_each_file_fresh(self):
+        keys = {age_stream.generate_identity().encode() for _ in range(20)}
+        self.assertEqual(len(keys), 20)
+        identity = age_stream.generate_identity()
+        self.assertNotEqual(key_encrypt(b"same", identity), key_encrypt(b"same", identity))
+
+    def test_a_wrong_key_is_kind_key_and_a_passphrase_is_refused(self):
+        blob = key_encrypt(b"data", age_stream.generate_identity())
+        with self.assertRaises(age_stream.AgeError) as caught:
+            age_stream.open_decrypt(io.BytesIO(blob), identity=age_stream.generate_identity())
+        self.assertEqual(caught.exception.kind, "key")
+        with self.assertRaises(age_stream.AgeError) as caught:
+            age_stream.open_decrypt(io.BytesIO(blob), PASSPHRASE)
+        self.assertEqual(caught.exception.kind, "recipient")
+        with self.assertRaises(age_stream.AgeError) as caught:
+            age_stream.open_decrypt(io.BytesIO(encrypt(b"data")), identity=age_stream.generate_identity())
+        self.assertEqual(caught.exception.kind, "header")
+
+    def test_header_kind(self):
+        self.assertEqual(age_stream.header_kind(io.BytesIO(encrypt(b"x"))), "passphrase")
+        self.assertEqual(age_stream.header_kind(io.BytesIO(key_encrypt(b"x", age_stream.generate_identity()))), "key")
+        for junk in (b"", b"not age\n", b"age-encryption.org/v1\n-> X25519 abc\n"):
+            self.assertIsNone(age_stream.header_kind(io.BytesIO(junk)))
+        self.assertTrue(age_stream.check_header(io.BytesIO(key_encrypt(b"x", age_stream.generate_identity()))))
+
+    def test_the_key_file_is_ages_layout_and_parses_back(self):
+        from datetime import datetime, timezone
+        identity = age_stream.generate_identity()
+        text = age_stream.identity_file(identity, datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc), STEM + ".tar.gz.age")
+        lines = text.splitlines()
+        self.assertEqual(lines[0], "# created: 2026-11-20T12:00:00Z")
+        self.assertEqual(lines[1], "# public key: " + identity.recipient)
+        self.assertIn(STEM + ".tar.gz.age", lines[2])
+        self.assertIn("Store it apart from the package", lines[2])
+        self.assertTrue(lines[3].startswith("AGE-SECRET-KEY-1") and lines[3] == lines[3].upper())
+        self.assertTrue(text.endswith("\n"))
+        self.assertEqual(bech32_data(identity.recipient)[0], "age")
+        self.assertEqual(age_stream.parse_identity(text).public_bytes, identity.public_bytes)
+        self.assertEqual(age_stream.parse_identity(text.replace("\n", "\r\n")).public_bytes, identity.public_bytes)
+        self.assertEqual(age_stream.parse_identity("\n\n" + lines[3]).public_bytes, identity.public_bytes)
+
+    def test_the_key_never_shows_in_a_repr_or_an_error(self):
+        identity = age_stream.generate_identity()
+        line = identity.encode()
+        self.assertNotIn(line, repr(identity))
+        self.assertNotIn(line.lower(), repr(identity).lower())
+        broken = line[:-1] + ("Q" if line[-1] != "Q" else "P")
+        other = age_stream.generate_identity().encode()
+        pq = "AGE-SECRET-KEY-PQ-1HZLGZUPT4ETPKDEV8HSGFDCYZ4E522W0A7PU2LHT8EH9W6YLNC3SW78XKG"
+        for text in ("", "# only a comment\n", broken, line + "\n" + other, line.lower()[:20] + line[20:],
+                     pq, "AGE-SECRET-KEY-1", "x" * (age_stream.KEY_FILE_MAX + 1), line + " ",
+                     identity.recipient):
+            with self.subTest(text=text[:24]), self.assertRaises(age_stream.AgeError) as caught:
+                age_stream.parse_identity(text)
+            self.assertEqual(caught.exception.kind, "identity")
+            self.assertNotIn(line, str(caught.exception))
+            self.assertNotIn(text.strip() or "\x00", str(caught.exception))
+
+    def test_the_encryptor_and_decryptor_take_exactly_one_secret(self):
+        identity = age_stream.generate_identity()
+        with self.assertRaises(ValueError):
+            age_stream.Encryptor(io.BytesIO())
+        with self.assertRaises(ValueError):
+            age_stream.Encryptor(io.BytesIO(), PASSPHRASE, LOW, recipient=identity.public_bytes)
+        with self.assertRaises(ValueError):
+            age_stream.open_decrypt(io.BytesIO(b""), PASSPHRASE, identity=identity)
+
+
 class Fixture(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
@@ -392,14 +564,22 @@ class Fixture(unittest.TestCase):
         packager._write_archive(stage or self.stage(), STEM, path, passphrase)
         return path
 
-    def build(self, passphrase=None):
+    def build(self, passphrase=None, key=False):
+        extra = {"key": True} if key else {}
         with patch.object(packager, "read_chunks", return_value=[]), \
              patch.object(packager.wc, "_collection_config_sync", return_value={"embedding_model": settings.embed_model}), \
              patch.object(packager, "_ingest_config", return_value=None), \
              patch.object(packager, "_goldstandard_sessions", return_value=[]), \
              patch.object(packager.sources, "load_index", return_value={"documents": {}}), \
              patch.object(packager.wc, "_meta_sync", return_value={"version": "test"}):
-            return packager.build("Corpus", passphrase=passphrase)
+            return packager.build("Corpus", passphrase=passphrase, **extra)
+
+    def keyed(self, name=STEM + ".tar.gz.age", stage=None):
+        """A key package in ./exports and its identity (#676)."""
+        identity = age_stream.generate_identity()
+        packager._write_archive(stage or self.stage(), STEM, self.exports / name,
+                                recipient=identity.public_bytes)
+        return self.exports / name, identity
 
 
 class Export(Fixture):
@@ -737,6 +917,439 @@ class ImportJob(Fixture):
         self.assertNotIn(PASSPHRASE, json.dumps(job) + logs)
 
 
+class KeyExports(Fixture):
+    """A new key per package (#676): the build, the key file, opening it."""
+
+    def test_a_key_build_writes_the_package_and_a_0600_key_file(self):
+        result = self.build(key=True)
+        name, key_name = result["filename"], result["key_filename"]
+        self.assertTrue(name.endswith(".tar.gz.age"), name)
+        self.assertEqual(key_name, name + ".key")
+        self.assertEqual((result["encrypted"], result["encryption"]), (True, "key"))
+        self.assertEqual(sorted(p.name for p in self.exports.iterdir()), sorted([name, key_name]))
+        self.assertEqual(os.stat(self.exports / key_name).st_mode & 0o777, 0o600)
+        text = (self.exports / key_name).read_text()
+        identity = age_stream.parse_identity(text)
+        self.assertIn(name, text)
+        self.assertNotIn(identity.encode(), json.dumps(result))
+        with (self.exports / name).open("rb") as fh:
+            self.assertEqual(age_stream.header_kind(fh), "key")
+        work = self.root / "open"
+        work.mkdir()
+        pkg, manifest = packager.open_package(self.exports / name, work, identity=identity)
+        packager.verify_digests(pkg, manifest)
+        readme = (pkg / "README.md").read_text()
+        self.assertIn(f"age -d -i {name}.key {name}", readme)
+        self.assertIn('"on_conflict": "abort", "key": "<the key file\'s text>"}', readme)
+        self.assertIn("Store the key apart from the package", readme)
+        self.assertNotIn(identity.encode(), readme)
+
+    def test_each_key_export_has_its_own_key(self):
+        keys = set()
+        for _ in range(3):
+            result = self.build(key=True)
+            keys.add(age_stream.parse_identity((self.exports / result["key_filename"]).read_text()).recipient)
+            for p in self.exports.iterdir():
+                p.unlink()
+        self.assertEqual(len(keys), 3)
+
+    def test_the_umask_cant_widen_the_key_file(self):
+        old = os.umask(0)
+        try:
+            result = self.build(key=True)
+        finally:
+            os.umask(old)
+        self.assertEqual(os.stat(self.exports / result["key_filename"]).st_mode & 0o777, 0o600)
+
+    def test_a_failed_key_build_leaves_neither_file(self):
+        for target in ("_add_members", "_write_key_file"):
+            with self.subTest(failing=target), \
+                 patch.object(packager, target, side_effect=OSError("disk full")), \
+                 self.assertRaises(OSError):
+                self.build(key=True)
+            self.assertEqual(list(self.exports.iterdir()), [])
+        # The package's placement fails after its key file was placed (#860).
+        real = os.link
+        def fail_package(src, dst, *args, **kwargs):
+            if str(dst).endswith(".tar.gz.age"):
+                raise OSError(errno.EIO, "disk full")
+            return real(src, dst, *args, **kwargs)
+        with patch.object(packager.os, "link", fail_package), self.assertRaises(OSError):
+            self.build(key=True)
+        self.assertEqual(list(self.exports.iterdir()), [])
+
+    def test_a_key_and_a_passphrase_are_never_both_used(self):
+        with self.assertRaises(ValueError):
+            packager.build("Corpus", passphrase=PASSPHRASE, key=True)
+
+    def test_the_startup_sweep_removes_key_partials(self):
+        for name in (".a.tar.gz.age.key.partial", "b.tar.gz.age.key"):
+            (self.exports / name).write_bytes(b"x")
+        packager.sweep_build_leftovers()
+        self.assertEqual(sorted(p.name for p in self.exports.iterdir()), ["b.tar.gz.age.key"])
+
+    def test_opening_with_the_wrong_key_or_the_wrong_kind(self):
+        archive, identity = self.keyed()
+        for secret, code, reason in ((dict(identity=age_stream.generate_identity()), "DECRYPT_FAILED", "key"),
+                                     (dict(passphrase=PASSPHRASE), "PACKAGE_UNREADABLE", None)):
+            work = self.root / ("w" + uuid.uuid4().hex[:6])
+            work.mkdir()
+            with self.subTest(secret=list(secret)), self.assertRaises(packager.PackageError) as caught:
+                packager.open_package(archive, work, **secret)
+            self.assertEqual(caught.exception.code, code)
+            if reason:
+                self.assertEqual(caught.exception.detail, {"reason": reason})
+            self.assertEqual(list(work.iterdir()), [])
+        work = self.root / "right"
+        work.mkdir()
+        packager.open_package(archive, work, identity=identity)
+
+
+class SameSecondNames(Fixture):
+    """Two exports of one collection in the same second get distinct names and
+    no export replaces a file in ./exports (#860, spec §4.1)."""
+
+    WHEN = datetime(2026, 11, 21, 12, 0, 0, tzinfo=timezone.utc)
+
+    def setUp(self):
+        super().setUp()
+        self.stack.enter_context(patch.object(packager, "_given", set()))
+        self.stack.enter_context(patch.object(packager, "_now", return_value=self.WHEN))
+
+    def files(self):
+        return {p.name: p.read_bytes() for p in self.exports.iterdir()}
+
+    def stem(self, result):
+        return result["filename"].split(".tar.gz")[0]
+
+    def test_same_second_exports_get_distinct_names_and_keep_every_file(self):
+        first = self.build(key=True)
+        kept = self.files()
+        second = self.build(key=True)
+        third = self.build(passphrase=PASSPHRASE)
+        stem = self.stem(first)
+        self.assertTrue(stem.endswith("-20261121T120000Z-" + first["id8"]), stem)
+        self.assertEqual([self.stem(second), self.stem(third)], [stem + "-2", stem + "-3"])
+        self.assertEqual(second["id8"], first["id8"])
+        names = [first["filename"], first["key_filename"], second["filename"], second["key_filename"],
+                 third["filename"]]
+        files = self.files()
+        self.assertEqual(sorted(files), sorted(names))
+        for name, data in kept.items():
+            self.assertEqual(files[name], data, name)
+        self.assertIsNone(third["key_filename"])
+        for result in (first, second):
+            work = self.root / ("open-" + self.stem(result))
+            work.mkdir()
+            identity = age_stream.parse_identity((self.exports / result["key_filename"]).read_text())
+            pkg, manifest = packager.open_package(self.exports / result["filename"], work, identity=identity)
+            packager.verify_digests(pkg, manifest)
+            self.assertEqual(pkg.name, self.stem(result))
+            self.assertIn(result["filename"], (pkg / "README.md").read_text())
+        with self.assertRaises(packager.PackageError) as caught:
+            packager.open_package(self.exports / second["filename"], self.root / "wrong",
+                                  identity=age_stream.parse_identity(
+                                      (self.exports / first["key_filename"]).read_text()))
+        self.assertEqual(caught.exception.code, "DECRYPT_FAILED")
+
+    def test_a_leftover_key_file_takes_the_name(self):
+        first = self.build(key=True)
+        (self.exports / first["filename"]).unlink()           # the package was downloaded
+        key = (self.exports / first["key_filename"]).read_bytes()
+        packager._given.clear()                               # a new process: only the folder counts
+        second = self.build(key=True)
+        self.assertEqual(self.stem(second), self.stem(first) + "-2")
+        self.assertEqual((self.exports / first["key_filename"]).read_bytes(), key)
+
+    def test_a_name_given_in_this_process_is_not_given_again(self):
+        first = self.build()
+        (self.exports / first["filename"]).unlink()           # downloaded and deleted
+        second = self.build()
+        self.assertEqual(second["filename"], self.stem(first) + "-2.tar.gz")
+
+    def plant_during_build(self, suffix):
+        """Wrap `_write_archive` so a file appears at the chosen name's `suffix`
+        after the name was chosen, as if something else wrote it."""
+        real = packager._write_archive
+        planted = []
+
+        def write(stage, stem, dest, *args, **kwargs):
+            path = self.exports / (stem + suffix)
+            path.write_bytes(b"someone else's file")
+            planted.append(path)
+            return real(stage, stem, dest, *args, **kwargs)
+        return patch.object(packager, "_write_archive", write), planted
+
+    def test_a_name_taken_after_it_was_chosen_fails_and_replaces_nothing(self):
+        for suffix in (".tar.gz.age", ".tar.gz.age.key"):
+            with self.subTest(planted=suffix):
+                for p in self.exports.iterdir():
+                    p.unlink()
+                wrapper, planted = self.plant_during_build(suffix)
+                with wrapper, self.assertRaises(FileExistsError) as caught:
+                    self.build(key=True)
+                self.assertIn(planted[0].name, str(caught.exception))
+                self.assertEqual(self.files(), {planted[0].name: b"someone else's file"})
+
+    def test_without_hard_links_the_fallback_places_and_refuses(self):
+        no_links = patch.object(packager.os, "link", side_effect=PermissionError(errno.EPERM, "no links"))
+        with no_links:
+            result = self.build(key=True)
+        self.assertEqual(sorted(self.files()), sorted([result["filename"], result["key_filename"]]))
+        self.assertEqual(os.stat(self.exports / result["key_filename"]).st_mode & 0o777, 0o600)
+        for p in self.exports.iterdir():
+            p.unlink()
+        wrapper, planted = self.plant_during_build(".tar.gz.age")
+        with no_links, wrapper, self.assertRaises(FileExistsError):
+            self.build(key=True)
+        self.assertEqual(self.files(), {planted[0].name: b"someone else's file"})
+
+    def test_no_free_name_fails_and_writes_nothing(self):
+        first = self.build()
+        (self.exports / (self.stem(first) + "-2.tar.gz.age.key")).write_bytes(b"x")
+        before = self.files()
+        with patch.object(packager, "MAX_NAME_SUFFIX", 2), self.assertRaises(RuntimeError):
+            self.build()
+        self.assertEqual(self.files(), before)
+
+    # Reviewer tests (rag-pr-review, #860).
+    def test_a_failed_removal_of_the_temporary_takes_the_placed_file_back(self):
+        # The link placed the file but the temporary can't be removed: the
+        # placed name is removed again, so the export leaves no half-placed pair.
+        tmp, final = self.exports / ".x.tar.gz.partial", self.exports / "x.tar.gz"
+        tmp.write_bytes(b"data")
+        real = os.unlink
+
+        def unlink(path, *args, **kwargs):
+            if str(path) == str(tmp):
+                raise OSError(errno.EIO, "busy")
+            return real(path, *args, **kwargs)
+        with patch.object(packager.os, "unlink", unlink), self.assertRaises(OSError):
+            packager._place(tmp, final)
+        self.assertFalse(final.exists())
+        self.assertEqual(tmp.read_bytes(), b"data")
+
+    def test_validate_package_accepts_a_suffixed_name_and_refuses_a_malformed_one(self):
+        first = self.build()
+        second = self.build()
+        self.assertEqual(second["filename"], self.stem(first) + "-2.tar.gz")
+        script = ROOT / "scripts" / "verify" / "validate_package.py"
+        # Only the name clauses are checked here: this fixture's mocked build
+        # leaves embedding.dimensions empty, which suite 05 checks on a real one.
+        ran = subprocess.run([sys.executable, str(script), str(self.exports / second["filename"])],
+                             capture_output=True, text=True, timeout=120)
+        self.assertIn("PASS  E5 filename matches the §4.1 pattern", ran.stdout, ran.stdout + ran.stderr)
+        self.assertIn("PASS  E19 README names the package file as delivered", ran.stdout)
+        for bad in ("-01", "-0", "-x"):
+            with self.subTest(suffix=bad):
+                renamed = self.exports / (self.stem(first) + bad + ".tar.gz")
+                renamed.write_bytes((self.exports / first["filename"]).read_bytes())
+                ran = subprocess.run([sys.executable, str(script), str(renamed)],
+                                     capture_output=True, text=True, timeout=120)
+                self.assertNotEqual(ran.returncode, 0)
+                self.assertIn("FAIL  E5 filename matches the §4.1 pattern", ran.stdout)
+
+
+class KeyApi(Fixture):
+    """POST /export's `encryption`, LAN mode, POST /import's `key` and the
+    listing (#676). No key text reaches a response, record or log."""
+
+    def setUp(self):
+        super().setUp()
+        self.client = TestClient(app, headers=auth_testing.headers(), raise_server_exceptions=False)
+        self.stack.enter_context(patch.object(importer, "_active", set()))
+
+    def started(self, body):
+        seen = []
+
+        async def start(collection, include_models, passphrase, owner=None, encryption=None):
+            seen.append((passphrase, encryption))
+            return "job12345"
+        with patch.object(wc, "collection_exists", return_value=True), \
+             patch.object(exporter, "start_export_job", side_effect=start):
+            response = self.client.post("/export", json={"collection": "Corpus", **body})
+        return response, seen
+
+    def test_the_default_export_is_a_key_export(self):
+        for body, expected in (({}, (None, "key")), ({"encryption": "key"}, (None, "key")),
+                               ({"encryption": "none"}, (None, "none")),
+                               ({"passphrase": PASSPHRASE}, (PASSPHRASE, "passphrase")),
+                               ({"encryption": "passphrase", "passphrase": PASSPHRASE}, (PASSPHRASE, "passphrase"))):
+            with self.subTest(body=list(body)):
+                response, seen = self.started(body)
+                self.assertEqual(response.status_code, 202, response.text)
+                self.assertEqual(seen, [expected])
+
+    def test_mismatched_choices_are_422_without_the_passphrase(self):
+        for body in ({"encryption": "passphrase"}, {"encryption": "key", "passphrase": PASSPHRASE},
+                     {"encryption": "none", "passphrase": PASSPHRASE}, {"encryption": "plain"}):
+            with self.subTest(body=body):
+                response, seen = self.started(body)
+                self.assertEqual(response.status_code, 422, response.text)
+                self.assertEqual(seen, [])
+                self.assertNotIn(PASSPHRASE, response.text)
+
+    def test_lan_mode_refuses_an_unencrypted_export_only(self):
+        with patch.object(settings, "rag_lan_mode", True):
+            response, seen = self.started({"encryption": "none"})
+            self.assertEqual(response.status_code, 400, response.text)
+            self.assertEqual(response.json()["error"]["code"], "ENCRYPTION_REQUIRED")
+            self.assertEqual(seen, [])
+            for body in ({}, {"passphrase": PASSPHRASE}):
+                response, seen = self.started(body)
+                self.assertEqual(response.status_code, 202, response.text)
+        response, seen = self.started({"encryption": "none"})
+        self.assertEqual(response.status_code, 202, response.text)
+
+    def test_a_key_export_job_names_its_key_file_and_never_the_key(self):
+        logs = io.StringIO()
+        handler = logging.StreamHandler(logs)
+        logging.getLogger().addHandler(handler)
+        self.addCleanup(logging.getLogger().removeHandler, handler)
+        with patch.object(wc, "collection_exists", return_value=True), \
+             patch.object(packager, "read_chunks", return_value=[]), \
+             patch.object(packager.wc, "_collection_config_sync", return_value={"embedding_model": settings.embed_model}), \
+             patch.object(packager, "_ingest_config", return_value=None), \
+             patch.object(packager, "_goldstandard_sessions", return_value=[]), \
+             patch.object(packager.sources, "load_index", return_value={"documents": {}}), \
+             patch.object(packager.wc, "_meta_sync", return_value={"version": "test"}):
+            self.client.portal = self.stack.enter_context(anyio.from_thread.start_blocking_portal())
+            response = self.client.post("/export", json={"collection": "Corpus"})
+            self.assertEqual(response.status_code, 202, response.text)
+            job_id = response.json()["job_id"]
+            for _ in range(300):
+                job = self.client.get(f"/export/job/{job_id}").json()
+                if job["status"] in ("completed", "failed"):
+                    break
+                time.sleep(0.05)
+        self.assertEqual(job["status"], "completed", job)
+        self.assertEqual((job["encryption"], job["key_filename"], job["key_on_server"]),
+                         ("key", job["filename"] + ".key", True))
+        key_text = (self.exports / job["key_filename"]).read_text()
+        secret = age_stream.parse_identity(key_text).encode()
+        listed = {p["filename"]: p for p in self.client.get("/packages").json()["packages"]}
+        self.assertEqual(sorted(listed), [job["filename"]])
+        self.assertEqual((listed[job["filename"]]["encryption"], listed[job["filename"]]["key_on_server"],
+                          listed[job["filename"]]["readable"]), ("key", True, True))
+        # GET /export/jobs adds the same fields to each listed record.
+        from routers import transfer
+        self.assertEqual(transfer._export_extras(exporter.get_job(job_id)),
+                         {"encryption": "key", "key_on_server": True})
+        self.assertEqual(transfer._export_extras({"encrypted": True}), {"encryption": "passphrase", "key_on_server": False})
+        self.assertEqual(transfer._export_extras({}), {"encryption": "none", "key_on_server": False})
+        self.assertEqual(transfer._export_extras({"encryption": "key", "key_filename": "../x.key"}),
+                         {"encryption": "key", "key_on_server": False})
+        (self.exports / job["key_filename"]).unlink()
+        self.assertFalse(self.client.get(f"/export/job/{job_id}").json()["key_on_server"])
+        self.assertFalse(self.client.get("/packages").json()["packages"][0]["key_on_server"])
+        for text in (json.dumps(dict(exporter._jobs)), logs.getvalue(), json.dumps(job)):
+            self.assertNotIn(secret, text)
+            self.assertNotIn(secret.lower(), text)
+
+    def import_body(self, filename, **secret):
+        return {"filename": filename, "on_conflict": "abort", **secret}
+
+    def test_import_refusals_before_any_job(self):
+        archive, identity = self.keyed()
+        line = identity.encode()
+        pp = self.sealed(name="ragpkg-pp-20261027T000000Z-0123abcd.tar.gz.age")
+        plain = self.exports / (STEM + ".tar.gz")
+        packager._write_archive(self.stage(), STEM, plain)
+        cases = ((archive.name, {}, "KEY_FILE_REQUIRED"),
+                 (archive.name, {"passphrase": PASSPHRASE}, "KEY_FILE_REQUIRED"),
+                 (archive.name, {"key": "not a key"}, "KEY_FILE_INVALID"),
+                 (archive.name, {"key": "AGE-SECRET-KEY-PQ-1HZLGZUPT4ETPKDEV8HSGFDCYZ4E522W0A7PU2LHT8EH9W6YLNC3SW78XKG"},
+                  "KEY_FILE_INVALID"),
+                 (pp.name, {"key": line}, "PASSPHRASE_REQUIRED"),
+                 (pp.name, {}, "PASSPHRASE_REQUIRED"),
+                 (plain.name, {"key": line}, "KEY_FILE_NOT_EXPECTED"),
+                 ("ragpkg-missing.tar.gz.age", {}, "PASSPHRASE_REQUIRED"))
+        for filename, secret, code in cases:
+            with self.subTest(code=code, secret=list(secret)), \
+                 patch.object(importer, "_run", side_effect=AssertionError("a job ran")):
+                response = self.client.post("/import", json=self.import_body(filename, **secret))
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assertEqual(response.json()["error"]["code"], code)
+                self.assertNotIn(line, response.text)
+                self.assertEqual(dict(importer._jobs), {})
+        for body in (self.import_body(archive.name, key=line, passphrase=PASSPHRASE),
+                     self.import_body(archive.name, key="x" * (age_stream.KEY_FILE_MAX + 1))):
+            response = self.client.post("/import", json=body)
+            self.assertEqual(response.status_code, 422, response.text)
+            self.assertNotIn(line, response.text)
+
+    def test_import_with_the_key_hands_the_worker_an_identity_only(self):
+        archive, identity = self.keyed()
+        line = identity.encode()
+        self.client.portal = self.stack.enter_context(anyio.from_thread.start_blocking_portal())
+        seen, ran = [], threading.Event()
+
+        def run(*args, **kwargs):
+            seen.append((args, kwargs))
+            ran.set()
+        key_text = age_stream.identity_file(identity, __import__("datetime").datetime.now(), archive.name)
+        with patch.object(importer, "_run", side_effect=run):
+            response = self.client.post("/import", json=self.import_body(archive.name, key=key_text))
+            self.assertEqual(response.status_code, 202, response.text)
+            job_id = response.json()["job_id"]
+            self.assertTrue(ran.wait(30), "the import worker did not run within 30 s")
+        args, kwargs = seen[0]
+        self.assertEqual(args[1:4], (archive.name, "abort", None))
+        handed = kwargs.get("identity") or args[4]
+        self.assertEqual(handed.public_bytes, identity.public_bytes)
+        job = self.client.get(f"/import/job/{job_id}").json()
+        self.assertEqual((job["encrypted"], job["encryption"]), (True, "key"))
+        self.assertNotIn(line, json.dumps(dict(importer._jobs)))
+
+    def test_an_unreadable_header_takes_either_secret(self):
+        bad = self.exports / "ragpkg-bad-20261027T000000Z-0123abcd.tar.gz.age"
+        bad.write_bytes(b"not an age file\n")
+        line = age_stream.generate_identity().encode()
+        self.client.portal = self.stack.enter_context(anyio.from_thread.start_blocking_portal())
+        for secret in ({"key": line}, {"passphrase": PASSPHRASE}):
+            ran = threading.Event()
+            with self.subTest(secret=list(secret)), \
+                 patch.object(importer, "_run", side_effect=lambda *a, **k: ran.set()):
+                response = self.client.post("/import", json=self.import_body(bad.name, **secret))
+                self.assertEqual(response.status_code, 202, response.text)
+                self.assertTrue(ran.wait(30))
+            importer._active.clear()
+
+
+class KeyImportJob(ImportJob):
+    """The import job with a key (#676): a wrong key touches nothing."""
+
+    def run_key_job(self, archive, identity):
+        job_id = "job" + uuid.uuid4().hex[:5]
+        importer._jobs[job_id] = {"job_id": job_id, "status": "queued", "filename": archive.name,
+                                  "on_conflict": "replace", "collection": None,
+                                  "original_collection": None, "chunks_written": 0,
+                                  "fidelity": None, "renamed": False, "notes": [],
+                                  "restored_sessions": [], "error": None, "error_code": None,
+                                  "error_detail": None, "encrypted": True, "encryption": "key"}
+        importer._run(job_id, archive.name, "replace", None, identity=identity)
+        return importer._jobs[job_id]
+
+    def test_a_wrong_key_fails_the_job_and_touches_nothing(self):
+        archive, _identity = self.keyed()
+        before = archive.read_bytes()
+        job = self.run_key_job(archive, age_stream.generate_identity())
+        self.assertEqual((job["status"], job["error_code"], job["error_detail"]),
+                         ("failed", "DECRYPT_FAILED", {"reason": "key"}))
+        self.create.assert_not_called()
+        self.exists.assert_not_called()
+        self.assertEqual(archive.read_bytes(), before)
+        self.assertEqual([p.name for p in self.uploads.iterdir() if p.name.startswith("import-")], [])
+
+    def test_the_right_key_reaches_the_conflict_check(self):
+        archive, identity = self.keyed()
+        with patch.object(importer, "_check_embedding"), \
+             patch.object(importer, "_ensure_models", return_value=[]):
+            job = self.run_key_job(archive, identity)
+        self.exists.assert_called()
+        self.assertEqual(job["collection"], "Corpus")
+
+
 class Api(Fixture):
     def setUp(self):
         super().setUp()
@@ -843,7 +1456,7 @@ class Api(Fixture):
         listed = {p["filename"]: p for p in response.json()["packages"]}
         self.assertEqual((listed["ragpkg-long.tar.gz.age"]["readable"], listed[good.name]["readable"],
                           listed[STEM + ".tar.gz"]["readable"]), (False, True, True))
-        with patch.object(age_stream, "check_header", side_effect=RuntimeError("unexpected")):
+        with patch.object(age_stream, "header_kind", side_effect=RuntimeError("unexpected")):
             response = self.client.get("/packages")
         self.assertEqual(response.status_code, 200, response.text)
         listed = {p["filename"]: p for p in response.json()["packages"]}
@@ -853,7 +1466,7 @@ class Api(Fixture):
     def test_export_bounds_count_characters(self):
         seen = []
 
-        async def start(collection, include_models, passphrase, owner=None):   # owner: #617
+        async def start(collection, include_models, passphrase, owner=None, encryption=None):   # #617, #676
             seen.append(passphrase)
             return "job12345"
         with patch.object(wc, "collection_exists", return_value=True), \

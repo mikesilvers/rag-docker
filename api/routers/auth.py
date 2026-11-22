@@ -18,6 +18,11 @@ challenge (the `rag_mfa` cookie) instead of a session, and POST
 own set-up, recovery codes and turn-off are under /auth/mfa; engineers reset a
 user's enrollment and switch "required for everyone". Codes and secrets are in
 their one answer only (no-store) and never logged or audited.
+
+Groups for collection access (#784): Engineers create, rename and delete groups
+of people and service principals under /auth/groups (browser sessions only, as
+account administration), and grant collections to them with PUT
+/collections/{name}/access. Each change is one WARNING line and one audit record.
 """
 from __future__ import annotations
 
@@ -31,10 +36,11 @@ from fastapi.responses import JSONResponse
 from auth import passwords, store
 from config import settings
 from services import audit
-from models.schemas import (AdminUserList, AdminUserResult, AuthStatus, AuthUser, KeyIssueRequest, LoginRequest,
-                            MfaCodeRequest, MfaDisableRequest, MfaPolicyRequest, PasswordChangeRequest,
-                            PrincipalCreateRequest, RoleChangeRequest, ServicePrincipalList, ServicePrincipalResult,
-                            UserCreateRequest)
+from models.schemas import (AdminUserList, AdminUserResult, AuthStatus, AuthUser, GroupCreateRequest,
+                            GroupDeleteResult, GroupList, GroupMembersRequest, GroupRenameRequest, GroupResult,
+                            KeyIssueRequest, LoginRequest, MfaCodeRequest, MfaDisableRequest, MfaPolicyRequest,
+                            PasswordChangeRequest, PrincipalCreateRequest, RoleChangeRequest, ServicePrincipalList,
+                            ServicePrincipalResult, UserCreateRequest)
 from utils import api_error
 
 router = APIRouter(prefix="/auth")
@@ -54,9 +60,11 @@ def _address(request: Request) -> str:
 
 
 def _user_body(username: str, role: str, must_change_password: bool) -> dict:
-    # query_only (#670) in every user answer, so the UI knows it from the login on.
+    # query_only (#670) and lan_mode (#26; the Transfer page hides the
+    # unencrypted export, #676) in every user answer, so the UI knows them from
+    # the login on.
     return {"username": username, "role": role, "must_change_password": must_change_password,
-            "query_only": settings.rag_query_only}
+            "query_only": settings.rag_query_only, "lan_mode": settings.rag_lan_mode}
 
 
 def _mfa_body(enrolled: bool, required: bool) -> dict:
@@ -696,3 +704,123 @@ async def revoke_key(name: str, key_id: str, request: Request):
         return _principal_refused(actor, "revoke-key", target, exc)
     _log.warning("Admin %r revoked key %s of service principal %r", actor, key_id, target)
     return JSONResponse({"principal": _principal_body(principal)})
+
+
+# ── groups for collection access (#784; Engineers only, in auth/policy.py) ────
+# Each change and each refusal is one WARNING line naming the Engineer, the
+# action and the group, as account administration's are.
+
+_GROUP_STATUS = {"GROUP_NOT_FOUND": 404, "GROUP_EXISTS": 409}
+
+
+def _group_body(group: store.Group) -> dict:
+    return {"name": group.name, "created_at": _iso(group.created_at), "users": list(group.users),
+            "service_principals": list(group.service_principals)}
+
+
+def _group_refusal(actor: str, action: str, target: str, code: str, message: str, status: int | None = None):
+    _log.warning("Admin %r: %s of group %r refused: %s", actor, action, target, message)
+    return api_error(status or _GROUP_STATUS.get(code, 409), code, message)
+
+
+def _group_refused(actor: str, action: str, target: str, exc: store.Refused):
+    message = str(exc)
+    message = message[:1].upper() + message[1:] + "."
+    if exc.code == "UNKNOWN_ACCOUNT":
+        # As PUT /collections/{name}/access answers an unknown account (#606).
+        return _group_refusal(actor, action, target, "INVALID_PARAMETER", message, 422)
+    return _group_refusal(actor, action, target, exc.code, message)
+
+
+def _group_not_found(actor: str, action: str, typed: str):
+    return _group_refusal(actor, action, typed, "GROUP_NOT_FOUND", f"There is no group {typed!r}.")
+
+
+def _invalid_group_name(actor: str, action: str, typed: str):
+    return _group_refusal(actor, action, typed, "INVALID_GROUP_NAME",
+                          f"The group name must be {passwords.USERNAME_RULE}.", 422)
+
+
+@router.get("/groups", response_model=GroupList)
+async def list_groups():
+    groups = await asyncio.to_thread(store.list_groups)
+    return {"groups": [_group_body(g) for g in groups]}
+
+
+@router.post("/groups", status_code=201, response_model=GroupResult)
+async def create_group(body: GroupCreateRequest, request: Request):
+    actor = request.state.auth.username
+    name = passwords.normalize_username(body.name)
+    audit.note(target=name or _shown(body.name))
+    if name is None:
+        return _invalid_group_name(actor, "create", _shown(body.name))
+    try:
+        group = await asyncio.to_thread(store.create_group, name)
+    except store.Refused as exc:
+        return _group_refused(actor, "create", name, exc)
+    _log.warning("Admin %r created group %r", actor, name)
+    return JSONResponse({"group": _group_body(group)}, status_code=201)
+
+
+@router.post("/groups/{name}/rename", response_model=GroupResult)
+async def rename_group(name: str, body: GroupRenameRequest, request: Request):
+    actor = request.state.auth.username
+    target = _target(name)
+    new = passwords.normalize_username(body.name)
+    audit.note(target=target or _shown(name), name=new or _shown(body.name))
+    if target is None:
+        return _group_not_found(actor, "rename", _shown(name))
+    if new is None:
+        return _invalid_group_name(actor, "rename", target)
+    try:
+        group = await asyncio.to_thread(store.rename_group, target, new)
+    except store.Refused as exc:
+        return _group_refused(actor, "rename", target, exc)
+    _log.warning("Admin %r renamed group %r to %r", actor, target, new)
+    return {"group": _group_body(group)}
+
+
+def _sorted_change(before: tuple, after: tuple) -> tuple[list, list]:
+    return sorted(set(after) - set(before)), sorted(set(before) - set(after))
+
+
+@router.put("/groups/{name}/members", response_model=GroupResult)
+async def set_group_members(name: str, body: GroupMembersRequest, request: Request):
+    """The group's members, the whole list at once."""
+    actor = request.state.auth.username
+    target = _target(name)
+    audit.note(target=target or _shown(name))
+    if target is None:
+        return _group_not_found(actor, "set-members", _shown(name))
+    try:
+        before, after = await asyncio.to_thread(store.set_group_members, target, body.users,
+                                                body.service_principals)
+    except store.Refused as exc:
+        return _group_refused(actor, "set-members", target, exc)
+    added_users, removed_users = _sorted_change(before.users, after.users)
+    added_svc, removed_svc = _sorted_change(before.service_principals, after.service_principals)
+    audit.note(added={"users": added_users, "service_principals": added_svc},
+               removed={"users": removed_users, "service_principals": removed_svc})
+    _log.warning("Admin %r set the members of group %r: %d people and %d service principals", actor, target,
+                 len(after.users), len(after.service_principals))
+    return {"group": _group_body(after)}
+
+
+@router.post("/groups/{name}/delete", response_model=GroupDeleteResult)
+async def delete_group(name: str, request: Request):
+    """The group, its members and its collection grants. A collection granted
+    only to it stays restricted."""
+    actor = request.state.auth.username
+    target = _target(name)
+    audit.note(target=target or _shown(name))
+    if target is None:
+        return _group_not_found(actor, "delete", _shown(name))
+    try:
+        collections, group = await asyncio.to_thread(store.delete_group, target)
+    except store.Refused as exc:
+        return _group_refused(actor, "delete", target, exc)
+    audit.note(collections=collections,
+               removed={"users": list(group.users), "service_principals": list(group.service_principals)})
+    _log.warning("Admin %r deleted group %r; its grants on %d collections were removed", actor, target,
+                 len(collections))
+    return {"name": target, "collections": collections}

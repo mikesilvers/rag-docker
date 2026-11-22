@@ -234,6 +234,9 @@ class Packager(unittest.TestCase):
                 # resolved from the compose settings by models.sh and compose-models.sh (#671).
                 (root/'ollama').mkdir()
                 for name in ('entrypoint.sh','models.sh','compose-models.sh'):shutil.copy(ROOT/'ollama'/name,root/'ollama'/name)
+                # It also tags and saves the backup scripts' age image (#852).
+                (root/'scripts/age').mkdir()
+                for name in ('backup-common.sh','age/Dockerfile'):shutil.copy(ROOT/'scripts'/name,root/'scripts'/name)
                 (root/'scripts/collector_offline.py').write_text("from pathlib import Path\nimport sys\nPath(sys.argv[2],'collector.tar').touch()\n")
                 stub=root/'bin/docker'
                 stub.write_text("""#!/usr/bin/env python3
