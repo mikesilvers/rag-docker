@@ -48,6 +48,7 @@ Change all four together: the Fix Version, the parent epic, the Jira release lab
 
 1. Move it to Done. A ticket finished by a PR moves when the PR merges. If the session merged the PR, it moves the ticket then. If the maintainer merged the PR himself (`joefeser` PRs, fork PRs, release PRs, or any he merges by hand), the session moves it once it sees the PR has landed, as for its own merges. A ticket closed without a PR (a duplicate, a won't-fix or a fold) moves when its approved close is applied (`rag-release-plan`, "Closing, folding and splitting").
 2. Check its GitHub issue's state. If it is still open, close it with `--reason completed`, or `--reason "not planned"` for a duplicate or won't-fix ("Done closes GitHub").
+3. For a PR by `joefeser`, after it merges, the session that moves the ticket to Done checks that his agents' "Follow-ups from #N" issue exists and lists every Medium from the recap of the merged head. If it doesn't, the session tells the maintainer. The check applies only when that recap has a Medium: with no Medium there may be no issue (`rag-pr-review` reference.md, "Maintainer follow-ups (PRs by `joefeser`)"; `AGENTS.md` §6).
 
 ### Open a new GitHub issue
 
