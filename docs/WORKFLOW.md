@@ -7,6 +7,7 @@ It describes the rules and doesn't change them. Each rule names the file that ho
 | Short name | File |
 | --- | --- |
 | `CLAUDE.md` | [CLAUDE.md](../CLAUDE.md) |
+| `AGENTS.md` | [AGENTS.md](../AGENTS.md) |
 | `rag-jira` | [SKILL.md](../.claude/skills/rag-jira/SKILL.md), [reference.md](../.claude/skills/rag-jira/reference.md) |
 | `rag-release-plan` | [SKILL.md](../.claude/skills/rag-release-plan/SKILL.md), [reference.md](../.claude/skills/rag-release-plan/reference.md) |
 | `rag-fix` | [SKILL.md](../.claude/skills/rag-fix/SKILL.md), [reference.md](../.claude/skills/rag-fix/reference.md) |
@@ -89,7 +90,7 @@ Reading two rows:
 
 ## 4. Limits on parallelism
 
-- **One agent per lane.** A lane is claimed by assigning yourself its tickets, so two agents never work in the same files. (`rag-release-plan` reference.md "The epic's Lanes section") A fix agent stops if another ticket in its lane is In Progress under another assignee. (`rag-fix` SKILL.md step 1)
+- **One agent per lane.** A lane is claimed by assigning yourself its tickets, so two agents never work in the same files. (`rag-release-plan` reference.md "The epic's Lanes section") A fix agent stops if another ticket in its lane is In Progress under another assignee. (`rag-fix` SKILL.md step 1) Each side, Mike's and Joe's agents, also posts its lane claim in Governed Talks before starting the lane and waits for the other side's acknowledgement, posts a lane release when it is done, and treats the other side's claimed lanes as off-limits. (`AGENTS.md` §2)
 - **One verify stack.** One machine runs one verify stack at a time (`rag-verify` on port 8081, behind a lock). Lanes can be developed and reviewed in parallel, but their verify runs and `rag-pr-review` evaluations queue. `rag-pr-review` processes PRs one at a time through its build check. (`rag-release-plan` reference.md "Lanes and links", `rag-pr-review` SKILL.md "Procedure")
 - **Limit on open PRs.** No non-Markdown PR from the release opens while 2 or more non-Markdown PRs from the release wait for or are in evaluation. Markdown-only PRs don't count, since they don't use the verify stack, and neither does a fix agent's question round. (`CLAUDE.md` "Planning a release", `rag-release-plan` "Running the release")
 - **Prepared branches.** While the limit is reached, a fix agent may still start: it writes the dev-docs, the code and the host tests, pushes its branch and stops without opening the PR. At most 2 prepared branches from the release exist at a time. The ticket stays In Progress, with the checkpoint comment `Prepared: <branch> @ <sha>, waiting for an open-PR slot`. When a slot frees, the agent merges the current `develop` (no rebase, no force-push), re-runs its host tests and opens the PR. (`CLAUDE.md` "Planning a release", `rag-release-plan` "Running the release", `rag-fix` SKILL.md step 5)
@@ -161,13 +162,14 @@ Just before merging, every check runs again: the author, the clean evaluation on
 - **Done.** The session that merged the PR moves the ticket to Done. When the maintainer merged the PR himself (`joefeser` PRs, fork PRs, release PRs, or any he merges by hand), the session moves it once it sees the PR has landed, as for its own merges. (`rag-jira` "Statuses", "Finish a ticket")
 - **The GitHub issue closes.** `Closes #N` closes it on the merge into `develop`. Moving the ticket to Done also closes the issue if it is still open: check its state first. (`CLAUDE.md`, `rag-jira` reference.md "Done closes GitHub")
 - **Follow-ups, any PR.** The merged PR's Medium and Low findings with no ready reviewer patch become a "Follow-ups from #N" issue (`CLAUDE.md`), with an RD ticket. The issue is left unlabelled for the maintainer to triage, and never gets `Triage`. (`rag-fix` SKILL.md "After the merge")
-- **Follow-ups, PRs by `joefeser`.** Only High findings go back to Joe; his PR is never held for Medium or Low findings. After it merges, the coordinator offers the maintainer a follow-up issue listing the Mediums, and the Lows worth doing, each with its `path:line`. Checks scored flaky or environmental are left out. Reviewer patches before merge don't apply to his PRs. (`rag-pr-review` reference.md "Maintainer follow-ups (PRs by `joefeser`)")
+- **Follow-ups, PRs by `joefeser`.** Only High findings go back to Joe; his PR is never held for Medium or Low findings. Joe's agents open the follow-up as a GitHub issue listing the Mediums, and the Lows worth doing, each with its `path:line`, end it with a `Recommended release:` line, and tell us in Governed Talks. We create its RD ticket, and the maintainer decides the release. Checks scored flaky or environmental are left out. Reviewer patches before merge don't apply to his PRs. (`AGENTS.md` §6, `rag-pr-review` reference.md "Maintainer follow-ups (PRs by `joefeser`)")
 
 ## 7. Joe's side
 
-Joe (GitHub `joefeser`) and his bots also work from Jira.
+Joe (GitHub `joefeser`) and his bots also work from Jira. His agents work by [AGENTS.md](../AGENTS.md).
 
-- **New work** comes from his side only as GitHub issues with a "Suggested release:" line. His side never creates Jira items. (`rag-jira` "Joe's side")
+- **New work** comes from his side only as GitHub issues with a "Recommended release:" line. His side never creates Jira items. (`AGENTS.md` §6, `rag-jira` "Joe's side")
 - **What his side picks:** only RD items under the current release's epic. (The maintainer's decision of 2026-11-16 on [#768](https://github.com/mikesilvers/rag-docker/issues/768); no skill holds this rule yet.)
+- **Questions** from his agents come to us in Governed Talks. We put each one to the maintainer, relay his answer there, and record it on the ticket as a Q/A comment, and on the issue as a Decision comment when it changes scope or acceptance. (`AGENTS.md` §3)
 - **The same ownership and checkpoint rules** apply to his bots: the assignee owns the ticket, and the checkpoint in `rag-docker-work` is saved after every step so any agent can resume it. (work-repo README)
-- **His PRs** are evaluated with `rag-pr-review`, and their findings are graded exactly as for any other PR. Only the maintainer merges them. (`rag-pr-review` reference.md "Maintainer follow-ups", `CLAUDE.md` "Merging into `develop`")
+- **His PRs** are announced by his agents in Governed Talks and evaluated with `rag-pr-review`, and their findings are graded exactly as for any other PR. The recap goes on the PR, and a short summary in Governed Talks. Only the maintainer merges them. (`AGENTS.md` §5, `rag-pr-review` reference.md "Maintainer follow-ups", `CLAUDE.md` "Merging into `develop`")

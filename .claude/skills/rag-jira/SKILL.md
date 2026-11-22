@@ -68,7 +68,7 @@ Only on the maintainer's go-ahead: set the ship date he gives as the release dat
 
 ## Joe's side
 
-Joe (GitHub `joefeser`) and his bots also work from Jira. His side adds work only as GitHub issues with a "Suggested release:" line, and never creates Jira items.
+Joe (GitHub `joefeser`) and his bots also work from Jira. His side adds work only as GitHub issues with a "Recommended release:" line (`AGENTS.md` §6), and never creates Jira items.
 
 ## Related skills
 
