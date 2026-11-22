@@ -185,7 +185,7 @@ When you open a new GitHub issue (a follow-up, or a bug found along the way):
 
 ## Joe's side
 
-Joe (GitHub `joefeser`) and his bots also work from Jira. His side adds work only as GitHub issues, with a "Suggested release:" line, and never creates Jira items.
+Joe (GitHub `joefeser`) and his bots also work from Jira. His side adds work only as GitHub issues, with a "Recommended release:" line (`AGENTS.md` §6), and never creates Jira items.
 
 ## Attachments
 
