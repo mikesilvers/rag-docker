@@ -389,6 +389,8 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
     ownership = collection_recovery.begin(collection, "tune", client)
     staging = ownership["staging"]
     cutover_started = False
+    replace_ready = False
+    history_marked = False
     completed = False
     original_intact = False
     try:
@@ -409,6 +411,7 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
             collection_recovery.retain(ownership)
         if before_replace:
             before_replace()
+        replace_ready = True
         collection_recovery.begin_cutover(ownership)
         cutover_started = True
         telemetry.call("weaviate.delete", client.collections.delete, collection)
@@ -440,24 +443,39 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
             if not original_intact:
                 try:
                     goldstandard.mark_stale(source_collection, "reindex replacement failed after cutover began; exact record preservation was not verified")
+                    history_marked = True
                 except Exception:
                     _log.exception("Could not mark evaluation historical after failed reindex")
         elif cutover_started:
             try:
                 goldstandard.mark_stale(source_collection, "collection replacement failed after cutover began; retained pairs require historical review")
+                history_marked = True
             except Exception:
                 _log.exception("Could not mark evaluation historical after failed rebuild")
+        if history_marked:
+            # History is already marked: record the decision so that a restart
+            # doesn't check and flag again; only a hard kill leaves it pending (#263).
+            try:
+                collection_recovery.finish_cutover_check(ownership, "stale")
+            except Exception:
+                _log.exception("Could not record the cutover decision for %r; startup will check it", staging)
         if cutover_started and not original_intact and ownership["state"] == "recovery":
             raise PackageError(
                 "TUNE_FAILED", f"{type(exc).__name__}: {exc}. Verified data is retained as '{staging}'.",
                 {"recovered_as": staging,
                  "sidecar_snapshots": collection_recovery.sidecar_reference(ownership)}) from exc
         if not cutover_started and ownership["state"] == "recovery":
-            # Only before_replace runs between retain and cutover. The original
-            # was never deleted, so the copy is discarded below.
+            # Between retain and cutover run before_replace (stale marking) and
+            # begin_cutover (the cutover record). The original was never deleted,
+            # so the copy is discarded below.
+            if not replace_ready:
+                raise PackageError(
+                    "TUNE_FAILED", f"{type(exc).__name__}: {exc}. Gold-standard sessions could not be "
+                    "marked stale before replacement, so the original collection is unchanged.") from exc
+            marked = " Gold-standard sessions were already marked stale." if before_replace else ""
             raise PackageError(
-                "TUNE_FAILED", f"{type(exc).__name__}: {exc}. Gold-standard sessions could not be "
-                "marked stale before replacement, so the original collection is unchanged.") from exc
+                "TUNE_FAILED", f"{type(exc).__name__}: {exc}. The cutover record could not be "
+                f"written, so the original collection is unchanged.{marked}") from exc
         raise
     finally:
         # Before cutover the original is intact, so a retained copy is not needed.
