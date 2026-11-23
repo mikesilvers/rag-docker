@@ -777,11 +777,25 @@ class SourcesTests(unittest.TestCase):
             sources.store("Coll", "p.txt", b"v3", replace=True)
         self.assertEqual(save.call_count, 2)        # the release, then the new entry
 
+    def failing_blob_write(self):
+        """The blob's replace fails; index saves go through. Records the
+        temporary files the failed writes had created."""
+        real, attempted = os.replace, []
+
+        def replace(src, dst):
+            if Path(dst).name != sources.INDEX_NAME:
+                attempted.append(Path(src))
+                raise OSError("disk full")
+            return real(src, dst)
+
+        return patch.object(sources.os, "replace", side_effect=replace), attempted
+
     def test_name_is_released_even_when_the_blob_write_fails(self):
         v1 = sources.store("Coll", "p.txt", b"v1", replace=True)
-        with patch.object(Path, "write_bytes", side_effect=OSError("disk full")), \
-                self.assertRaises(OSError):
+        failing, attempted = self.failing_blob_write()
+        with failing, self.assertRaises(OSError):
             sources.store("Coll", "p.txt", b"v2", replace=True)
+        self.assertEqual(len(attempted), 1)
         self.assertEqual(self.docs(), {})
         self.assertFalse(sources.blob_path("Coll", v1).exists())
 
@@ -789,13 +803,98 @@ class SourcesTests(unittest.TestCase):
         # #52: the blob's temporary file is created exclusively before it is
         # written, so a failed write must remove it, not leave it in the folder.
         sources.store("Coll", "p.txt", b"v1", replace=True)
-        with patch.object(Path, "write_bytes", side_effect=OSError("disk full")), \
-                self.assertRaises(OSError):
+        failing, attempted = self.failing_blob_write()
+        with failing, self.assertRaises(OSError):
             sources.store("Coll", "q.txt", b"v2", replace=False)
+        self.assertEqual(len(attempted), 1)
+        self.assertEqual(attempted[0].parent, sources.collection_dir("Coll"))
+        self.assertFalse(attempted[0].exists())
         self.assertEqual([p.name for p in sources.collection_dir("Coll").iterdir()
                           if p.name.endswith(".tmp")], [])
         self.assertFalse(sources.blob_path("Coll", hashlib.sha256(b"v2").hexdigest()).exists())
         self.assertEqual(sorted(n for e in self.docs().values() for n in e["filenames"]), ["p.txt"])
+
+    def test_the_blob_is_published_and_fsynced_882(self):
+        # #882: the blob was written without an fsync while the index naming
+        # it was fsynced, so a power loss could leave the index naming an
+        # empty or truncated blob.
+        real_fsync, synced = os.fsync, []
+
+        def fsync(fd):
+            synced.append(fd)
+            return real_fsync(fd)
+
+        with patch.object(sources, "_publish", wraps=sources._publish) as publish, \
+                patch.object(sources.os, "fsync", side_effect=fsync):
+            digest = sources.store("Coll", "p.txt", b"v1", replace=True)
+        blob = sources.blob_path("Coll", digest)
+        self.assertEqual(publish.call_args_list[0].args, (blob, b"v1"))
+        self.assertEqual(len(synced), 2)            # the blob, then the index
+        self.assertEqual(blob.read_bytes(), b"v1")
+        # An existing blob isn't written again: only the index is.
+        with patch.object(sources, "_publish", wraps=sources._publish) as publish:
+            sources.store("Coll", "q.txt", b"v1", replace=True)
+        self.assertEqual([c.args[0].name for c in publish.call_args_list], [sources.INDEX_NAME])
+
+    def test_delete_drops_the_collections_lock_882(self):
+        sources.store("Coll", "p.txt", b"v1", replace=True)
+        key = str(sources.collection_dir("Coll"))
+        self.assertIn(key, sources._locks)
+        sources.delete("Coll")
+        self.assertNotIn(key, sources._locks)
+        self.assertFalse(sources.collection_dir("Coll").exists())
+        digest = sources.store("Coll", "p.txt", b"v2", replace=True)
+        self.assertIn(key, sources._locks)
+        self.assertEqual(self.docs(), {digest: self.docs()[digest]})
+
+    def test_the_startup_sweep_removes_only_interrupted_saves_882(self):
+        digest = sources.store("Coll", "p.txt", b"v1", replace=True)
+        folder = sources.collection_dir("Coll")
+        leftovers = [folder / f"{sources.INDEX_NAME}.0123456789abcdef.tmp",
+                     folder / f"{digest}.fedcba9876543210.tmp"]
+        kept = [folder / "notes.tmp", folder / "x.abc.tmp",
+                folder / f"{sources.INDEX_NAME}.0123.tmp"]
+        for path in leftovers + kept:
+            path.write_bytes(b"partial")
+        # A linked folder could lead outside the sources root: never followed.
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        foreign = Path(outside.name) / f"{sources.INDEX_NAME}.0123456789abcdef.tmp"
+        foreign.write_bytes(b"not ours")
+        (Path(settings.sources_dir) / "Linked").symlink_to(outside.name)
+        (Path(settings.sources_dir) / "stray.0123456789abcdef.tmp").write_bytes(b"x")
+        sources.remove_interrupted_saves()
+        self.assertEqual([p for p in leftovers if p.exists()], [])
+        self.assertEqual([p for p in kept if not p.exists()], [])
+        self.assertTrue(foreign.exists())
+        self.assertTrue((Path(settings.sources_dir) / "stray.0123456789abcdef.tmp").exists())
+        self.assertEqual(sources.digests_for_filename("Coll", "p.txt"), [digest])
+        self.assertTrue(sources.blob_path("Coll", digest).is_file())
+
+    def test_a_leftover_that_cant_be_removed_is_logged_and_kept_882(self):
+        sources.store("Coll", "p.txt", b"v1", replace=True)
+        folder = sources.collection_dir("Coll")
+        stuck = folder / f"{sources.INDEX_NAME}.0000000000000000.tmp"
+        other = folder / f"{sources.INDEX_NAME}.1111111111111111.tmp"
+        stuck.write_bytes(b"partial"); other.write_bytes(b"partial")
+        real = Path.unlink
+
+        def unlink(path, *args, **kwargs):
+            if path == stuck:
+                raise PermissionError("in use")
+            return real(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", unlink), \
+                self.assertLogs(sources.log, "ERROR") as logged:
+            sources.remove_interrupted_saves()
+        self.assertTrue(stuck.exists())
+        self.assertFalse(other.exists())
+        self.assertIn(f"Could not remove interrupted source write {stuck}", "\n".join(logged.output))
+
+    def test_the_startup_sweep_needs_no_sources_folder_882(self):
+        with patch.object(settings, "sources_dir", str(Path(settings.sources_dir) / "missing")):
+            sources.remove_interrupted_saves()
+            self.assertFalse(Path(settings.sources_dir).exists())
 
     def folder(self):
         """Every file in Coll's retained folder, by name, with its bytes."""

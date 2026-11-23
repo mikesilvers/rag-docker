@@ -120,6 +120,11 @@ def _temporary(path: Path) -> Path:
     return path.with_name(f"{path.name}.{secrets.token_hex(8)}.tmp")
 
 
+# The names _temporary makes. Only a crash or kill between creating one and
+# replacing its target leaves one behind (#882).
+_LEFTOVER = re.compile(r".+\.[0-9a-f]{16}\.tmp\Z")
+
+
 def _publish(path: Path, payload: bytes) -> None:
     """Replace path whole: a uniquely named temporary file in the same folder,
     fsynced, then os.replace. A failure before the replace removes the
@@ -249,17 +254,9 @@ def store(collection: str, filename: str, data: bytes, media_type: str | None = 
                 _drop_blobs(collection, orphans)
 
         if not target.exists():
-            tmp = _temporary(target)
-            try:
-                tmp.touch(exist_ok=False)     # created exclusively: never shared
-                tmp.write_bytes(data)
-                os.replace(tmp, target)
-            except BaseException:
-                try:
-                    tmp.unlink()
-                except OSError:
-                    pass
-                raise
+            # Published like an index (#882): fsynced before the index that
+            # names it, so a power loss can't leave it empty or truncated.
+            _publish(target, data)
 
         now = datetime.now(timezone.utc).isoformat()
         entry = index["documents"].get(digest)
@@ -308,4 +305,33 @@ def delete(collection: str) -> None:
     Called when the collection is deleted. Without this the volume leaks
     silently: it is surfaced nowhere in the UI.
     """
-    shutil.rmtree(collection_dir(collection), ignore_errors=True)
+    directory = collection_dir(collection)
+    shutil.rmtree(directory, ignore_errors=True)
+    # Its lock goes too (#882), so the map doesn't keep one per collection
+    # ever stored into; a later store into the same name makes a new one.
+    with _locks_guard:
+        _locks.pop(str(directory), None)
+
+
+def remove_interrupted_saves() -> None:
+    """Remove the temporary files of saves a crash or kill interrupted (#882).
+
+    Every index and blob is written whole through a uniquely named temporary
+    file, so a leftover is never used, only disk space. Called once at startup,
+    before any request, so no save is in progress. Only names _temporary makes
+    are removed, in each collection folder that isn't a link; a leftover that
+    can't be removed is logged and kept. An error listing the folders is the
+    whole sweep failing, which the caller logs.
+    """
+    root = _root()
+    if not root.is_dir():
+        return
+    for folder in root.iterdir():
+        if folder.is_symlink() or not folder.is_dir():
+            continue
+        for leftover in folder.iterdir():
+            if _LEFTOVER.fullmatch(leftover.name):
+                try:
+                    leftover.unlink()
+                except OSError:
+                    log.exception("Could not remove interrupted source write %s", leftover)

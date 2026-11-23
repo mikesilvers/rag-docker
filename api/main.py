@@ -39,6 +39,11 @@ async def lifespan(app: FastAPI):
         except Exception:                                 # noqa: BLE001
             log.exception("Startup sweep of interrupted collection registry writes failed")
         try:
+            from services import sources
+            await asyncio.to_thread(sources.remove_interrupted_saves)
+        except Exception:                                 # noqa: BLE001
+            log.exception("Startup sweep of interrupted source-index writes failed")
+        try:
             abandoned = await wc.sweep_staging()
             if abandoned:
                 log.warning("Removed %d staging collection(s) left by a previous run: %s. "
