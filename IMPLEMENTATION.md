@@ -15878,6 +15878,11 @@ def _verify_records(collection: str, records: list[dict]) -> None:
 
 _MISSING_CHUNK_INDEX = object()
 
+# How many uncovered names a coverage refusal keeps in
+# error_detail.uncovered_source_files, which the job API returns;
+# uncovered_source_files_omitted counts the rest (#208), as #28 caps members.
+_MAX_NAMED_UNCOVERED = 10
+
 
 def _source_coverage(collection: str, documents: dict) -> tuple[list[str], set[str]]:
     """The stored source files a rebuild from the retained originals would not
@@ -15892,7 +15897,11 @@ def _source_coverage(collection: str, documents: dict) -> tuple[list[str], set[s
     seen: dict[str, set] = {}
     uncovered = set()
     stored = set()
-    for obj in telemetry.iterate(wc.get_client().collections.get(collection).iterator):
+    # Only the two properties the rule reads, and no vector: not each chunk's
+    # text, on every GET /tune (#258).
+    for obj in telemetry.iterate(wc.get_client().collections.get(collection).iterator,
+                                 include_vector=False,
+                                 return_properties=["source_file", "chunk_index"]):
         props = obj.properties or {}
         filename = props.get("source_file")
         if not isinstance(filename, str) or not filename:
@@ -16069,7 +16078,9 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
             "Cannot change chunk boundaries: some stored chunks have missing or "
             "ambiguous retained originals. Re-embed without chunking parameters "
             "or re-index to preserve the existing chunks.",
-            {"collection": collection, "uncovered_source_files": uncovered})
+            {"collection": collection,
+             "uncovered_source_files": uncovered[:_MAX_NAMED_UNCOVERED],
+             "uncovered_source_files_omitted": max(0, len(uncovered) - _MAX_NAMED_UNCOVERED)})
 
     out: list[dict] = []
     now = datetime.now(timezone.utc).isoformat()
@@ -49751,6 +49762,10 @@ ENDPY
 check "E29: its package carries the valid source under its digest, and nothing else" $?
 rm -f "$EXPORTS/$E29PKG"
 
+# tune_wait <job-id> <timeout>: a missing job id fails at once rather than
+# polling /tune/job/ for the whole timeout (#580).
+tune_wait() { if [ -n "$1" ]; then wait_for_job "/tune/job/$1" "$2"; else printf 'no job id'; fi; }
+
 # Read boundaries: an unsafe index already on disk (as a pre-fix import would
 # have left it) must not let export or re-chunking read the sentinel.
 plant() {   # plant <abs|link|restore>
@@ -49805,29 +49820,29 @@ for mode in abs link; do
       "$(wait_for_job "/tune/job/$(jfield "['job_id']" < /tmp/vfy_tj.json)" 1800)" "failed"
   fi
   check_eq "E29: ... and leaves the chunk count alone ($mode)" "$(count_of "$C")" "$chunks_before"
+  # An index that fails validation, or a retained original that is a link
+  # (the re-chunk check reads every blob path, #258), is a typed 409, not a
+  # 500, and doesn't block tuning that never reads sources.
+  check_eq "E29: GET /tune reports an on-disk $mode entry as HTTP 409" "$(api_code "$API/tune/$C")" "409"
+  check_eq "E29: ... with error code SOURCE_INDEX_INVALID ($mode)" \
+    "$(api_get "/tune/$C" | jfield "['error']['code']")" "SOURCE_INDEX_INVALID"
   if [ "$mode" = abs ]; then
-    # An index that fails validation is a typed 409, not a 500, and doesn't
-    # block tuning that never reads sources (reindex copies stored records).
-    check_eq "E29: GET /tune reports an on-disk abs entry as HTTP 409" "$(api_code "$API/tune/$C")" "409"
-    check_eq "E29: ... with error code SOURCE_INDEX_INVALID" \
-      "$(api_get "/tune/$C" | jfield "['error']['code']")" "SOURCE_INDEX_INVALID"
+    # Re-indexing copies stored records.
     api_post "/tune/reindex" "{\"collection\":\"$C\"}" > /tmp/vfy_tj.json
+    e29rijob=$(jfield "['job_id']" < /tmp/vfy_tj.json)
     check_eq "E29: re-indexing from stored records still completes with an on-disk abs entry" \
-      "$(wait_for_job "/tune/job/$(jfield "['job_id']" < /tmp/vfy_tj.json)" 1800)" "completed"
+      "$(tune_wait "$e29rijob" 1800)" "completed"
     check_eq "E29: ... and keeps the chunk count (abs)" "$(count_of "$C")" "$chunks_before"
     leak=$(no_sentinel_in_exports); check "E29: ... and nothing in exports holds outside bytes after it (abs)" $? "$leak"
-    # Re-embedding from stored chunk text never reads the sources either, so
-    # without chunking fields it still starts a job (#389).
-    api_post "/tune/reembed" "{\"collection\":\"$C\"}" > /tmp/vfy_tj.json
-    e29rejob=$(jfield "['job_id']" < /tmp/vfy_tj.json)
-    check_eq "E29: re-embedding without chunking fields still starts a job with an on-disk abs entry" \
-      "$(jfield "['status']" < /tmp/vfy_tj.json) $([ -n "$e29rejob" ] && echo job)" "queued job"
-    check_eq "E29: ... and completes (re-embed, abs)" \
-      "$(wait_for_job "/tune/job/$e29rejob" 1800)" "completed"
-    check_eq "E29: ... and keeps the chunk count (re-embed, abs)" "$(count_of "$C")" "$chunks_before"
-  else
-    echo "    (info) GET /tune/$C with the $mode entry planted: HTTP $(api_code "$API/tune/$C")"
   fi
+  # Re-embedding from stored chunk text never reads the sources either, so
+  # without chunking fields it still starts a job (#389), in both modes (#580).
+  api_post "/tune/reembed" "{\"collection\":\"$C\"}" > /tmp/vfy_tj.json
+  e29rejob=$(jfield "['job_id']" < /tmp/vfy_tj.json)
+  check_eq "E29: re-embedding without chunking fields still starts a job with an on-disk $mode entry" \
+    "$(jfield "['status']" < /tmp/vfy_tj.json) $([ -n "$e29rejob" ] && echo job)" "queued job"
+  check_eq "E29: ... and completes (re-embed, $mode)" "$(tune_wait "$e29rejob" 1800)" "completed"
+  check_eq "E29: ... and keeps the chunk count (re-embed, $mode)" "$(count_of "$C")" "$chunks_before"
   plant restore
   check "E29: restored the collection's own source index ($mode)" $?
 done
@@ -50137,6 +50152,10 @@ check_eq "re-chunk completes" "$tstatus" "completed"
 after_chunks=$(api_get "/tune/job/$tjob" | jfield "['chunks_written']")
 [ "$after_chunks" -gt "$chunks_before" ]
 check "re-chunking with a smaller size yields more chunks" $? "$chunks_before -> $after_chunks"
+# A rebuild writes one chunk set per retained (digest, name) pair (#22), so
+# the re-chunked collection still meets the coverage rule (#258).
+check_eq "re-chunking is still offered after a re-chunk" \
+  "$(api_get "/tune/$C" | jfield "['can_rechunk']")" "True"
 
 # ── re-chunking after a replacement (#22, E17, E32) ──────────────────────────
 # Re-ingesting replaces a name's chunks and retained original, so a rebuild
@@ -50230,6 +50249,61 @@ wait_for_job "/tune/job/$tjob" 900 >/dev/null
 check_eq "re-embedding a chunks-only collection with new chunking is refused" \
   "$(api_get "/tune/job/$tjob" | jfield "['error_code']")" "SOURCES_REQUIRED"
 drop_collection "$SRCLESS"
+
+# ── a partially retained collection refuses re-chunking (#190, #208) ─────────
+# Chunks from policies.txt with no retained original, then a normal upload of
+# policies.md that is retained. Re-chunking from the retained subset alone
+# would drop every policies.txt chunk, so it must be refused before staging.
+MIXED="${PREFIX}Mixedsources"
+drop_collection "$MIXED"; make_collection "$MIXED"
+mixed_ingest() {
+  curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$MIXED" -F "strategy=fixed" \
+    -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$FIX/$1" > /tmp/vfy_m.json
+  wait_for_job "/ingest/job/$(jfield "['job_id']" < /tmp/vfy_m.json)" 900 >/dev/null
+}
+mixed_count() { api_get "/collections" | python3 -c "
+import json,sys; print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$MIXED'][0])"; }
+mixed_names() { api_get "/collections" | python3 -c "
+import json,sys; print(sorted(c['name'] for c in json.load(sys.stdin)['collections']))"; }
+mixed_files() { (cd "$REPO_ROOT" && docker compose exec -T api python - "$MIXED") <<'ENDPY'
+import sys
+from services import weaviate_client as wc
+try:
+    coll = wc.get_client().collections.get(sys.argv[1])
+    print(sorted({o.properties.get("source_file") for o in coll.iterator()}))
+finally:
+    wc.close_client()
+ENDPY
+}
+mixed_ingest policies.txt
+(cd "$REPO_ROOT" && docker compose exec -T api sh -c "rm -rf /app/sources/$MIXED") >/dev/null 2>&1
+mixed_ingest policies.md
+mixed_before=$(mixed_count); names_before=$(mixed_names); files_before=$(mixed_files)
+check_eq "the mixed collection holds chunks from both files" "$files_before" "['policies.md', 'policies.txt']"
+for op in rechunk reembed; do
+  api_post "/tune/$op" "{\"collection\":\"$MIXED\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_tj.json
+  tjob=$(jfield "['job_id']" < /tmp/vfy_tj.json)
+  tune_wait "$tjob" 900 >/dev/null
+  api_get "/tune/job/$tjob" > /tmp/vfy_tjs.json
+  check_eq "#190 $op with new chunking on a partially retained collection is refused" \
+    "$(jfield "['error_code']" < /tmp/vfy_tjs.json)" "SOURCES_REQUIRED"
+  check_eq "#190 ... and names the source file with no retained original" \
+    "$(jfield "['error_detail']['uncovered_source_files']" < /tmp/vfy_tjs.json)" "['policies.txt']"
+  check_eq "#190 ... and leaves every stored chunk in place" "$(mixed_count)" "$mixed_before"
+  check_eq "#190 ... and leaves both source files' chunks in place" "$(mixed_files)" "$files_before"
+  check_eq "#190 ... and leaves no staging or recovery collection behind" "$(mixed_names)" "$names_before"
+done
+api_post "/tune/reembed" "{\"collection\":\"$MIXED\"}" > /tmp/vfy_tj.json
+tjob=$(jfield "['job_id']" < /tmp/vfy_tj.json)
+check_eq "#190 re-embedding the existing chunk text still completes" \
+  "$(tune_wait "$tjob" 1800)" "completed"
+check_eq "#190 ... and keeps every chunk" "$(mixed_count)" "$mixed_before"
+api_post "/tune/reindex" "{\"collection\":\"$MIXED\",\"index_type\":\"flat\",\"distance_metric\":\"cosine\"}" > /tmp/vfy_tj.json
+tjob=$(jfield "['job_id']" < /tmp/vfy_tj.json)
+check_eq "#190 re-indexing a partially retained collection still completes" \
+  "$(tune_wait "$tjob" 1800)" "completed"
+check_eq "#190 ... and keeps both source files' chunks" "$(mixed_files)" "$files_before"
+drop_collection "$MIXED"
 
 # ── #328 (reviewer): retained originals with no stored chunks ────────────────
 # A file that produces no chunks is still retained at ingest. With nothing to

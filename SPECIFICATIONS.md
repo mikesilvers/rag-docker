@@ -2648,7 +2648,10 @@ ingest default.
   chunking fields is refused rather than half-honoured. Re-chunking is also
   refused when a stored source file has no single retained original (a name
   uploaded more than once, or a second name for the same content) or a
-  retained original is missing from disk.
+  retained original is missing from disk. The coverage refusal's
+  `error_detail.uncovered_source_files` names the stored source files a rebuild
+  would not reproduce, at most 10 (the first in sorted order), and
+  `uncovered_source_files_omitted` counts the rest (#208).
 - Re-chunking rebuilds only the names that have stored chunks (#311). A name the
   retained index lists without stored chunks (for example a file that produced no
   chunks at ingest) is skipped, not brought back; the index keeps it.
