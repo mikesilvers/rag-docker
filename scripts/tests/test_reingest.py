@@ -337,6 +337,52 @@ class WorkerTests(unittest.TestCase):
         steps = [c[0] for c in backend.calls if c[0] != "has"]
         self.assertEqual(steps, ["mark", "insert", "delete", "insert", "insert", "delete"])
 
+    def real_sources(self):
+        """Retention into a temporary sources folder, through the real store."""
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        change = patch.object(settings, "sources_dir", temp.name)
+        change.start(); self.addCleanup(change.stop)
+        return sources.store
+
+    def unreadable(self):
+        """Path.read_bytes failing, as only retention reads a file that way."""
+        def read_bytes(path):
+            raise OSError(f"cannot read {path.name}")
+        return patch.object(Path, "read_bytes", read_bytes)
+
+    def test_a_reupload_that_cant_be_read_releases_its_name_880(self):
+        # #880: the read failed before sources.store ran, so the index kept the
+        # name on the old version while the collection held the new chunks.
+        store = self.real_sources()
+        old = store("Coll", "p.txt", b"v1 text", replace=True)
+        backend = FakeCollection(**{"p.txt": ["v1"]})
+        with self.unreadable(), self.assertLogs(ingest_pipeline._log, "ERROR") as logged:
+            job = self.run_job(backend, [("p.txt", "v2a v2b")], store=store)
+        self.assertEqual((job["status"], job["files_completed"], job["files_failed"]),
+                         ("completed", 1, 0))
+        self.assertIn("Could not retain source 'p.txt' for 'Coll': cannot read p.txt",
+                      "\n".join(logged.output))
+        self.assertEqual(sources.digests_for_filename("Coll", "p.txt"), [])
+        self.assertFalse(sources.blob_path("Coll", old).exists())
+        self.assertEqual([c["content"] for c in backend.chunks["p.txt"]], ["v2a", "v2b"])
+
+    def test_a_failed_release_is_logged_and_the_file_still_counts_880(self):
+        store = self.real_sources()
+        old = store("Coll", "p.txt", b"v1 text", replace=True)
+        backend = FakeCollection(**{"p.txt": ["v1"]})
+        with self.unreadable(), \
+                patch.object(sources, "_save_index", side_effect=OSError("read-only")), \
+                self.assertLogs(sources.log, "ERROR") as released, \
+                self.assertLogs(ingest_pipeline._log, "ERROR") as retained:
+            job = self.run_job(backend, [("p.txt", "v2a")], store=store)
+        self.assertEqual((job["status"], job["files_completed"], job["files_failed"]),
+                         ("completed", 1, 0))
+        self.assertIn("a re-chunk could rebuild that earlier version", "\n".join(released.output))
+        self.assertIn("cannot read p.txt", "\n".join(retained.output))
+        # Best effort: the index couldn't be saved, so it still names the old version.
+        self.assertEqual(sources.digests_for_filename("Coll", "p.txt"), [old])
+
     def test_unchanged_content_is_still_replaced(self):
         backend = FakeCollection(**{"p.txt": ["same", "words"]})
         job = self.run_job(backend, [("p.txt", "same words")])
@@ -644,6 +690,92 @@ class SourcesTests(unittest.TestCase):
         v1 = sources.store("Coll", "p.txt", b"v1")
         v2 = sources.store("Coll", "p.txt", b"v2")
         self.assertEqual(sorted(sources.digests_for_filename("Coll", "p.txt")), sorted([v1, v2]))
+
+    def index_bytes(self):
+        return (sources.collection_dir("Coll") / sources.INDEX_NAME).read_bytes()
+
+    def test_release_drops_the_name_and_an_orphan_after_the_save_880(self):
+        old = sources.store("Coll", "p.txt", b"v1", replace=True)
+        shared = sources.store("Coll", "a.txt", b"same", replace=True)
+        sources.store("Coll", "b.txt", b"same", replace=True)
+        sources.release("Coll", "p.txt")
+        self.assertNotIn(old, self.docs())
+        self.assertFalse(sources.blob_path("Coll", old).exists())
+        # A digest another name still lists keeps its entry and its blob.
+        sources.release("Coll", "a.txt")
+        self.assertEqual(self.docs()[shared]["filenames"], ["b.txt"])
+        self.assertTrue(sources.blob_path("Coll", shared).is_file())
+        self.assertEqual(sources.digests_for_filename("Coll", "p.txt"), [])
+        self.assertEqual(sources.digests_for_filename("Coll", "a.txt"), [])
+
+    def test_release_writes_nothing_for_an_unlisted_name_880(self):
+        sources.store("Coll", "p.txt", b"v1", replace=True)
+        before = self.folder()
+        with patch.object(sources, "_save_index", wraps=sources._save_index) as save:
+            sources.release("Coll", "other.txt")
+            sources.release("Empty", "p.txt")
+        save.assert_not_called()
+        self.assertEqual(self.folder(), before)
+        self.assertFalse(sources.collection_dir("Empty").exists())
+
+    def test_release_refuses_an_unreadable_index_without_writing_880(self):
+        sources.store("Coll", "p.txt", b"v1", replace=True)
+        (sources.collection_dir("Coll") / sources.INDEX_NAME).write_text("{not json")
+        before = self.folder()
+        with self.assertRaisesRegex(ValueError, "Unreadable retained source index"):
+            sources.release("Coll", "p.txt")
+        self.assertEqual(self.folder(), before)
+
+    def test_a_failed_final_save_leaves_the_name_released_880(self):
+        # #880: the release used to be saved only with the new entry, so a
+        # failed final save left the name on the version it replaced.
+        old = sources.store("Coll", "p.txt", b"v1", replace=True)
+        real, calls = sources._save_index, []
+
+        def second_fails(collection, index):
+            calls.append(collection)
+            if len(calls) == 2:
+                raise OSError("disk full")
+            return real(collection, index)
+
+        with patch.object(sources, "_save_index", side_effect=second_fails), \
+                self.assertRaisesRegex(OSError, "disk full"):
+            sources.store("Coll", "p.txt", b"v2", replace=True)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.docs(), {})
+        self.assertEqual(sources.digests_for_filename("Coll", "p.txt"), [])
+        self.assertFalse(sources.blob_path("Coll", old).exists())
+
+    def test_a_failed_release_save_keeps_the_index_and_is_logged_880(self):
+        sources.store("Coll", "p.txt", b"v1", replace=True)
+        before = self.index_bytes()
+        with patch.object(sources, "_save_index", side_effect=OSError("read-only")), \
+                self.assertLogs(sources.log, "ERROR") as logged, \
+                self.assertRaisesRegex(OSError, "read-only"):
+            sources.store("Coll", "p.txt", b"v2", replace=True)
+        self.assertEqual(self.index_bytes(), before)
+        self.assertIn("Could not release 'p.txt' from its earlier version in 'Coll'; a "
+                      "re-chunk could rebuild that earlier version: read-only",
+                      "\n".join(logged.output))
+        with patch.object(sources, "_save_index", side_effect=OSError("read-only")), \
+                self.assertLogs(sources.log, "ERROR") as logged, \
+                self.assertRaisesRegex(OSError, "read-only"):
+            sources.release("Coll", "p.txt")
+        self.assertEqual(self.index_bytes(), before)
+        self.assertIn("a re-chunk could rebuild that earlier version", "\n".join(logged.output))
+
+    def test_nothing_to_release_saves_once_880(self):
+        cases = (("first upload", "p.txt", b"v1", True),
+                 ("the same content again", "p.txt", b"v1", True),
+                 ("without replace", "q.txt", b"v2", False))
+        for case, name, data, replace in cases:
+            with self.subTest(case=case), \
+                    patch.object(sources, "_save_index", wraps=sources._save_index) as save:
+                sources.store("Coll", name, data, replace=replace)
+                self.assertEqual(save.call_count, 1)
+        with patch.object(sources, "_save_index", wraps=sources._save_index) as save:
+            sources.store("Coll", "p.txt", b"v3", replace=True)
+        self.assertEqual(save.call_count, 2)        # the release, then the new entry
 
     def test_name_is_released_even_when_the_blob_write_fails(self):
         v1 = sources.store("Coll", "p.txt", b"v1", replace=True)

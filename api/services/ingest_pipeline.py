@@ -797,6 +797,23 @@ def _remove_earlier(collection: str, name: str, created_at: datetime,
         return getattr(exc, "deleted", 0), str(exc) or type(exc).__name__
 
 
+def _retention_bytes(collection: str, name: str, path: Path) -> bytes:
+    """The bytes to retain for name. When they can't be read, the name is
+    released all the same before the error is raised (#880): its new chunks are
+    stored, so it must not keep pointing at the version they replaced, which a
+    re-chunk would rebuild. Best effort: a failed save is logged by sources, and
+    an invalid index already refuses re-chunking. Only an argument of
+    sources.store, so a large file's bytes aren't held after it returns."""
+    try:
+        return path.read_bytes()
+    except OSError:
+        try:
+            sources.release(collection, name)
+        except (OSError, ValueError):
+            pass
+        raise
+
+
 @telemetry.traced("rag.ingest")
 @collection_writes.serialized("collection")
 def _process_job_sync(
@@ -897,7 +914,7 @@ def _process_job_sync(
                     sources.store(
                         collection,
                         name,
-                        path.read_bytes(),
+                        _retention_bytes(collection, name, path),
                         "application/gzip" if encoding else media_type,
                         replace=True,
                     )
