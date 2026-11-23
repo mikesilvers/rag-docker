@@ -112,6 +112,11 @@ def _verify_records(collection: str, records: list[dict]) -> None:
 
 _MISSING_CHUNK_INDEX = object()
 
+# How many uncovered names a coverage refusal keeps in
+# error_detail.uncovered_source_files, which the job API returns;
+# uncovered_source_files_omitted counts the rest (#208), as #28 caps members.
+_MAX_NAMED_UNCOVERED = 10
+
 
 def _source_coverage(collection: str, documents: dict) -> tuple[list[str], set[str]]:
     """The stored source files a rebuild from the retained originals would not
@@ -126,7 +131,11 @@ def _source_coverage(collection: str, documents: dict) -> tuple[list[str], set[s
     seen: dict[str, set] = {}
     uncovered = set()
     stored = set()
-    for obj in telemetry.iterate(wc.get_client().collections.get(collection).iterator):
+    # Only the two properties the rule reads, and no vector: not each chunk's
+    # text, on every GET /tune (#258).
+    for obj in telemetry.iterate(wc.get_client().collections.get(collection).iterator,
+                                 include_vector=False,
+                                 return_properties=["source_file", "chunk_index"]):
         props = obj.properties or {}
         filename = props.get("source_file")
         if not isinstance(filename, str) or not filename:
@@ -303,7 +312,9 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
             "Cannot change chunk boundaries: some stored chunks have missing or "
             "ambiguous retained originals. Re-embed without chunking parameters "
             "or re-index to preserve the existing chunks.",
-            {"collection": collection, "uncovered_source_files": uncovered})
+            {"collection": collection,
+             "uncovered_source_files": uncovered[:_MAX_NAMED_UNCOVERED],
+             "uncovered_source_files_omitted": max(0, len(uncovered) - _MAX_NAMED_UNCOVERED)})
 
     out: list[dict] = []
     now = datetime.now(timezone.utc).isoformat()
