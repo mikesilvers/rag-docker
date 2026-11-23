@@ -589,6 +589,68 @@ class RecoveryTests(unittest.TestCase):
         stale.assert_called_once_with('Corpus', 'interrupted tuning final write; verified recovery retained')
         self.assertEqual(self.recovery_record()['cutover_checked'], 'stale')
 
+    # Reviewer tests (PR #879 testing review, head 8233a39).
+    def test_failed_decision_write_after_handled_failure_leaves_the_check_for_startup(self):
+        # #263: a failed decision write is logged, the job error is unchanged,
+        # and the check stays pending for startup, as after a hard kill.
+        self.cols.final_fault = 'reject'
+        with patch.object(tuning.goldstandard, 'mark_stale') as stale, \
+                patch.object(recovery, 'finish_cutover_check', side_effect=OSError('disk full')), \
+                patch.object(tuning, '_log') as log, \
+                self.assertRaises(importer.PackageError) as error:
+            self.rebuild()
+        stale.assert_called_once()
+        record = self.recovery_record()
+        self.assertEqual(error.exception.code, 'TUNE_FAILED')
+        self.assertEqual(error.exception.detail['recovered_as'], record['staging'])
+        self.assertTrue(record['cutover_pending'])
+        self.assertTrue(any('cutover decision' in str(c.args[0]) for c in log.exception.call_args_list),
+                        log.exception.call_args_list)
+        with patch.object(tuning.goldstandard, 'mark_stale') as stale:
+            recovery.sweep(self.client)
+            recovery.sweep(self.client)
+        stale.assert_called_once_with('Corpus', 'interrupted tuning final write; verified recovery retained')
+        self.assertEqual(self.recovery_record()['cutover_checked'], 'stale')
+
+    def test_handled_reindex_failure_records_the_decision_only_when_history_is_marked(self):
+        # #263 on the records (reindex) path: a failure after cutover whose
+        # preservation can't be verified marks history and records 'stale'; one
+        # whose target verifies as intact marks nothing and keeps no record.
+        records_ = [{'id': r['id'], 'vector': r['vector'], 'properties': r['properties']} for r in self.original]
+        for intact in (False, True):
+            with self.subTest(intact=intact):
+                for path in recovery._root().glob('*.json'):
+                    path.unlink()
+                self.cols.items = {'Corpus': self.cols.get('Corpus')}
+                def write(name, recs):
+                    if name == 'Corpus':
+                        raise RuntimeError('final write failed')
+                verified = []
+                def verify(name, recs):
+                    verified.append(name)
+                    if len(verified) > 1 and not intact:
+                        raise RuntimeError('readback changed')
+                with patch.object(wc, '_validate_reindex_vectorizer_sync'), \
+                        patch.object(tuning, '_write_records', side_effect=write), \
+                        patch.object(tuning, '_verify_records', side_effect=verify), \
+                        patch.object(tuning.goldstandard, 'mark_stale') as stale, \
+                        self.assertRaises(Exception):
+                    tuning._rebuild('Corpus', [], None, None, None, records=records_)
+                self.assertEqual(verified, ['Corpus', 'Corpus'])
+                paths = list(recovery._root().glob('*.json'))
+                if intact:
+                    stale.assert_not_called()
+                    self.assertEqual(paths, [])
+                else:
+                    stale.assert_called_once_with('Corpus', 'reindex replacement failed after cutover began; exact record preservation was not verified')
+                    record = self.recovery_record()
+                    self.assertFalse(record['cutover_pending'])
+                    self.assertEqual(record['cutover_checked'], 'stale')
+                    with patch.object(tuning.goldstandard, 'mark_stale') as again:
+                        recovery.sweep(self.client)
+                    again.assert_not_called()
+                    recovery.discard(record, self.client)
+
     def test_import_replace_note_counts_canonical_and_alias_sessions(self):
         seen = []
         def sessions(name):
