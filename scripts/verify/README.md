@@ -741,7 +741,9 @@ anything in a sub-folder are kept. A symlink is never followed, at the top or in
 removed directory, and sizes don't count what links point at. A failed removal is logged and
 not reported as removed, and a missing exports folder is not created. A real lifespan run in a
 child process removes both kinds and logs them by name and size. A second one, whose export
-sweep fails, logs the error and still starts, with the ingest staging removed (#423).
+sweep fails, logs the error and still starts, with the ingest staging removed (#423). The
+first run also removes a source-index save a crash interrupted
+(`SOURCES_DIR/<collection>/index.json.<16 hex>.tmp`) and keeps the index beside it (#882).
 `02_ingest.sh` runs it in the API container. With `RAG_ALLOW_RESTART=1`, `02_ingest.sh` checks
 that its two killed ingests' `ingest-*` staging existed before its restart and is gone after it
 (#423), and `05_transfer.sh` checks after its export restart that the interrupted export's staging
@@ -774,10 +776,21 @@ a name has chunks only when stored exactly, and a non-default rule selects what 
 the deletion by ID in batches of at most 10,000, never empty, and its bound, refused before
 deleting; the precondition and final count,
 retention releasing the name (also when the blob write fails, keeping shared digests), the
+release saved before the new blob and entry (#880: a failed final save leaves the name
+released, a failed release save keeps the index and logs that a re-chunk could rebuild the
+earlier version, nothing to release still saves once; `sources.release` drops the name and an
+orphan, keeps a shared digest, writes nothing for an unlisted name and refuses an unreadable
+index; an ingest whose re-upload can't be read for retention still counts the file and leaves
+the name listed by no digest, and when even that release can't be saved it is logged and the
+file still counts), the
 retained index's updates (#52: an unreadable index, invalid JSON, invalid UTF-8 or a read
 error, is refused and left unchanged, and a store into it writes nothing; two threads storing
 into one collection both keep their entries; index saves use unique temporary files and a
-failed save keeps the previous index; an imported index is published with an atomic replace), and
+failed save keeps the previous index; an imported index is published with an atomic replace),
+the #882 follow-ups (a new blob is published and fsynced, an existing one isn't rewritten;
+`delete` drops the collection's lock and a later store makes a new one; the startup sweep
+removes only `*.<16 hex>.tmp` leftovers in collection folders, skips a linked folder, logs and
+keeps one it can't remove, and needs no sources folder), and
 rechunk coverage and per-(digest, name) rebuilds, rebuilding only names with stored chunks
 while a missing blob is still refused (#311), also for one blob under 50 names with one
 stored and a digest with none (only the stored name is parsed). A collection whose retained
