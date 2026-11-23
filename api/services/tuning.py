@@ -12,6 +12,10 @@ starts, a verified recovery copy and its sidecars survive failure and restart.
 Identity-changing operations flag retained evaluations before replacement;
 failed reindex cutovers flag them when exact identity cannot be verified.
 
+**Memory.** Re-embedding from stored chunk text and reindexing read and copy the
+collection a page at a time; a reindex verifies every copy against a disk-backed
+fingerprint snapshot of the original, never decoded records in memory (#583).
+
 **Gold standard.** Anything that changes chunk identity marks every session for
 the collection `stale`, with a reason and a timestamp. Sessions are never
 deleted and never remapped (spec §7.3).
@@ -54,10 +58,34 @@ def get_job(job_id: str) -> dict | None:
 
 # ── Reading the collection's own chunks ───────────────────────────────────────
 
-def _existing_chunks(collection: str) -> list[dict]:
+class _StoredChunks:
+    """Stored properties, without vectors, read a page at a time (#583).
+
+    Re-iterable: every pass walks the collection again, so the batch writer's
+    preflight, write and resend passes stream it instead of holding it. The
+    collection writer guard keeps the walks identical. The count is Weaviate's
+    aggregate, taken once.
+    """
+
+    def __init__(self, collection: str) -> None:
+        self.collection = collection
+        self._count: int | None = None
+
+    def __iter__(self):
+        col = wc.get_client().collections.get(self.collection)
+        return (dict(o.properties or {}) for o in telemetry.iterate(col.iterator))
+
+    def __len__(self) -> int:
+        if self._count is None:
+            col = wc.get_client().collections.get(self.collection)
+            self._count = telemetry.call("weaviate.aggregate", col.aggregate.over_all,
+                                         total_count=True).total_count or 0
+        return self._count
+
+
+def _existing_chunks(collection: str) -> _StoredChunks:
     """Stored properties, without vectors. Used when re-embedding chunk text."""
-    col = wc.get_client().collections.get(collection)
-    return [dict(o.properties or {}) for o in telemetry.iterate(col.iterator)]
+    return _StoredChunks(collection)
 
 
 def _existing_records(collection: str) -> list[dict]:
@@ -66,7 +94,8 @@ def _existing_records(collection: str) -> list[dict]:
 
 
 def _iter_existing_records(collection: str):
-    seen = set()
+    # Duplicate UUIDs are refused by the snapshot's unique key (_snapshot), so
+    # nothing here grows with the collection (#583).
     col = wc.get_client().collections.get(collection)
     for obj in telemetry.iterate(col.iterator, include_vector=True):
         identity = str(obj.uuid)
@@ -79,35 +108,100 @@ def _iter_existing_records(collection: str):
                 or any(isinstance(value, bool) or not isinstance(value, (int, float))
                        or not math.isfinite(value) for value in vector)):
             raise RuntimeError(f"Reindex cannot preserve the stored vector for {identity}")
-        if identity in seen:
-            raise RuntimeError(f"Reindex received duplicate stored UUID {identity}")
-        seen.add(identity)
         yield {"id": identity, "vector": copy.deepcopy(vector),
                "properties": copy.deepcopy(dict(obj.properties or {}))}
 
 
-def _write_records(collection: str, records: list[dict]) -> None:
-    """Supply exact records, drain the batch, then compare backend readback."""
-    col = wc.get_client().collections.get(collection)
-    with telemetry.span("weaviate.batch"):
-        with col.batch.dynamic() as batch:
-            for record in records:
-                batch.add_object(properties=copy.deepcopy(record["properties"]),
-                                 uuid=record["id"], vector=copy.deepcopy(record["vector"]))
-        if batch.number_errors:
-            raise RuntimeError(f"{batch.number_errors} error(s) copying reindex records")
-    _verify_records(collection, records)
+class _RecordSnapshot:
+    """A reindex's fixed expectation and where to read the records it copies.
+
+    `expected` holds the original's UUIDs and property/float32-vector
+    fingerprints on disk (batch_write.ExpectedRecords, spec §6.5); `read()`
+    streams records from one collection. The snapshot never changes, so a check
+    after cutover still compares against the original (#583).
+    """
+
+    def __init__(self, expected, read) -> None:
+        self.expected = expected
+        self.read = read
+
+    def __len__(self) -> int:
+        return self.expected.count
+
+    def reading(self, collection: str) -> "_RecordSnapshot":
+        return _RecordSnapshot(self.expected, lambda: _iter_existing_records(collection))
+
+    def close(self) -> None:
+        self.expected.__exit__(None, None, None)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
 
 
-def _verify_records(collection: str, records: list[dict]) -> None:
-    expected = {record["id"]: record for record in records}
-    seen = set()
-    for record in _iter_existing_records(collection):
-        if record != expected.get(record["id"]):
-            raise RuntimeError("Reindex backend readback changed UUIDs, properties or vectors")
-        seen.add(record["id"])
-    if seen != expected.keys():
-        raise RuntimeError("Reindex backend readback changed UUIDs, properties or vectors")
+_DUPLICATE = "Duplicate chunk UUID "
+
+
+def _snapshot(records) -> _RecordSnapshot:
+    """Fingerprint a reusable record source once: a zero-argument callable
+    returning an iterator, or a list."""
+    read = records if callable(records) else (lambda: iter(records))
+    expected = batch_write.ExpectedRecords()
+    try:
+        expected.capture(read)
+    except BaseException as exc:
+        expected.__exit__(None, None, None)
+        if isinstance(exc, ValueError) and str(exc).startswith(_DUPLICATE):
+            raise RuntimeError("Reindex received duplicate stored UUID "
+                               + str(exc)[len(_DUPLICATE):]) from exc
+        raise
+    return _RecordSnapshot(expected, read)
+
+
+def _record_snapshot(collection: str) -> _RecordSnapshot:
+    """The reindex snapshot of the stored collection, read a page at a time."""
+    return _snapshot(lambda: _iter_existing_records(collection))
+
+
+def _as_snapshot(records) -> tuple[_RecordSnapshot, bool]:
+    """A snapshot, and whether the caller made it and must close it."""
+    if isinstance(records, _RecordSnapshot):
+        return records, False
+    return _snapshot(records), True
+
+
+def _write_records(collection: str, records) -> None:
+    """Copy a snapshot's records a page at a time, drain the batch, then compare
+    backend readback with the snapshot."""
+    snapshot, owned = _as_snapshot(records)
+    try:
+        col = wc.get_client().collections.get(collection)
+        with telemetry.span("weaviate.batch"):
+            with col.batch.dynamic() as batch:
+                for record in snapshot.read():
+                    batch.add_object(properties=copy.deepcopy(record["properties"]),
+                                     uuid=record["id"], vector=copy.deepcopy(record["vector"]))
+            if batch.number_errors:
+                raise RuntimeError(f"{batch.number_errors} error(s) copying reindex records")
+        _verify_records(collection, snapshot)
+    finally:
+        if owned:
+            snapshot.close()
+
+
+def _verify_records(collection: str, records) -> None:
+    """Stream the collection against the snapshot: every UUID once, nothing
+    else, the same property and float32 vector fingerprints."""
+    snapshot, owned = _as_snapshot(records)
+    try:
+        snapshot.expected.verify(wc.get_client().collections.get(collection), exact=True)
+    except batch_write.BatchVerificationError as exc:
+        raise RuntimeError("Reindex backend readback changed UUIDs, properties or vectors") from exc
+    finally:
+        if owned:
+            snapshot.close()
 
 
 _MISSING_CHUNK_INDEX = object()
@@ -376,7 +470,11 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
 def _rebuild(collection: str, properties: list[dict], index_type: str | None,
              distance_metric: str | None, progress, *, records: list[dict] | None = None,
              source_collection: str | None = None, before_replace=None) -> int:
-    """Stage and verify, then replace the live collection under its writer guard."""
+    """Stage and verify, then replace the live collection under its writer guard.
+
+    Reindex `records` are a fingerprint snapshot of the original (a list is
+    snapshotted here); nothing holds the collection in memory (#583).
+    """
     source_collection = source_collection or collection
     collection = collection_writes.canonical(collection)
     if records is not None:
@@ -393,7 +491,10 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
     history_marked = False
     completed = False
     original_intact = False
+    owned_records = False
     try:
+        if records is not None:
+            records, owned_records = _as_snapshot(records)
         wc._create_collection_sync(staging, new_index, new_distance, hnsw, preserve_hnsw=True)
         if records is not None:
             _write_records(staging, records)
@@ -418,7 +519,8 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
         wc._create_collection_sync(collection, new_index, new_distance, hnsw, preserve_hnsw=True,
                                    description=collection_recovery.cutover_description(ownership))
         if records is not None:
-            _write_records(collection, records)
+            # The original is gone: copy the verified staging collection.
+            _write_records(collection, records.reading(staging))
             written = len(records)
         else:
             def staged():
@@ -484,6 +586,8 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
                 collection_recovery.discard(ownership, client)
             except Exception:
                 _log.exception("Could not remove owned staging collection %r", staging)
+        if owned_records:
+            records.close()
 
 
 @telemetry.traced("rag.tuning")
@@ -505,11 +609,11 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
         collection_writes.end_job("tune", job_id)
         job.update(fields)
 
+    records = None
     try:
         needs_sources = operation == "rechunk" or (
             operation == "reembed" and params.get("chunking") is not None)
         has_sources = sources.has_sources(source_collection) if needs_sources else False
-        records = None
 
         if operation == "rechunk":
             if not has_sources:
@@ -543,8 +647,8 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
                           "so its vectors changed")
 
         elif operation == "reindex":
-            records = _existing_records(collection)
-            properties = [record["properties"] for record in records]
+            records = _record_snapshot(collection)
+            properties = records     # its len() is the snapshot's count
             reason = None            # exact UUID/vector/property copy is verified
         else:
             raise PackageError("TUNE_UNSUPPORTED", f"Unknown operation '{operation}'.")
@@ -581,6 +685,8 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
         finish(status="failed", error_code="TUNE_FAILED",
                error=f"{type(exc).__name__}: {exc}")
     finally:
+        if isinstance(records, _RecordSnapshot):
+            records.close()
         collection_writes.end_job("tune", job_id)
         with _lock:
             _active.discard(collection)
