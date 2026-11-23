@@ -169,6 +169,44 @@ class ValidityServiceTests(unittest.TestCase):
                     self.assertIn('cutover',current['stale_reason'])
                 self.assertFalse(gs.get_session('gs_33333333').get('stale',False))
 
+    def test_failed_reindex_cutover_marks_both_backend_aliases(self):
+        # #218: the records (reindex) path's after-cutover failure, when exact
+        # preservation can't be verified, must also mark both spellings.
+        from services import tuning
+        from unittest.mock import MagicMock
+        for caller in ('ValidityFixture','validityFixture'):
+            with self.subTest(caller=caller):
+                for sid,name in (('gs_11111111','ValidityFixture'),('gs_22222222','validityFixture'),('gs_33333333','Validityfixture')):
+                    data=session();data.update(session_id=sid,collection=name);gs.store_session(data)
+                ownership={'staging':'ValidityFixture__test','state':'scratch','operation_id':'test'}
+                calls=[]
+                def verify(name,records):
+                    calls.append(name)
+                    if len(calls)>1:raise RuntimeError('verify fault')
+                def create(name,*args,**kwargs):
+                    if name=='ValidityFixture':raise RuntimeError('create fault')
+                records=[{'id':'00000000-0000-0000-0000-000000000001','vector':[0.1],'properties':{'content':'Inert'}}]
+                with patch.object(tuning.wc,'get_client',return_value=MagicMock()), \
+                     patch.object(tuning.wc,'_validate_reindex_vectorizer_sync'), \
+                     patch.object(tuning.wc,'_collection_config_sync',return_value={'index_type':'hnsw','distance_metric':'cosine','hnsw_config':{}}), \
+                     patch.object(tuning.wc,'_create_collection_sync',side_effect=create), \
+                     patch.object(tuning,'_write_records'), \
+                     patch.object(tuning,'_verify_records',side_effect=verify), \
+                     patch.object(tuning.collection_recovery,'begin',return_value=ownership), \
+                     patch.object(tuning.collection_recovery,'retain',side_effect=lambda owner,**kw:owner.update(state='recovery')), \
+                     patch.object(tuning.collection_recovery,'sidecar_reference',return_value=None), \
+                     patch.object(tuning.collection_recovery,'discard'):
+                    with self.assertRaises(Exception):
+                        tuning._rebuild(caller,[],None,None,None,records=records,source_collection=caller)
+                self.assertEqual(len(calls),2,calls)
+                gs._sessions={};gs.load_sessions_from_disk()
+                for sid,name in (('gs_11111111','ValidityFixture'),('gs_22222222','validityFixture')):
+                    current=gs.get_session(sid)
+                    self.assertEqual(current['collection'],name)
+                    self.assertTrue(current.get('stale'),(caller,name))
+                    self.assertIn('exact record preservation was not verified',current['stale_reason'])
+                self.assertFalse(gs.get_session('gs_33333333').get('stale',False))
+
     def test_successful_identity_preserving_reindex_keeps_validity_semantics(self):
         from services import tuning
         job={'status':'queued'}
