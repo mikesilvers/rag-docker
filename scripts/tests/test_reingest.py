@@ -653,6 +653,149 @@ class SourcesTests(unittest.TestCase):
         self.assertEqual(self.docs(), {})
         self.assertFalse(sources.blob_path("Coll", v1).exists())
 
+    def test_a_failed_blob_write_leaves_no_temporary_file(self):
+        # #52: the blob's temporary file is created exclusively before it is
+        # written, so a failed write must remove it, not leave it in the folder.
+        sources.store("Coll", "p.txt", b"v1", replace=True)
+        with patch.object(Path, "write_bytes", side_effect=OSError("disk full")), \
+                self.assertRaises(OSError):
+            sources.store("Coll", "q.txt", b"v2", replace=False)
+        self.assertEqual([p.name for p in sources.collection_dir("Coll").iterdir()
+                          if p.name.endswith(".tmp")], [])
+        self.assertFalse(sources.blob_path("Coll", hashlib.sha256(b"v2").hexdigest()).exists())
+        self.assertEqual(sorted(n for e in self.docs().values() for n in e["filenames"]), ["p.txt"])
+
+    def folder(self):
+        """Every file in Coll's retained folder, by name, with its bytes."""
+        directory = sources.collection_dir("Coll")
+        return {p.name: p.read_bytes() if p.is_file() else None for p in directory.iterdir()}
+
+    def test_an_unreadable_index_is_refused_and_left_unchanged(self):
+        # #52: an unreadable index was treated as empty, so the next store
+        # replaced every earlier entry. It is refused like an invalid one.
+        directory = sources.collection_dir("Coll")
+        directory.mkdir(parents=True)
+        index = directory / sources.INDEX_NAME
+        for form, content in (("invalid JSON", b"{not json"), ("invalid UTF-8", b"\xff\xfe{}")):
+            with self.subTest(form=form):
+                index.write_bytes(content)
+                with self.assertRaisesRegex(ValueError, "Unreadable retained source index"):
+                    sources.load_index("Coll")
+                self.assertEqual(index.read_bytes(), content)
+        index.unlink()
+        index.mkdir()                      # reading it raises IsADirectoryError, an OSError
+        with self.subTest(form="read error"):
+            with self.assertRaisesRegex(ValueError, "Unreadable retained source index"):
+                sources.load_index("Coll")
+            self.assertTrue(index.is_dir())
+
+    def test_store_refuses_an_unreadable_index_and_writes_nothing(self):
+        # #52: a corrupt index followed by an ingest must not become a partial
+        # index; nothing in the folder changes, no blob or temporary file appears.
+        sources.store("Coll", "a.txt", b"one", replace=True)
+        (sources.collection_dir("Coll") / sources.INDEX_NAME).write_text("{not json")
+        before = self.folder()
+        for replace in (True, False):
+            with self.subTest(replace=replace), \
+                    self.assertRaisesRegex(ValueError, "Unreadable retained source index"):
+                sources.store("Coll", "b.txt", b"two", replace=replace)
+            self.assertEqual(self.folder(), before)
+
+    def test_concurrent_stores_into_one_collection_keep_both_entries(self):
+        # #52: two stores read the same index and the later save dropped the
+        # other's entry. The first store waits inside its cycle for the second
+        # to start reading; with the lock, the second can't start until the
+        # first has saved, and both entries are on disk.
+        real = sources.load_index
+        inside, second = threading.Event(), threading.Event()
+        calls = []
+
+        def load_index(collection):
+            calls.append(collection)
+            if len(calls) == 1:
+                inside.set()
+                second.wait(0.5)
+            else:
+                second.set()
+            return real(collection)
+
+        errors = []
+
+        def store(name, data):
+            try:
+                sources.store("Coll", name, data, replace=True)
+            except BaseException as exc:         # noqa: BLE001 - reported below
+                errors.append(exc)
+
+        with patch.object(sources, "load_index", load_index):
+            first = threading.Thread(target=store, args=("a.txt", b"one"))
+            first.start()
+            self.assertTrue(inside.wait(5))
+            other = threading.Thread(target=store, args=("b.txt", b"two"))
+            other.start()
+            first.join(10)
+            other.join(10)
+        self.assertEqual(errors, [])
+        self.assertEqual({d: e["filenames"] for d, e in real("Coll")["documents"].items()},
+                         {hashlib.sha256(b"one").hexdigest(): ["a.txt"],
+                          hashlib.sha256(b"two").hexdigest(): ["b.txt"]})
+
+    def test_index_saves_use_unique_temporary_files_and_a_failed_save_keeps_the_index(self):
+        real = os.replace
+        published = []
+
+        def record(src, dst):
+            if Path(dst).name == sources.INDEX_NAME:
+                published.append(Path(src))
+            return real(src, dst)
+
+        with patch.object(sources.os, "replace", side_effect=record):
+            sources.store("Coll", "a.txt", b"one", replace=True)
+            sources.store("Coll", "b.txt", b"two", replace=True)
+        self.assertEqual(len(published), 2)
+        self.assertNotEqual(published[0], published[1])
+        for tmp in published:
+            self.assertEqual(tmp.parent, sources.collection_dir("Coll"))
+            self.assertTrue(tmp.name.startswith("index.json.") and tmp.name.endswith(".tmp"))
+            self.assertFalse(tmp.exists())
+
+        index = sources.collection_dir("Coll") / sources.INDEX_NAME
+        saved = index.read_bytes()
+
+        def fail_index(src, dst):
+            if Path(dst).name == sources.INDEX_NAME:
+                raise OSError("disk full")
+            return real(src, dst)
+
+        with patch.object(sources.os, "replace", side_effect=fail_index), \
+                self.assertRaises(OSError):
+            sources.store("Coll", "c.txt", b"three", replace=True)
+        self.assertEqual(index.read_bytes(), saved)
+        self.assertEqual([p.name for p in index.parent.iterdir() if p.name.endswith(".tmp")], [])
+
+    def test_restore_package_publishes_the_index_atomically(self):
+        package = Path(tempfile.mkdtemp(dir=settings.sources_dir))
+        (package / "sources").mkdir()
+        digest = hashlib.sha256(b"packaged").hexdigest()
+        (package / "sources" / digest).write_bytes(b"packaged")
+        payload = json.dumps({"version": 1, "documents": {digest: {"filenames": ["p.txt"]}}}).encode()
+        (package / "sources" / sources.INDEX_NAME).write_bytes(payload)
+        real = os.replace
+        published = []
+
+        def record(src, dst):
+            published.append((Path(src), Path(dst)))
+            return real(src, dst)
+
+        with patch.object(sources.os, "replace", side_effect=record):
+            sources.restore_package(package, "Restored")
+        index = sources.collection_dir("Restored") / sources.INDEX_NAME
+        self.assertEqual([dst for _, dst in published], [index])
+        self.assertEqual(published[0][0].parent, index.parent)
+        self.assertTrue(published[0][0].name.endswith(".tmp"))
+        self.assertEqual(index.read_bytes(), payload)
+        self.assertEqual(sources.load_index("Restored")["documents"].keys(), {digest})
+
 
 class RechunkTests(unittest.TestCase):
     def setUp(self):
@@ -873,7 +1016,10 @@ class RechunkTests(unittest.TestCase):
                 ("non-digest key", lambda: index.write_text(json.dumps(
                     {"version": 1, "documents": {"../outside.txt": {"filenames": ["a.txt"]}}}))),
                 ("non-object document", lambda: index.write_text("[]")),
-                ("linked index", lambda: index.symlink_to(valid))):
+                ("linked index", lambda: index.symlink_to(valid)),
+                # #52: unreadable indexes were treated as empty, not refused.
+                ("unreadable JSON", lambda: index.write_text("{not json")),
+                ("invalid UTF-8", lambda: index.write_bytes(b"\xff\xfe{}"))):
             index.unlink(missing_ok=True)
             write()
             with self.assertRaises(ValueError):
@@ -958,7 +1104,7 @@ class RechunkTests(unittest.TestCase):
                         self.assertIn(response.json()["job_id"], set(tuning._jobs))
                         started.append(response.json()["job_id"])
         self.assertEqual(set(tuning._jobs) - before, set(started))
-        self.assertEqual(len(started), 6)
+        self.assertEqual(len(started), 10)    # five index forms, two routes
         self.assertEqual((tuning._active, collection_writes.active_jobs("Coll")), (set(), []))
 
     def test_the_guards_answer_before_an_invalid_source_index(self):
