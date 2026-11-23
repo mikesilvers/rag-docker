@@ -653,6 +653,18 @@ class SourcesTests(unittest.TestCase):
         self.assertEqual(self.docs(), {})
         self.assertFalse(sources.blob_path("Coll", v1).exists())
 
+    def test_a_failed_blob_write_leaves_no_temporary_file(self):
+        # #52: the blob's temporary file is created exclusively before it is
+        # written, so a failed write must remove it, not leave it in the folder.
+        sources.store("Coll", "p.txt", b"v1", replace=True)
+        with patch.object(Path, "write_bytes", side_effect=OSError("disk full")), \
+                self.assertRaises(OSError):
+            sources.store("Coll", "q.txt", b"v2", replace=False)
+        self.assertEqual([p.name for p in sources.collection_dir("Coll").iterdir()
+                          if p.name.endswith(".tmp")], [])
+        self.assertFalse(sources.blob_path("Coll", hashlib.sha256(b"v2").hexdigest()).exists())
+        self.assertEqual(sorted(n for e in self.docs().values() for n in e["filenames"]), ["p.txt"])
+
     def folder(self):
         """Every file in Coll's retained folder, by name, with its bytes."""
         directory = sources.collection_dir("Coll")
