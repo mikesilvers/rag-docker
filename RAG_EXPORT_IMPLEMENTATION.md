@@ -498,6 +498,13 @@ each digested into the package manifest's `files` map.
   in the package was restored and unflagged (it is valid again); the one that
   existed only on the target stayed orphaned, with its pairs intact.
 
+> **Note, 2026-11-23 (#266):** E16 now also covers re-embedding that rebuilds the
+> collection, failed destructive cutover and both first-character spellings, with
+> the reported count including both (`RAG_EXPORT_SPECIFICATIONS.md` §13). Suite 10
+> checks it: the live alias check in `scripts/verify/session_validity.py`, and
+> `test_session_validity.py`'s `test_failed_cutover_marks_both_backend_aliases` and
+> `test_failed_reindex_cutover_marks_both_backend_aliases`.
+
 Also verified: `/tune/reembed` on a `chunks-only` collection is permitted and
 leaves chunk count unchanged (39 → 39); `/tune/reindex` moved the collection from
 `hnsw/cosine` to `flat/l2-squared` and correctly did **not** mark sessions stale,
@@ -769,7 +776,7 @@ All 22 criteria are defined in spec §13.
 | E13 | Truncate `chunks.jsonl`; import fails `PACKAGE_CORRUPT` naming it |
 | E14 | Import three times with `abort`, `rename`, `replace` |
 | E15 | Kill the api mid-import; assert no `__importing_` collection and no partial target |
-| E16 | Re-chunk; sessions become `stale` |
+| E16 | Re-chunk and re-embed through either first-character spelling, and fail a destructive cutover; sessions under both spellings become `stale`, the reported count includes both (suite 10: the live alias check in `scripts/verify/session_validity.py`; `test_session_validity.py`'s `test_failed_cutover_marks_both_backend_aliases` and `test_failed_reindex_cutover_marks_both_backend_aliases`) |
 | E17 | Re-chunk a `chunks-only` collection; `SOURCES_REQUIRED` |
 | E18 | `replace` a collection with sessions; orphan count reported |
 | E19 | Package `README.md` names the collection, fidelity and the encryption warning |

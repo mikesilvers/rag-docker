@@ -77,8 +77,14 @@ def begin(target: str, operation: str, client) -> dict:
 
 
 def _copy(source: Path, destination: Path) -> None:
+    # Never read through a link (#881). A linked source path is refused, as a
+    # linked retained-source folder is (sources.blob_path); links inside a
+    # copied folder stay links, so the copy refuses them on read as the
+    # original does and an outside file's bytes never become retained data.
+    if source.is_symlink():
+        raise ValueError(f"Recovery source {source.name!r} is a link")
     if source.is_dir():
-        shutil.copytree(source, destination)
+        shutil.copytree(source, destination, symlinks=True)
     elif source.is_file():
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, destination)
@@ -124,11 +130,11 @@ def retain(record: dict, *, package: Path | None = None, source_collection: str 
     for path in paths:
         files = list(path.rglob("*")) if path.is_dir() else [path]
         for item in files:
-            if item.is_file():
+            if item.is_file() and not item.is_symlink():
                 with item.open("rb") as data:
                     os.fsync(data.fileno())
         if path.is_dir():
-            for directory in sorted((p for p in path.rglob("*") if p.is_dir()), reverse=True):
+            for directory in sorted((p for p in path.rglob("*") if p.is_dir() and not p.is_symlink()), reverse=True):
                 _sync_dir(directory)
             _sync_dir(path)
         if path.exists():
@@ -150,7 +156,7 @@ def begin_cutover(record: dict) -> None:
     record.update(updated)
 
 
-def _finish_cutover_check(record: dict, outcome: str) -> None:
+def finish_cutover_check(record: dict, outcome: str) -> None:
     """Retire only the check; recovery data remains available for inspection."""
     updated = {**record, "cutover_pending": False, "cutover_checked": outcome}
     _write(updated)
@@ -168,7 +174,7 @@ def _check_tuning_cutover(record: dict, client) -> None:
         collection = client.collections.get(target)
         if telemetry.call("weaviate.config", collection.config.get).description != cutover_description(record):
             log.warning("Tuning target %r has another instance; preserved", target)
-            _finish_cutover_check(record, "other-instance")
+            finish_cutover_check(record, "other-instance")
             return
         def expected():
             for obj in telemetry.iterate(client.collections.get(staging).iterator, include_vector=True):
@@ -180,14 +186,14 @@ def _check_tuning_cutover(record: dict, client) -> None:
                 yield {"id": str(obj.uuid), "properties": dict(obj.properties or {}), "vector": vector}
         try:
             batch_write.verify(collection, expected, exact=True)
-            _finish_cutover_check(record, "complete")
+            finish_cutover_check(record, "complete")
             return  # Fully written target: no historical flag or deletion.
         except batch_write.BatchVerificationError:
             goldstandard.mark_stale(target, "interrupted tuning final write; verified recovery retained")
             log.warning("Incomplete owned tuning target %r; target and recovery %r preserved for inspection", target, staging)
     else:
         goldstandard.mark_stale(target, "interrupted tuning cutover; verified recovery retained")
-    _finish_cutover_check(record, "stale")
+    finish_cutover_check(record, "stale")
 
 
 def sidecar_reference(record: dict) -> str:

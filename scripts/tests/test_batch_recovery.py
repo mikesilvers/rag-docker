@@ -371,6 +371,121 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(list(self.cols.items), ['Corpus'])
         self.assertFalse(list(recovery._root().glob('*.json')))
 
+    # #881: the recovery copy never reads through a link. A link entry in the
+    # sources folder is copied as a link; a linked sources folder is refused.
+    def plant_source_link(self):
+        outside = self.root / 'outside.txt'
+        outside.write_bytes(b'outside secret bytes')
+        digest = hashlib.sha256(outside.read_bytes()).hexdigest()
+        (Path(settings.sources_dir) / 'Corpus' / digest).symlink_to(outside)
+        return outside, digest
+
+    def test_failed_cutover_copies_source_links_as_links_never_their_bytes(self):
+        outside, digest = self.plant_source_link()
+        folder = self.root / 'outside-folder'
+        folder.mkdir()
+        (folder / 'inside.txt').write_bytes(b'outside secret bytes')
+        (Path(settings.sources_dir) / 'Corpus' / 'linked-folder').symlink_to(folder)
+        flushed, real_fsync = [], os.fsync
+
+        def fsync(fd):
+            flushed.append(os.fstat(fd).st_ino)
+            return real_fsync(fd)
+        self.cols.create_failure = True
+        with patch.object(recovery.os, 'fsync', side_effect=fsync), \
+                patch.object(recovery, '_sync_dir', wraps=recovery._sync_dir) as sync_dir, \
+                self.assertRaises(importer.PackageError):
+            self.rebuild()
+        synced = [Path(c.args[0]) for c in sync_dir.call_args_list]
+        record = self.recovery_record()
+        self.assert_retained(record)
+        copy_dir = Path(settings.sources_dir) / record['staging']
+        self.assertTrue((copy_dir / digest).is_symlink())
+        self.assertEqual(os.readlink(copy_dir / digest), str(outside))
+        self.assertTrue((copy_dir / 'linked-folder').is_symlink())
+        self.assertEqual(os.readlink(copy_dir / 'linked-folder'), str(folder))
+        for root in (copy_dir, recovery._root() / record['operation_id']):
+            for path in root.rglob('*'):
+                if path.is_file() and not path.is_symlink():
+                    self.assertNotIn(b'outside secret bytes', path.read_bytes(), path)
+        self.assertTrue(flushed)
+        self.assertNotIn(outside.stat().st_ino, flushed)
+        self.assertNotIn((folder / 'inside.txt').stat().st_ino, flushed)
+        self.assertFalse([path for path in synced if path.is_symlink()])
+        self.assertEqual(outside.read_bytes(), b'outside secret bytes')
+        self.assertEqual([p.name for p in folder.iterdir()], ['inside.txt'])
+
+    def test_linked_sources_folder_is_refused_before_cutover(self):
+        sources_dir = Path(settings.sources_dir)
+        folder = self.root / 'outside-sources'
+        (sources_dir / 'Corpus').rename(folder)
+        (sources_dir / 'Corpus').symlink_to(folder)
+        with self.assertRaises(ValueError) as error:
+            self.rebuild()
+        self.assertIn('is a link', str(error.exception))
+        self.assertEqual(self.cols.get('Corpus').rows, {r['id']: r for r in self.original})
+        self.assertEqual(list(self.cols.items), ['Corpus'])
+        self.assertFalse(list(recovery._root().glob('*.json')))
+        self.assertEqual([p.name for p in sources_dir.iterdir()], ['Corpus'])
+        self.assertTrue((sources_dir / 'Corpus').is_symlink())
+        self.assertEqual([p.name for p in folder.iterdir()], ['source-blob'])
+        self.assertEqual((folder / 'source-blob').read_bytes(), b'original source')
+
+    def test_linked_config_sidecar_is_refused_before_cutover(self):
+        # #881: the file branch of _copy's refusal. A linked ingest or
+        # retrieval config is never copied through into the recovery sidecars.
+        for kind in ('ingest', 'retrieval'):
+            with self.subTest(kind=kind):
+                config = Path(settings.upload_dir) / f'{kind}_configs' / 'Corpus.json'
+                outside = self.root / f'outside-{kind}.json'
+                outside.write_text(json.dumps({'collection': 'Corpus', 'secret': 'outside config bytes'}))
+                saved = config.read_bytes()
+                config.unlink()
+                config.symlink_to(outside)
+                try:
+                    with self.assertRaises(ValueError) as error:
+                        self.rebuild()
+                    self.assertIn('is a link', str(error.exception))
+                    self.assertEqual(self.cols.get('Corpus').rows, {r['id']: r for r in self.original})
+                    self.assertEqual(list(self.cols.items), ['Corpus'])
+                    self.assertFalse(list(recovery._root().glob('*.json')))
+                    self.assertEqual([p.name for p in Path(settings.sources_dir).iterdir()], ['Corpus'])
+                    for name in ('ingest_configs', 'retrieval_configs'):
+                        self.assertEqual([p.name for p in (Path(settings.upload_dir) / name).iterdir()], ['Corpus.json'])
+                    for path in recovery._root().rglob('*'):
+                        if path.is_file():
+                            self.assertNotIn(b'outside config bytes', path.read_bytes(), path)
+                    self.assertTrue(config.is_symlink())
+                    self.assertIn('outside config bytes', outside.read_text())
+                finally:
+                    config.unlink()
+                    config.write_bytes(saved)
+
+    def test_dangling_source_link_is_copied_as_a_link(self):
+        # #881: copytree(symlinks=True) keeps a dangling link entry as a link
+        # instead of failing the snapshot on a missing target.
+        missing = self.root / 'missing-target'
+        (Path(settings.sources_dir) / 'Corpus' / 'dangling').symlink_to(missing)
+        self.cols.create_failure = True
+        with self.assertRaises(importer.PackageError):
+            self.rebuild()
+        record = self.recovery_record()
+        self.assert_retained(record)
+        copied = Path(settings.sources_dir) / record['staging'] / 'dangling'
+        self.assertTrue(copied.is_symlink())
+        self.assertEqual(os.readlink(copied), str(missing))
+        self.assertFalse(missing.exists())
+
+    def test_success_discards_copied_source_links_without_touching_targets(self):
+        outside, digest = self.plant_source_link()
+        written = tuning._rebuild('Corpus', [r['properties'] for r in self.original], None, None, None)
+        self.assertEqual(written, 2)
+        self.assertFalse(list(recovery._root().glob('*.json')))
+        sources_dir = Path(settings.sources_dir)
+        self.assertEqual([p.name for p in sources_dir.iterdir()], ['Corpus'])
+        self.assertTrue((sources_dir / 'Corpus' / digest).is_symlink())
+        self.assertEqual(outside.read_bytes(), b'outside secret bytes')
+
     def package(self):
         pkg = self.root / 'package'
         pkg.mkdir(exist_ok=True)
@@ -433,7 +548,7 @@ class RecoveryTests(unittest.TestCase):
         self.assertTrue(self.cols.exists('Corpus'))
         stale.assert_not_called()
 
-    def test_interrupted_tuning_keeps_complete_target_and_unreadable_state(self):
+    def test_interrupted_tuning_keeps_complete_target(self):
         self.cols.interrupt = True
         with self.assertRaises(KeyboardInterrupt):
             self.rebuild()
@@ -442,10 +557,6 @@ class RecoveryTests(unittest.TestCase):
         self.cols.create('Corpus', description=recovery.cutover_description(record))
         self.cols.get('Corpus').rows = copy.deepcopy(self.cols.get(record['staging']).rows)
         with patch.object(tuning.goldstandard, 'mark_stale') as stale:
-            recovery.sweep(self.client)
-            self.assertTrue(self.cols.exists('Corpus'))
-            stale.assert_not_called()
-            self.cols.get('Corpus').fault = 'read'
             recovery.sweep(self.client)
             self.assertTrue(self.cols.exists('Corpus'))
             stale.assert_not_called()
@@ -514,6 +625,150 @@ class RecoveryTests(unittest.TestCase):
             recovery.sweep(self.client)
         self.assertFalse(self.recovery_record()['cutover_pending'])
 
+    # Reviewer tests (PR #247 testing review, head 51c1706).
+    def test_interrupted_tuning_missing_target_marks_stale_and_keeps_recovery(self):
+        # A kill right after the target delete leaves no target at all.
+        self.cols.interrupt = True
+        with self.assertRaises(KeyboardInterrupt):
+            self.rebuild()
+        record = self.recovery_record()
+        self.assertTrue(record['cutover_pending'])
+        self.assertFalse(self.cols.exists('Corpus'))
+        with patch.object(tuning.goldstandard, 'mark_stale') as stale:
+            self.assertEqual(recovery.sweep(self.client), [])
+            recovery.sweep(self.client)
+        stale.assert_called_once_with('Corpus', 'interrupted tuning cutover; verified recovery retained')
+        self.assertTrue(self.cols.exists(record['staging']))
+        checked = self.recovery_record()
+        self.assertFalse(checked['cutover_pending'])
+        self.assertEqual(checked['cutover_checked'], 'stale')
+        self.assertTrue((recovery._root() / record['operation_id']).is_dir())
+
+    def test_interrupted_tuning_missing_recovery_never_flags_or_deletes(self):
+        self.cols.interrupt = True
+        with self.assertRaises(KeyboardInterrupt):
+            self.rebuild()
+        record = self.recovery_record()
+        self.cols.interrupt = False
+        self.cols.create('Corpus', description=recovery.cutover_description(record))
+        self.cols.items.pop(record['staging'])
+        with patch.object(tuning.goldstandard, 'mark_stale') as stale:
+            self.assertEqual(recovery.sweep(self.client), [])
+        stale.assert_not_called()
+        self.assertTrue(self.cols.exists('Corpus'))
+        self.assertTrue(self.recovery_record()['cutover_pending'])
+        self.assertTrue((recovery._root() / record['operation_id']).is_dir())
+
+    def test_invalid_cutover_pending_records_never_authorize_cleanup(self):
+        for operation, value in (('tune', 'yes'), ('tune', 1), ('import', True)):
+            with self.subTest(operation=operation, value=value):
+                record = recovery.begin('Corpus', operation, self.client)
+                self.cols.create(record['staging'])
+                path = recovery._root() / (record['operation_id'] + '.json')
+                path.write_text(json.dumps({**record, 'cutover_pending': value}))
+                self.assertEqual(recovery.sweep(self.client), [])
+                self.assertTrue(path.exists())
+                self.assertTrue(self.cols.exists(record['staging']))
+                path.unlink()
+
+    def test_successful_tuning_tags_target_and_leaves_no_pending_record(self):
+        tuning._rebuild('Corpus', [r['properties'] for r in self.original], None, None, None)
+        self.assertTrue(self.cols.get('Corpus').description.startswith('rag-tune:'))
+        self.assertFalse(list(recovery._root().glob('*.json')))
+        with patch.object(tuning.goldstandard, 'mark_stale') as stale:
+            recovery.sweep(self.client)
+        stale.assert_not_called()
+
+    # A handled failure after cutover records its own decision (#263).
+    def test_handled_failure_after_cutover_records_the_decision(self):
+        self.cols.final_fault = 'reject'
+        with patch.object(tuning.goldstandard, 'mark_stale') as stale:
+            with self.assertRaises(importer.PackageError) as error:
+                self.rebuild()
+            stale.assert_called_once()
+            record = self.recovery_record()
+            self.assertEqual(error.exception.detail['recovered_as'], record['staging'])
+            self.assertFalse(record['cutover_pending'])
+            self.assertEqual(record['cutover_checked'], 'stale')
+            recovery.sweep(self.client)
+            recovery.sweep(self.client)
+            stale.assert_called_once()
+        self.assertTrue(self.cols.exists(record['staging']))
+
+    def test_failed_post_cutover_marking_leaves_the_check_for_startup(self):
+        self.cols.final_fault = 'reject'
+        with patch.object(tuning.goldstandard, 'mark_stale', side_effect=OSError('session store unavailable')), \
+                patch.object(tuning, '_log'), self.assertRaises(importer.PackageError):
+            self.rebuild()
+        self.assertTrue(self.recovery_record()['cutover_pending'])
+        with patch.object(tuning.goldstandard, 'mark_stale') as stale:
+            recovery.sweep(self.client)
+            recovery.sweep(self.client)
+        stale.assert_called_once_with('Corpus', 'interrupted tuning final write; verified recovery retained')
+        self.assertEqual(self.recovery_record()['cutover_checked'], 'stale')
+
+    # Reviewer tests (PR #879 testing review, head 8233a39).
+    def test_failed_decision_write_after_handled_failure_leaves_the_check_for_startup(self):
+        # #263: a failed decision write is logged, the job error is unchanged,
+        # and the check stays pending for startup, as after a hard kill.
+        self.cols.final_fault = 'reject'
+        with patch.object(tuning.goldstandard, 'mark_stale') as stale, \
+                patch.object(recovery, 'finish_cutover_check', side_effect=OSError('disk full')), \
+                patch.object(tuning, '_log') as log, \
+                self.assertRaises(importer.PackageError) as error:
+            self.rebuild()
+        stale.assert_called_once()
+        record = self.recovery_record()
+        self.assertEqual(error.exception.code, 'TUNE_FAILED')
+        self.assertEqual(error.exception.detail['recovered_as'], record['staging'])
+        self.assertTrue(record['cutover_pending'])
+        self.assertTrue(any('cutover decision' in str(c.args[0]) for c in log.exception.call_args_list),
+                        log.exception.call_args_list)
+        with patch.object(tuning.goldstandard, 'mark_stale') as stale:
+            recovery.sweep(self.client)
+            recovery.sweep(self.client)
+        stale.assert_called_once_with('Corpus', 'interrupted tuning final write; verified recovery retained')
+        self.assertEqual(self.recovery_record()['cutover_checked'], 'stale')
+
+    def test_handled_reindex_failure_records_the_decision_only_when_history_is_marked(self):
+        # #263 on the records (reindex) path: a failure after cutover whose
+        # preservation can't be verified marks history and records 'stale'; one
+        # whose target verifies as intact marks nothing and keeps no record.
+        records_ = [{'id': r['id'], 'vector': r['vector'], 'properties': r['properties']} for r in self.original]
+        for intact in (False, True):
+            with self.subTest(intact=intact):
+                for path in recovery._root().glob('*.json'):
+                    path.unlink()
+                self.cols.items = {'Corpus': self.cols.get('Corpus')}
+                def write(name, recs):
+                    if name == 'Corpus':
+                        raise RuntimeError('final write failed')
+                verified = []
+                def verify(name, recs):
+                    verified.append(name)
+                    if len(verified) > 1 and not intact:
+                        raise RuntimeError('readback changed')
+                with patch.object(wc, '_validate_reindex_vectorizer_sync'), \
+                        patch.object(tuning, '_write_records', side_effect=write), \
+                        patch.object(tuning, '_verify_records', side_effect=verify), \
+                        patch.object(tuning.goldstandard, 'mark_stale') as stale, \
+                        self.assertRaises(Exception):
+                    tuning._rebuild('Corpus', [], None, None, None, records=records_)
+                self.assertEqual(verified, ['Corpus', 'Corpus'])
+                paths = list(recovery._root().glob('*.json'))
+                if intact:
+                    stale.assert_not_called()
+                    self.assertEqual(paths, [])
+                else:
+                    stale.assert_called_once_with('Corpus', 'reindex replacement failed after cutover began; exact record preservation was not verified')
+                    record = self.recovery_record()
+                    self.assertFalse(record['cutover_pending'])
+                    self.assertEqual(record['cutover_checked'], 'stale')
+                    with patch.object(tuning.goldstandard, 'mark_stale') as again:
+                        recovery.sweep(self.client)
+                    again.assert_not_called()
+                    recovery.discard(record, self.client)
+
     def test_import_replace_note_counts_canonical_and_alias_sessions(self):
         seen = []
         def sessions(name):
@@ -580,6 +835,26 @@ class RecoveryTests(unittest.TestCase):
         self.assertFalse((directory / digest).exists())
         sources.store(recovered, 'future.txt', future)
         self.assertEqual((directory / digest).read_bytes(), future)
+
+    def test_failed_replace_recovery_of_indexless_package_retains_no_sources(self):
+        from services import sources
+        pkg, manifest = self.package()
+        (pkg / 'sources' / 'index.json').unlink()
+        self.cols.create_failure = True
+        with patch.object(self, 'package', return_value=(pkg, manifest)):
+            job = self.import_replace()
+        self.assertEqual(job['status'], 'failed')
+        record = self.recovery_record()
+        recovered = job['error_detail']['recovered_as']
+        self.assertEqual(recovered, record['staging'])
+        self.assertFalse(sources.collection_dir(recovered).exists(),
+                         'an indexless package must leave no retained sources in the recovery copy')
+        before = copy.deepcopy(self.cols.get(recovered).rows)
+        recovery.sweep(self.client)
+        self.assertEqual(self.cols.get(recovered).rows, before)
+        self.assertEqual(len(before), len(self.original))
+        recovery.discard(record, self.client)
+        self.assertFalse(list(recovery._root().glob('*.json')))
 
     def test_replace_restart_after_target_delete_preserves_staging(self):
         self.cols.interrupt = True
@@ -964,6 +1239,28 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.cols.get('Corpus').rows, before)
         self.assertEqual(list(self.cols.items), ['Corpus'])
         self.assertEqual(list(recovery._root().iterdir()), [])
+
+    def test_cutover_record_failure_is_reported_as_such(self):
+        # #263: the marking ran (or wasn't needed); only the cutover record failed.
+        for marking in (True, False):
+            with self.subTest(marking=marking):
+                calls = []
+                before = copy.deepcopy(self.cols.get('Corpus').rows)
+                with patch.object(recovery, 'begin_cutover', side_effect=OSError('disk full')), \
+                        self.assertRaises(importer.PackageError) as error:
+                    tuning._rebuild('Corpus', [r['properties'] for r in self.original], None, None, None,
+                                    before_replace=(lambda: calls.append('marked')) if marking else None)
+                message = error.exception.message
+                self.assertEqual(error.exception.code, 'TUNE_FAILED')
+                self.assertIn('cutover record could not be written', message)
+                self.assertIn('original collection is unchanged', message)
+                self.assertNotIn('could not be marked stale', message)
+                self.assertEqual('already marked stale' in message, marking)
+                self.assertEqual(calls, ['marked'] if marking else [])
+                self.assertNotIn('recovered_as', error.exception.detail or {})
+                self.assertEqual(self.cols.get('Corpus').rows, before)
+                self.assertEqual(list(self.cols.items), ['Corpus'])
+                self.assertEqual(list(recovery._root().iterdir()), [])
 
     # ── reviewer-added (#126 item 1, 7) ──
 
