@@ -80,5 +80,26 @@ class TransferPrefixTests(unittest.TestCase):
                 self.assertEqual(lines, ['CHECK batch recovery across an API restart'], lines)
 
 
+class TuneWaitTests(unittest.TestCase):
+    """Reviewer-added: 05_transfer.sh's tune_wait fails fast on a missing job id (#580)."""
+
+    def run_tune_wait(self, *args):
+        script = (ROOT / 'scripts/verify/05_transfer.sh').read_text()
+        line = next(l for l in script.splitlines() if l.startswith('tune_wait() {'))
+        stub = 'wait_for_job(){ echo "WAIT $*" >&2; printf completed; }\n'
+        quoted = ' '.join("'" + a + "'" for a in args)
+        result = subprocess.run(['bash', '-c', stub + line + '\ntune_wait ' + quoted],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout, result.stderr.splitlines()
+
+    def test_an_empty_job_id_fails_at_once_without_polling(self):
+        self.assertEqual(self.run_tune_wait('', '1800'), ('no job id', []))
+
+    def test_a_job_id_polls_its_tune_job(self):
+        self.assertEqual(self.run_tune_wait('abc-123', '900'),
+                         ('completed', ['WAIT /tune/job/abc-123 900']))
+
+
 if __name__ == '__main__':
     unittest.main()

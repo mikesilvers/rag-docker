@@ -848,6 +848,19 @@ class RechunkTests(unittest.TestCase):
             "collection": "Coll", "uncovered_source_files": names[:10],
             "uncovered_source_files_omitted": 2})
 
+    def test_the_coverage_refusal_cap_boundary(self):
+        # Reviewer-added: exactly ten names are all listed with none omitted;
+        # the eleventh is the first one counted instead of named (#208).
+        sources.store("Coll", "kept.txt", b"kept text", replace=True)
+        for count, omitted in ((10, 0), (11, 1)):
+            with self.subTest(uncovered=count):
+                names = [f"n{i:02d}.txt" for i in range(count)]
+                with self.stored(("kept.txt", 0), *[(name, 0) for name in names]):
+                    with self.assertRaises(tuning.PackageError) as refused:
+                        tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0)
+                self.assertEqual(refused.exception.detail["uncovered_source_files"], names[:10])
+                self.assertEqual(refused.exception.detail["uncovered_source_files_omitted"], omitted)
+
     def test_the_coverage_walk_reads_only_source_file_and_chunk_index(self):
         # Not each chunk's text and vector, on every GET /tune (#258).
         sources.store("Coll", "a.txt", b"alpha", replace=True)
