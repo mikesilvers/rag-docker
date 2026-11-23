@@ -678,6 +678,93 @@ check "two concurrent uploads of one name leave exactly one job's version, whole
 drop_collection "$RI"
 rm -rf "$RIFIX"
 
+# ── source-index updates (#52) ───────────────────────────────────────────────
+# The retained index's read/update/write cycle is serialized, so two ingests of
+# different files started together both keep their entries; an index that can't
+# be read is refused, never treated as empty, so an ingest can't replace it with
+# a partial one. The index is read from disk each time, as after a restart.
+SI="${PREFIX}SourceIndex"
+# The collection's retained names (from disk), the index file's SHA-256 and the
+# folder's file names.
+si_state() {
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "$SI") <<'ENDPY'
+import hashlib, json, sys
+from services import sources
+d = sources.collection_dir(sys.argv[1])
+raw = (d / "index.json").read_bytes()
+try:
+    names = sorted(n for e in sources.load_index(sys.argv[1])["documents"].values()
+                   for n in e["filenames"])
+except ValueError as exc:
+    names = str(exc)
+print(json.dumps({"names": names, "sha": hashlib.sha256(raw).hexdigest(),
+                  "files": sorted(p.name for p in d.iterdir())}))
+ENDPY
+}
+# si_index <break|restore>: replace index.json with text that isn't JSON, keeping
+# a copy beside it, or put that copy back.
+si_index() {
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "$SI" "$1") <<'ENDPY'
+import os, sys
+from services import sources
+d = sources.collection_dir(sys.argv[1]); idx, bak = d / "index.json", d / "index.json.si52bak"
+if sys.argv[2] == "break":
+    bak.write_bytes(idx.read_bytes())
+    idx.write_text("{not json")
+else:
+    os.replace(bak, idx)
+ENDPY
+}
+drop_collection "$SI"; make_collection "$SI"
+for v in txt md; do
+  curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$SI" -F "strategy=fixed" \
+    -F "chunk_size=200" -F "chunk_overlap=60" -F "min_chunk_size=40" \
+    -F "files=@$FIX/policies.$v" > "/tmp/vfy_si_$v.json" &
+done
+wait
+for v in txt md; do
+  sj=$(jfield "['job_id']" < "/tmp/vfy_si_$v.json")
+  [ -n "$sj" ] && wait_for_job "/ingest/job/$sj" 900 >/dev/null
+  api_get "/ingest/job/$sj" > "/tmp/vfy_si_$v.done.json"
+done
+si_state > /tmp/vfy_si_state.json
+python3 - <<'ENDPY'
+import json, sys
+jobs = [json.load(open(f"/tmp/vfy_si_{v}.done.json")) for v in ("txt", "md")]
+st = json.load(open("/tmp/vfy_si_state.json"))
+print([j.get("status") for j in jobs], st["names"])
+sys.exit(0 if all(j.get("status") == "completed" for j in jobs)
+         and st["names"] == ["policies.md", "policies.txt"] else 1)
+ENDPY
+check "two ingests of different files started together both keep their retained entries (#52)" $?
+si_index break
+check "replaced the retained index with text that isn't JSON" $?
+si_state > /tmp/vfy_si_broken.json
+check_eq "an unreadable retained index makes GET /tune answer HTTP 409 (#52)" \
+  "$(api_code "$API/tune/$SI")" "409"
+check_eq "... with error code SOURCE_INDEX_INVALID, not chunks-only" \
+  "$(api_get "/tune/$SI" | jfield "['error']['code']")" "SOURCE_INDEX_INVALID"
+ingest "$SI" fixed 200 40 "$FIX/policies.csv"
+read -r status completed failed <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], d['files_completed'], d['files_failed'])")"
+[ "$status" = completed ] && [ "$completed" = 1 ] && [ "$failed" = 0 ]
+check "an ingest into a collection with an unreadable index still completes" $? \
+  "status=$status completed=$completed failed=$failed"
+si_state > /tmp/vfy_si_after.json
+python3 - <<'ENDPY'
+import json, sys
+before, after = (json.load(open(f"/tmp/vfy_si_{n}.json")) for n in ("broken", "after"))
+print(before["sha"][:12], after["sha"][:12], after["files"] == before["files"])
+sys.exit(0 if after["sha"] == before["sha"] and after["files"] == before["files"] else 1)
+ENDPY
+check "... and leaves the unreadable index and the retained files exactly as they were (#52)" $?
+si_index restore
+check "restored the retained index" $?
+check_eq "... which lists the two files again" \
+  "$(si_state | jfield "['names']")" "['policies.md', 'policies.txt']"
+drop_collection "$SI"
+
 # ── replacing a name touches only that name (#622) ───────────────────────────
 # source_file is word-tokenized, so Weaviate's equal("report.pdf") also matches
 # a/report.pdf and Report.PDF, and uploading report.pdf deleted their chunks.
