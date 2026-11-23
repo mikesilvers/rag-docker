@@ -130,7 +130,6 @@ minimum, 32 GB recommended) assumes the current behaviour and MUST be restated a
 
 ---
 
-
 ## 3. Prerequisite B — Retrieval Settings Persistence
 
 Also required before export, because a package ships a script that claims to
@@ -877,6 +876,7 @@ first request, which is what makes this safe.
 |---|---|---|
 | Owned import/tuning scratch | a valid durable `collection_operations/<operation-id>.json` record with state `scratch` | delete the recorded scratch collection and its copied sidecars |
 | Verified recovery | a durable record with state `recovery`, written before deleting the target | preserve the collection and all sidecars; log its identity and metadata snapshot directory |
+| Interrupted tuning cutover | a `recovery` record with `cutover_pending: true`, written before tuning deletes its target | check once and delete nothing. A missing recovery collection or a failed backend read leaves the check pending. A missing target, or a target with the operation's `rag-tune:<operation-id>` description whose records don't match the recovery exactly, flags the collection's sessions `stale`; a matching complete target flags nothing; a target without that description is another instance and is left alone. The decision (`complete`, `stale` or `other-instance`) is recorded (`cutover_pending: false`, `cutover_checked`) and never checked again |
 | Successful/intentional cleanup interrupted by I/O failure | durable `cleanup` phase, written before deletion | retry only that authorized backend/sidecar/metadata cleanup until complete |
 | Unowned marker-like name or unreadable ownership | insufficient ownership evidence | preserve; a substring or age is never deletion authority |
 | New-target partial import | a small version-4 marker bound by SHA-256 to a compact SQLite expectation snapshot, and by a random instance token to the schema description (`rag-import:<token>`) the import gives the collection it creates | only for the collection carrying the marker's token: verify the full stored records and delete a proven mismatch. A collection without the token was created later under that name: keep it and retire the marker. Preserve on unreadable/legacy metadata or backend read failure. A version-3 marker carries no token and never deletes: in state `building` it is kept and logged; in state `cleanup` its cleanup is finished |
@@ -898,6 +898,13 @@ manifest and collection config. The error detail includes `recovered_as` and
 (`collection_operations/<operation-id>`); the absolute path appears only in the
 server log. A recovery record remains preserved even if its backend
 collection is later missing, since its sidecars may still be useful.
+
+Tuning writes `cutover_pending: true` on its recovery record, flushed, before it
+deletes its target, and creates the new target with the schema description
+`rag-tune:<operation-id>`, so startup compares only the instance that operation
+created. A failure the tuning job handles after cutover marks the sessions
+`stale` and records `stale` at once, so only a hard kill, a failed marking or a
+failed decision write leaves the check for startup (#263).
 
 The owner can export the named recovery collection, inspect its metadata snapshots,
 and intentionally recover or discard it. Automatic startup cleanup never discards
@@ -978,7 +985,12 @@ including chunks-only data. Cleanup may delete scratch while the original remain
 safe, or delete recovery only after final persisted-record verification succeeds
 or when a step fails before the original is deleted. If marking gold-standard
 sessions stale fails at that point, the job fails `TUNE_FAILED`, says so and that
-the original collection is unchanged, and the retained copy is discarded.
+the original collection is unchanged, and the retained copy is discarded. Tuning
+durably records its cutover intent before deleting the original (§6.5.1). A
+failure after cutover marks the sessions `stale` and records that decision, so a
+restart doesn't flag them again. If the cutover record itself can't be written,
+the job fails `TUNE_FAILED`, says so and that the original collection is
+unchanged, and the retained copy is discarded (#263).
 
 ### 7.5 Weaviate unreadable at a tune route
 
@@ -1128,7 +1140,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E13 | A truncated package fails `PACKAGE_CORRUPT` naming the file |
 | E14 | `on_conflict=abort` fails; `rename` imports under a new name; `replace` succeeds |
 | E15 | Failed new-target builds remove partial collections; failed destructive replacement retains and names verified recovery data and sidecars |
-| E16 | Re-chunking and failed destructive cutover mark sessions under both supported first-character collection aliases `stale`; the reported count includes both spellings, and stored provenance is unchanged |
+| E16 | Re-chunking, re-embedding that rebuilds the collection, and failed destructive cutover mark sessions under both supported first-character collection aliases `stale`; the reported count includes both spellings, and stored provenance is unchanged |
 | E17 | Re-chunking a `chunks-only`, partially retained or ambiguously retained collection (a name retained under more than one digest, or a name with more than one chunk set) fails `SOURCES_REQUIRED` before staging; re-embed with new chunking parameters uses the same coverage guard. A second name for the same retained content is covered: re-chunking emits one chunk set per (digest, name) pair, under the full logical name (#22). Only pairs whose name has stored chunks are rebuilt: a name the index lists without stored chunks is skipped, and the index keeps it (#311). When no listed name has stored chunks there is nothing to rebuild: the tuning options don't offer re-chunking and say why, and the request is refused up front, HTTP 409 `SOURCES_REQUIRED`, with no job (#328); a Weaviate error during that check answers HTTP 503 `SERVICE_UNAVAILABLE`, with no job (#340) |
 | E18 | `replace` reports the number of orphaned sessions |
 | E19 | Package `README.md` states the collection name, fidelity and file name as delivered, and carries the encryption section (the "Encryption" heading, the `.tar.gz.age` form and that a `.tar.gz` package is not encrypted) (#27) |
