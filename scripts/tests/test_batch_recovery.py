@@ -428,6 +428,51 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual([p.name for p in folder.iterdir()], ['source-blob'])
         self.assertEqual((folder / 'source-blob').read_bytes(), b'original source')
 
+    def test_linked_config_sidecar_is_refused_before_cutover(self):
+        # #881: the file branch of _copy's refusal. A linked ingest or
+        # retrieval config is never copied through into the recovery sidecars.
+        for kind in ('ingest', 'retrieval'):
+            with self.subTest(kind=kind):
+                config = Path(settings.upload_dir) / f'{kind}_configs' / 'Corpus.json'
+                outside = self.root / f'outside-{kind}.json'
+                outside.write_text(json.dumps({'collection': 'Corpus', 'secret': 'outside config bytes'}))
+                saved = config.read_bytes()
+                config.unlink()
+                config.symlink_to(outside)
+                try:
+                    with self.assertRaises(ValueError) as error:
+                        self.rebuild()
+                    self.assertIn('is a link', str(error.exception))
+                    self.assertEqual(self.cols.get('Corpus').rows, {r['id']: r for r in self.original})
+                    self.assertEqual(list(self.cols.items), ['Corpus'])
+                    self.assertFalse(list(recovery._root().glob('*.json')))
+                    self.assertEqual([p.name for p in Path(settings.sources_dir).iterdir()], ['Corpus'])
+                    for name in ('ingest_configs', 'retrieval_configs'):
+                        self.assertEqual([p.name for p in (Path(settings.upload_dir) / name).iterdir()], ['Corpus.json'])
+                    for path in recovery._root().rglob('*'):
+                        if path.is_file():
+                            self.assertNotIn(b'outside config bytes', path.read_bytes(), path)
+                    self.assertTrue(config.is_symlink())
+                    self.assertIn('outside config bytes', outside.read_text())
+                finally:
+                    config.unlink()
+                    config.write_bytes(saved)
+
+    def test_dangling_source_link_is_copied_as_a_link(self):
+        # #881: copytree(symlinks=True) keeps a dangling link entry as a link
+        # instead of failing the snapshot on a missing target.
+        missing = self.root / 'missing-target'
+        (Path(settings.sources_dir) / 'Corpus' / 'dangling').symlink_to(missing)
+        self.cols.create_failure = True
+        with self.assertRaises(importer.PackageError):
+            self.rebuild()
+        record = self.recovery_record()
+        self.assert_retained(record)
+        copied = Path(settings.sources_dir) / record['staging'] / 'dangling'
+        self.assertTrue(copied.is_symlink())
+        self.assertEqual(os.readlink(copied), str(missing))
+        self.assertFalse(missing.exists())
+
     def test_success_discards_copied_source_links_without_touching_targets(self):
         outside, digest = self.plant_source_link()
         written = tuning._rebuild('Corpus', [r['properties'] for r in self.original], None, None, None)
