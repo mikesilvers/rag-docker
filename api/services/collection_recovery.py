@@ -150,7 +150,7 @@ def begin_cutover(record: dict) -> None:
     record.update(updated)
 
 
-def _finish_cutover_check(record: dict, outcome: str) -> None:
+def finish_cutover_check(record: dict, outcome: str) -> None:
     """Retire only the check; recovery data remains available for inspection."""
     updated = {**record, "cutover_pending": False, "cutover_checked": outcome}
     _write(updated)
@@ -168,7 +168,7 @@ def _check_tuning_cutover(record: dict, client) -> None:
         collection = client.collections.get(target)
         if telemetry.call("weaviate.config", collection.config.get).description != cutover_description(record):
             log.warning("Tuning target %r has another instance; preserved", target)
-            _finish_cutover_check(record, "other-instance")
+            finish_cutover_check(record, "other-instance")
             return
         def expected():
             for obj in telemetry.iterate(client.collections.get(staging).iterator, include_vector=True):
@@ -180,14 +180,14 @@ def _check_tuning_cutover(record: dict, client) -> None:
                 yield {"id": str(obj.uuid), "properties": dict(obj.properties or {}), "vector": vector}
         try:
             batch_write.verify(collection, expected, exact=True)
-            _finish_cutover_check(record, "complete")
+            finish_cutover_check(record, "complete")
             return  # Fully written target: no historical flag or deletion.
         except batch_write.BatchVerificationError:
             goldstandard.mark_stale(target, "interrupted tuning final write; verified recovery retained")
             log.warning("Incomplete owned tuning target %r; target and recovery %r preserved for inspection", target, staging)
     else:
         goldstandard.mark_stale(target, "interrupted tuning cutover; verified recovery retained")
-    _finish_cutover_check(record, "stale")
+    finish_cutover_check(record, "stale")
 
 
 def sidecar_reference(record: dict) -> str:

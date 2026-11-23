@@ -125,7 +125,8 @@ def _create_collection_sync(
 
     telemetry.call("weaviate.create", client.collections.create,
         name=name,
-        # Set only by import, to bind its in-progress marker to this instance.
+        # Set by import (rag-import:<token>) and tuning (rag-tune:<operation-id>)
+        # to bind the collection they create to their operation's record.
         description=description,
         vectorizer_config=vectorizer,
         vector_index_config=vector_index,
