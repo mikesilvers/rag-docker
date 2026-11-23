@@ -86,13 +86,16 @@ class Collection:
             self.rows.pop(key, None)
         return SimpleNamespace(failed=0)
 
-    def iterator(self, include_vector=False):
+    def iterator(self, include_vector=False, return_properties=None):
         if self.fault == 'read':
             raise OSError('backend unavailable')
         for row in self.rows.values():
             props = {'source_file': None, 'chunk_size': None, **copy.deepcopy(row['properties'])}
             if isinstance(props.get('created_at'), str):
                 props['created_at'] = datetime.fromisoformat(props['created_at'].replace('Z', '+00:00'))
+            if return_properties is not None:
+                # As Weaviate does: only the properties asked for (#258).
+                props = {key: value for key, value in props.items() if key in return_properties}
             yield SimpleNamespace(uuid=uuid.UUID(row['id']), properties=props,
                                   vector={'default': row['vector']})
 
@@ -1448,6 +1451,7 @@ class SourceCoverageTests(unittest.TestCase):
                         self.assertEqual(job["status"], "failed")
                         self.assertEqual(job["error_code"], "SOURCES_REQUIRED")
                         self.assertEqual(job["error_detail"]["uncovered_source_files"], expected)
+                        self.assertEqual(job["error_detail"]["uncovered_source_files_omitted"], 0)
                         parse.assert_not_called()
                         self.assertEqual(cols.get("Corpus").rows, {r["id"]: r for r in original})
                         self.assertEqual(cols.deleted, [])
@@ -1531,6 +1535,25 @@ class SourceCoverageTests(unittest.TestCase):
                 self.assertEqual(response.can_rechunk, can_rechunk)
                 self.assertEqual(response.note, note)
                 self.assertEqual(response.fidelity, "with-sources" if retained else "chunks-only")
+
+    def test_tune_options_report_a_linked_original_as_typed_error(self):
+        # can_rechunk reads every blob path, so a retained original that is a
+        # link is the index-invalid 409, not a 500 and not can_rechunk: true.
+        from routers import tuning as tuning_router
+        from services import sources
+        with tempfile.TemporaryDirectory() as tmp:
+            cols = Collections()
+            self.corpus(cols, [("a.txt", 0)])
+            with patch.object(settings, "sources_dir", str(Path(tmp)/"sources")), patch.object(wc, "get_client", return_value=SimpleNamespace(collections=cols)), patch.object(tuning_router.wc, "collection_exists", new_callable=AsyncMock, return_value=True):
+                digest = sources.store("Corpus", "a.txt", b"v1")
+                blob = sources.collection_dir("Corpus") / digest
+                target = Path(tmp) / "outside.txt"
+                target.write_bytes(b"v1")
+                blob.unlink()
+                blob.symlink_to(target)
+                response = asyncio.run(tuning_router.tune_options("Corpus"))
+            self.assertEqual(response.status_code, 409)
+            self.assertEqual(json.loads(response.body)["error"]["code"], "SOURCE_INDEX_INVALID")
 
 
 if __name__ == '__main__':
