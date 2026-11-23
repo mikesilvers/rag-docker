@@ -368,6 +368,76 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(list(self.cols.items), ['Corpus'])
         self.assertFalse(list(recovery._root().glob('*.json')))
 
+    # #881: the recovery copy never reads through a link. A link entry in the
+    # sources folder is copied as a link; a linked sources folder is refused.
+    def plant_source_link(self):
+        outside = self.root / 'outside.txt'
+        outside.write_bytes(b'outside secret bytes')
+        digest = hashlib.sha256(outside.read_bytes()).hexdigest()
+        (Path(settings.sources_dir) / 'Corpus' / digest).symlink_to(outside)
+        return outside, digest
+
+    def test_failed_cutover_copies_source_links_as_links_never_their_bytes(self):
+        outside, digest = self.plant_source_link()
+        folder = self.root / 'outside-folder'
+        folder.mkdir()
+        (folder / 'inside.txt').write_bytes(b'outside secret bytes')
+        (Path(settings.sources_dir) / 'Corpus' / 'linked-folder').symlink_to(folder)
+        flushed, real_fsync = [], os.fsync
+
+        def fsync(fd):
+            flushed.append(os.fstat(fd).st_ino)
+            return real_fsync(fd)
+        self.cols.create_failure = True
+        with patch.object(recovery.os, 'fsync', side_effect=fsync), \
+                patch.object(recovery, '_sync_dir', wraps=recovery._sync_dir) as sync_dir, \
+                self.assertRaises(importer.PackageError):
+            self.rebuild()
+        synced = [Path(c.args[0]) for c in sync_dir.call_args_list]
+        record = self.recovery_record()
+        self.assert_retained(record)
+        copy_dir = Path(settings.sources_dir) / record['staging']
+        self.assertTrue((copy_dir / digest).is_symlink())
+        self.assertEqual(os.readlink(copy_dir / digest), str(outside))
+        self.assertTrue((copy_dir / 'linked-folder').is_symlink())
+        self.assertEqual(os.readlink(copy_dir / 'linked-folder'), str(folder))
+        for root in (copy_dir, recovery._root() / record['operation_id']):
+            for path in root.rglob('*'):
+                if path.is_file() and not path.is_symlink():
+                    self.assertNotIn(b'outside secret bytes', path.read_bytes(), path)
+        self.assertTrue(flushed)
+        self.assertNotIn(outside.stat().st_ino, flushed)
+        self.assertNotIn((folder / 'inside.txt').stat().st_ino, flushed)
+        self.assertFalse([path for path in synced if path.is_symlink()])
+        self.assertEqual(outside.read_bytes(), b'outside secret bytes')
+        self.assertEqual([p.name for p in folder.iterdir()], ['inside.txt'])
+
+    def test_linked_sources_folder_is_refused_before_cutover(self):
+        sources_dir = Path(settings.sources_dir)
+        folder = self.root / 'outside-sources'
+        (sources_dir / 'Corpus').rename(folder)
+        (sources_dir / 'Corpus').symlink_to(folder)
+        with self.assertRaises(ValueError) as error:
+            self.rebuild()
+        self.assertIn('is a link', str(error.exception))
+        self.assertEqual(self.cols.get('Corpus').rows, {r['id']: r for r in self.original})
+        self.assertEqual(list(self.cols.items), ['Corpus'])
+        self.assertFalse(list(recovery._root().glob('*.json')))
+        self.assertEqual([p.name for p in sources_dir.iterdir()], ['Corpus'])
+        self.assertTrue((sources_dir / 'Corpus').is_symlink())
+        self.assertEqual([p.name for p in folder.iterdir()], ['source-blob'])
+        self.assertEqual((folder / 'source-blob').read_bytes(), b'original source')
+
+    def test_success_discards_copied_source_links_without_touching_targets(self):
+        outside, digest = self.plant_source_link()
+        written = tuning._rebuild('Corpus', [r['properties'] for r in self.original], None, None, None)
+        self.assertEqual(written, 2)
+        self.assertFalse(list(recovery._root().glob('*.json')))
+        sources_dir = Path(settings.sources_dir)
+        self.assertEqual([p.name for p in sources_dir.iterdir()], ['Corpus'])
+        self.assertTrue((sources_dir / 'Corpus' / digest).is_symlink())
+        self.assertEqual(outside.read_bytes(), b'outside secret bytes')
+
     def package(self):
         pkg = self.root / 'package'
         pkg.mkdir(exist_ok=True)
