@@ -773,7 +773,11 @@ chunks are deleted or counted among word matches such as `a/report.pdf`, `Report
 a name has chunks only when stored exactly, and a non-default rule selects what it accepts;
 the deletion by ID in batches of at most 10,000, never empty, and its bound, refused before
 deleting; the precondition and final count,
-retention releasing the name (also when the blob write fails, keeping shared digests), and
+retention releasing the name (also when the blob write fails, keeping shared digests), the
+retained index's updates (#52: an unreadable index, invalid JSON, invalid UTF-8 or a read
+error, is refused and left unchanged, and a store into it writes nothing; two threads storing
+into one collection both keep their entries; index saves use unique temporary files and a
+failed save keeps the previous index; an imported index is published with an atomic replace), and
 rechunk coverage and per-(digest, name) rebuilds, rebuilding only names with stored chunks
 while a missing blob is still refused (#311), also for one blob under 50 names with one
 stored and a digest with none (only the stored name is parsed). A collection whose retained
@@ -781,8 +785,8 @@ names have no stored chunks is refused as having nothing to rebuild, before stag
 a rechunk or a re-embed with chunking parameters, before any job is created, with the route
 answering 409 (#328). That check runs only for those two, after the `TUNE_IN_PROGRESS` and
 `COLLECTION_DELETING` guards; a re-index and a collection with a stored listed name still
-start a job. An invalid retained source index (a non-digest key, a non-object document or a
-linked index) refuses those two before any job is created, with 409 `SOURCE_INDEX_INVALID`,
+start a job. An invalid retained source index (a non-digest key, a non-object document, a
+linked index, or one that isn't JSON or valid UTF-8, #52) refuses those two before any job is created, with 409 `SOURCE_INDEX_INVALID`,
 the guards released and Weaviate never read, while a re-index and a re-embed without chunking
 parameters still start; the guards answer first, leaving the other tune's guard held. These
 are checked over HTTP through the app (#389). A Weaviate error during the check answers 503
@@ -808,7 +812,10 @@ ZIP (it completes with no errors, stores only its file and lists the AppleDouble
 that ingesting a new name leaves the session current and a replacing re-ingest marks it
 stale, naming the file. Two concurrent uploads of one name must leave exactly one job's
 version, whole: its chunk set, its digest, and `chunks_replaced` equal to the other job's
-chunks. Replacing a name touches only that name (#622): with `a/report.pdf` (in a ZIP) and
+chunks. Two uploads of different files started together into one collection must both keep
+their retained entries, and with the retained index replaced by text that isn't JSON,
+`GET /tune/{collection}` answers 409 `SOURCE_INDEX_INVALID` and an ingest completes leaving
+the index and the retained files unchanged; the index is then restored (#52). Replacing a name touches only that name (#622): with `a/report.pdf` (in a ZIP) and
 `Report.PDF` stored, uploading `report.pdf` replaces nothing and uploading it again replaces
 only its first set, and the other two keep exactly their chunks; the first upload leaves a
 planted gold-standard session current. `exact_source.py` then checks the same selection in
@@ -984,7 +991,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `exact_source.py` | helper for ingest (#622), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, replacing `report.pdf` deletes only its earlier chunks and `_source_has_chunks_sync` answers by exact name, with a few word matches (`page`), over 10,000 (`walk`), and over 10,000 earlier chunks of the name itself, deleted in batches of 10,000 (`bulk`); the collection is removed afterwards |
 | `../tests/test_collection_spelling.py` | controlled regressions for per-collection state keyed by the stored collection name (#372), registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
-| `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal, unresolvable chunk-source refusal and export read-boundary regressions, registered by transfer |
+| `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal, unresolvable chunk-source refusal and export read-boundary regressions, and an index that isn't JSON answering `SOURCE_INDEX_INVALID` at the tuning options, refusing export and left unchanged by an ingest (#52), registered by transfer |
 | `../tests/test_export_snapshot.py` | controlled export writer-guard regressions: a mid-export re-ingest can't change the package, busy and waiting writers, guard release (#509), a cancelled export's status (#521), registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
 | `../tests/test_batch_recovery_fixture.py` | controlled check that the import package `batch_recovery.py`'s `write_import_package` writes passes the importer's real digest and source checks; run in the API image with no network and the repository mounted read-only, registered by transfer |

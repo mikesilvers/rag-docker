@@ -11,6 +11,14 @@ name. Storage is proportional to the corpus rather than to upload count.
 A logical name belongs to one digest at a time (#22): ingest stores with
 replace=True, so a name ingested with new content leaves the digest it had, and a
 digest left with no names is removed with its blob.
+
+The index is only ever replaced whole (#52): a uniquely named temporary file in
+the collection's folder, fsynced, then an atomic replace, so a failed or
+interrupted save leaves the previous index. One collection's updates (read,
+update, write, orphan deletion) are serialized within the API process, so
+concurrent stores can't lose each other's entries. An index that can't be read
+or parsed is refused like an invalid one, never treated as empty: an update
+would otherwise replace every earlier entry with a partial index.
 """
 from __future__ import annotations
 from services import telemetry
@@ -18,8 +26,11 @@ from services import telemetry
 import hashlib
 import json
 import logging
+import os
 import re
+import secrets
 import shutil
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -80,9 +91,12 @@ def load_index(collection: str) -> dict:
         return {"version": INDEX_VERSION, "documents": {}}
     try:
         data = json.loads(p.read_text())
-    except (OSError, ValueError):
-        log.warning("Unreadable source index for %r; treating as empty", collection)
-        return {"version": INDEX_VERSION, "documents": {}}
+    except (OSError, ValueError) as exc:
+        # Never treated as empty (#52): the next store would replace every
+        # earlier entry with an index holding only its own. Refused like an
+        # invalid index, so the callers report SOURCE_INDEX_INVALID or fail.
+        log.warning("Unreadable source index for %r; leaving it unchanged", collection)
+        raise ValueError("Unreadable retained source index") from exc
     if not isinstance(data, dict):
         raise ValueError("Invalid retained source index")
     data.setdefault("version", INDEX_VERSION)
@@ -90,14 +104,47 @@ def load_index(collection: str) -> dict:
     return validate_index(data)
 
 
+# One lock per collection folder serializes store's read/update/write cycle
+# within this process (#52), like collection_writes; the API is one process.
+_locks_guard = threading.Lock()
+_locks: dict[str, threading.Lock] = {}
+
+
+def _collection_lock(collection: str) -> threading.Lock:
+    with _locks_guard:
+        return _locks.setdefault(str(collection_dir(collection)), threading.Lock())
+
+
+def _temporary(path: Path) -> Path:
+    """A new name beside path, so concurrent writers never share one (#52)."""
+    return path.with_name(f"{path.name}.{secrets.token_hex(8)}.tmp")
+
+
+def _publish(path: Path, payload: bytes) -> None:
+    """Replace path whole: a uniquely named temporary file in the same folder,
+    fsynced, then os.replace. A failure before the replace removes the
+    temporary file and leaves path as it was (#52)."""
+    tmp = _temporary(path)
+    try:
+        # "x" creates it exclusively, with the default permissions an index
+        # always had.
+        with open(tmp, "xb") as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def _save_index(collection: str, index: dict) -> None:
     p = _index_path(collection)
     p.parent.mkdir(parents=True, exist_ok=True)
-    # Write via a temp file in the same directory so a crash cannot truncate an
-    # existing index.
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(index, indent=2, sort_keys=True))
-    tmp.replace(p)
+    _publish(p, json.dumps(index, indent=2, sort_keys=True).encode())
 
 
 def restore_package(package: Path, collection: str) -> None:
@@ -114,7 +161,8 @@ def restore_package(package: Path, collection: str) -> None:
     dest.mkdir(parents=True, exist_ok=True)
     for digest in index["documents"]:
         shutil.copyfile(src / digest, dest / digest)
-    shutil.copyfile(src / INDEX_NAME, dest / INDEX_NAME)
+    # The package's exact bytes, published whole like every index save (#52).
+    _publish(dest / INDEX_NAME, (src / INDEX_NAME).read_bytes())
 
 
 def _drop_blobs(collection: str, digests: list[str]) -> None:
@@ -137,48 +185,61 @@ def store(collection: str, filename: str, data: bytes, media_type: str | None = 
     other digest, and digests left with no names are dropped. That happens even
     when writing the new blob fails, so the name never keeps claiming the
     version it replaced, which a rechunk would otherwise rebuild.
+
+    The whole cycle holds the collection's lock (#52), and the index is loaded
+    before anything is written: an unreadable or invalid index raises
+    ValueError and leaves the folder exactly as it was.
     """
     digest = hashlib.sha256(data).hexdigest()
-    target = collection_dir(collection) / digest
-    target.parent.mkdir(parents=True, exist_ok=True)
+    with _collection_lock(collection):
+        target = collection_dir(collection) / digest
+        target.parent.mkdir(parents=True, exist_ok=True)
 
-    index = load_index(collection)
-    orphans: list[str] = []
-    if replace:
-        for other, entry in list(index["documents"].items()):
-            if other != digest and filename in entry["filenames"]:
-                entry["filenames"] = [n for n in entry["filenames"] if n != filename]
-                if not entry["filenames"]:
-                    del index["documents"][other]
-                    orphans.append(other)
-
-    try:
-        if not target.exists():
-            tmp = target.with_name(digest + ".tmp")
-            tmp.write_bytes(data)
-            tmp.replace(target)
-    except BaseException:
+        index = load_index(collection)
+        orphans: list[str] = []
         if replace:
-            _save_index(collection, index)
-            _drop_blobs(collection, orphans)
-        raise
+            for other, entry in list(index["documents"].items()):
+                if other != digest and filename in entry["filenames"]:
+                    entry["filenames"] = [n for n in entry["filenames"] if n != filename]
+                    if not entry["filenames"]:
+                        del index["documents"][other]
+                        orphans.append(other)
 
-    now = datetime.now(timezone.utc).isoformat()
-    entry = index["documents"].get(digest)
-    if entry is None:
-        index["documents"][digest] = {
-            "filenames": [filename],
-            "size": len(data),
-            "media_type": media_type,
-            "first_seen": now,
-            "last_seen": now,
-        }
-    else:
-        if filename not in entry["filenames"]:
-            entry["filenames"].append(filename)
-        entry["last_seen"] = now
-    _save_index(collection, index)
-    _drop_blobs(collection, orphans)
+        try:
+            if not target.exists():
+                tmp = _temporary(target)
+                try:
+                    tmp.touch(exist_ok=False)     # created exclusively: never shared
+                    tmp.write_bytes(data)
+                    os.replace(tmp, target)
+                except BaseException:
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
+                    raise
+        except BaseException:
+            if replace:
+                _save_index(collection, index)
+                _drop_blobs(collection, orphans)
+            raise
+
+        now = datetime.now(timezone.utc).isoformat()
+        entry = index["documents"].get(digest)
+        if entry is None:
+            index["documents"][digest] = {
+                "filenames": [filename],
+                "size": len(data),
+                "media_type": media_type,
+                "first_seen": now,
+                "last_seen": now,
+            }
+        else:
+            if filename not in entry["filenames"]:
+                entry["filenames"].append(filename)
+            entry["last_seen"] = now
+        _save_index(collection, index)
+        _drop_blobs(collection, orphans)
     return digest
 
 

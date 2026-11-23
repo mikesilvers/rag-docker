@@ -49,6 +49,12 @@ Export cannot ship what the system throws away. This MUST land before export.
   no extension.
 - A per-collection index `/app/sources/<collection>/index.json` maps each digest
   to its logical filenames, media type, size and first-seen timestamp.
+- `index.json` is only ever replaced whole: each save writes a uniquely named
+  temporary file in the collection's folder, fsyncs it and atomically replaces
+  the index, so a failed or interrupted save leaves the previous index. Blobs
+  are written through uniquely named temporary files too. One collection's
+  updates (read, update, write, orphan deletion) are serialized within the API
+  process, so concurrent ingests can't lose each other's entries (#52).
 
 ### 2.2 Ingest changes
 
@@ -88,7 +94,11 @@ An invalid on-disk index makes tuning options return a typed 409
 `SOURCE_INDEX_INVALID`, and re-chunking (or re-embedding with chunking
 parameters) is refused with the same 409 before any job is created (#389);
 re-embedding from stored chunks and re-indexing do not need to read retained
-sources. A failed retention write after chunk storage does
+sources. An index that can't be read or isn't valid JSON is invalid too, and is
+never treated as empty (#52): ingest leaves it and its blobs exactly as they
+are and retains nothing (the failure is logged), the same 409 answers apply,
+and export fails rather than shipping the collection as `chunks-only`.
+A failed retention write after chunk storage does
 not misreport the ingested file as failed.
 
 Retained-source import restores only blobs named by the validated index. Unindexed
@@ -1091,7 +1101,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | `TUNE_IN_PROGRESS` | concurrent tuning of the same collection |
 | `COLLECTION_DELETING` | HTTP 409 for a new export or tune, and an import job's failure: a delete of the collection is in progress (SPECIFICATIONS.md §3.1.2; #302) |
 | `TUNE_FAILED` | an unexpected error during a rebuild; the message carries the cause |
-| `SOURCE_INDEX_INVALID` | HTTP 409: the retained source index is invalid; repair it before source-dependent tuning. Answered by the tuning options, and by a re-chunk or a re-embed with chunking parameters before any job is created (#389). Reindex and re-embed from stored chunks remain available. |
+| `SOURCE_INDEX_INVALID` | HTTP 409: the retained source index is invalid, including one that can't be read or isn't JSON (#52); repair it before source-dependent tuning. Answered by the tuning options, and by a re-chunk or a re-embed with chunking parameters before any job is created (#389). Reindex and re-embed from stored chunks remain available. |
 | `IMPORT_FAILED` | an unexpected error during import; the message carries the cause |
 | `INTERRUPTED` | the API restarted while the export, import or tune job was queued or running; start it again (#23) |
 
@@ -1158,6 +1168,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E43 | Import checks and installs only this instance's answer model: a build model that differs, absent or not, is neither checked, installed nor noted (#671), by `test_retrieval_import.py` |
 | E44 | A default export is a key export (#676): `<stem>.tar.gz.age` with one `X25519` stanza and `<stem>.tar.gz.age.key` (0600, age's identity layout) beside it, a new key every time, no plaintext archive and nothing left by a failure; the package opens with the key file through import and an independent decryption, every vendored CCTV vector with an X25519 key behaves as its `expect:` says, `KEY_FILE_REQUIRED`, `KEY_FILE_INVALID`, `KEY_FILE_NOT_EXPECTED` and `ENCRYPTION_REQUIRED` refuse before any job, a wrong key fails `DECRYPT_FAILED` (`reason` `key`) touching nothing, and the key file is downloaded once and expired on its own, by `test_export_encryption.py`, `test_package_download.py`, `test_query_only.py` and suites 05, 18 and 24 |
 | E45 | Two exports of one collection whose names would be the same (the same `<id8>` in the same second) get distinct names, the later one `-2`, then `-3` (§4.1, #860): both packages and both key files are kept, no export replaces a file in `./exports`, and a name taken after it was chosen fails the export and leaves that file, by `test_export_encryption.py` (`SameSecondNames`) and suite 05's same-second check |
+| E46 | Retained-source index updates (#52): an index that can't be read (invalid JSON, invalid UTF-8, a read error) is refused like an invalid one and left unchanged; a store into it writes nothing; two stores into one collection from different threads both keep their entries; index saves use unique temporary files and a failed save keeps the previous index; `restore_package` publishes its index with an atomic replace; the #389 invalid-index tune checks include the unreadable forms, by `test_reingest.py`. Tuning options answer 409 `SOURCE_INDEX_INVALID`, export refuses, and an ingest completes and leaves the retained folder unchanged, for an index that isn't JSON, by `test_source_index_boundary.py`. Live, suite 02: two ingests of different files started together both keep their retained entries, and with the index replaced by text that isn't JSON, `GET /tune/{collection}` answers 409 `SOURCE_INDEX_INVALID` and an ingest completes leaving the index and the retained files unchanged |
 
 ---
 

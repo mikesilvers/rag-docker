@@ -3046,6 +3046,14 @@ name. Storage is proportional to the corpus rather than to upload count.
 A logical name belongs to one digest at a time (#22): ingest stores with
 replace=True, so a name ingested with new content leaves the digest it had, and a
 digest left with no names is removed with its blob.
+
+The index is only ever replaced whole (#52): a uniquely named temporary file in
+the collection's folder, fsynced, then an atomic replace, so a failed or
+interrupted save leaves the previous index. One collection's updates (read,
+update, write, orphan deletion) are serialized within the API process, so
+concurrent stores can't lose each other's entries. An index that can't be read
+or parsed is refused like an invalid one, never treated as empty: an update
+would otherwise replace every earlier entry with a partial index.
 """
 from __future__ import annotations
 from services import telemetry
@@ -3053,8 +3061,11 @@ from services import telemetry
 import hashlib
 import json
 import logging
+import os
 import re
+import secrets
 import shutil
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -3115,9 +3126,12 @@ def load_index(collection: str) -> dict:
         return {"version": INDEX_VERSION, "documents": {}}
     try:
         data = json.loads(p.read_text())
-    except (OSError, ValueError):
-        log.warning("Unreadable source index for %r; treating as empty", collection)
-        return {"version": INDEX_VERSION, "documents": {}}
+    except (OSError, ValueError) as exc:
+        # Never treated as empty (#52): the next store would replace every
+        # earlier entry with an index holding only its own. Refused like an
+        # invalid index, so the callers report SOURCE_INDEX_INVALID or fail.
+        log.warning("Unreadable source index for %r; leaving it unchanged", collection)
+        raise ValueError("Unreadable retained source index") from exc
     if not isinstance(data, dict):
         raise ValueError("Invalid retained source index")
     data.setdefault("version", INDEX_VERSION)
@@ -3125,14 +3139,47 @@ def load_index(collection: str) -> dict:
     return validate_index(data)
 
 
+# One lock per collection folder serializes store's read/update/write cycle
+# within this process (#52), like collection_writes; the API is one process.
+_locks_guard = threading.Lock()
+_locks: dict[str, threading.Lock] = {}
+
+
+def _collection_lock(collection: str) -> threading.Lock:
+    with _locks_guard:
+        return _locks.setdefault(str(collection_dir(collection)), threading.Lock())
+
+
+def _temporary(path: Path) -> Path:
+    """A new name beside path, so concurrent writers never share one (#52)."""
+    return path.with_name(f"{path.name}.{secrets.token_hex(8)}.tmp")
+
+
+def _publish(path: Path, payload: bytes) -> None:
+    """Replace path whole: a uniquely named temporary file in the same folder,
+    fsynced, then os.replace. A failure before the replace removes the
+    temporary file and leaves path as it was (#52)."""
+    tmp = _temporary(path)
+    try:
+        # "x" creates it exclusively, with the default permissions an index
+        # always had.
+        with open(tmp, "xb") as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def _save_index(collection: str, index: dict) -> None:
     p = _index_path(collection)
     p.parent.mkdir(parents=True, exist_ok=True)
-    # Write via a temp file in the same directory so a crash cannot truncate an
-    # existing index.
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(index, indent=2, sort_keys=True))
-    tmp.replace(p)
+    _publish(p, json.dumps(index, indent=2, sort_keys=True).encode())
 
 
 def restore_package(package: Path, collection: str) -> None:
@@ -3149,7 +3196,8 @@ def restore_package(package: Path, collection: str) -> None:
     dest.mkdir(parents=True, exist_ok=True)
     for digest in index["documents"]:
         shutil.copyfile(src / digest, dest / digest)
-    shutil.copyfile(src / INDEX_NAME, dest / INDEX_NAME)
+    # The package's exact bytes, published whole like every index save (#52).
+    _publish(dest / INDEX_NAME, (src / INDEX_NAME).read_bytes())
 
 
 def _drop_blobs(collection: str, digests: list[str]) -> None:
@@ -3172,48 +3220,61 @@ def store(collection: str, filename: str, data: bytes, media_type: str | None = 
     other digest, and digests left with no names are dropped. That happens even
     when writing the new blob fails, so the name never keeps claiming the
     version it replaced, which a rechunk would otherwise rebuild.
+
+    The whole cycle holds the collection's lock (#52), and the index is loaded
+    before anything is written: an unreadable or invalid index raises
+    ValueError and leaves the folder exactly as it was.
     """
     digest = hashlib.sha256(data).hexdigest()
-    target = collection_dir(collection) / digest
-    target.parent.mkdir(parents=True, exist_ok=True)
+    with _collection_lock(collection):
+        target = collection_dir(collection) / digest
+        target.parent.mkdir(parents=True, exist_ok=True)
 
-    index = load_index(collection)
-    orphans: list[str] = []
-    if replace:
-        for other, entry in list(index["documents"].items()):
-            if other != digest and filename in entry["filenames"]:
-                entry["filenames"] = [n for n in entry["filenames"] if n != filename]
-                if not entry["filenames"]:
-                    del index["documents"][other]
-                    orphans.append(other)
-
-    try:
-        if not target.exists():
-            tmp = target.with_name(digest + ".tmp")
-            tmp.write_bytes(data)
-            tmp.replace(target)
-    except BaseException:
+        index = load_index(collection)
+        orphans: list[str] = []
         if replace:
-            _save_index(collection, index)
-            _drop_blobs(collection, orphans)
-        raise
+            for other, entry in list(index["documents"].items()):
+                if other != digest and filename in entry["filenames"]:
+                    entry["filenames"] = [n for n in entry["filenames"] if n != filename]
+                    if not entry["filenames"]:
+                        del index["documents"][other]
+                        orphans.append(other)
 
-    now = datetime.now(timezone.utc).isoformat()
-    entry = index["documents"].get(digest)
-    if entry is None:
-        index["documents"][digest] = {
-            "filenames": [filename],
-            "size": len(data),
-            "media_type": media_type,
-            "first_seen": now,
-            "last_seen": now,
-        }
-    else:
-        if filename not in entry["filenames"]:
-            entry["filenames"].append(filename)
-        entry["last_seen"] = now
-    _save_index(collection, index)
-    _drop_blobs(collection, orphans)
+        try:
+            if not target.exists():
+                tmp = _temporary(target)
+                try:
+                    tmp.touch(exist_ok=False)     # created exclusively: never shared
+                    tmp.write_bytes(data)
+                    os.replace(tmp, target)
+                except BaseException:
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
+                    raise
+        except BaseException:
+            if replace:
+                _save_index(collection, index)
+                _drop_blobs(collection, orphans)
+            raise
+
+        now = datetime.now(timezone.utc).isoformat()
+        entry = index["documents"].get(digest)
+        if entry is None:
+            index["documents"][digest] = {
+                "filenames": [filename],
+                "size": len(data),
+                "media_type": media_type,
+                "first_seen": now,
+                "last_seen": now,
+            }
+        else:
+            if filename not in entry["filenames"]:
+                entry["filenames"].append(filename)
+            entry["last_seen"] = now
+        _save_index(collection, index)
+        _drop_blobs(collection, orphans)
     return digest
 
 
@@ -30029,7 +30090,11 @@ chunks are deleted or counted among word matches such as `a/report.pdf`, `Report
 a name has chunks only when stored exactly, and a non-default rule selects what it accepts;
 the deletion by ID in batches of at most 10,000, never empty, and its bound, refused before
 deleting; the precondition and final count,
-retention releasing the name (also when the blob write fails, keeping shared digests), and
+retention releasing the name (also when the blob write fails, keeping shared digests), the
+retained index's updates (#52: an unreadable index, invalid JSON, invalid UTF-8 or a read
+error, is refused and left unchanged, and a store into it writes nothing; two threads storing
+into one collection both keep their entries; index saves use unique temporary files and a
+failed save keeps the previous index; an imported index is published with an atomic replace), and
 rechunk coverage and per-(digest, name) rebuilds, rebuilding only names with stored chunks
 while a missing blob is still refused (#311), also for one blob under 50 names with one
 stored and a digest with none (only the stored name is parsed). A collection whose retained
@@ -30037,8 +30102,8 @@ names have no stored chunks is refused as having nothing to rebuild, before stag
 a rechunk or a re-embed with chunking parameters, before any job is created, with the route
 answering 409 (#328). That check runs only for those two, after the `TUNE_IN_PROGRESS` and
 `COLLECTION_DELETING` guards; a re-index and a collection with a stored listed name still
-start a job. An invalid retained source index (a non-digest key, a non-object document or a
-linked index) refuses those two before any job is created, with 409 `SOURCE_INDEX_INVALID`,
+start a job. An invalid retained source index (a non-digest key, a non-object document, a
+linked index, or one that isn't JSON or valid UTF-8, #52) refuses those two before any job is created, with 409 `SOURCE_INDEX_INVALID`,
 the guards released and Weaviate never read, while a re-index and a re-embed without chunking
 parameters still start; the guards answer first, leaving the other tune's guard held. These
 are checked over HTTP through the app (#389). A Weaviate error during the check answers 503
@@ -30064,7 +30129,10 @@ ZIP (it completes with no errors, stores only its file and lists the AppleDouble
 that ingesting a new name leaves the session current and a replacing re-ingest marks it
 stale, naming the file. Two concurrent uploads of one name must leave exactly one job's
 version, whole: its chunk set, its digest, and `chunks_replaced` equal to the other job's
-chunks. Replacing a name touches only that name (#622): with `a/report.pdf` (in a ZIP) and
+chunks. Two uploads of different files started together into one collection must both keep
+their retained entries, and with the retained index replaced by text that isn't JSON,
+`GET /tune/{collection}` answers 409 `SOURCE_INDEX_INVALID` and an ingest completes leaving
+the index and the retained files unchanged; the index is then restored (#52). Replacing a name touches only that name (#622): with `a/report.pdf` (in a ZIP) and
 `Report.PDF` stored, uploading `report.pdf` replaces nothing and uploading it again replaces
 only its first set, and the other two keep exactly their chunks; the first upload leaves a
 planted gold-standard session current. `exact_source.py` then checks the same selection in
@@ -30240,7 +30308,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `exact_source.py` | helper for ingest (#622), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, replacing `report.pdf` deletes only its earlier chunks and `_source_has_chunks_sync` answers by exact name, with a few word matches (`page`), over 10,000 (`walk`), and over 10,000 earlier chunks of the name itself, deleted in batches of 10,000 (`bulk`); the collection is removed afterwards |
 | `../tests/test_collection_spelling.py` | controlled regressions for per-collection state keyed by the stored collection name (#372), registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
-| `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal, unresolvable chunk-source refusal and export read-boundary regressions, registered by transfer |
+| `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal, unresolvable chunk-source refusal and export read-boundary regressions, and an index that isn't JSON answering `SOURCE_INDEX_INVALID` at the tuning options, refusing export and left unchanged by an ingest (#52), registered by transfer |
 | `../tests/test_export_snapshot.py` | controlled export writer-guard regressions: a mid-export re-ingest can't change the package, busy and waiting writers, guard release (#509), a cancelled export's status (#521), registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
 | `../tests/test_batch_recovery_fixture.py` | controlled check that the import package `batch_recovery.py`'s `write_import_package` writes passes the importer's real digest and source checks; run in the API image with no network and the repository mounted read-only, registered by transfer |
@@ -47507,6 +47575,93 @@ check "two concurrent uploads of one name leave exactly one job's version, whole
 drop_collection "$RI"
 rm -rf "$RIFIX"
 
+# ── source-index updates (#52) ───────────────────────────────────────────────
+# The retained index's read/update/write cycle is serialized, so two ingests of
+# different files started together both keep their entries; an index that can't
+# be read is refused, never treated as empty, so an ingest can't replace it with
+# a partial one. The index is read from disk each time, as after a restart.
+SI="${PREFIX}SourceIndex"
+# The collection's retained names (from disk), the index file's SHA-256 and the
+# folder's file names.
+si_state() {
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "$SI") <<'ENDPY'
+import hashlib, json, sys
+from services import sources
+d = sources.collection_dir(sys.argv[1])
+raw = (d / "index.json").read_bytes()
+try:
+    names = sorted(n for e in sources.load_index(sys.argv[1])["documents"].values()
+                   for n in e["filenames"])
+except ValueError as exc:
+    names = str(exc)
+print(json.dumps({"names": names, "sha": hashlib.sha256(raw).hexdigest(),
+                  "files": sorted(p.name for p in d.iterdir())}))
+ENDPY
+}
+# si_index <break|restore>: replace index.json with text that isn't JSON, keeping
+# a copy beside it, or put that copy back.
+si_index() {
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "$SI" "$1") <<'ENDPY'
+import os, sys
+from services import sources
+d = sources.collection_dir(sys.argv[1]); idx, bak = d / "index.json", d / "index.json.si52bak"
+if sys.argv[2] == "break":
+    bak.write_bytes(idx.read_bytes())
+    idx.write_text("{not json")
+else:
+    os.replace(bak, idx)
+ENDPY
+}
+drop_collection "$SI"; make_collection "$SI"
+for v in txt md; do
+  curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$SI" -F "strategy=fixed" \
+    -F "chunk_size=200" -F "chunk_overlap=60" -F "min_chunk_size=40" \
+    -F "files=@$FIX/policies.$v" > "/tmp/vfy_si_$v.json" &
+done
+wait
+for v in txt md; do
+  sj=$(jfield "['job_id']" < "/tmp/vfy_si_$v.json")
+  [ -n "$sj" ] && wait_for_job "/ingest/job/$sj" 900 >/dev/null
+  api_get "/ingest/job/$sj" > "/tmp/vfy_si_$v.done.json"
+done
+si_state > /tmp/vfy_si_state.json
+python3 - <<'ENDPY'
+import json, sys
+jobs = [json.load(open(f"/tmp/vfy_si_{v}.done.json")) for v in ("txt", "md")]
+st = json.load(open("/tmp/vfy_si_state.json"))
+print([j.get("status") for j in jobs], st["names"])
+sys.exit(0 if all(j.get("status") == "completed" for j in jobs)
+         and st["names"] == ["policies.md", "policies.txt"] else 1)
+ENDPY
+check "two ingests of different files started together both keep their retained entries (#52)" $?
+si_index break
+check "replaced the retained index with text that isn't JSON" $?
+si_state > /tmp/vfy_si_broken.json
+check_eq "an unreadable retained index makes GET /tune answer HTTP 409 (#52)" \
+  "$(api_code "$API/tune/$SI")" "409"
+check_eq "... with error code SOURCE_INDEX_INVALID, not chunks-only" \
+  "$(api_get "/tune/$SI" | jfield "['error']['code']")" "SOURCE_INDEX_INVALID"
+ingest "$SI" fixed 200 40 "$FIX/policies.csv"
+read -r status completed failed <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], d['files_completed'], d['files_failed'])")"
+[ "$status" = completed ] && [ "$completed" = 1 ] && [ "$failed" = 0 ]
+check "an ingest into a collection with an unreadable index still completes" $? \
+  "status=$status completed=$completed failed=$failed"
+si_state > /tmp/vfy_si_after.json
+python3 - <<'ENDPY'
+import json, sys
+before, after = (json.load(open(f"/tmp/vfy_si_{n}.json")) for n in ("broken", "after"))
+print(before["sha"][:12], after["sha"][:12], after["files"] == before["files"])
+sys.exit(0 if after["sha"] == before["sha"] and after["files"] == before["files"] else 1)
+ENDPY
+check "... and leaves the unreadable index and the retained files exactly as they were (#52)" $?
+si_index restore
+check "restored the retained index" $?
+check_eq "... which lists the two files again" \
+  "$(si_state | jfield "['names']")" "['policies.md', 'policies.txt']"
+drop_collection "$SI"
+
 # ── replacing a name touches only that name (#622) ───────────────────────────
 # source_file is word-tokenized, so Weaviate's equal("report.pdf") also matches
 # a/report.pdf and Report.PDF, and uploading report.pdf deleted their chunks.
@@ -58595,6 +58750,69 @@ class SourceIndexBoundaryTests(unittest.TestCase):
         insert.assert_called_once()
         self.assertEqual((job["status"], job["files_completed"], job["files_failed"],
                           job["chunks_stored"]), ("completed", 1, 0, 1))
+
+    def unreadable(self, collection):
+        """A retained folder with one stored blob and an index that isn't JSON (#52)."""
+        retained = sources.collection_dir(collection)
+        retained.mkdir(parents=True)
+        content = b"stored before the index broke"
+        (retained / hashlib.sha256(content).hexdigest()).write_bytes(content)
+        (retained / "index.json").write_text("{not json")
+        return retained
+
+    def snapshot(self, folder):
+        return {p.name: p.read_bytes() for p in folder.iterdir()}
+
+    def test_tune_options_reports_an_unreadable_index_as_typed_error(self):
+        # #52: an unreadable index read as empty, so the options said chunks-only.
+        from routers import tuning as tuning_router
+        retained = self.unreadable("Unreadable")
+        before = self.snapshot(retained)
+        with patch.object(tuning_router.wc, "collection_exists", new_callable=AsyncMock,
+                          return_value=True):
+            response = asyncio.run(tuning_router.tune_options("Unreadable"))
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(json.loads(response.body)["error"]["code"], "SOURCE_INDEX_INVALID")
+        self.assertEqual(self.snapshot(retained), before)
+
+    def test_export_refuses_an_unreadable_index(self):
+        # #52: export read an unreadable index as empty and shipped chunks-only.
+        retained = self.unreadable("Unreadable")
+        before = self.snapshot(retained)
+        with patch.object(packager, "exports_dir", return_value=self.root), \
+             patch.object(packager, "read_chunks", return_value=iter(())), \
+             patch.object(packager.wc, "_collection_config_sync", return_value={"embedding_model": settings.embed_model}), \
+             patch.object(packager, "_ingest_config", return_value=None), \
+             patch.object(packager.retrieval_config, "resolve", return_value=({}, True)), \
+             patch.object(packager, "_goldstandard_sessions", return_value=[]):
+            with self.assertRaisesRegex(ValueError, "Unreadable retained source index"):
+                packager.build("Unreadable")
+        self.assertFalse(list(self.root.glob("*.tar.gz")))
+        self.assertEqual(self.snapshot(retained), before)
+
+    def test_ingest_keeps_an_unreadable_index_and_retains_nothing(self):
+        # #52: a corrupt index followed by an ingest became an index holding
+        # only the new file. The chunks are stored, the file completes, and the
+        # retained folder is left exactly as it was.
+        retained = self.unreadable("Unreadable")
+        before = self.snapshot(retained)
+        work = self.root / "job"                 # the job removes its own folder when it ends
+        work.mkdir()
+        upload = work / "accepted.txt"
+        upload.write_text("accepted text")
+        job_id = "source-index-unreadable"
+        job = {"status": "queued", "files_total": 1, "files_completed": 0,
+               "files_failed": 0, "chunks_stored": 0, "errors": []}
+        with patch.dict(ingest_pipeline._jobs, {job_id: job}, clear=True), \
+             patch.object(ingest_pipeline, "_parse_file", return_value=("accepted text", [])), \
+             patch.object(ingest_pipeline.wc, "_insert_chunks_sync") as insert, \
+             patch.object(ingest_pipeline.wc, "_source_has_chunks_sync", return_value=False):
+            ingest_pipeline._process_job_sync(job_id, [upload], work,
+                                              "Unreadable", "fixed", 150, 0, 0.85, 0)
+        insert.assert_called_once()
+        self.assertEqual((job["status"], job["files_completed"], job["files_failed"],
+                          job["chunks_stored"]), ("completed", 1, 0, 1))
+        self.assertEqual(self.snapshot(retained), before)
 
     def chunks_file(self, package, *digests):
         """chunks.jsonl with one record per digest (None writes a null link)."""

@@ -301,6 +301,69 @@ class SourceIndexBoundaryTests(unittest.TestCase):
         self.assertEqual((job["status"], job["files_completed"], job["files_failed"],
                           job["chunks_stored"]), ("completed", 1, 0, 1))
 
+    def unreadable(self, collection):
+        """A retained folder with one stored blob and an index that isn't JSON (#52)."""
+        retained = sources.collection_dir(collection)
+        retained.mkdir(parents=True)
+        content = b"stored before the index broke"
+        (retained / hashlib.sha256(content).hexdigest()).write_bytes(content)
+        (retained / "index.json").write_text("{not json")
+        return retained
+
+    def snapshot(self, folder):
+        return {p.name: p.read_bytes() for p in folder.iterdir()}
+
+    def test_tune_options_reports_an_unreadable_index_as_typed_error(self):
+        # #52: an unreadable index read as empty, so the options said chunks-only.
+        from routers import tuning as tuning_router
+        retained = self.unreadable("Unreadable")
+        before = self.snapshot(retained)
+        with patch.object(tuning_router.wc, "collection_exists", new_callable=AsyncMock,
+                          return_value=True):
+            response = asyncio.run(tuning_router.tune_options("Unreadable"))
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(json.loads(response.body)["error"]["code"], "SOURCE_INDEX_INVALID")
+        self.assertEqual(self.snapshot(retained), before)
+
+    def test_export_refuses_an_unreadable_index(self):
+        # #52: export read an unreadable index as empty and shipped chunks-only.
+        retained = self.unreadable("Unreadable")
+        before = self.snapshot(retained)
+        with patch.object(packager, "exports_dir", return_value=self.root), \
+             patch.object(packager, "read_chunks", return_value=iter(())), \
+             patch.object(packager.wc, "_collection_config_sync", return_value={"embedding_model": settings.embed_model}), \
+             patch.object(packager, "_ingest_config", return_value=None), \
+             patch.object(packager.retrieval_config, "resolve", return_value=({}, True)), \
+             patch.object(packager, "_goldstandard_sessions", return_value=[]):
+            with self.assertRaisesRegex(ValueError, "Unreadable retained source index"):
+                packager.build("Unreadable")
+        self.assertFalse(list(self.root.glob("*.tar.gz")))
+        self.assertEqual(self.snapshot(retained), before)
+
+    def test_ingest_keeps_an_unreadable_index_and_retains_nothing(self):
+        # #52: a corrupt index followed by an ingest became an index holding
+        # only the new file. The chunks are stored, the file completes, and the
+        # retained folder is left exactly as it was.
+        retained = self.unreadable("Unreadable")
+        before = self.snapshot(retained)
+        work = self.root / "job"                 # the job removes its own folder when it ends
+        work.mkdir()
+        upload = work / "accepted.txt"
+        upload.write_text("accepted text")
+        job_id = "source-index-unreadable"
+        job = {"status": "queued", "files_total": 1, "files_completed": 0,
+               "files_failed": 0, "chunks_stored": 0, "errors": []}
+        with patch.dict(ingest_pipeline._jobs, {job_id: job}, clear=True), \
+             patch.object(ingest_pipeline, "_parse_file", return_value=("accepted text", [])), \
+             patch.object(ingest_pipeline.wc, "_insert_chunks_sync") as insert, \
+             patch.object(ingest_pipeline.wc, "_source_has_chunks_sync", return_value=False):
+            ingest_pipeline._process_job_sync(job_id, [upload], work,
+                                              "Unreadable", "fixed", 150, 0, 0.85, 0)
+        insert.assert_called_once()
+        self.assertEqual((job["status"], job["files_completed"], job["files_failed"],
+                          job["chunks_stored"]), ("completed", 1, 0, 1))
+        self.assertEqual(self.snapshot(retained), before)
+
     def chunks_file(self, package, *digests):
         """chunks.jsonl with one record per digest (None writes a null link)."""
         records = [{"id": f"00000000-0000-4000-8000-00000000000{i}", "vector": [0.5],
