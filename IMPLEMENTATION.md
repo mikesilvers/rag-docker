@@ -15840,6 +15840,10 @@ starts, a verified recovery copy and its sidecars survive failure and restart.
 Identity-changing operations flag retained evaluations before replacement;
 failed reindex cutovers flag them when exact identity cannot be verified.
 
+**Memory.** Re-embedding from stored chunk text and reindexing read and copy the
+collection a page at a time; a reindex verifies every copy against a disk-backed
+fingerprint snapshot of the original, never decoded records in memory (#583).
+
 **Gold standard.** Anything that changes chunk identity marks every session for
 the collection `stale`, with a reason and a timestamp. Sessions are never
 deleted and never remapped (spec §7.3).
@@ -15882,10 +15886,34 @@ def get_job(job_id: str) -> dict | None:
 
 # ── Reading the collection's own chunks ───────────────────────────────────────
 
-def _existing_chunks(collection: str) -> list[dict]:
+class _StoredChunks:
+    """Stored properties, without vectors, read a page at a time (#583).
+
+    Re-iterable: every pass walks the collection again, so the batch writer's
+    preflight, write and resend passes stream it instead of holding it. The
+    collection writer guard keeps the walks identical. The count is Weaviate's
+    aggregate, taken once.
+    """
+
+    def __init__(self, collection: str) -> None:
+        self.collection = collection
+        self._count: int | None = None
+
+    def __iter__(self):
+        col = wc.get_client().collections.get(self.collection)
+        return (dict(o.properties or {}) for o in telemetry.iterate(col.iterator))
+
+    def __len__(self) -> int:
+        if self._count is None:
+            col = wc.get_client().collections.get(self.collection)
+            self._count = telemetry.call("weaviate.aggregate", col.aggregate.over_all,
+                                         total_count=True).total_count or 0
+        return self._count
+
+
+def _existing_chunks(collection: str) -> _StoredChunks:
     """Stored properties, without vectors. Used when re-embedding chunk text."""
-    col = wc.get_client().collections.get(collection)
-    return [dict(o.properties or {}) for o in telemetry.iterate(col.iterator)]
+    return _StoredChunks(collection)
 
 
 def _existing_records(collection: str) -> list[dict]:
@@ -15894,7 +15922,8 @@ def _existing_records(collection: str) -> list[dict]:
 
 
 def _iter_existing_records(collection: str):
-    seen = set()
+    # Duplicate UUIDs are refused by the snapshot's unique key (_snapshot), so
+    # nothing here grows with the collection (#583).
     col = wc.get_client().collections.get(collection)
     for obj in telemetry.iterate(col.iterator, include_vector=True):
         identity = str(obj.uuid)
@@ -15907,35 +15936,100 @@ def _iter_existing_records(collection: str):
                 or any(isinstance(value, bool) or not isinstance(value, (int, float))
                        or not math.isfinite(value) for value in vector)):
             raise RuntimeError(f"Reindex cannot preserve the stored vector for {identity}")
-        if identity in seen:
-            raise RuntimeError(f"Reindex received duplicate stored UUID {identity}")
-        seen.add(identity)
         yield {"id": identity, "vector": copy.deepcopy(vector),
                "properties": copy.deepcopy(dict(obj.properties or {}))}
 
 
-def _write_records(collection: str, records: list[dict]) -> None:
-    """Supply exact records, drain the batch, then compare backend readback."""
-    col = wc.get_client().collections.get(collection)
-    with telemetry.span("weaviate.batch"):
-        with col.batch.dynamic() as batch:
-            for record in records:
-                batch.add_object(properties=copy.deepcopy(record["properties"]),
-                                 uuid=record["id"], vector=copy.deepcopy(record["vector"]))
-        if batch.number_errors:
-            raise RuntimeError(f"{batch.number_errors} error(s) copying reindex records")
-    _verify_records(collection, records)
+class _RecordSnapshot:
+    """A reindex's fixed expectation and where to read the records it copies.
+
+    `expected` holds the original's UUIDs and property/float32-vector
+    fingerprints on disk (batch_write.ExpectedRecords, spec §6.5); `read()`
+    streams records from one collection. The snapshot never changes, so a check
+    after cutover still compares against the original (#583).
+    """
+
+    def __init__(self, expected, read) -> None:
+        self.expected = expected
+        self.read = read
+
+    def __len__(self) -> int:
+        return self.expected.count
+
+    def reading(self, collection: str) -> "_RecordSnapshot":
+        return _RecordSnapshot(self.expected, lambda: _iter_existing_records(collection))
+
+    def close(self) -> None:
+        self.expected.__exit__(None, None, None)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
 
 
-def _verify_records(collection: str, records: list[dict]) -> None:
-    expected = {record["id"]: record for record in records}
-    seen = set()
-    for record in _iter_existing_records(collection):
-        if record != expected.get(record["id"]):
-            raise RuntimeError("Reindex backend readback changed UUIDs, properties or vectors")
-        seen.add(record["id"])
-    if seen != expected.keys():
-        raise RuntimeError("Reindex backend readback changed UUIDs, properties or vectors")
+_DUPLICATE = "Duplicate chunk UUID "
+
+
+def _snapshot(records) -> _RecordSnapshot:
+    """Fingerprint a reusable record source once: a zero-argument callable
+    returning an iterator, or a list."""
+    read = records if callable(records) else (lambda: iter(records))
+    expected = batch_write.ExpectedRecords()
+    try:
+        expected.capture(read)
+    except BaseException as exc:
+        expected.__exit__(None, None, None)
+        if isinstance(exc, ValueError) and str(exc).startswith(_DUPLICATE):
+            raise RuntimeError("Reindex received duplicate stored UUID "
+                               + str(exc)[len(_DUPLICATE):]) from exc
+        raise
+    return _RecordSnapshot(expected, read)
+
+
+def _record_snapshot(collection: str) -> _RecordSnapshot:
+    """The reindex snapshot of the stored collection, read a page at a time."""
+    return _snapshot(lambda: _iter_existing_records(collection))
+
+
+def _as_snapshot(records) -> tuple[_RecordSnapshot, bool]:
+    """A snapshot, and whether the caller made it and must close it."""
+    if isinstance(records, _RecordSnapshot):
+        return records, False
+    return _snapshot(records), True
+
+
+def _write_records(collection: str, records) -> None:
+    """Copy a snapshot's records a page at a time, drain the batch, then compare
+    backend readback with the snapshot."""
+    snapshot, owned = _as_snapshot(records)
+    try:
+        col = wc.get_client().collections.get(collection)
+        with telemetry.span("weaviate.batch"):
+            with col.batch.dynamic() as batch:
+                for record in snapshot.read():
+                    batch.add_object(properties=copy.deepcopy(record["properties"]),
+                                     uuid=record["id"], vector=copy.deepcopy(record["vector"]))
+            if batch.number_errors:
+                raise RuntimeError(f"{batch.number_errors} error(s) copying reindex records")
+        _verify_records(collection, snapshot)
+    finally:
+        if owned:
+            snapshot.close()
+
+
+def _verify_records(collection: str, records) -> None:
+    """Stream the collection against the snapshot: every UUID once, nothing
+    else, the same property and float32 vector fingerprints."""
+    snapshot, owned = _as_snapshot(records)
+    try:
+        snapshot.expected.verify(wc.get_client().collections.get(collection), exact=True)
+    except batch_write.BatchVerificationError as exc:
+        raise RuntimeError("Reindex backend readback changed UUIDs, properties or vectors") from exc
+    finally:
+        if owned:
+            snapshot.close()
 
 
 _MISSING_CHUNK_INDEX = object()
@@ -16204,7 +16298,11 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
 def _rebuild(collection: str, properties: list[dict], index_type: str | None,
              distance_metric: str | None, progress, *, records: list[dict] | None = None,
              source_collection: str | None = None, before_replace=None) -> int:
-    """Stage and verify, then replace the live collection under its writer guard."""
+    """Stage and verify, then replace the live collection under its writer guard.
+
+    Reindex `records` are a fingerprint snapshot of the original (a list is
+    snapshotted here); nothing holds the collection in memory (#583).
+    """
     source_collection = source_collection or collection
     collection = collection_writes.canonical(collection)
     if records is not None:
@@ -16221,7 +16319,10 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
     history_marked = False
     completed = False
     original_intact = False
+    owned_records = False
     try:
+        if records is not None:
+            records, owned_records = _as_snapshot(records)
         wc._create_collection_sync(staging, new_index, new_distance, hnsw, preserve_hnsw=True)
         if records is not None:
             _write_records(staging, records)
@@ -16246,7 +16347,8 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
         wc._create_collection_sync(collection, new_index, new_distance, hnsw, preserve_hnsw=True,
                                    description=collection_recovery.cutover_description(ownership))
         if records is not None:
-            _write_records(collection, records)
+            # The original is gone: copy the verified staging collection.
+            _write_records(collection, records.reading(staging))
             written = len(records)
         else:
             def staged():
@@ -16312,6 +16414,8 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
                 collection_recovery.discard(ownership, client)
             except Exception:
                 _log.exception("Could not remove owned staging collection %r", staging)
+        if owned_records:
+            records.close()
 
 
 @telemetry.traced("rag.tuning")
@@ -16333,11 +16437,11 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
         collection_writes.end_job("tune", job_id)
         job.update(fields)
 
+    records = None
     try:
         needs_sources = operation == "rechunk" or (
             operation == "reembed" and params.get("chunking") is not None)
         has_sources = sources.has_sources(source_collection) if needs_sources else False
-        records = None
 
         if operation == "rechunk":
             if not has_sources:
@@ -16371,8 +16475,8 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
                           "so its vectors changed")
 
         elif operation == "reindex":
-            records = _existing_records(collection)
-            properties = [record["properties"] for record in records]
+            records = _record_snapshot(collection)
+            properties = records     # its len() is the snapshot's count
             reason = None            # exact UUID/vector/property copy is verified
         else:
             raise PackageError("TUNE_UNSUPPORTED", f"Unknown operation '{operation}'.")
@@ -16409,6 +16513,8 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
         finish(status="failed", error_code="TUNE_FAILED",
                error=f"{type(exc).__name__}: {exc}")
     finally:
+        if isinstance(records, _RecordSnapshot):
+            records.close()
         collection_writes.end_job("tune", job_id)
         with _lock:
             _active.discard(collection)
@@ -30358,7 +30464,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_retrieve_script.py` | controlled `retrieve.py` defaults, flags and exit codes against a stub API, registered by suite 15 |
 | `../tests/test_distribution.py` | `package.sh`, `package-offline.sh` and `install-offline.sh` with stubbed `docker`, and the image list, on the host, registered by suite 15; the offline bundle also saves the backup scripts' age image, built from the bundle's own `scripts/age` when missing, and a failed build saves nothing (#852) |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types, the Import page's corpus preparation rules download (#615), the page controls of #400 (see "UI control browser checks") and, last, the login page against nginx's real login rate limit (#577) |
-| `14_reindex.sh` | exact-record reindex: a host check that the embedded sources match the real files (`../tests/test_reindex_preservation.py`), 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
+| `14_reindex.sh` | exact-record reindex: a host check that the embedded sources match the real files (`../tests/test_reindex_preservation.py`), 27 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
 | `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures, canonical local session IDs and exact successful-creation ownership. Verifier collection names deliberately lie outside the parent prefix-sweep namespace. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves a durable exact-name fixture receipt/directory before standalone exit; inspection must confirm terminal writer state before exact-name cleanup |
 | `compose_target.py` | refuses a remote or mismatched API/Compose target before the new acceptance suite runs |
 | `model_integrity.py` | bundled-model byte checks with the pulled embedding model, using a temporary package/store; registered by transfer (#386) |
@@ -56901,6 +57007,7 @@ class Batch:
     def __enter__(self): return self
     def add_object(self, properties, uuid=None, vector=None):
         self.pending.append({'id': str(uuid), 'vector': copy.deepcopy(vector), 'properties': copy.deepcopy(properties)})
+        self.owner.events.append(('add', self.name))
         if self.owner.mutate_arguments:
             properties['content'] = 'SDK argument mutation'; vector[0] = 999
     def __exit__(self, *exc):
@@ -56918,9 +57025,12 @@ class Collections:
         self.data = {'OwnedReindex': copy.deepcopy(initial)}; self.deleted = []; self.created = []; self.closed = []
         self.fail = lambda name: False; self.corrupt = lambda name: False
         self.change_source = self.mutate_arguments = False
+        self.events = []
     def get(self, name):
         def iterator(include_vector=False):
+            self.events.append(('walk', name))
             for record in self.data[name]:
+                self.events.append(('read', name))
                 yield SimpleNamespace(uuid=record['id'], properties=copy.deepcopy(record['properties']), vector={'default':copy.deepcopy(record['vector'])} if include_vector else None)
         return SimpleNamespace(iterator=iterator, batch=SimpleNamespace(dynamic=lambda: Batch(self, name), failed_objects=[]), aggregate=SimpleNamespace(over_all=lambda **kwargs: SimpleNamespace(total_count=len(self.data[name]))))
     def delete(self, name): self.deleted.append(name); del self.data[name]
@@ -57023,12 +57133,12 @@ class ReindexTests(unittest.TestCase):
         from concurrent.futures import ThreadPoolExecutor
         from services import ingest_pipeline as ingest
         parsed=threading.Event();release=threading.Event();snapshot=threading.Event();attempted=threading.Event()
-        original_read=tuning._existing_records
+        original_read=tuning._record_snapshot
         def read(name):snapshot.set();return original_read(name)
         def parse(path):parsed.set();assert release.wait(3);return 'Owned active upload',[]
         def insert(name,chunks):self.backend.data[name].append({'id':str(uuid.uuid4()),'vector':[.125,0.,-.25],'properties':chunks[0]})
         job={'status':'queued','chunks_stored':0,'files_completed':0,'files_failed':0,'files_total':1,'errors':[]}
-        with tempfile.TemporaryDirectory() as temp,patch.object(tuning,'_existing_records',side_effect=read),patch.object(ingest,'_jobs',{'owned_ingest':job}),patch.object(ingest,'_parse_file',side_effect=parse),patch.object(ingest,'do_chunk',return_value=['Owned active upload']),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=insert),patch.object(tuning.wc,'_source_has_chunks_sync',return_value=False),patch.object(ingest.sources,'store'),ThreadPoolExecutor() as pool:
+        with tempfile.TemporaryDirectory() as temp,patch.object(tuning,'_record_snapshot',side_effect=read),patch.object(ingest,'_jobs',{'owned_ingest':job}),patch.object(ingest,'_parse_file',side_effect=parse),patch.object(ingest,'do_chunk',return_value=['Owned active upload']),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=insert),patch.object(tuning.wc,'_source_has_chunks_sync',return_value=False),patch.object(ingest.sources,'store'),ThreadPoolExecutor() as pool:
             path=Path(temp)/'owned.txt';path.write_text('Owned active upload')
             upload=pool.submit(ingest._process_job_sync,'owned_ingest',[path],Path(temp),'OwnedReindex','fixed',150,0,.5,40)
             self.assertTrue(parsed.wait(2))
@@ -57143,11 +57253,50 @@ class ReindexTests(unittest.TestCase):
                 self.assertEqual(set(self.backend.data),{'OwnedReindex'})
     def test_reembed_retains_its_explicit_regeneration_path(self):
         def embed(name,props):
+            props=list(props)   # the re-embed reader streams; this fixture holds two
             self.backend.data[name]=[{'id':'49000000-0000-4000-8000-000000000100','vector':[4.,5.,6.],'properties':copy.deepcopy(props[0])},
                                      {'id':'49000000-0000-4000-8000-000000000101','vector':[4.,5.,6.],'properties':copy.deepcopy(props[1])}]
         self.embedding.side_effect=embed; job=self.run_job('reembed')
         self.assertEqual(job['status'],'completed'); self.embedding.assert_called_once(); self.stale.assert_called_once()
         self.assertNotEqual(self.backend.data['OwnedReindex'],self.original)
+    def test_reindex_copies_stream_without_holding_the_collection(self):
+        # #583: each copy pass adds its first record before its source walk ends.
+        self.original=[{'id':'49000000-0000-4000-8000-00000000002'+str(i),'vector':[0.125,float(i),-0.25],
+                        'properties':{'content':'Owned inert '+str(i),'chunk_index':i,'source_file':'owned.txt'}} for i in range(5)]
+        self.backend.data['OwnedReindex']=copy.deepcopy(self.original); job=self.run_job()
+        self.assertEqual(job['status'],'completed'); self.assertEqual(job['chunks_total'],5); self.assertEqual(job['chunks_written'],5)
+        self.assertEqual(self.backend.data['OwnedReindex'],self.original)
+        events=self.backend.events; stage='OwnedReindex__tuning_owned'
+        for source,target in (('OwnedReindex',stage),(stage,'OwnedReindex')):
+            with self.subTest(source=source,target=target):
+                first=events.index(('add',target))
+                walk=max(i for i in range(first) if events[i]==('walk',source))
+                self.assertEqual(events[walk+1:first],[('read',source)])
+    def test_reembed_reads_stored_chunks_lazily_on_every_pass(self):
+        # #583: re-embed hands _rebuild a reader that walks the collection on every pass.
+        with patch.object(tuning,'_rebuild',return_value=2) as rebuild: job=self.run_job('reembed')
+        self.assertEqual(job['status'],'completed'); self.assertEqual(job['chunks_total'],2)
+        chunks=rebuild.call_args.args[1]; self.assertIsInstance(chunks,tuning._StoredChunks); self.assertNotIsInstance(chunks,list)
+        for _ in range(2):
+            walks=self.backend.events.count(('walk','OwnedReindex'))
+            self.assertEqual(list(chunks),[record['properties'] for record in self.original])
+            self.assertEqual(self.backend.events.count(('walk','OwnedReindex')),walks+1)
+    def test_record_snapshot_is_removed_after_success_and_failure(self):
+        # #583: the disk-backed fingerprint snapshot never outlives its job.
+        real=tuning.batch_write.ExpectedRecords; paths=[]
+        class Recorded(real):
+            def __init__(self,*args,**kwargs):
+                super().__init__(*args,**kwargs); paths.append(self.path)
+        for fail in (False,True):
+            with self.subTest(fail=fail):
+                self.backend=Collections(self.original); paths.clear()
+                self.backend.fail=(lambda name:name=='OwnedReindex') if fail else (lambda name:False)
+                with patch.object(tuning.wc,'get_client',return_value=SimpleNamespace(collections=self.backend)),\
+                     patch.object(tuning.wc,'_create_collection_sync',side_effect=self.backend.create),\
+                     patch.object(tuning.batch_write,'ExpectedRecords',Recorded):
+                    job=self.run_job()
+                self.assertEqual(job['status'],'failed' if fail else 'completed'); self.assertTrue(paths)
+                self.assertFalse([path for path in paths if path.exists() or path.parent.exists()])
 
 if __name__=='__main__': unittest.main()
 ```
@@ -58517,7 +58666,7 @@ class SourceIndexBoundaryTests(unittest.TestCase):
                  patch.object(tuning, "_jobs", {"owned": {}}), \
                  patch.object(tuning.sources, "has_sources", side_effect=AssertionError("sources read")), \
                  patch.object(tuning, "_existing_chunks", return_value=[]), \
-                 patch.object(tuning, "_existing_records", return_value=[]), \
+                 patch.object(tuning, "_record_snapshot", return_value=[]), \
                  patch.object(tuning, "_rebuild", return_value=0), \
                  patch.object(tuning.goldstandard, "mark_stale", return_value=0):
                 tuning._run("owned", "Invalid", operation, {})
