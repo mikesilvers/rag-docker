@@ -2683,8 +2683,8 @@ ingest default.
   collection does not have. Re-embedding a `chunks-only` collection *with*
   chunking fields is refused rather than half-honoured. Re-chunking is also
   refused when a stored source file has no single retained original (a name
-  uploaded more than once, or a second name for the same content) or a
-  retained original is missing from disk. The coverage refusal's
+  retained under more than one digest, or a name with more than one stored
+  chunk set) or a retained original is missing from disk. The coverage refusal's
   `error_detail.uncovered_source_files` names the stored source files a rebuild
   would not reproduce, at most 10 (the first in sorted order), and
   `uncovered_source_files_omitted` counts the rest (#208).
@@ -4485,6 +4485,10 @@ now lives once, in `api/services/ingest_config.py`.
       *Controlled restart cases in `test_batch_recovery.py`; startup deliberately does not delete targets using mutable recovery data.*
 - [x] After an interrupted tuning cutover is checked, startup durably records the outcome (`complete`, `stale`, or `other-instance`) and clears `cutover_pending`, preserving the recovery collection and journal. Later startups do not compare or re-flag that operation. An undecidable check or failed outcome write remains pending for retry. A tuning job that handles a failure after cutover and has marked history stale records `stale` itself, so only a hard kill, a failed marking or a failed decision write leaves the check for startup (#263).
       *`test_batch_recovery.py`: `test_startup_check_flags_an_interrupted_cutover_only_once`, `test_complete_cutover_is_not_rechecked_after_later_mutation`, `test_other_instance_decision_is_retired_without_touching_sessions`, `test_unreadable_cutover_stays_pending_until_check_can_finish`, `test_failed_outcome_write_keeps_cutover_pending_for_retry`, `test_handled_failure_after_cutover_records_the_decision` and `test_failed_post_cutover_marking_leaves_the_check_for_startup`.*
+- [x] A tuning job whose run is cancelled ends `failed` `TUNE_FAILED`, never `running`; one cancelled after cutover marks sessions stale, records the cutover decision and reports `recovered_as` and `sidecar_snapshots` as a failure does (#870).
+      *`test_batch_recovery.py`: `test_cancellation_before_cutover_fails_the_job_and_leaves_the_original`, `test_cancellation_after_cutover_reports_the_retained_copy`, `test_cancellation_after_reindex_cutover_marks_stale_and_reports_the_copy`, `test_cancellation_while_marking_stale_leaves_the_original_and_says_so`, `test_cancellation_at_the_cutover_record_leaves_the_original_and_says_so` and `test_cancellation_before_the_rebuild_fails_the_job`.*
+- [x] A tuning rebuild's recovery copy keeps links inside the sources folder as links and never stores an outside file's bytes; a linked retained-sources folder, config or gold-standard session, dangling or not, is refused before cutover, naming its path relative to its volume, and the original is kept (#881, #886).
+      *`test_batch_recovery.py`: `test_failed_cutover_copies_source_links_as_links_never_their_bytes`, `test_linked_sources_folder_is_refused_before_cutover`, `test_success_discards_copied_source_links_without_touching_targets`, `test_linked_config_sidecar_is_refused_before_cutover`, `test_dangling_source_link_is_copied_as_a_link` and `test_dangling_session_link_is_refused_naming_its_path`.*
 - [x] Export includes only approved/edited pairs; excluded count matches rejected + pending.
       *2 approved + 1 edited saved; 1 rejected + 1 pending excluded.*
 - [x] Exported file is valid JSON and each pair matches the RAGAS schema.
