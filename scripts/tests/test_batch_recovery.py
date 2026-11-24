@@ -371,6 +371,69 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(list(self.cols.items), ['Corpus'])
         self.assertFalse(list(recovery._root().glob('*.json')))
 
+    # #312: a re-chunk's reader is staged one part at a time.
+    def source_reader(self, files):
+        """A real re-chunk reader over retained files of a collection of their own."""
+        from services import sources, splitter
+        for name, data in files:
+            sources.store('Retained', name, data, replace=True)
+        documents = sources.load_index('Retained')['documents']
+        return tuning._SourceChunks('Retained', documents, {name for name, _ in files},
+                                    splitter.Settings('fixed', 1000, 0, 0.85, 0))
+
+    def staging_inserts(self):
+        inserts = []
+        real = wc._insert_chunks_sync
+
+        def insert(name, chunks):
+            inserts.append((name, len(chunks)))
+            return real(name, chunks)
+        return inserts, patch.object(wc, '_insert_chunks_sync', side_effect=insert)
+
+    def test_a_reader_is_staged_one_part_at_a_time(self):
+        reader = self.source_reader([(f'f{i}.jsonl', ''.join(
+            json.dumps({'t': f'{i}-{n} ' + 'x' * 400}) + '\n' for n in range(size)).encode())
+            for i, size in enumerate((4, 9, 2))])
+        expected = [c['content'] for c in reader]
+        inserts, patched = self.staging_inserts()
+        staged = []
+        with patched:
+            written = tuning._rebuild('Corpus', reader, None, None, None, staged=staged.append)
+        sizes = [count for _, count in inserts]
+        self.assertEqual(len(inserts), 3)
+        self.assertTrue(all(name != 'Corpus' for name, _ in inserts), inserts)
+        self.assertEqual(staged, [sizes[0], sizes[0] + sizes[1], sum(sizes)])
+        self.assertEqual(written, len(expected))
+        self.assertEqual(sorted(r['properties']['content'] for r in self.cols.get('Corpus').rows.values()),
+                         sorted(expected))
+        self.assertEqual(list(self.cols.items), ['Corpus'])
+        self.assertFalse(list(recovery._root().glob('*.json')))
+
+    def test_a_reader_that_fails_mid_way_leaves_the_original(self):
+        bad = b'{"t": "x"}\n{bad\n'
+        # The reader goes by digest: pick a good file whose digest sorts first.
+        good = next(g for g in (b'{"t": "first %d"}\n' % n for n in range(1000))
+                    if hashlib.sha256(g).hexdigest() < hashlib.sha256(bad).hexdigest())
+        reader = self.source_reader([('a.jsonl', good), ('b.jsonl', bad)])
+        inserts, patched = self.staging_inserts()
+        with patched, self.assertRaisesRegex(ValueError, 'line 2 is not valid JSON'):
+            tuning._rebuild('Corpus', reader, None, None, None)
+        self.assertEqual(len(inserts), 1)  # a.jsonl was staged before b.jsonl failed
+        self.assertEqual(self.cols.get('Corpus').rows, {r['id']: r for r in self.original})
+        self.assertEqual(list(self.cols.items), ['Corpus'])
+        self.assertFalse(list(recovery._root().glob('*.json')))
+        self.assertFalse(list(Path(settings.upload_dir).glob('rechunk-*')))
+
+    def test_a_reader_with_no_chunks_leaves_the_original(self):
+        reader = self.source_reader([('empty.jsonl', b'{}\n')])
+        with self.assertRaises(importer.PackageError) as error:
+            tuning._rebuild('Corpus', reader, None, None, None)
+        self.assertEqual(error.exception.code, 'SOURCES_REQUIRED')
+        self.assertIn('produced no chunks', error.exception.message)
+        self.assertEqual(self.cols.get('Corpus').rows, {r['id']: r for r in self.original})
+        self.assertEqual(list(self.cols.items), ['Corpus'])
+        self.assertFalse(list(recovery._root().glob('*.json')))
+
     # #881: the recovery copy never reads through a link. A link entry in the
     # sources folder is copied as a link; a linked sources folder is refused.
     def plant_source_link(self):
