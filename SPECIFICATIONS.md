@@ -4356,6 +4356,16 @@ now lives once, in `api/services/ingest_config.py`.
       `finished_at`; `test_finished_at_boundary_of_the_window` lists one exactly 24 hours before the
       request and drops one a second earlier.*
 
+- [x] The ingest time estimate (#614, #896, §3.1.3, "Time estimate"): while an ingest job runs, its
+      status gives each file's chunk counts once it is chunked, the instance's rate measured from
+      stored parts and saved across restarts (a new job uses it from its start), and the time left
+      per file and for the job, a minimum while files not reached, a file being parsed, or a split
+      file's later parts remain; the rate and times are `null` ("no estimate yet") only before the
+      instance's first measurement, and a job that isn't running has no rate or times.
+      *`scripts/tests/test_ingest_estimate.py` (API image, no network, run by `02_ingest.sh`): the
+      rate store across a restart, the time left a running job's status computes, and the per-file
+      progress the job loop records.*
+
 - [x] A write with any record left to `text2vec-ollama` uses `fixed_size(batch_size=10, concurrent_requests=1)` and one whose records all carry vectors `dynamic()`; only objects whose embedding timed out in Weaviate are sent again, at most twice; no other failure is retried; a chunk sent again counts once in `chunks_submitted` (#613, #721).
       *`scripts/tests/test_embed_batching.py` (13 tests, run by `02_ingest.sh` in the API image) checks
       both batch kinds, the resend, its limit, the write counts and rollback, that no other failure is
