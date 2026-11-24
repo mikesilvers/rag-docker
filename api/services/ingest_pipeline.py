@@ -32,13 +32,16 @@ SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".csv", ".json", ".jsonl
 # MAX_GZIP_DECOMPRESSED_BYTES. The bounds are per file, so several gzipped
 # members could each reach them: a ZIP's members, their gzip output included,
 # are bounded together by settings.max_zip_expanded_bytes (#298). A directly
-# uploaded .jsonl.gz is bounded by its own limit alone.
+# uploaded .jsonl.gz is bounded by its own limit alone: 2 GiB, the same as the
+# ZIP expansion cap (#312). It is read a line at a time and stored part by part
+# (#621), so the bound limits work, not memory.
 GZIP_JSON_SUFFIX = ".json.gz"
 GZIP_JSONL_SUFFIX = ".jsonl.gz"
-MAX_GZIP_DECOMPRESSED_BYTES = 512 * 1024 * 1024
+MAX_GZIP_DECOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024
 # The most of one JSON Lines line that is read (#291). A line is parsed whole,
 # so this bounds the memory one record can take (a 10 MB line of small numbers
-# parses to about 230 MB). Files beyond the per-file limits are #312's subject.
+# parses to about 230 MB). A file over the per-file limits is split into parts
+# (#621).
 # It counts neither the line ending (`\n` or `\r\n`) nor line 1's byte-order
 # mark, so a CRLF file and an LF file behave the same (#314).
 MAX_JSONL_LINE_BYTES = 10_000_000
@@ -117,11 +120,19 @@ def _save_upload(src, dest: Path) -> None:
         shutil.copyfileobj(src, fh, length=1024 * 1024)
 
 
+def _size_text(size: int) -> str:
+    """A byte bound as the messages give it: `2 GiB` for a whole number of GiB,
+    otherwise in whole MB (`512 MB`)."""
+    gib = 1024 * 1024 * 1024
+    if size >= gib and size % gib == 0:
+        return f"{size // gib} GiB"
+    return f"{size // (1024 * 1024)} MB"
+
+
 def _gzip_too_large() -> ValueError:
     return ValueError(
-        f"decompresses to more than "
-        f"{MAX_GZIP_DECOMPRESSED_BYTES // (1024 * 1024)} MB, the limit for "
-        f"one compressed file; nothing from it was stored")
+        f"decompresses to more than {_size_text(MAX_GZIP_DECOMPRESSED_BYTES)}, "
+        f"the limit for one compressed file; nothing from it was stored")
 
 
 def _gunzip_bounded(src: Path, dest: Path) -> None:
@@ -186,11 +197,15 @@ MAX_JSON_INPUT_BYTES = 30_000_000
 # allows millions of tiny ones (`[[1],[1],...]`, 3 characters each with the
 # blank line between records). A file of more than this many records averages
 # under 8 characters a record; any other passes the text bound first.
-# It also bounds a JSON Lines file's lines (#314): every line counts, blank ones
-# and records with no text included, since those spend none of the text bound.
 # An element-schema file's items count too (#321): partition_json builds each
 # into an element, whatever its text.
 MAX_JSON_RECORDS = 1_000_000
+# The most lines one JSON Lines file may hold (#314): every line counts, blank
+# ones and records with no text included, since those spend none of the text
+# bound. Raised from the JSON record cap by #312; JSON Lines is read a line at a
+# time and stored part by part (#621), so this bounds work, not memory. Other
+# file types keep MAX_JSON_RECORDS.
+MAX_JSONL_LINES = 10_000_000
 
 
 def _json_input_too_large(verb: str) -> str:
@@ -198,9 +213,11 @@ def _json_input_too_large(verb: str) -> str:
             f"split the file or convert it to JSON Lines")
 
 
-def _too_many_records() -> str:
-    # One message for the JSON record cap and the JSON Lines line cap (#330).
-    return (f"has more than {MAX_JSON_RECORDS:,} records, the most one file can hold; "
+def _too_many_records(cap: int | None = None) -> str:
+    # One message for the JSON record cap and the JSON Lines line cap (#330),
+    # each with its own number (#312). The default is read when called.
+    cap = MAX_JSON_RECORDS if cap is None else cap
+    return (f"has more than {cap:,} records, the most one file can hold; "
             f"split the file")
 
 
@@ -488,7 +505,7 @@ def _iter_jsonl_values(stream: Any) -> Iterator[tuple[int, bytes, str, Any]]:
 
     Read one line at a time, at most MAX_JSONL_LINE_BYTES of it besides its line
     ending and line 1's byte-order mark, and stopped at the first bad line, at
-    the line past MAX_JSON_RECORDS, or at a record whose text passes the
+    the line past MAX_JSONL_LINES, or at a record whose text passes the
     per-record limit (#621), so memory is bounded by one line and one record,
     never by the file's size, and work by the line count.
     """
@@ -500,9 +517,9 @@ def _iter_jsonl_values(stream: Any) -> Iterator[tuple[int, bytes, str, Any]]:
         if not raw:
             break
         number += 1
-        if number > MAX_JSON_RECORDS:
+        if number > MAX_JSONL_LINES:
             # Every line counts, so lines with no text can't run on to the gzip bound.
-            raise _JsonlTooLarge(_too_many_records())
+            raise _JsonlTooLarge(_too_many_records(MAX_JSONL_LINES))
         if raw.endswith(b"\r\n"):
             raw = raw[:-2]
         elif raw.endswith(b"\n"):
@@ -891,13 +908,14 @@ def _process_job_sync(
                 # chunked and stored. A file that fails any of those steps
                 # leaves no orphan source behind. replace=True releases the name
                 # from the version it replaces, so rechunk can't rebuild that.
+                # The file is passed by path and read in blocks, never whole (#312).
                 try:
                     # A gzipped file's bytes are gzip, whatever it decompresses to.
                     media_type, encoding = mimetypes.guess_type(name)
                     sources.store(
                         collection,
                         name,
-                        path.read_bytes(),
+                        path,
                         "application/gzip" if encoding else media_type,
                         replace=True,
                     )

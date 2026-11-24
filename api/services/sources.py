@@ -6,7 +6,9 @@ are copied here instead.
 
 Files are content-addressed: the SHA-256 of the raw bytes is the storage key, so
 re-ingesting the same document stores one copy and records the extra logical
-name. Storage is proportional to the corpus rather than to upload count.
+name. Storage is proportional to the corpus rather than to upload count. Ingest
+passes the file by path, and it is hashed and copied in blocks, never held whole
+in memory (#312).
 
 A logical name belongs to one digest at a time (#22): ingest stores with
 replace=True, so a name ingested with new content leaves the digest it had, and a
@@ -33,6 +35,7 @@ import shutil
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Union
 
 from config import settings
 
@@ -41,6 +44,8 @@ log = logging.getLogger(__name__)
 INDEX_NAME = "index.json"
 INDEX_VERSION = 1
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+# How much of a retained file is read at a time when it is passed by path (#312).
+_BLOCK = 1024 * 1024
 
 
 def validate_index(index: dict) -> dict:
@@ -176,10 +181,38 @@ def _drop_blobs(collection: str, digests: list[str]) -> None:
                       digest[:12], collection, exc)
 
 
+def _file_digest(path: Path) -> tuple[str, int]:
+    """The SHA-256 and byte count of a file, read in blocks (#312)."""
+    digest = hashlib.sha256()
+    size = 0
+    with open(path, "rb") as source:
+        for block in iter(lambda: source.read(_BLOCK), b""):
+            digest.update(block)
+            size += len(block)
+    return digest.hexdigest(), size
+
+
+def _copy_checked(path: Path, dest: Path, digest: str) -> None:
+    """Copy a file into dest in blocks, hashing what is written: if the file
+    changed since its digest was taken, the copy is refused rather than stored
+    under a digest that doesn't match its bytes (#312)."""
+    copied = hashlib.sha256()
+    with open(path, "rb") as source, open(dest, "wb") as output:
+        for block in iter(lambda: source.read(_BLOCK), b""):
+            copied.update(block)
+            output.write(block)
+    if copied.hexdigest() != digest:
+        raise ValueError("Retained source changed while it was being retained; "
+                         "nothing was retained")
+
+
 @telemetry.traced("rag.retain")
-def store(collection: str, filename: str, data: bytes, media_type: str | None = None,
-          *, replace: bool = False) -> str:
+def store(collection: str, filename: str, data: Union[bytes, str, os.PathLike],
+          media_type: str | None = None, *, replace: bool = False) -> str:
     """Retain one accepted upload. Returns its sha256.
+
+    `data` is the file's bytes, or its path: a path is hashed and copied in
+    blocks, so retaining a large file never holds it in memory (#312).
 
     With replace=True (ingest, #22) the filename is first released from every
     other digest, and digests left with no names are dropped. That happens even
@@ -190,7 +223,12 @@ def store(collection: str, filename: str, data: bytes, media_type: str | None = 
     before anything is written: an unreadable or invalid index raises
     ValueError and leaves the folder exactly as it was.
     """
-    digest = hashlib.sha256(data).hexdigest()
+    if isinstance(data, (bytes, bytearray)):
+        path = None
+        digest, size = hashlib.sha256(data).hexdigest(), len(data)
+    else:
+        path = Path(data)
+        digest, size = _file_digest(path)
     with _collection_lock(collection):
         target = collection_dir(collection) / digest
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -210,7 +248,10 @@ def store(collection: str, filename: str, data: bytes, media_type: str | None = 
                 tmp = _temporary(target)
                 try:
                     tmp.touch(exist_ok=False)     # created exclusively: never shared
-                    tmp.write_bytes(data)
+                    if path is None:
+                        tmp.write_bytes(data)
+                    else:
+                        _copy_checked(path, tmp, digest)
                     os.replace(tmp, target)
                 except BaseException:
                     try:
@@ -229,7 +270,7 @@ def store(collection: str, filename: str, data: bytes, media_type: str | None = 
         if entry is None:
             index["documents"][digest] = {
                 "filenames": [filename],
-                "size": len(data),
+                "size": size,
                 "media_type": media_type,
                 "first_seen": now,
                 "last_seen": now,
