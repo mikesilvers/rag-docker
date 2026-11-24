@@ -646,9 +646,10 @@ line-cap message and stores nothing.
 
 `scripts/tests/test_large_corpus.py` (#312) checks, with Weaviate mocked, that retention
 hashes and copies a file passed by path in blocks (its digest, size and bytes, a traced peak
-that doesn't grow with the file, replace, and a file that changes while it is copied
-publishing nothing), that a 48 MiB retained original goes through export and the import's
-source restore byte for byte in bounded memory, that the re-chunk reader gives the chunks a
+that doesn't grow with the file, replace, a file that changes while it is copied
+publishing nothing, and a `str` refused with `TypeError`, writing nothing (#893)), that a
+48 MiB retained original goes through export and the import's source restore byte for byte
+in bounded memory, that the re-chunk reader gives the chunks a
 re-chunk gave, reads a later file only when its part is asked for, keeps a flat traced peak
 over 10 and 40 files, refuses a missing blob before reading anything and keeps its messages,
 and that `chunks_total` follows staging. `02_ingest.sh` runs it in the API image; in full runs
@@ -656,7 +657,12 @@ it then ingests a `.jsonl.gz` of 9,000,005 lines (576 MB decompressed, about 1.7
 through the proxy, checks its retained original byte for byte in the API container,
 re-chunks it (`chunks_total` = `chunks_written` = the collection's count) and replaces it with
 a smaller file (`chunks_replaced` is the re-chunk's count; the index lists only the new
-original, the large blob removed).
+original, the large blob removed). That is #690's acceptance (a re-chunk of a collection larger
+than the API container's memory budget completes) shown by proxy, not a memory-limit test: the
+bound comes from the traced-memory tests above (the re-chunk reader's traced peak doesn't grow
+with the number of files), while the full-run corpus is 576 MB decompressed but almost all `{}`
+padding, so its re-chunk holds little text, and the API container has no memory limit in
+`docker-compose.yml`.
 `browser/ui_criteria.js` (suite 06) checks that the Import page's file picker accepts
 `.jsonl` and `.jsonl.gz` and that its hint names JSONL.
 
@@ -805,7 +811,8 @@ failed save keeps the previous index; an imported index is published with an ato
 the #882 follow-ups (a new blob is published and fsynced, an existing one isn't rewritten;
 `delete` drops the collection's lock and a later store makes a new one; the startup sweep
 removes only `*.<16 hex>.tmp` leftovers in collection folders, skips a linked folder, logs and
-keeps one it can't remove, and needs no sources folder), and
+keeps one it can't remove, logs a collection folder it can't list and sweeps the others (#892),
+and needs no sources folder), and
 rechunk coverage and per-(digest, name) rebuilds, rebuilding only names with stored chunks
 while a missing blob is still refused (#311), also for one blob under 50 names with one
 stored and a digest with none (only the stored name is parsed). A collection whose retained
