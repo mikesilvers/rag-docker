@@ -520,6 +520,7 @@ class RecoveryTests(unittest.TestCase):
         with self.assertRaises(ValueError) as error:
             self.rebuild()
         self.assertIn('is a link', str(error.exception))
+        self.assertIn("'Corpus' is a link", str(error.exception))  # #886: named relative to the sources root
         self.assertEqual(self.cols.get('Corpus').rows, {r['id']: r for r in self.original})
         self.assertEqual(list(self.cols.items), ['Corpus'])
         self.assertFalse(list(recovery._root().glob('*.json')))
@@ -543,6 +544,9 @@ class RecoveryTests(unittest.TestCase):
                     with self.assertRaises(ValueError) as error:
                         self.rebuild()
                     self.assertIn('is a link', str(error.exception))
+                    # #886: the error names the path under UPLOAD_DIR, not only the file.
+                    self.assertIn(f"'{kind}_configs/Corpus.json' is a link", str(error.exception))
+                    self.assertNotIn(str(self.root), str(error.exception))
                     self.assertEqual(self.cols.get('Corpus').rows, {r['id']: r for r in self.original})
                     self.assertEqual(list(self.cols.items), ['Corpus'])
                     self.assertFalse(list(recovery._root().glob('*.json')))
@@ -557,6 +561,23 @@ class RecoveryTests(unittest.TestCase):
                 finally:
                     config.unlink()
                     config.write_bytes(saved)
+
+    def test_dangling_session_link_is_refused_naming_its_path(self):
+        # #886: a gold-standard session that is a dangling link can't be read, so
+        # it counts as the collection's; the rebuild is refused before cutover and
+        # the error names the session's path under UPLOAD_DIR, never an absolute one.
+        session = Path(settings.upload_dir) / 'goldstandard_sessions' / 'gs_0123abcd.json'
+        session.unlink()
+        session.symlink_to(self.root / 'missing-session.json')
+        with self.assertRaises(ValueError) as error:
+            self.rebuild()
+        self.assertIn("Recovery source 'goldstandard_sessions/gs_0123abcd.json' is a link", str(error.exception))
+        self.assertNotIn(str(self.root), str(error.exception))
+        self.assertEqual(self.cols.get('Corpus').rows, {r['id']: r for r in self.original})
+        self.assertEqual(list(self.cols.items), ['Corpus'])
+        self.assertFalse(list(recovery._root().glob('*.json')))
+        self.assertEqual([p.name for p in Path(settings.sources_dir).iterdir()], ['Corpus'])
+        self.assertTrue(session.is_symlink())
 
     def test_dangling_source_link_is_copied_as_a_link(self):
         # #881: copytree(symlinks=True) keeps a dangling link entry as a link
