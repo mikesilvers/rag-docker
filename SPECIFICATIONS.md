@@ -949,7 +949,18 @@ GET /ingest/job/{job_id}
   "chunks_replaced": 0,
   "errors": [],
   "skipped": [],
-  "split": []
+  "split": [],
+  "file_progress": [
+    {"file": "a.pdf", "chunks": 142, "chunks_stored": 142, "characters": 131200,
+     "characters_stored": 131200, "chunked": true, "failed": false, "seconds_left": 0.0},
+    {"file": "b.jsonl", "chunks": 9800, "chunks_stored": 0, "characters": 9620000,
+     "characters_stored": 0, "chunked": false, "failed": false, "seconds_left": 7400.0}
+  ],
+  "file_progress_omitted": 0,
+  "files_not_chunked": 1,
+  "rate_characters_per_second": 1300.0,
+  "seconds_left": 7400.0,
+  "seconds_left_is_minimum": true
 }
 ```
 
@@ -971,6 +982,31 @@ entry per such file that completed, in order: `<file>: split into N parts, store
 '<name> (part 1)' to '<name> (part N)'`, `<file>` as in `errors` and `<name>` its logical
 name. A split file is not a failure: it counts once in `files_completed`. Job records written
 before the field existed read back with `[]`.
+
+**Time estimate (#614).** While a job runs, the status says how long the rest will take on
+this machine. `file_progress` has one entry per file the job has started chunking, in order:
+`file` as in `errors`, the chunks made from it so far and the characters of those chunks
+(`chunks`, `characters`), how many of them are stored (`chunks_stored`,
+`characters_stored`), `chunked` (`true` once the whole file is chunked: at once for a file
+stored whole, and for a file split into parts (§5.1.1) only after its last part) and
+`failed`. The record keeps the newest 100 entries; `file_progress_omitted` counts the earlier
+ones. The rate is measured from real ingests only: each stored part (a file stored whole is
+one part) is a measurement of the characters of its chunks over the seconds its store took,
+embedding and the insert check included; a failed store is not one. The instance keeps its
+last 20 measurements in `{UPLOAD_DIR}/ingest-rate.json` (counts and times only), so a restart
+keeps the rate, and `rate_characters_per_second` is their characters over their seconds.
+Each entry's `seconds_left` is its characters not yet stored over the rate; for the file
+whose part is being stored it counts down by the time that store has been running, never
+below 0, and a failed file's is 0. The job's `seconds_left` is their sum: it counts only work
+already chunked. `files_not_chunked` is how many files the job hasn't reached, and
+`seconds_left_is_minimum` is `true` while any such file, or any unfinished split file's later
+parts, remain, so the job's time left is then a minimum. Before the instance's first
+measurement the rate and every `seconds_left` are `null` (the Import page says "No estimate
+yet"); there is no default rate. A job that isn't `running` has `null` rate and times and
+`seconds_left_is_minimum` `false`; its `file_progress` counts stay. Job records written before
+these fields existed read back with `file_progress: []`, `file_progress_omitted: 0` and the
+other estimate fields `null`/`false`. `GET /ingest/jobs` entries carry `file_progress` as
+recorded, without the computed times.
 
 `status` values: `"queued"`, `"running"`, `"completed"`, `"partial"` (some files failed),
 `"failed"`.
