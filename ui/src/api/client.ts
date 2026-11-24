@@ -249,6 +249,14 @@ export interface Group { name: string; created_at: string; users: string[]; serv
 export interface CreateCollectionBody {
   name: string; index_type: string; distance_metric: string; hnsw_config: { efConstruction: number; maxConnections: number; ef: number }
 }
+// One file of an ingest job, for its time estimate (#614).
+export interface FileProgress {
+  file: string; chunks: number; chunks_stored: number; characters: number; characters_stored: number
+  // False while a split file may still have more parts.
+  chunked: boolean; failed: boolean
+  // Null when no rate has been measured yet, and whenever the job isn't running.
+  seconds_left?: number | null
+}
 export interface JobStatus {
   job_id: string; status: string; files_total: number; files_completed: number; files_failed: number; chunks_stored: number; errors: string[]
   // Files that could not be parsed at all, or that a later file with the same
@@ -262,6 +270,16 @@ export interface JobStatus {
   // written before the fields existed. chunks_stored counts the checked ones.
   chunks_submitted?: number | null
   chunks_accepted?: number | null
+  // The time estimate (#614): each file's chunk count once it is chunked (the
+  // newest 100; file_progress_omitted counts the rest), the instance's measured
+  // rate and the time left, null until a part has been measured and whenever the
+  // job isn't running. The job's time left counts only work already chunked.
+  file_progress?: FileProgress[]
+  file_progress_omitted?: number
+  files_not_chunked?: number | null
+  rate_characters_per_second?: number | null
+  seconds_left?: number | null
+  seconds_left_is_minimum?: boolean
 }
 export interface IngestConfig {
   collection: string; chunking_strategy: string; chunk_size: number; chunk_overlap: number; similarity_threshold: number | null; min_chunk_size: number; is_default: boolean
