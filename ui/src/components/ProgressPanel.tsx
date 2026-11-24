@@ -10,11 +10,16 @@ function formatDuration(seconds: number): string {
   return rest ? `${hours} h ${rest} min` : `${hours} h`
 }
 
+// "about 5 min left", but "under a minute left" without "about" (#896).
+function timeLeft(seconds: number): string {
+  return seconds < 60 ? 'under a minute left' : `about ${formatDuration(seconds)} left`
+}
+
 function fileState(f: FileProgress, running: boolean): string {
   if (f.failed) return 'failed'
   const stored = `${f.chunks_stored.toLocaleString()} stored`
   if (f.chunked && f.chunks_stored >= f.chunks) return `${stored} · done`
-  if (running && typeof f.seconds_left === 'number') return `${stored} · about ${formatDuration(f.seconds_left)} left`
+  if (running && typeof f.seconds_left === 'number') return `${stored} · ${timeLeft(f.seconds_left)}`
   return stored
 }
 
@@ -58,7 +63,7 @@ export default function ProgressPanel({ job }: { job: JobStatus }) {
                 ? `At least ${formatDuration(left)} left (${notChunked > 0
                     ? `${notChunked} file${notChunked === 1 ? '' : 's'} not chunked yet`
                     : 'more parts may follow'})`
-                : `About ${formatDuration(left)} left`}
+                : left < 60 ? 'Under a minute left' : `About ${formatDuration(left)} left`}
             </p>
           )}
         </div>

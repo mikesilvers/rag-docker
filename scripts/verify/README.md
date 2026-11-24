@@ -676,8 +676,8 @@ On the stack, `02_ingest.sh` then checks that the six-type job's finished status
 file's chunk and character counts, all stored, with no rate or time left, and that the real
 store left valid measurements in the API's `UPLOAD_DIR/embedding-rate.json`.
 `browser/ui_criteria.js` (suite 06) stubs job responses to check the Import page's progress
-panel: "No estimate yet" before a measurement, the rate and "About ... left", "At least ...
-left" for files not chunked yet and for a split file with more parts, and a finished job's
+panel: "No estimate yet" before a measurement, the rate and "About ... left" ("Under a minute
+left" without "about", #896), "At least ... left" for files not chunked yet and for a split file with more parts, and a finished job's
 per-file counts (failed, done, earlier files not shown) with no estimate.
 `browser/ui_criteria.js` (suite 06) checks that the Import page's file picker accepts
 `.jsonl` and `.jsonl.gz` and that its hint names JSONL.

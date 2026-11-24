@@ -25289,11 +25289,16 @@ function formatDuration(seconds: number): string {
   return rest ? `${hours} h ${rest} min` : `${hours} h`
 }
 
+// "about 5 min left", but "under a minute left" without "about" (#896).
+function timeLeft(seconds: number): string {
+  return seconds < 60 ? 'under a minute left' : `about ${formatDuration(seconds)} left`
+}
+
 function fileState(f: FileProgress, running: boolean): string {
   if (f.failed) return 'failed'
   const stored = `${f.chunks_stored.toLocaleString()} stored`
   if (f.chunked && f.chunks_stored >= f.chunks) return `${stored} · done`
-  if (running && typeof f.seconds_left === 'number') return `${stored} · about ${formatDuration(f.seconds_left)} left`
+  if (running && typeof f.seconds_left === 'number') return `${stored} · ${timeLeft(f.seconds_left)}`
   return stored
 }
 
@@ -25337,7 +25342,7 @@ export default function ProgressPanel({ job }: { job: JobStatus }) {
                 ? `At least ${formatDuration(left)} left (${notChunked > 0
                     ? `${notChunked} file${notChunked === 1 ? '' : 's'} not chunked yet`
                     : 'more parts may follow'})`
-                : `About ${formatDuration(left)} left`}
+                : left < 60 ? 'Under a minute left' : `About ${formatDuration(left)} left`}
             </p>
           )}
         </div>
@@ -30518,8 +30523,8 @@ On the stack, `02_ingest.sh` then checks that the six-type job's finished status
 file's chunk and character counts, all stored, with no rate or time left, and that the real
 store left valid measurements in the API's `UPLOAD_DIR/embedding-rate.json`.
 `browser/ui_criteria.js` (suite 06) stubs job responses to check the Import page's progress
-panel: "No estimate yet" before a measurement, the rate and "About ... left", "At least ...
-left" for files not chunked yet and for a split file with more parts, and a finished job's
+panel: "No estimate yet" before a measurement, the rate and "About ... left" ("Under a minute
+left" without "about", #896), "At least ... left" for files not chunked yet and for a split file with more parts, and a finished job's
 per-file counts (failed, done, earlier files not shown) with no estimate.
 `browser/ui_criteria.js` (suite 06) checks that the Import page's file picker accepts
 `.jsonl` and `.jsonl.gz` and that its hint names JSONL.
@@ -54526,7 +54531,14 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
       ['a split file with more parts', { status: 'running', files_total: 1, files_completed: 0, files_failed: 0, chunks_stored: 40,
         file_progress: [fp('big.jsonl', 50, 40, { chunked: false, seconds_left: 30 })], files_not_chunked: 0,
         rate_characters_per_second: 500, seconds_left: 30, seconds_left_is_minimum: true },
-        ['At least under a minute left (more parts may follow)', '50 chunks so far · 40 stored · about under a minute left'], ['No estimate yet']],
+        ['At least under a minute left (more parts may follow)', '50 chunks so far · 40 stored · under a minute left'],
+        ['No estimate yet', 'about under a minute']],
+      // Under a minute reads without "about" (#896).
+      ['under a minute left', { status: 'running', files_total: 1, files_completed: 0, files_failed: 0, chunks_stored: 10,
+        file_progress: [fp('a.txt', 12, 10, { seconds_left: 20 })], files_not_chunked: 0,
+        rate_characters_per_second: 500, seconds_left: 20, seconds_left_is_minimum: false },
+        ['Under a minute left', '12 chunks · 10 stored · under a minute left'],
+        ['About under a minute', 'about under a minute', 'At least ', 'No estimate yet']],
       ['a finished job', { status: 'partial', files_total: 5, files_completed: 4, files_failed: 1, chunks_stored: 3,
         file_progress: [fp('bad.txt', 4, 0, { chunked: false, failed: true }), fp('good.txt', 3, 3)], file_progress_omitted: 3,
         files_not_chunked: 0, rate_characters_per_second: null, seconds_left: null, seconds_left_is_minimum: false },
