@@ -20,6 +20,7 @@ class Batch:
     def __enter__(self): return self
     def add_object(self, properties, uuid=None, vector=None):
         self.pending.append({'id': str(uuid), 'vector': copy.deepcopy(vector), 'properties': copy.deepcopy(properties)})
+        self.owner.events.append(('add', self.name))
         if self.owner.mutate_arguments:
             properties['content'] = 'SDK argument mutation'; vector[0] = 999
     def __exit__(self, *exc):
@@ -37,9 +38,12 @@ class Collections:
         self.data = {'OwnedReindex': copy.deepcopy(initial)}; self.deleted = []; self.created = []; self.closed = []
         self.fail = lambda name: False; self.corrupt = lambda name: False
         self.change_source = self.mutate_arguments = False
+        self.events = []
     def get(self, name):
         def iterator(include_vector=False):
+            self.events.append(('walk', name))
             for record in self.data[name]:
+                self.events.append(('read', name))
                 yield SimpleNamespace(uuid=record['id'], properties=copy.deepcopy(record['properties']), vector={'default':copy.deepcopy(record['vector'])} if include_vector else None)
         return SimpleNamespace(iterator=iterator, batch=SimpleNamespace(dynamic=lambda: Batch(self, name), failed_objects=[]), aggregate=SimpleNamespace(over_all=lambda **kwargs: SimpleNamespace(total_count=len(self.data[name]))))
     def delete(self, name): self.deleted.append(name); del self.data[name]
@@ -142,12 +146,12 @@ class ReindexTests(unittest.TestCase):
         from concurrent.futures import ThreadPoolExecutor
         from services import ingest_pipeline as ingest
         parsed=threading.Event();release=threading.Event();snapshot=threading.Event();attempted=threading.Event()
-        original_read=tuning._existing_records
+        original_read=tuning._record_snapshot
         def read(name):snapshot.set();return original_read(name)
         def parse(path):parsed.set();assert release.wait(3);return 'Owned active upload',[]
         def insert(name,chunks):self.backend.data[name].append({'id':str(uuid.uuid4()),'vector':[.125,0.,-.25],'properties':chunks[0]})
         job={'status':'queued','chunks_stored':0,'files_completed':0,'files_failed':0,'files_total':1,'errors':[]}
-        with tempfile.TemporaryDirectory() as temp,patch.object(tuning,'_existing_records',side_effect=read),patch.object(ingest,'_jobs',{'owned_ingest':job}),patch.object(ingest,'_parse_file',side_effect=parse),patch.object(ingest,'do_chunk',return_value=['Owned active upload']),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=insert),patch.object(tuning.wc,'_source_has_chunks_sync',return_value=False),patch.object(ingest.sources,'store'),ThreadPoolExecutor() as pool:
+        with tempfile.TemporaryDirectory() as temp,patch.object(tuning,'_record_snapshot',side_effect=read),patch.object(ingest,'_jobs',{'owned_ingest':job}),patch.object(ingest,'_parse_file',side_effect=parse),patch.object(ingest,'do_chunk',return_value=['Owned active upload']),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=insert),patch.object(tuning.wc,'_source_has_chunks_sync',return_value=False),patch.object(ingest.sources,'store'),ThreadPoolExecutor() as pool:
             path=Path(temp)/'owned.txt';path.write_text('Owned active upload')
             upload=pool.submit(ingest._process_job_sync,'owned_ingest',[path],Path(temp),'OwnedReindex','fixed',150,0,.5,40)
             self.assertTrue(parsed.wait(2))
@@ -262,10 +266,76 @@ class ReindexTests(unittest.TestCase):
                 self.assertEqual(set(self.backend.data),{'OwnedReindex'})
     def test_reembed_retains_its_explicit_regeneration_path(self):
         def embed(name,props):
+            props=list(props)   # the re-embed reader streams; this fixture holds two
             self.backend.data[name]=[{'id':'49000000-0000-4000-8000-000000000100','vector':[4.,5.,6.],'properties':copy.deepcopy(props[0])},
                                      {'id':'49000000-0000-4000-8000-000000000101','vector':[4.,5.,6.],'properties':copy.deepcopy(props[1])}]
         self.embedding.side_effect=embed; job=self.run_job('reembed')
         self.assertEqual(job['status'],'completed'); self.embedding.assert_called_once(); self.stale.assert_called_once()
         self.assertNotEqual(self.backend.data['OwnedReindex'],self.original)
+    def test_reindex_copies_stream_without_holding_the_collection(self):
+        # #583: each copy pass adds its first record before its source walk ends.
+        self.original=[{'id':'49000000-0000-4000-8000-00000000002'+str(i),'vector':[0.125,float(i),-0.25],
+                        'properties':{'content':'Owned inert '+str(i),'chunk_index':i,'source_file':'owned.txt'}} for i in range(5)]
+        self.backend.data['OwnedReindex']=copy.deepcopy(self.original); job=self.run_job()
+        self.assertEqual(job['status'],'completed'); self.assertEqual(job['chunks_total'],5); self.assertEqual(job['chunks_written'],5)
+        self.assertEqual(self.backend.data['OwnedReindex'],self.original)
+        events=self.backend.events; stage='OwnedReindex__tuning_owned'
+        for source,target in (('OwnedReindex',stage),(stage,'OwnedReindex')):
+            with self.subTest(source=source,target=target):
+                first=events.index(('add',target))
+                walk=max(i for i in range(first) if events[i]==('walk',source))
+                self.assertEqual(events[walk+1:first],[('read',source)])
+    def test_reembed_reads_stored_chunks_lazily_on_every_pass(self):
+        # #583: re-embed hands _rebuild a reader that walks the collection on every pass.
+        with patch.object(tuning,'_rebuild',return_value=2) as rebuild: job=self.run_job('reembed')
+        self.assertEqual(job['status'],'completed'); self.assertEqual(job['chunks_total'],2)
+        chunks=rebuild.call_args.args[1]; self.assertIsInstance(chunks,tuning._StoredChunks); self.assertNotIsInstance(chunks,list)
+        for _ in range(2):
+            walks=self.backend.events.count(('walk','OwnedReindex'))
+            self.assertEqual(list(chunks),[record['properties'] for record in self.original])
+            self.assertEqual(self.backend.events.count(('walk','OwnedReindex')),walks+1)
+    def test_record_snapshot_is_removed_after_success_and_failure(self):
+        # #583: the disk-backed fingerprint snapshot never outlives its job.
+        real=tuning.batch_write.ExpectedRecords; paths=[]
+        class Recorded(real):
+            def __init__(self,*args,**kwargs):
+                super().__init__(*args,**kwargs); paths.append(self.path)
+        for fail in (False,True):
+            with self.subTest(fail=fail):
+                self.backend=Collections(self.original); paths.clear()
+                self.backend.fail=(lambda name:name=='OwnedReindex') if fail else (lambda name:False)
+                with patch.object(tuning.wc,'get_client',return_value=SimpleNamespace(collections=self.backend)),\
+                     patch.object(tuning.wc,'_create_collection_sync',side_effect=self.backend.create),\
+                     patch.object(tuning.batch_write,'ExpectedRecords',Recorded):
+                    job=self.run_job()
+                self.assertEqual(job['status'],'failed' if fail else 'completed'); self.assertTrue(paths)
+                self.assertFalse([path for path in paths if path.exists() or path.parent.exists()])
+    def test_duplicate_stored_uuid_keeps_its_refusal_message(self):
+        # #583: duplicates are refused by the snapshot's unique key, with the same message.
+        self.backend.data['OwnedReindex'].append(copy.deepcopy(self.original[0])); job=self.run_job()
+        self.assertEqual(job['status'],'failed'); self.assertEqual(job['error_code'],'TUNE_FAILED')
+        self.assertIn('Reindex received duplicate stored UUID '+self.original[0]['id'],job['error']); self.assertEqual(self.backend.created,[])
+    def test_post_cutover_failure_with_verified_original_marks_nothing(self):
+        # #583/#884: after cutover, the intact check compares the new collection with the
+        # original's snapshot; when it verifies, nothing is marked stale and no copy is kept.
+        class FailingProgress(dict):
+            def __setitem__(self,key,value):
+                if key=='chunks_written' and value: raise RuntimeError('Owned progress failure after cutover')
+                super().__setitem__(key,value)
+        tuning._jobs['owned']=FailingProgress(status='queued',chunks_written=0,notes=[])
+        tuning._run('owned','OwnedReindex','reindex',{'index_type':'flat','distance_metric':'dot'})
+        job=tuning._jobs['owned']
+        self.assertEqual(job['status'],'failed'); self.assertIn('Owned progress failure after cutover',job['error'])
+        self.assertIn('OwnedReindex',self.backend.deleted); self.assertEqual(self.backend.data['OwnedReindex'],self.original)
+        self.stale.assert_not_called(); self.assertEqual(set(self.backend.data),{'OwnedReindex'})
+    def test_final_copy_from_staging_is_checked_against_the_original_snapshot(self):
+        # #583: after cutover the copy is read from staging; a staging change after its
+        # check is caught against the original's snapshot, not against staging itself.
+        stage='OwnedReindex__tuning_owned'; begin=tuning.collection_recovery.begin_cutover
+        def corrupt_then_begin(owner):
+            self.backend.data[stage][0]['properties']['content']='Owned staging drift'; return begin(owner)
+        with patch.object(tuning.collection_recovery,'begin_cutover',side_effect=corrupt_then_begin): job=self.run_job()
+        self.assertEqual(job['status'],'failed'); self.assertEqual(job['chunks_written'],0)
+        self.assertIn('readback changed',job['error']); self.stale.assert_called_once()
 
 if __name__=='__main__': unittest.main()

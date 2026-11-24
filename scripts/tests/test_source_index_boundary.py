@@ -122,7 +122,7 @@ class SourceIndexBoundaryTests(unittest.TestCase):
                  patch.object(tuning, "_jobs", {"owned": {}}), \
                  patch.object(tuning.sources, "has_sources", side_effect=AssertionError("sources read")), \
                  patch.object(tuning, "_existing_chunks", return_value=[]), \
-                 patch.object(tuning, "_existing_records", return_value=[]), \
+                 patch.object(tuning, "_record_snapshot", return_value=[]), \
                  patch.object(tuning, "_rebuild", return_value=0), \
                  patch.object(tuning.goldstandard, "mark_stale", return_value=0):
                 tuning._run("owned", "Invalid", operation, {})

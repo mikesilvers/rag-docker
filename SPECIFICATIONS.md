@@ -2665,9 +2665,12 @@ sidecars are then kept across restarts and named in the job error
 the staging collection rather than regenerated, so the corpus is embedded once.
 
 A re-chunk parses and chunks every retained original and holds all of the new chunks in the
-API's memory until the rebuild has staged them; re-embedding and re-indexing likewise hold the
-whole collection. Split files can store up to ten times their own size (§5.1.1), so a very
-large collection can run the API container out of memory. Bounding this is tracked in #690.
+API's memory until the rebuild has staged them, and so does a re-embed with chunking parameters,
+which re-chunks first. Split files can store up to ten times their own size (§5.1.1), so a very
+large collection can run the API container out of memory; bounding this is tracked in #312.
+Re-embedding from the stored chunk text and re-indexing don't hold the collection: they read and
+copy it a page at a time, and a re-index checks its copies against fingerprints of the original
+kept on disk (#583, `RAG_EXPORT_SPECIFICATIONS.md` §7.4).
 
 Any operation that changes chunk identity marks the collection's gold-standard
 sessions `stale`. `/tune/reindex` does not, because chunk identity is unchanged.

@@ -212,7 +212,7 @@ class ValidityServiceTests(unittest.TestCase):
         job={'status':'queued'}
         with patch.dict(tuning._jobs,{'synthetic':job}), \
              patch.object(tuning.sources,'has_sources',return_value=False), \
-             patch.object(tuning,'_existing_records',return_value=[{'id':'00000000-0000-0000-0000-000000000001','vector':[0.1],'properties':{'content':'Inert'}}]), \
+             patch.object(tuning,'_record_snapshot',return_value=[{'id':'00000000-0000-0000-0000-000000000001','vector':[0.1],'properties':{'content':'Inert'}}]), \
              patch.object(tuning,'_rebuild',return_value=1) as rebuild, \
              patch.object(gs,'mark_stale') as mark:
             tuning._run('synthetic','ValidityFixture','reindex',{})

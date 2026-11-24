@@ -912,9 +912,10 @@ collection is later missing, since its sidecars may still be useful.
 Tuning writes `cutover_pending: true` on its recovery record, flushed, before it
 deletes its target, and creates the new target with the schema description
 `rag-tune:<operation-id>`, so startup compares only the instance that operation
-created. A failure the tuning job handles after cutover marks the sessions
-`stale` and records `stale` at once, so only a hard kill, a failed marking or a
-failed decision write leaves the check for startup (#263).
+created. A failure the tuning job handles after cutover that leaves the original
+unverified marks the sessions `stale` and records `stale` at once, so only a hard
+kill, a failed marking or a failed decision write leaves the check for startup; a
+reindex whose original verifies intact marks nothing (#263).
 
 The owner can export the named recovery collection, inspect its metadata snapshots,
 and intentionally recover or discard it. Automatic startup cleanup never discards
@@ -997,10 +998,20 @@ or when a step fails before the original is deleted. If marking gold-standard
 sessions stale fails at that point, the job fails `TUNE_FAILED`, says so and that
 the original collection is unchanged, and the retained copy is discarded. Tuning
 durably records its cutover intent before deleting the original (§6.5.1). A
-failure after cutover marks the sessions `stale` and records that decision, so a
-restart doesn't flag them again. If the cutover record itself can't be written,
-the job fails `TUNE_FAILED`, says so and that the original collection is
-unchanged, and the retained copy is discarded (#263).
+failure after cutover that leaves the original unverified marks the sessions
+`stale` and records that decision, so a restart doesn't flag them again. If the
+cutover record itself can't be written, the job fails `TUNE_FAILED`, says so and
+that the original collection is unchanged, and the retained copy is discarded
+(#263).
+
+Re-embedding from stored chunk text and re-indexing read the collection a page
+at a time and never hold it in memory (#583). Re-embedding streams the stored
+chunk text into staging. Re-indexing first records the original's UUIDs and
+property and float32 vector fingerprints in a disk-backed snapshot (§6.5), then
+copies records a page at a time, from the original to staging and, after
+cutover, from staging to the new collection; every readback check, including
+whether the original is intact after a failed cutover, compares against that
+snapshot.
 
 ### 7.5 Weaviate unreadable at a tune route
 
