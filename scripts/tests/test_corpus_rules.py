@@ -114,11 +114,15 @@ def expected():
     levels = language_split_levels()
     language_any = 2 + 2 * levels
     per_chunk_any = (size - overlap) // language_any
-    for name, value in (('expanded', expanded % GIB), ('exempt', exempt % MIB)):
+    gzip_cap = ingest_pipeline.MAX_GZIP_DECOMPRESSED_BYTES
+    for name, value in (('expanded', expanded % GIB), ('exempt', exempt % MIB),
+                        ('gzip', gzip_cap % GIB)):
         assert value == 0, f'{name} is no longer a whole number of GiB/MiB; reword the file'
     phrases = {
         f'{upload_mb} MB': [upload_mb],
+        # The ZIP expansion cap and, since #312, the .jsonl.gz cap.
         f'{expanded // GIB} GiB': [expanded // GIB],
+        f'{gzip_cap // GIB} GiB': [gzip_cap // GIB],
         f'{members:,} entries': [members],
         f'{ratio:,} times its compressed size': [ratio],
         f'{exempt // MIB} MiB': [exempt // MIB],
@@ -126,9 +130,8 @@ def expected():
                                  ingest_pipeline.MAX_JSON_TEXT_CHARACTERS],
         f'{chunks:,} chunks': [chunks, chunker.MAX_OVERLAP_WINDOWS],
         f'{ingest_pipeline.MAX_JSON_RECORDS:,} records': [ingest_pipeline.MAX_JSON_RECORDS],
+        f'{ingest_pipeline.MAX_JSONL_LINES:,} lines': [ingest_pipeline.MAX_JSONL_LINES],
         f'{ingest_pipeline.MAX_JSONL_LINE_BYTES:,} bytes': [ingest_pipeline.MAX_JSONL_LINE_BYTES],
-        f'{ingest_pipeline.MAX_GZIP_DECOMPRESSED_BYTES // MIB} MB':
-            [ingest_pipeline.MAX_GZIP_DECOMPRESSED_BYTES // MIB],
         f'{ingest_pipeline.MAX_JSON_INPUT_BYTES:,} bytes': [ingest_pipeline.MAX_JSON_INPUT_BYTES],
         f'{chunker.MAX_SEMANTIC_SENTENCES:,} sentences': [chunker.MAX_SEMANTIC_SENTENCES],
         f'{chunker.MAX_CHUNK_CHARACTERS:,} characters': [chunker.MAX_CHUNK_CHARACTERS],
@@ -170,7 +173,7 @@ def byte_limits():
     return [
         ('`.json`', f'{ingest_pipeline.MAX_JSON_INPUT_BYTES:,} bytes'),
         ('JSON Lines line', f'{ingest_pipeline.MAX_JSONL_LINE_BYTES:,} bytes'),
-        ('`.jsonl.gz`', f'{ingest_pipeline.MAX_GZIP_DECOMPRESSED_BYTES // MIB} MB'),
+        ('`.jsonl.gz`', f'{ingest_pipeline.MAX_GZIP_DECOMPRESSED_BYTES // GIB} GiB'),
     ]
 
 

@@ -346,10 +346,11 @@ class WorkerTests(unittest.TestCase):
         return sources.store
 
     def unreadable(self):
-        """Path.read_bytes failing, as only retention reads a file that way."""
-        def read_bytes(path):
-            raise OSError(f"cannot read {path.name}")
-        return patch.object(Path, "read_bytes", read_bytes)
+        """Retention's read of the uploaded file failing. Since #312 the file is
+        passed by path and read in blocks by sources._file_digest."""
+        def file_digest(path):
+            raise OSError(f"cannot read {Path(path).name}")
+        return patch.object(sources, "_file_digest", file_digest)
 
     def test_a_reupload_that_cant_be_read_releases_its_name_880(self):
         # #880: the read failed before sources.store ran, so the index kept the
@@ -1047,7 +1048,7 @@ class RechunkTests(unittest.TestCase):
         sources.store("Coll", "b/report.txt", b"beta text", replace=True)
         sources.store("Coll", "copy.txt", b"alpha text", replace=True)
         with self.stored(("a/report.txt", 0), ("b/report.txt", 0), ("copy.txt", 0)):
-            chunks = tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0)
+            chunks = list(tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0))
         got = sorted((c["source_file"], c["content"], c["source_type"]) for c in chunks)
         self.assertEqual(got, [("a/report.txt", "alpha text", "txt"),
                                ("b/report.txt", "beta text", "txt"),
@@ -1096,7 +1097,7 @@ class RechunkTests(unittest.TestCase):
         names = [f"n{i:02d}.txt" for i in range(12)]
         with self.stored(("kept.txt", 0), *[(name, 0) for name in reversed(names)]):
             with self.assertRaises(tuning.PackageError) as refused:
-                tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0)
+                list(tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0))
         self.assertEqual(refused.exception.code, "SOURCES_REQUIRED")
         self.assertEqual(refused.exception.detail, {
             "collection": "Coll", "uncovered_source_files": names[:10],
@@ -1111,7 +1112,7 @@ class RechunkTests(unittest.TestCase):
                 names = [f"n{i:02d}.txt" for i in range(count)]
                 with self.stored(("kept.txt", 0), *[(name, 0) for name in names]):
                     with self.assertRaises(tuning.PackageError) as refused:
-                        tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0)
+                        list(tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0))
                 self.assertEqual(refused.exception.detail["uncovered_source_files"], names[:10])
                 self.assertEqual(refused.exception.detail["uncovered_source_files_omitted"], omitted)
 
@@ -1145,7 +1146,7 @@ class RechunkTests(unittest.TestCase):
 
         real_copyfile = shutil.copyfile
         with self.stored(("kept.txt", 0)), patch.object(tuning.shutil, "copyfile", copyfile):
-            chunks = tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0)
+            chunks = list(tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0))
         self.assertEqual([(c["source_file"], c["content"]) for c in chunks],
                          [("kept.txt", "shared text")])
         self.assertEqual(copies, ["kept.txt"])
@@ -1157,7 +1158,7 @@ class RechunkTests(unittest.TestCase):
         digest = sources.store("Coll", "ghost.txt", b"ghost", replace=True)
         sources.blob_path("Coll", digest).unlink()
         with self.stored(("kept.txt", 0)), self.assertRaises(tuning.PackageError) as caught:
-            tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0)
+            list(tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0))
         self.assertEqual((caught.exception.code, caught.exception.detail.get("digest")),
                          ("SOURCES_REQUIRED", digest))
 
@@ -1176,7 +1177,7 @@ class RechunkTests(unittest.TestCase):
             return real_parse(path)
 
         with self.stored(("n07.txt", 0)), patch.object(tuning, "_parse_file", parse):
-            chunks = tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0)
+            chunks = list(tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0))
         self.assertEqual(parsed, ["n07.txt"])
         self.assertEqual([(c["source_file"], c["content"]) for c in chunks],
                          [("n07.txt", "one blob")])
@@ -1194,7 +1195,7 @@ class RechunkTests(unittest.TestCase):
         copies = []
         with self.stored(), patch.object(tuning.shutil, "copyfile", lambda s, d, *a, **k: copies.append(d)), \
                 self.assertRaises(tuning.PackageError) as caught:
-            tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0)
+            list(tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0))
         self.assertEqual((caught.exception.code, caught.exception.message, caught.exception.detail),
                          ("SOURCES_REQUIRED", self.NOTHING_TO_REBUILD, {"collection": "Coll"}))
         self.assertEqual(copies, [])

@@ -80,6 +80,7 @@ class OverlapTests(unittest.TestCase):
             digest = hashlib.sha256(records).hexdigest()
             (src_dir / digest).write_bytes(records)
             job_id = 'tune-budget-test'
+            built = []
             tuning._jobs[job_id] = {'job_id': job_id}
             params = {'chunking': {'strategy': 'overlap', 'chunk_size': 1000,
                                     'chunk_overlap': 800, 'similarity_threshold': 0.85,
@@ -89,7 +90,8 @@ class OverlapTests(unittest.TestCase):
                  patch.object(tuning.sources, 'load_index',
                                return_value={'documents': {digest: {'filenames': ['big.jsonl']}}}), \
                  patch.object(tuning.sources, 'collection_dir', return_value=src_dir), \
-                 patch.object(tuning, '_rebuild', return_value=0) as rebuild, \
+                 patch.object(tuning, '_rebuild',
+                              side_effect=lambda c, props, *a, **k: built.append(list(props)) or 0) as rebuild, \
                  patch.object(tuning.wc, 'get_client') as get_client:
                 # big.jsonl is stored as one part, so the rebuild has something
                 # to rebuild (#311, #328): a part counts for its original.
@@ -98,7 +100,8 @@ class OverlapTests(unittest.TestCase):
                 tuning._run(job_id, 'ReviewTuneBudget', 'rechunk', params)
             tuning._jobs.pop(job_id)
             rebuild.assert_called_once()
-            properties = rebuild.call_args.args[1]
+            # The re-chunk reader is consumed inside the rebuild (#312).
+            properties = built[0]
             names = sorted({p['source_file'] for p in properties})
             self.assertGreaterEqual(len(names), 2, names)
             self.assertEqual(names, sorted(f'big.jsonl (part {n})' for n in range(1, len(names) + 1)))

@@ -30,7 +30,8 @@ LINE_LIMIT = ("is longer than 10,000,000 bytes, the most one line can hold; "
               "split the record across lines or files")
 
 
-RECORD_CAP = "has more than 1,000,000 records, the most one file can hold; split the file"
+# JSON Lines has its own line cap since #312; .json keeps 1,000,000 records.
+RECORD_CAP = "has more than 10,000,000 records, the most one file can hold; split the file"
 
 
 def too_large(line, limit="10,000,000"):
@@ -293,21 +294,32 @@ class BudgetTests(JsonlTestCase):
 
 
 class RecordCapTests(JsonlTestCase):
-    # ── #314: at most 1,000,000 lines, every line counted ────────────────────
+    # ── #314: at most 10,000,000 lines (#312), every line counted ────────────
     def capped(self, cap):
-        change = patch.object(ingest_pipeline, "MAX_JSON_RECORDS", cap)
+        change = patch.object(ingest_pipeline, "MAX_JSONL_LINES", cap)
         change.start()
         self.addCleanup(change.stop)
 
     def test_exactly_the_cap_parses_and_one_more_line_fails(self):
-        self.assertEqual(ingest_pipeline.MAX_JSON_RECORDS, 1_000_000)
-        lines = "{}\n" * 1_000_000
+        self.assertEqual(ingest_pipeline.MAX_JSONL_LINES, 10_000_000)
+        lines = "{}\n" * 10_000_000
         self.assertEqual(self.parse(lines), ("", []))
         self.assert_fails(lines + "\n", RECORD_CAP)
         self.assert_fails(lines + '{"a": 1}', RECORD_CAP)
 
     def test_a_jsonl_gz_over_the_cap_is_prefixed(self):
-        self.assert_fails("{}\n" * 1_000_001, "was decompressed, but it " + RECORD_CAP, "doc.jsonl.gz")
+        self.assert_fails("{}\n" * 10_000_001, "was decompressed, but it " + RECORD_CAP, "doc.jsonl.gz")
+
+    def test_the_json_record_cap_is_unchanged_and_apart(self):
+        # #312 raised only the JSON Lines cap: 1,000,001 lines read, and a .json
+        # file still keeps at most 1,000,000 records.
+        self.assertEqual(ingest_pipeline.MAX_JSON_RECORDS, 1_000_000)
+        self.assertEqual(self.parse("{}\n" * 1_000_001), ("", []))
+        path = self.write("[" + ",".join(["[1]"] * 1_000_001) + "]", "many.json")
+        with self.assertRaises(ValueError) as caught:
+            ingest_pipeline._parse_file(path)
+        self.assertEqual(str(caught.exception), "has more than 1,000,000 records, the most one "
+                                                "file can hold; split the file")
 
     def test_blank_lines_and_records_with_no_text_count(self):
         self.capped(3)
@@ -407,9 +419,11 @@ class GzipTests(JsonlTestCase):
                          "nothing from it was stored")
         self.assert_no_temp_left(["doc.jsonl.gz"])
 
-    def test_the_gzip_limit_message_is_unchanged(self):
+    def test_the_gzip_limit_is_2_gib_and_its_message_says_so(self):
+        # #312: the same as the ZIP expansion cap.
+        self.assertEqual(ingest_pipeline.MAX_GZIP_DECOMPRESSED_BYTES, 2 * 1024 ** 3)
         self.assertEqual(str(ingest_pipeline._gzip_too_large()),
-                         "decompresses to more than 512 MB, the limit for one compressed file; "
+                         "decompresses to more than 2 GiB, the limit for one compressed file; "
                          "nothing from it was stored")
 
 
@@ -429,7 +443,8 @@ class JobTests(JsonlTestCase):
         with patch.object(wc, "_insert_chunks_sync", lambda _c, chunks: stored.extend(chunks)), \
                 patch.object(wc, "_source_has_chunks_sync", return_value=False), \
                 patch.object(ingest_pipeline.sources, "store",
-                             lambda _c, name, data, *a, **k: retained.append((name, data))), \
+                             lambda _c, name, data, *a, **k: retained.append(
+                                 (name, Path(data).read_bytes()))), \
                 self.assertLogs("services.ingest_pipeline", "WARNING"):
             ingest_pipeline._process_job_sync(job_id, [good, bad], tmp, "Coll",
                                               "fixed", 1000, 0, 0.85, 0, labels)
@@ -502,7 +517,7 @@ class JobOutcomeTests(JsonlTestCase):
 
     def test_a_file_over_the_record_cap_fails_and_stores_nothing(self):
         job, stored, retained = self.run_job(
-            [("many.jsonl.gz", gzip.compress(b"{}\n" * 1_000_001)), ("ok.jsonl", b'{"a": 1}\n')])
+            [("many.jsonl.gz", gzip.compress(b"{}\n" * 10_000_001)), ("ok.jsonl", b'{"a": 1}\n')])
         self.assertEqual(job["status"], "partial")
         self.assertEqual(job["errors"], ["many.jsonl.gz: was decompressed, but it " + RECORD_CAP])
         self.assertEqual([c["source_file"] for c in stored], ["ok.jsonl"])
@@ -527,7 +542,7 @@ class RechunkTests(unittest.TestCase):
         coll = SimpleNamespace(iterator=lambda **_: iter(objects))
         with patch.object(wc, "get_client", return_value=SimpleNamespace(
                 collections=SimpleNamespace(get=lambda name: coll))):
-            chunks = tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0)
+            chunks = list(tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0))
         self.assertEqual(sorted((c["source_file"], c["source_type"], c["content"]) for c in chunks), [
             ("corpus/bills.jsonl.gz", "jsonl", "title: A\nmeta.author: Zoë\n\ntitle: B"),
             ("plain.jsonl", "jsonl", "k: v")])

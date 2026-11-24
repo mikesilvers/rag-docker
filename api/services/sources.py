@@ -6,7 +6,9 @@ are copied here instead.
 
 Files are content-addressed: the SHA-256 of the raw bytes is the storage key, so
 re-ingesting the same document stores one copy and records the extra logical
-name. Storage is proportional to the corpus rather than to upload count.
+name. Storage is proportional to the corpus rather than to upload count. Ingest
+passes the file by path, and it is hashed and copied in blocks, never held whole
+in memory (#312).
 
 A logical name belongs to one digest at a time (#22): ingest stores with
 replace=True, so a name ingested with new content leaves the digest it had, and a
@@ -33,6 +35,7 @@ import shutil
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Union
 
 from config import settings
 
@@ -41,6 +44,8 @@ log = logging.getLogger(__name__)
 INDEX_NAME = "index.json"
 INDEX_VERSION = 1
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+# How much of a retained file is read at a time when it is passed by path (#312).
+_BLOCK = 1024 * 1024
 
 
 def validate_index(index: dict) -> dict:
@@ -210,9 +215,9 @@ def _save_release(collection: str, index: dict, filename: str) -> None:
 
 
 def release(collection: str, filename: str) -> None:
-    """Release filename from every digest (#880): ingest calls this when the
-    re-uploaded file can't be read for retention, so the name never keeps
-    claiming the version whose chunks it replaced.
+    """Release filename from every digest (#880): store calls this when a
+    re-uploaded file passed by path can't be read for retention, so the name
+    never keeps claiming the version whose chunks it replaced.
 
     Holds the collection's lock (#52). An unreadable or invalid index raises
     ValueError, and nothing is written then or when no digest lists the name.
@@ -225,10 +230,51 @@ def release(collection: str, filename: str) -> None:
             _drop_blobs(collection, orphans)
 
 
+def _file_digest(path: Path) -> tuple[str, int]:
+    """The SHA-256 and byte count of a file, read in blocks (#312)."""
+    digest = hashlib.sha256()
+    size = 0
+    with open(path, "rb") as source:
+        for block in iter(lambda: source.read(_BLOCK), b""):
+            digest.update(block)
+            size += len(block)
+    return digest.hexdigest(), size
+
+
+def _publish_file(path: Path, source: Path, digest: str) -> None:
+    """_publish for a file passed by path (#312): copied in blocks into a
+    uniquely named temporary file, hashing what is written, fsynced (#882),
+    then os.replace. If the file changed since its digest was taken, nothing is
+    published rather than a blob that doesn't match its name. A failure before
+    the replace removes the temporary file and leaves path as it was."""
+    tmp = _temporary(path)
+    try:
+        copied = hashlib.sha256()
+        with open(source, "rb") as reader, open(tmp, "xb") as output:
+            for block in iter(lambda: reader.read(_BLOCK), b""):
+                copied.update(block)
+                output.write(block)
+            output.flush()
+            os.fsync(output.fileno())
+        if copied.hexdigest() != digest:
+            raise ValueError("Retained source changed while it was being retained; "
+                             "nothing was retained")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 @telemetry.traced("rag.retain")
-def store(collection: str, filename: str, data: bytes, media_type: str | None = None,
-          *, replace: bool = False) -> str:
+def store(collection: str, filename: str, data: Union[bytes, str, os.PathLike],
+          media_type: str | None = None, *, replace: bool = False) -> str:
     """Retain one accepted upload. Returns its sha256.
+
+    `data` is the file's bytes, or its path: a path is hashed and copied in
+    blocks, so retaining a large file never holds it in memory (#312).
 
     With replace=True (ingest, #22) the filename is first released from every
     other digest, and digests left with no names are dropped. That release is
@@ -241,7 +287,25 @@ def store(collection: str, filename: str, data: bytes, media_type: str | None = 
     before anything is written: an unreadable or invalid index raises
     ValueError and leaves the folder exactly as it was.
     """
-    digest = hashlib.sha256(data).hexdigest()
+    if isinstance(data, (bytes, bytearray)):
+        path = None
+        digest, size = hashlib.sha256(data).hexdigest(), len(data)
+    else:
+        path = Path(data)
+        try:
+            digest, size = _file_digest(path)
+        except OSError:
+            # The file can't be read for retention, but its new chunks are
+            # stored: the name is released all the same, so it never keeps
+            # claiming the version they replaced (#880). Best effort: a failed
+            # save is logged by _save_release, and an invalid index already
+            # refuses re-chunking.
+            if replace:
+                try:
+                    release(collection, filename)
+                except (OSError, ValueError):
+                    pass
+            raise
     with _collection_lock(collection):
         target = collection_dir(collection) / digest
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -255,15 +319,19 @@ def store(collection: str, filename: str, data: bytes, media_type: str | None = 
 
         if not target.exists():
             # Published like an index (#882): fsynced before the index that
-            # names it, so a power loss can't leave it empty or truncated.
-            _publish(target, data)
+            # names it, so a power loss can't leave it empty or truncated. A
+            # path is copied in blocks and checked against its digest (#312).
+            if path is None:
+                _publish(target, data)
+            else:
+                _publish_file(target, path, digest)
 
         now = datetime.now(timezone.utc).isoformat()
         entry = index["documents"].get(digest)
         if entry is None:
             index["documents"][digest] = {
                 "filenames": [filename],
-                "size": len(data),
+                "size": size,
                 "media_type": media_type,
                 "first_seen": now,
                 "last_seen": now,

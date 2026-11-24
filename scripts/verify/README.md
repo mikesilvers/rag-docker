@@ -630,8 +630,9 @@ the line ending nor line 1's byte-order mark (#314): it is checked at and one pa
 with `\n` and `\r\n` endings, with and without the mark, and a CRLF file gives the same
 errors as an LF one. Lines 1 to 5 bytes over the limit, at the edge of the read window, fail
 on their own line with `\n`, `\r\n` or no ending, with and without the mark. The
-1,000,000-line cap (#314) is checked at and one past its edge, with
-blank lines and lines with no text counting, and reading stops at the line past it. Gzip: the
+10,000,000-line cap (#314, #312) is checked at and one past its edge, with
+blank lines and lines with no text counting, and reading stops at the line past it; a
+`.json` file still keeps at most 1,000,000 records. Gzip: the
 same text as plain, the `was decompressed, but` prefix (line, line-limit, text-limit and cap
 errors), corrupt, truncated and over-size data. It also checks `source_type` `jsonl`, a job
 that stores nothing for a bad file beside a good one, job-level outcomes (#314: empty files
@@ -640,8 +641,22 @@ fails and stores nothing, `context_aware` keeps one chunk per record), and rechu
 retained `.jsonl.gz`. `02_ingest.sh` runs it in the API container, then ingests a direct
 `records.jsonl` and `records.jsonl.gz` through the proxy and reads their records back, checks
 that `bad.jsonl` (malformed line 2) fails naming the line and stores nothing, and that
-`jsonl_many_records.jsonl.gz` (1,000,001 `{}` lines, a few KB gzipped) fails with the
-record-cap message and stores nothing.
+`jsonl_many_records.jsonl.gz` (10,000,001 `{}` lines, about 30 KB gzipped) fails with the
+line-cap message and stores nothing.
+
+`scripts/tests/test_large_corpus.py` (#312) checks, with Weaviate mocked, that retention
+hashes and copies a file passed by path in blocks (its digest, size and bytes, a traced peak
+that doesn't grow with the file, replace, and a file that changes while it is copied
+publishing nothing), that a 48 MiB retained original goes through export and the import's
+source restore byte for byte in bounded memory, that the re-chunk reader gives the chunks a
+re-chunk gave, reads a later file only when its part is asked for, keeps a flat traced peak
+over 10 and 40 files, refuses a missing blob before reading anything and keeps its messages,
+and that `chunks_total` follows staging. `02_ingest.sh` runs it in the API image; in full runs
+it then ingests a `.jsonl.gz` of 9,000,005 lines (576 MB decompressed, about 1.7 MB gzipped)
+through the proxy, checks its retained original byte for byte in the API container,
+re-chunks it (`chunks_total` = `chunks_written` = the collection's count) and replaces it with
+a smaller file (`chunks_replaced` is the re-chunk's count; the index lists only the new
+original, the large blob removed).
 `browser/ui_criteria.js` (suite 06) checks that the Import page's file picker accepts
 `.jsonl` and `.jsonl.gz` and that its hint names JSONL.
 
@@ -978,7 +993,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `16_api_paths.sh` | ingest, query, metrics and health API paths (#399), run last by suite 01: `NO_SUPPORTED_FILES`, `JOB_NOT_FOUND`, schema rules, the proxy's `/api/` timeouts, `/metrics/latency`, a default query and its metric (LLM); opt-in restart and first-start checks |
 | `../tests/test_api_paths.py` | controlled ingest error, `/query` default, §6 prompt, query metric, retrieval-config file, `/metrics/latency` and `/health` probe regressions (#399), registered by `16_api_paths.sh` |
 | `../tests/test_ollama_entrypoint.py` | `ollama/entrypoint.sh` with stub commands, on the host: skip present models, timed pull, retries (#399), registered by `16_api_paths.sh` |
-| `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure |
+| `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure; in full runs, a large JSON Lines corpus ingested, retained, re-chunked and replaced (#312) |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `../tests/test_metrics.py` | controlled metrics-file regressions (#374): a failed write keeps the answer, the bound, crash-safe compaction, reload after a restart; registered by suite 03 |
 | `../tests/test_citation_score.py` | controlled citation-score regressions (#376): each metric's distance-to-score conversion, best first, missing values and unknown metrics as `null`, a failed metric read as the 503, the metric read on every query; registered by suite 03 |
@@ -1000,6 +1015,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_jobstore.py` | controlled job-record persistence, throttling, startup marking and retention regressions, registered by ingest |
 | `../tests/test_reingest.py` | controlled re-ingest replacement, exact-name selection (#622), same-name upload, macOS ZIP metadata, retention and rechunk-coverage regressions, registered by ingest |
 | `../tests/test_split_parts.py` | controlled regressions for files over the per-file limits stored as parts (#621): the reviewer's 13,000 records, files over 10,000,000 characters, family replacement, all or nothing, cuts, CSV, Markdown, encoding, `overlap` sizing, re-chunk and export links, registered by ingest |
+| `../tests/test_large_corpus.py` | controlled large-corpus regressions (#312): retention by path in blocks, a large retained original through export and import, the re-chunk reader staging one part at a time and its refusals, `chunks_total` following staging; registered by ingest in the API image with the repository mounted |
 | `split_parts.py` | helper for ingest (#621), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, files over the per-file limits are stored as parts, a smaller re-upload replaces every part, and a bad line after part 1 stores nothing; the collection is removed afterwards |
 | `exact_source.py` | helper for ingest (#622), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, replacing `report.pdf` deletes only its earlier chunks and `_source_has_chunks_sync` answers by exact name, with a few word matches (`page`), over 10,000 (`walk`), and over 10,000 earlier chunks of the name itself, deleted in batches of 10,000 (`bulk`); the collection is removed afterwards |
 | `../tests/test_collection_spelling.py` | controlled regressions for per-collection state keyed by the stored collection name (#372), registered by ingest |

@@ -514,11 +514,11 @@ class RechunkElementSchemaTests(unittest.TestCase):
                 patch.object(tuning.sources, "blob_path", lambda _c, _d: blob), \
                 patch.object(tuning, "_source_coverage", lambda _c, _d: ([], {"elements.json"})):
             blob.write_text(json.dumps(items[:3]))
-            out = tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0)
+            out = list(tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0))
             self.assertEqual([c["content"] for c in out], ["t0\nt1\nt2"])
             blob.write_text(json.dumps(items))
             with self.assertRaises(ValueError) as caught:
-                tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0)
+                list(tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0))
         self.assertEqual(str(caught.exception),
                          "has more than 3 records, the most one file can hold; split the file")
         self.assertEqual(sorted(p.name for p in root.iterdir()), [digest])

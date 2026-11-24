@@ -321,20 +321,20 @@ print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name
 check "a malformed line fails the file with its line number and stores nothing" $? \
   "status=$status error=$first_error stored=$stored"
 
-# A JSON Lines file holds at most 1,000,000 lines, records with no text
-# included (#314): a few KB of gzipped `{}` lines fails and stores nothing.
+# A JSON Lines file holds at most 10,000,000 lines, records with no text
+# included (#314, #312): under 100 KB of gzipped `{}` lines fails and stores nothing.
 drop_collection "$C"; make_collection "$C"
 ingest "$C" fixed 1000 0 "$FIX/jsonl_many_records.jsonl.gz"
 read -r status cap_error <<<"$(python3 -c "
 import json; d=json.load(open('/tmp/vfy_job.json'))
-want = ['jsonl_many_records.jsonl.gz: was decompressed, but it has more than 1,000,000 records, '
+want = ['jsonl_many_records.jsonl.gz: was decompressed, but it has more than 10,000,000 records, '
         'the most one file can hold; split the file']
 print(d['status'], 'yes' if d['errors'] == want else repr(d['errors']))")"
 stored=$(api_get "/collections" | python3 -c "
 import json,sys
 print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$C'][0])")
 [ "$status" = failed ] && [ "$cap_error" = yes ] && [ "$stored" = 0 ]
-check "a JSON Lines file over 1,000,000 lines fails with the record cap and stores nothing" $? \
+check "a JSON Lines file over 10,000,000 lines fails with the line cap and stores nothing" $? \
   "status=$status error=$cap_error stored=$stored"
 
 # ── upload size limit at the proxy ───────────────────────────────────────────
@@ -934,6 +934,106 @@ PY
 check "reviewer: re-uploading the name through the API replaces every part (#621)" $?
 drop_collection "$SPL"
 rm -rf "$SPLFIX" /tmp/vfy_split_job.json
+
+# ── a large JSON Lines corpus (#312) ─────────────────────────────────────────
+# Controlled cases: retention by path in blocks, the re-chunk reader staging one
+# part at a time, and a large retained original through export and import, in
+# bounded memory.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_large_corpus.py)
+check "large corpora: streamed retention, one-part re-chunk staging, export and import in bounded memory (#312)" $?
+# End to end on the stack (full runs only: reading the file twice takes minutes):
+# a .jsonl.gz over the old caps, 9,000,000 lines of 64 bytes (576,000,000 bytes
+# decompressed, over 512 MiB and under 2 GiB; about 1 MB gzipped) after five
+# records with text, is ingested, retained as uploaded, re-chunked and replaced.
+LC="${PREFIX}LargeCorpus"
+if [ "$SKIP_SLOW" = "1" ]; then
+  skip "#312: a large JSON Lines corpus ingests, is retained as uploaded, re-chunks and is replaced" \
+    "set RAG_SKIP_SLOW=0 to include it"
+else
+  LCFIX=$(mktemp -d)
+  python3 - "$LCFIX" <<'PY'
+import gzip, hashlib, json, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+(root / "big").mkdir()
+(root / "small").mkdir()
+text = "".join(json.dumps({"bill": "HR-%d" % i, "title": " ".join(["word%d" % i] * 60)}) + "\n"
+               for i in range(5)).encode()
+pad = b"{}" + b" " * 61 + b"\n"
+with open(root / "big" / "corpus.jsonl.gz", "wb") as raw:
+    with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as gz:
+        gz.write(text)
+        block = pad * 100_000
+        for _ in range(90):
+            gz.write(block)
+(root / "small" / "corpus.jsonl.gz").write_bytes(
+    gzip.compress(b'{"bill": "HR-9", "title": "a smaller version"}\n{"bill": "HR-10"}\n', mtime=0))
+for name in ("big", "small"):
+    data = (root / name / "corpus.jsonl.gz").read_bytes()
+    (root / name / "digest").write_text("%s %d\n" % (hashlib.sha256(data).hexdigest(), len(data)))
+PY
+  read -r big_digest big_size < "$LCFIX/big/digest"
+  read -r small_digest small_size < "$LCFIX/small/digest"
+  lc_count() {
+    api_get "/collections" | python3 -c "
+import json,sys
+print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$LC'][0])"
+  }
+  # The retained index lists exactly one digest under corpus.jsonl.gz, with its
+  # size, and the blob hashes to it; any earlier digest's blob is gone.
+  lc_retained() {
+    (cd "$REPO_ROOT" && docker compose exec -T api python - "$LC" "$1" "$2" "${3:-}" <<'PY'
+import hashlib, sys
+from services import sources
+collection, digest, size, earlier = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+documents = sources.load_index(collection)["documents"]
+entry = documents.get(digest) or {}
+h = hashlib.sha256()
+with open(sources.blob_path(collection, digest), "rb") as fh:
+    for block in iter(lambda: fh.read(1 << 20), b""):
+        h.update(block)
+gone = not earlier or not sources.blob_path(collection, earlier).exists()
+ok = (list(documents) == [digest] and entry.get("filenames") == ["corpus.jsonl.gz"]
+      and entry.get("size") == size and h.hexdigest() == digest and gone)
+print({"documents": {d[:12]: e.get("size") for d, e in documents.items()}, "earlier_gone": gone})
+sys.exit(0 if ok else 1)
+PY
+    )
+  }
+  drop_collection "$LC"; make_collection "$LC"
+  ingest "$LC" fixed 1000 0 "$LCFIX/big/corpus.jsonl.gz"
+  read -r status completed chunks <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], d['files_completed'], d['chunks_stored'])")"
+  [ "$status" = completed ] && [ "$completed" = 1 ] && [ "$chunks" -gt 0 ]
+  check "#312: a .jsonl.gz of 9,000,005 lines, 576 MB decompressed, ingests" $? \
+    "status=$status completed=$completed chunks=$chunks $(head -c 300 /tmp/vfy_job.json)"
+  lc_retained "$big_digest" "$big_size"
+  check "#312: its retained original is the uploaded file, byte for byte" $?
+  api_post "/tune/rechunk" "{\"collection\":\"$LC\",\"chunking_strategy\":\"fixed\",\"chunk_size\":300,\"min_chunk_size\":30}" > /tmp/vfy_lc_tj.json
+  lcjob=$(jfield "['job_id']" < /tmp/vfy_lc_tj.json)
+  lcstatus=$(wait_for_job "/tune/job/$lcjob" 1800)
+  api_get "/tune/job/$lcjob" > /tmp/vfy_lc_tj.json
+  read -r lc_total lc_written <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_lc_tj.json')); print(d['chunks_total'], d['chunks_written'])")"
+  lc_stored=$(lc_count)
+  [ "$lcstatus" = completed ] && [ "$lc_total" = "$lc_written" ] && [ "$lc_written" = "$lc_stored" ] \
+    && [ "$lc_written" -gt "$chunks" ]
+  check "#312: re-chunking it completes, chunks_total = chunks_written = the collection's count" $? \
+    "status=$lcstatus total=$lc_total written=$lc_written stored=$lc_stored before=$chunks"
+  ingest "$LC" fixed 1000 0 "$LCFIX/small/corpus.jsonl.gz"
+  read -r status replaced stored_now <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], d.get('chunks_replaced'), d['chunks_stored'])")"
+  lc_stored=$(lc_count)
+  [ "$status" = completed ] && [ "$replaced" = "$lc_written" ] && [ "$lc_stored" = "$stored_now" ]
+  check "#312: re-ingesting the name replaces every re-chunked chunk" $? \
+    "status=$status replaced=$replaced (want $lc_written) stored=$lc_stored (want $stored_now)"
+  lc_retained "$small_digest" "$small_size" "$big_digest"
+  check "#312: ...and its retained original, the large blob removed" $?
+  drop_collection "$LC"
+  rm -rf "$LCFIX" /tmp/vfy_lc_tj.json
+fi
 
 # ── job status transitions ───────────────────────────────────────────────────
 # `queued` is only observable when the executor is saturated, so this asserts

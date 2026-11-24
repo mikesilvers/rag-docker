@@ -3041,7 +3041,9 @@ are copied here instead.
 
 Files are content-addressed: the SHA-256 of the raw bytes is the storage key, so
 re-ingesting the same document stores one copy and records the extra logical
-name. Storage is proportional to the corpus rather than to upload count.
+name. Storage is proportional to the corpus rather than to upload count. Ingest
+passes the file by path, and it is hashed and copied in blocks, never held whole
+in memory (#312).
 
 A logical name belongs to one digest at a time (#22): ingest stores with
 replace=True, so a name ingested with new content leaves the digest it had, and a
@@ -3068,6 +3070,7 @@ import shutil
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Union
 
 from config import settings
 
@@ -3076,6 +3079,8 @@ log = logging.getLogger(__name__)
 INDEX_NAME = "index.json"
 INDEX_VERSION = 1
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+# How much of a retained file is read at a time when it is passed by path (#312).
+_BLOCK = 1024 * 1024
 
 
 def validate_index(index: dict) -> dict:
@@ -3245,9 +3250,9 @@ def _save_release(collection: str, index: dict, filename: str) -> None:
 
 
 def release(collection: str, filename: str) -> None:
-    """Release filename from every digest (#880): ingest calls this when the
-    re-uploaded file can't be read for retention, so the name never keeps
-    claiming the version whose chunks it replaced.
+    """Release filename from every digest (#880): store calls this when a
+    re-uploaded file passed by path can't be read for retention, so the name
+    never keeps claiming the version whose chunks it replaced.
 
     Holds the collection's lock (#52). An unreadable or invalid index raises
     ValueError, and nothing is written then or when no digest lists the name.
@@ -3260,10 +3265,51 @@ def release(collection: str, filename: str) -> None:
             _drop_blobs(collection, orphans)
 
 
+def _file_digest(path: Path) -> tuple[str, int]:
+    """The SHA-256 and byte count of a file, read in blocks (#312)."""
+    digest = hashlib.sha256()
+    size = 0
+    with open(path, "rb") as source:
+        for block in iter(lambda: source.read(_BLOCK), b""):
+            digest.update(block)
+            size += len(block)
+    return digest.hexdigest(), size
+
+
+def _publish_file(path: Path, source: Path, digest: str) -> None:
+    """_publish for a file passed by path (#312): copied in blocks into a
+    uniquely named temporary file, hashing what is written, fsynced (#882),
+    then os.replace. If the file changed since its digest was taken, nothing is
+    published rather than a blob that doesn't match its name. A failure before
+    the replace removes the temporary file and leaves path as it was."""
+    tmp = _temporary(path)
+    try:
+        copied = hashlib.sha256()
+        with open(source, "rb") as reader, open(tmp, "xb") as output:
+            for block in iter(lambda: reader.read(_BLOCK), b""):
+                copied.update(block)
+                output.write(block)
+            output.flush()
+            os.fsync(output.fileno())
+        if copied.hexdigest() != digest:
+            raise ValueError("Retained source changed while it was being retained; "
+                             "nothing was retained")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 @telemetry.traced("rag.retain")
-def store(collection: str, filename: str, data: bytes, media_type: str | None = None,
-          *, replace: bool = False) -> str:
+def store(collection: str, filename: str, data: Union[bytes, str, os.PathLike],
+          media_type: str | None = None, *, replace: bool = False) -> str:
     """Retain one accepted upload. Returns its sha256.
+
+    `data` is the file's bytes, or its path: a path is hashed and copied in
+    blocks, so retaining a large file never holds it in memory (#312).
 
     With replace=True (ingest, #22) the filename is first released from every
     other digest, and digests left with no names are dropped. That release is
@@ -3276,7 +3322,25 @@ def store(collection: str, filename: str, data: bytes, media_type: str | None = 
     before anything is written: an unreadable or invalid index raises
     ValueError and leaves the folder exactly as it was.
     """
-    digest = hashlib.sha256(data).hexdigest()
+    if isinstance(data, (bytes, bytearray)):
+        path = None
+        digest, size = hashlib.sha256(data).hexdigest(), len(data)
+    else:
+        path = Path(data)
+        try:
+            digest, size = _file_digest(path)
+        except OSError:
+            # The file can't be read for retention, but its new chunks are
+            # stored: the name is released all the same, so it never keeps
+            # claiming the version they replaced (#880). Best effort: a failed
+            # save is logged by _save_release, and an invalid index already
+            # refuses re-chunking.
+            if replace:
+                try:
+                    release(collection, filename)
+                except (OSError, ValueError):
+                    pass
+            raise
     with _collection_lock(collection):
         target = collection_dir(collection) / digest
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -3290,15 +3354,19 @@ def store(collection: str, filename: str, data: bytes, media_type: str | None = 
 
         if not target.exists():
             # Published like an index (#882): fsynced before the index that
-            # names it, so a power loss can't leave it empty or truncated.
-            _publish(target, data)
+            # names it, so a power loss can't leave it empty or truncated. A
+            # path is copied in blocks and checked against its digest (#312).
+            if path is None:
+                _publish(target, data)
+            else:
+                _publish_file(target, path, digest)
 
         now = datetime.now(timezone.utc).isoformat()
         entry = index["documents"].get(digest)
         if entry is None:
             index["documents"][digest] = {
                 "filenames": [filename],
-                "size": len(data),
+                "size": size,
                 "media_type": media_type,
                 "first_seen": now,
                 "last_seen": now,
@@ -6189,13 +6257,16 @@ SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".csv", ".json", ".jsonl
 # MAX_GZIP_DECOMPRESSED_BYTES. The bounds are per file, so several gzipped
 # members could each reach them: a ZIP's members, their gzip output included,
 # are bounded together by settings.max_zip_expanded_bytes (#298). A directly
-# uploaded .jsonl.gz is bounded by its own limit alone.
+# uploaded .jsonl.gz is bounded by its own limit alone: 2 GiB, the same as the
+# ZIP expansion cap (#312). It is read a line at a time and stored part by part
+# (#621), so the bound limits work, not memory.
 GZIP_JSON_SUFFIX = ".json.gz"
 GZIP_JSONL_SUFFIX = ".jsonl.gz"
-MAX_GZIP_DECOMPRESSED_BYTES = 512 * 1024 * 1024
+MAX_GZIP_DECOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024
 # The most of one JSON Lines line that is read (#291). A line is parsed whole,
 # so this bounds the memory one record can take (a 10 MB line of small numbers
-# parses to about 230 MB). Files beyond the per-file limits are #312's subject.
+# parses to about 230 MB). A file over the per-file limits is split into parts
+# (#621).
 # It counts neither the line ending (`\n` or `\r\n`) nor line 1's byte-order
 # mark, so a CRLF file and an LF file behave the same (#314).
 MAX_JSONL_LINE_BYTES = 10_000_000
@@ -6274,11 +6345,19 @@ def _save_upload(src, dest: Path) -> None:
         shutil.copyfileobj(src, fh, length=1024 * 1024)
 
 
+def _size_text(size: int) -> str:
+    """A byte bound as the messages give it: `2 GiB` for a whole number of GiB,
+    otherwise in whole MB (`512 MB`)."""
+    gib = 1024 * 1024 * 1024
+    if size >= gib and size % gib == 0:
+        return f"{size // gib} GiB"
+    return f"{size // (1024 * 1024)} MB"
+
+
 def _gzip_too_large() -> ValueError:
     return ValueError(
-        f"decompresses to more than "
-        f"{MAX_GZIP_DECOMPRESSED_BYTES // (1024 * 1024)} MB, the limit for "
-        f"one compressed file; nothing from it was stored")
+        f"decompresses to more than {_size_text(MAX_GZIP_DECOMPRESSED_BYTES)}, "
+        f"the limit for one compressed file; nothing from it was stored")
 
 
 def _gunzip_bounded(src: Path, dest: Path) -> None:
@@ -6343,11 +6422,15 @@ MAX_JSON_INPUT_BYTES = 30_000_000
 # allows millions of tiny ones (`[[1],[1],...]`, 3 characters each with the
 # blank line between records). A file of more than this many records averages
 # under 8 characters a record; any other passes the text bound first.
-# It also bounds a JSON Lines file's lines (#314): every line counts, blank ones
-# and records with no text included, since those spend none of the text bound.
 # An element-schema file's items count too (#321): partition_json builds each
 # into an element, whatever its text.
 MAX_JSON_RECORDS = 1_000_000
+# The most lines one JSON Lines file may hold (#314): every line counts, blank
+# ones and records with no text included, since those spend none of the text
+# bound. Raised from the JSON record cap by #312; JSON Lines is read a line at a
+# time and stored part by part (#621), so this bounds work, not memory. Other
+# file types keep MAX_JSON_RECORDS.
+MAX_JSONL_LINES = 10_000_000
 
 
 def _json_input_too_large(verb: str) -> str:
@@ -6355,9 +6438,11 @@ def _json_input_too_large(verb: str) -> str:
             f"split the file or convert it to JSON Lines")
 
 
-def _too_many_records() -> str:
-    # One message for the JSON record cap and the JSON Lines line cap (#330).
-    return (f"has more than {MAX_JSON_RECORDS:,} records, the most one file can hold; "
+def _too_many_records(cap: int | None = None) -> str:
+    # One message for the JSON record cap and the JSON Lines line cap (#330),
+    # each with its own number (#312). The default is read when called.
+    cap = MAX_JSON_RECORDS if cap is None else cap
+    return (f"has more than {cap:,} records, the most one file can hold; "
             f"split the file")
 
 
@@ -6645,7 +6730,7 @@ def _iter_jsonl_values(stream: Any) -> Iterator[tuple[int, bytes, str, Any]]:
 
     Read one line at a time, at most MAX_JSONL_LINE_BYTES of it besides its line
     ending and line 1's byte-order mark, and stopped at the first bad line, at
-    the line past MAX_JSON_RECORDS, or at a record whose text passes the
+    the line past MAX_JSONL_LINES, or at a record whose text passes the
     per-record limit (#621), so memory is bounded by one line and one record,
     never by the file's size, and work by the line count.
     """
@@ -6657,9 +6742,9 @@ def _iter_jsonl_values(stream: Any) -> Iterator[tuple[int, bytes, str, Any]]:
         if not raw:
             break
         number += 1
-        if number > MAX_JSON_RECORDS:
+        if number > MAX_JSONL_LINES:
             # Every line counts, so lines with no text can't run on to the gzip bound.
-            raise _JsonlTooLarge(_too_many_records())
+            raise _JsonlTooLarge(_too_many_records(MAX_JSONL_LINES))
         if raw.endswith(b"\r\n"):
             raw = raw[:-2]
         elif raw.endswith(b"\n"):
@@ -6954,23 +7039,6 @@ def _remove_earlier(collection: str, name: str, created_at: datetime,
         return getattr(exc, "deleted", 0), str(exc) or type(exc).__name__
 
 
-def _retention_bytes(collection: str, name: str, path: Path) -> bytes:
-    """The bytes to retain for name. When they can't be read, the name is
-    released all the same before the error is raised (#880): its new chunks are
-    stored, so it must not keep pointing at the version they replaced, which a
-    re-chunk would rebuild. Best effort: a failed save is logged by sources, and
-    an invalid index already refuses re-chunking. Only an argument of
-    sources.store, so a large file's bytes aren't held after it returns."""
-    try:
-        return path.read_bytes()
-    except OSError:
-        try:
-            sources.release(collection, name)
-        except (OSError, ValueError):
-            pass
-        raise
-
-
 @telemetry.traced("rag.ingest")
 @collection_writes.serialized("collection")
 def _process_job_sync(
@@ -7065,13 +7133,14 @@ def _process_job_sync(
                 # chunked and stored. A file that fails any of those steps
                 # leaves no orphan source behind. replace=True releases the name
                 # from the version it replaces, so rechunk can't rebuild that.
+                # The file is passed by path and read in blocks, never whole (#312).
                 try:
                     # A gzipped file's bytes are gzip, whatever it decompresses to.
                     media_type, encoding = mimetypes.guess_type(name)
                     sources.store(
                         collection,
                         name,
-                        _retention_bytes(collection, name, path),
+                        path,
                         "application/gzip" if encoding else media_type,
                         replace=True,
                     )
@@ -15928,6 +15997,8 @@ failed reindex cutovers flag them when exact identity cannot be verified.
 **Memory.** Re-embedding from stored chunk text and reindexing read and copy the
 collection a page at a time; a reindex verifies every copy against a disk-backed
 fingerprint snapshot of the original, never decoded records in memory (#583).
+Re-chunking, and re-embedding with chunking parameters, stage the new chunks one
+file part at a time as each retained original is read (#312).
 
 **Gold standard.** Anything that changes chunk identity marks every session for
 the collection `stale`, with a reason and a timestamp. Sessions are never
@@ -15937,6 +16008,7 @@ from __future__ import annotations
 from services import telemetry
 
 import asyncio
+import contextlib
 import copy
 import logging
 import math
@@ -16276,15 +16348,27 @@ def rechunk_refusal(collection: str) -> str | None:
     return RECHUNK_NOT_COVERED if uncovered else None
 
 
+def _missing_source(collection: str, digest: str) -> PackageError:
+    return PackageError(
+        "SOURCES_REQUIRED",
+        f"Retained source {digest[:12]} is missing from disk, so "
+        f"'{collection}' cannot be rebuilt from its originals.",
+        {"collection": collection, "digest": digest})
+
+
 @telemetry.traced("rag.chunk")
 def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                          chunk_overlap: int, similarity_threshold: float,
-                         min_chunk_size: int) -> list[dict]:
-    """Re-parse and re-chunk every retained original.
+                         min_chunk_size: int) -> "_SourceChunks":
+    """Check that every retained original can be re-parsed and re-chunked, and
+    return a reader that re-chunks them one file part at a time (#312).
 
-    Everything is parsed before the collection is touched: parsing is the
-    failure-prone step, and discovering a bad file after the rebuild has started
-    would cost the collection.
+    Every check that needs no parsing runs here, before any collection is
+    created. Parsing, the failure-prone step, runs as the rebuild consumes the
+    reader: each part is staged before the next is read, so the collection is
+    never held in memory, and a bad file found then fails the rebuild while the
+    live collection is still untouched (it is only replaced once staging
+    succeeds). `list(reader)` gives every chunk, in order.
     """
     index = sources.load_index(collection)
     documents = index.get("documents") or {}
@@ -16322,69 +16406,134 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
             {"collection": collection,
              "uncovered_source_files": uncovered[:_MAX_NAMED_UNCOVERED],
              "uncovered_source_files_omitted": max(0, len(uncovered) - _MAX_NAMED_UNCOVERED)})
+    # Every blob is checked before anything is parsed or staged (#312), in the
+    # order the reader reaches them.
+    for digest in sorted(documents):
+        if not sources.blob_path(collection, digest).is_file():
+            raise _missing_source(collection, digest)
+    return _SourceChunks(collection, documents, stored, splitter.Settings(
+        strategy, chunk_size, chunk_overlap, similarity_threshold, min_chunk_size))
 
-    out: list[dict] = []
-    now = datetime.now(timezone.utc).isoformat()
-    work = Path(tempfile.mkdtemp(prefix="rechunk-", dir=settings.upload_dir))
-    try:
-        slots = 0
-        for digest, entry in sorted(documents.items()):
-            blob = sources.blob_path(collection, digest)
-            if not blob.is_file():
-                raise PackageError(
-                    "SOURCES_REQUIRED",
-                    f"Retained source {digest[:12]} is missing from disk, so "
-                    f"'{collection}' cannot be rebuilt from its originals.",
-                    {"collection": collection, "digest": digest})
-            for filename in entry["filenames"]:
-                if filename not in stored:
-                    continue
-                # Parsers dispatch on the file extension, so the original name
-                # has to be restored before parsing; each pair is staged in a
-                # directory of its own, so a/report.txt and b/report.txt can't
-                # collide.
-                slots += 1
-                slot = work / str(slots)
-                slot.mkdir()
-                staged = slot / PurePosixPath(filename).name
-                shutil.copyfile(blob, staged)
 
-                source_type = source_type_of(staged)
-                # Split as ingest splits it (#621): a file over the per-file
-                # limits under the new settings is rebuilt as parts, however
-                # many parts it had before.
-                number = 0
-                split_settings = splitter.Settings(strategy, chunk_size, chunk_overlap,
-                                                   similarity_threshold, min_chunk_size)
-                try:
-                    for kind, chunks in splitter.split_file(staged, split_settings, _parse_file, do_chunk):
-                        number += 1
-                        source = filename if kind == "whole" else parts.part_name(filename, number)
-                        out.extend({
-                            "content": c,
-                            "source_file": source,
-                            "source_type": source_type,
-                            "chunk_index": i,
-                            "chunk_strategy": strategy,
-                            "chunk_size": chunk_size,
-                            "chunk_overlap": chunk_overlap,
-                            "created_at": now,
-                        } for i, c in enumerate(chunks))
-                except splitter.PartError as exc:
-                    raise ValueError(f"{filename}: part {exc.number}: {exc}") from exc.cause
-                except splitter.StoredTextTooLarge as exc:
-                    # The same cap as ingest (PR #630): the re-chunk fails whole,
-                    # before the collection is touched.
-                    raise ValueError(f"{filename}: {exc}") from exc
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
+class _SourceChunks:
+    """A re-chunk's new chunks, read from the retained originals one file part
+    at a time (#312).
 
-    if not out:
-        raise PackageError(
-            "SOURCES_REQUIRED",
-            f"Re-chunking '{collection}' produced no chunks; check the chunking "
-            "parameters.", {"collection": collection})
-    return out
+    `parts()` yields each part's chunks as a list, parsing the next part only
+    when asked, so whoever stages a part before asking for the next holds one
+    part (at most the per-file limits) whatever the collection's size. It reads
+    the originals once per call. Iterating gives every chunk in turn.
+
+    `start()` reads the first part ahead, before any collection is created, so
+    a re-chunk that produces no chunks, or whose first file can't be read,
+    fails before the rebuild starts, as it did when everything was parsed first;
+    the next `parts()` begins with that part. `close()` ends a started read.
+    """
+
+    def __init__(self, collection: str, documents: dict, stored: set[str],
+                 split_settings: splitter.Settings) -> None:
+        self.collection = collection
+        self.documents = documents
+        self.stored = stored
+        self.settings = split_settings
+        # One created_at for the whole rebuild.
+        self.now = datetime.now(timezone.utc).isoformat()
+        self._started = None
+        self._first = None
+
+    def start(self) -> None:
+        reading = self._read()
+        # An empty read raises the no-chunks error here (see _read).
+        self._first = next(reading)
+        self._started = reading
+
+    def close(self) -> None:
+        if self._started is not None:
+            self._started.close()
+            self._started = self._first = None
+
+    def parts(self):
+        if self._started is None:
+            yield from self._read()
+            return
+        reading, first = self._started, self._first
+        self._started = self._first = None
+        try:
+            yield first
+            del first
+            yield from reading
+        finally:
+            reading.close()
+
+    def _read(self):
+        collection, split_settings = self.collection, self.settings
+        produced = 0
+        work = Path(tempfile.mkdtemp(prefix="rechunk-", dir=settings.upload_dir))
+        try:
+            slots = 0
+            for digest, entry in sorted(self.documents.items()):
+                blob = sources.blob_path(collection, digest)
+                if not blob.is_file():
+                    # Removed since _chunks_from_sources checked it.
+                    raise _missing_source(collection, digest)
+                for filename in entry["filenames"]:
+                    if filename not in self.stored:
+                        continue
+                    # Parsers dispatch on the file extension, so the original name
+                    # has to be restored before parsing; each pair is staged in a
+                    # directory of its own, so a/report.txt and b/report.txt can't
+                    # collide.
+                    slots += 1
+                    slot = work / str(slots)
+                    slot.mkdir()
+                    staged = slot / PurePosixPath(filename).name
+                    shutil.copyfile(blob, staged)
+
+                    source_type = source_type_of(staged)
+                    # Split as ingest splits it (#621): a file over the per-file
+                    # limits under the new settings is rebuilt as parts, however
+                    # many parts it had before.
+                    number = 0
+                    try:
+                        for kind, chunks in splitter.split_file(staged, split_settings,
+                                                                _parse_file, do_chunk):
+                            number += 1
+                            source = filename if kind == "whole" else parts.part_name(filename, number)
+                            part = [{
+                                "content": c,
+                                "source_file": source,
+                                "source_type": source_type,
+                                "chunk_index": i,
+                                "chunk_strategy": split_settings.strategy,
+                                "chunk_size": split_settings.chunk_size,
+                                "chunk_overlap": split_settings.chunk_overlap,
+                                "created_at": self.now,
+                            } for i, c in enumerate(chunks)]
+                            del chunks
+                            if part:
+                                produced += len(part)
+                                yield part
+                            # Dropped before the next part is read, so only one
+                            # part is held at a time.
+                            del part
+                    except splitter.PartError as exc:
+                        raise ValueError(f"{filename}: part {exc.number}: {exc}") from exc.cause
+                    except splitter.StoredTextTooLarge as exc:
+                        # The same cap as ingest (PR #630): the re-chunk fails whole,
+                        # before the collection is replaced.
+                        raise ValueError(f"{filename}: {exc}") from exc
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+        if not produced:
+            raise PackageError(
+                "SOURCES_REQUIRED",
+                f"Re-chunking '{collection}' produced no chunks; check the chunking "
+                "parameters.", {"collection": collection})
+
+    def __iter__(self):
+        for part in self.parts():
+            yield from part
 
 
 # ── Rebuilding ────────────────────────────────────────────────────────────────
@@ -16393,11 +16542,14 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
 @collection_writes.serialized("collection")
 def _rebuild(collection: str, properties: list[dict], index_type: str | None,
              distance_metric: str | None, progress, *, records: list[dict] | None = None,
-             source_collection: str | None = None, before_replace=None) -> int:
+             source_collection: str | None = None, before_replace=None, staged=None) -> int:
     """Stage and verify, then replace the live collection under its writer guard.
 
     Reindex `records` are a fingerprint snapshot of the original (a list is
-    snapshotted here); nothing holds the collection in memory (#583).
+    snapshotted here); nothing holds the collection in memory (#583). A
+    re-chunk's `properties` is a _SourceChunks reader: each part is inserted
+    into staging before the next is read, and `staged(n)` is told the running
+    count (#312). Other properties are inserted in one write.
     """
     source_collection = source_collection or collection
     collection = collection_writes.canonical(collection)
@@ -16426,10 +16578,22 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
             # backend writers are detected by comparing the source again.
             _verify_records(collection, records)
         else:
-            wc._insert_chunks_sync(staging, properties)
+            produce = getattr(properties, "parts", None)
+            if produce is not None:
+                expected = 0
+                with contextlib.closing(produce()) as produced:
+                    for part in produced:
+                        wc._insert_chunks_sync(staging, part)
+                        expected += len(part)
+                        del part
+                        if staged:
+                            staged(expected)
+            else:
+                wc._insert_chunks_sync(staging, properties)
+                expected = len(properties)
             staged_count = telemetry.call("weaviate.aggregate", client.collections.get(staging).aggregate.over_all, total_count=True).total_count
-            if staged_count != len(properties):
-                raise RuntimeError(f"staged {staged_count} chunks but expected {len(properties)}")
+            if staged_count != expected:
+                raise RuntimeError(f"staged {staged_count} chunks but expected {expected}")
         if source_collection != collection:
             collection_recovery.retain(ownership, source_collection=source_collection)
         else:
@@ -16447,14 +16611,14 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
             _write_records(collection, records.reading(staging))
             written = len(records)
         else:
-            def staged():
+            def staged_records():
                 return (
                     {"id": str(obj.uuid), "vector": (obj.vector or {}).get("default"),
                      "properties": dict(obj.properties or {})}
                     for obj in telemetry.iterate(client.collections.get(staging).iterator, include_vector=True)
                 )
-            written = batch_write.insert(client.collections.get(collection), staged,
-                                         expected_count=len(properties))
+            written = batch_write.insert(client.collections.get(collection), staged_records,
+                                         expected_count=expected)
         if progress:
             progress(written)
         completed = True
@@ -16534,6 +16698,7 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
         job.update(fields)
 
     records = None
+    properties = None
     try:
         needs_sources = operation == "rechunk" or (
             operation == "reembed" and params.get("chunking") is not None)
@@ -16577,17 +16742,27 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
         else:
             raise PackageError("TUNE_UNSUPPORTED", f"Unknown operation '{operation}'.")
 
-        job["chunks_total"] = len(properties)
+        # A re-chunk's reader counts its chunks only as they are staged (#312):
+        # its total starts at 0 and follows staging. Its first part is read
+        # now, so a re-chunk with no chunks fails before any collection exists.
+        streaming = hasattr(properties, "parts")
+        if streaming and hasattr(properties, "start"):
+            properties.start()
+        job["chunks_total"] = 0 if streaming else len(properties)
         stale_count = 0
 
         def mark_before_replace() -> None:
             nonlocal stale_count
             stale_count = goldstandard.mark_stale(source_collection, reason, require_durable=True)
 
+        def staged(n: int) -> None:
+            job["chunks_total"] = n
+
         written = _rebuild(
             collection, properties, params.get("index_type"), params.get("distance_metric"),
             progress, records=records, source_collection=source_collection,
-            before_replace=mark_before_replace if reason else None)
+            before_replace=mark_before_replace if reason else None,
+            **({"staged": staged} if streaming else {}))
 
         notes = []
         if reason:
@@ -16611,6 +16786,8 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
     finally:
         if isinstance(records, _RecordSnapshot):
             records.close()
+        if isinstance(properties, _SourceChunks):
+            properties.close()
         collection_writes.end_job("tune", job_id)
         with _lock:
             _active.discard(collection)
@@ -30162,8 +30339,9 @@ the line ending nor line 1's byte-order mark (#314): it is checked at and one pa
 with `\n` and `\r\n` endings, with and without the mark, and a CRLF file gives the same
 errors as an LF one. Lines 1 to 5 bytes over the limit, at the edge of the read window, fail
 on their own line with `\n`, `\r\n` or no ending, with and without the mark. The
-1,000,000-line cap (#314) is checked at and one past its edge, with
-blank lines and lines with no text counting, and reading stops at the line past it. Gzip: the
+10,000,000-line cap (#314, #312) is checked at and one past its edge, with
+blank lines and lines with no text counting, and reading stops at the line past it; a
+`.json` file still keeps at most 1,000,000 records. Gzip: the
 same text as plain, the `was decompressed, but` prefix (line, line-limit, text-limit and cap
 errors), corrupt, truncated and over-size data. It also checks `source_type` `jsonl`, a job
 that stores nothing for a bad file beside a good one, job-level outcomes (#314: empty files
@@ -30172,8 +30350,22 @@ fails and stores nothing, `context_aware` keeps one chunk per record), and rechu
 retained `.jsonl.gz`. `02_ingest.sh` runs it in the API container, then ingests a direct
 `records.jsonl` and `records.jsonl.gz` through the proxy and reads their records back, checks
 that `bad.jsonl` (malformed line 2) fails naming the line and stores nothing, and that
-`jsonl_many_records.jsonl.gz` (1,000,001 `{}` lines, a few KB gzipped) fails with the
-record-cap message and stores nothing.
+`jsonl_many_records.jsonl.gz` (10,000,001 `{}` lines, about 30 KB gzipped) fails with the
+line-cap message and stores nothing.
+
+`scripts/tests/test_large_corpus.py` (#312) checks, with Weaviate mocked, that retention
+hashes and copies a file passed by path in blocks (its digest, size and bytes, a traced peak
+that doesn't grow with the file, replace, and a file that changes while it is copied
+publishing nothing), that a 48 MiB retained original goes through export and the import's
+source restore byte for byte in bounded memory, that the re-chunk reader gives the chunks a
+re-chunk gave, reads a later file only when its part is asked for, keeps a flat traced peak
+over 10 and 40 files, refuses a missing blob before reading anything and keeps its messages,
+and that `chunks_total` follows staging. `02_ingest.sh` runs it in the API image; in full runs
+it then ingests a `.jsonl.gz` of 9,000,005 lines (576 MB decompressed, about 1.7 MB gzipped)
+through the proxy, checks its retained original byte for byte in the API container,
+re-chunks it (`chunks_total` = `chunks_written` = the collection's count) and replaces it with
+a smaller file (`chunks_replaced` is the re-chunk's count; the index lists only the new
+original, the large blob removed).
 `browser/ui_criteria.js` (suite 06) checks that the Import page's file picker accepts
 `.jsonl` and `.jsonl.gz` and that its hint names JSONL.
 
@@ -30510,7 +30702,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `16_api_paths.sh` | ingest, query, metrics and health API paths (#399), run last by suite 01: `NO_SUPPORTED_FILES`, `JOB_NOT_FOUND`, schema rules, the proxy's `/api/` timeouts, `/metrics/latency`, a default query and its metric (LLM); opt-in restart and first-start checks |
 | `../tests/test_api_paths.py` | controlled ingest error, `/query` default, §6 prompt, query metric, retrieval-config file, `/metrics/latency` and `/health` probe regressions (#399), registered by `16_api_paths.sh` |
 | `../tests/test_ollama_entrypoint.py` | `ollama/entrypoint.sh` with stub commands, on the host: skip present models, timed pull, retries (#399), registered by `16_api_paths.sh` |
-| `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure |
+| `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure; in full runs, a large JSON Lines corpus ingested, retained, re-chunked and replaced (#312) |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
 | `../tests/test_metrics.py` | controlled metrics-file regressions (#374): a failed write keeps the answer, the bound, crash-safe compaction, reload after a restart; registered by suite 03 |
 | `../tests/test_citation_score.py` | controlled citation-score regressions (#376): each metric's distance-to-score conversion, best first, missing values and unknown metrics as `null`, a failed metric read as the 503, the metric read on every query; registered by suite 03 |
@@ -30532,6 +30724,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_jobstore.py` | controlled job-record persistence, throttling, startup marking and retention regressions, registered by ingest |
 | `../tests/test_reingest.py` | controlled re-ingest replacement, exact-name selection (#622), same-name upload, macOS ZIP metadata, retention and rechunk-coverage regressions, registered by ingest |
 | `../tests/test_split_parts.py` | controlled regressions for files over the per-file limits stored as parts (#621): the reviewer's 13,000 records, files over 10,000,000 characters, family replacement, all or nothing, cuts, CSV, Markdown, encoding, `overlap` sizing, re-chunk and export links, registered by ingest |
+| `../tests/test_large_corpus.py` | controlled large-corpus regressions (#312): retention by path in blocks, a large retained original through export and import, the re-chunk reader staging one part at a time and its refusals, `chunks_total` following staging; registered by ingest in the API image with the repository mounted |
 | `split_parts.py` | helper for ingest (#621), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, files over the per-file limits are stored as parts, a smaller re-upload replaces every part, and a bad line after part 1 stores nothing; the collection is removed afterwards |
 | `exact_source.py` | helper for ingest (#622), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, replacing `report.pdf` deletes only its earlier chunks and `_source_has_chunks_sync` answers by exact name, with a few word matches (`page`), over 10,000 (`walk`), and over 10,000 earlier chunks of the name itself, deleted in batches of 10,000 (`bulk`); the collection is removed afterwards |
 | `../tests/test_collection_spelling.py` | controlled regressions for per-collection state keyed by the stored collection name (#372), registered by ingest |
@@ -45897,10 +46090,10 @@ def write(target: pathlib.Path) -> None:
     (target / "records.jsonl.gz").write_bytes(gzip.compress(records.encode("utf-8"), mtime=0))
     (target / "bad.jsonl").write_text('{"bill": "HR-3"}\n{"bill": }\n{"bill": "HR-4"}\n',
                                       encoding="utf-8")
-    # Issue #314. A JSON Lines file holds at most 1,000,000 lines, every line
-    # counting: jsonl_many_records.jsonl.gz is 1,000,001 records with no text
-    # (about 3 MB decompressed, a few KB gzipped), which fails the file.
-    (target / "jsonl_many_records.jsonl.gz").write_bytes(gzip.compress(b"{}\n" * 1_000_001, mtime=0))
+    # Issues #314 and #312. A JSON Lines file holds at most 10,000,000 lines, every
+    # line counting: jsonl_many_records.jsonl.gz is 10,000,001 records with no
+    # text (about 30 MB decompressed, under 100 KB gzipped), which fails the file.
+    (target / "jsonl_many_records.jsonl.gz").write_bytes(gzip.compress(b"{}\n" * 10_000_001, mtime=0))
 
     # Issue #298. An upload's ZIPs may expand to at most 2 GiB in all. Both
     # files are about 2 MB. zip_over_declared.zip honestly declares a member of
@@ -47446,20 +47639,20 @@ print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name
 check "a malformed line fails the file with its line number and stores nothing" $? \
   "status=$status error=$first_error stored=$stored"
 
-# A JSON Lines file holds at most 1,000,000 lines, records with no text
-# included (#314): a few KB of gzipped `{}` lines fails and stores nothing.
+# A JSON Lines file holds at most 10,000,000 lines, records with no text
+# included (#314, #312): under 100 KB of gzipped `{}` lines fails and stores nothing.
 drop_collection "$C"; make_collection "$C"
 ingest "$C" fixed 1000 0 "$FIX/jsonl_many_records.jsonl.gz"
 read -r status cap_error <<<"$(python3 -c "
 import json; d=json.load(open('/tmp/vfy_job.json'))
-want = ['jsonl_many_records.jsonl.gz: was decompressed, but it has more than 1,000,000 records, '
+want = ['jsonl_many_records.jsonl.gz: was decompressed, but it has more than 10,000,000 records, '
         'the most one file can hold; split the file']
 print(d['status'], 'yes' if d['errors'] == want else repr(d['errors']))")"
 stored=$(api_get "/collections" | python3 -c "
 import json,sys
 print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$C'][0])")
 [ "$status" = failed ] && [ "$cap_error" = yes ] && [ "$stored" = 0 ]
-check "a JSON Lines file over 1,000,000 lines fails with the record cap and stores nothing" $? \
+check "a JSON Lines file over 10,000,000 lines fails with the line cap and stores nothing" $? \
   "status=$status error=$cap_error stored=$stored"
 
 # ── upload size limit at the proxy ───────────────────────────────────────────
@@ -48059,6 +48252,106 @@ PY
 check "reviewer: re-uploading the name through the API replaces every part (#621)" $?
 drop_collection "$SPL"
 rm -rf "$SPLFIX" /tmp/vfy_split_job.json
+
+# ── a large JSON Lines corpus (#312) ─────────────────────────────────────────
+# Controlled cases: retention by path in blocks, the re-chunk reader staging one
+# part at a time, and a large retained original through export and import, in
+# bounded memory.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_large_corpus.py)
+check "large corpora: streamed retention, one-part re-chunk staging, export and import in bounded memory (#312)" $?
+# End to end on the stack (full runs only: reading the file twice takes minutes):
+# a .jsonl.gz over the old caps, 9,000,000 lines of 64 bytes (576,000,000 bytes
+# decompressed, over 512 MiB and under 2 GiB; about 1 MB gzipped) after five
+# records with text, is ingested, retained as uploaded, re-chunked and replaced.
+LC="${PREFIX}LargeCorpus"
+if [ "$SKIP_SLOW" = "1" ]; then
+  skip "#312: a large JSON Lines corpus ingests, is retained as uploaded, re-chunks and is replaced" \
+    "set RAG_SKIP_SLOW=0 to include it"
+else
+  LCFIX=$(mktemp -d)
+  python3 - "$LCFIX" <<'PY'
+import gzip, hashlib, json, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+(root / "big").mkdir()
+(root / "small").mkdir()
+text = "".join(json.dumps({"bill": "HR-%d" % i, "title": " ".join(["word%d" % i] * 60)}) + "\n"
+               for i in range(5)).encode()
+pad = b"{}" + b" " * 61 + b"\n"
+with open(root / "big" / "corpus.jsonl.gz", "wb") as raw:
+    with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as gz:
+        gz.write(text)
+        block = pad * 100_000
+        for _ in range(90):
+            gz.write(block)
+(root / "small" / "corpus.jsonl.gz").write_bytes(
+    gzip.compress(b'{"bill": "HR-9", "title": "a smaller version"}\n{"bill": "HR-10"}\n', mtime=0))
+for name in ("big", "small"):
+    data = (root / name / "corpus.jsonl.gz").read_bytes()
+    (root / name / "digest").write_text("%s %d\n" % (hashlib.sha256(data).hexdigest(), len(data)))
+PY
+  read -r big_digest big_size < "$LCFIX/big/digest"
+  read -r small_digest small_size < "$LCFIX/small/digest"
+  lc_count() {
+    api_get "/collections" | python3 -c "
+import json,sys
+print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$LC'][0])"
+  }
+  # The retained index lists exactly one digest under corpus.jsonl.gz, with its
+  # size, and the blob hashes to it; any earlier digest's blob is gone.
+  lc_retained() {
+    (cd "$REPO_ROOT" && docker compose exec -T api python - "$LC" "$1" "$2" "${3:-}" <<'PY'
+import hashlib, sys
+from services import sources
+collection, digest, size, earlier = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+documents = sources.load_index(collection)["documents"]
+entry = documents.get(digest) or {}
+h = hashlib.sha256()
+with open(sources.blob_path(collection, digest), "rb") as fh:
+    for block in iter(lambda: fh.read(1 << 20), b""):
+        h.update(block)
+gone = not earlier or not sources.blob_path(collection, earlier).exists()
+ok = (list(documents) == [digest] and entry.get("filenames") == ["corpus.jsonl.gz"]
+      and entry.get("size") == size and h.hexdigest() == digest and gone)
+print({"documents": {d[:12]: e.get("size") for d, e in documents.items()}, "earlier_gone": gone})
+sys.exit(0 if ok else 1)
+PY
+    )
+  }
+  drop_collection "$LC"; make_collection "$LC"
+  ingest "$LC" fixed 1000 0 "$LCFIX/big/corpus.jsonl.gz"
+  read -r status completed chunks <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], d['files_completed'], d['chunks_stored'])")"
+  [ "$status" = completed ] && [ "$completed" = 1 ] && [ "$chunks" -gt 0 ]
+  check "#312: a .jsonl.gz of 9,000,005 lines, 576 MB decompressed, ingests" $? \
+    "status=$status completed=$completed chunks=$chunks $(head -c 300 /tmp/vfy_job.json)"
+  lc_retained "$big_digest" "$big_size"
+  check "#312: its retained original is the uploaded file, byte for byte" $?
+  api_post "/tune/rechunk" "{\"collection\":\"$LC\",\"chunking_strategy\":\"fixed\",\"chunk_size\":300,\"min_chunk_size\":30}" > /tmp/vfy_lc_tj.json
+  lcjob=$(jfield "['job_id']" < /tmp/vfy_lc_tj.json)
+  lcstatus=$(wait_for_job "/tune/job/$lcjob" 1800)
+  api_get "/tune/job/$lcjob" > /tmp/vfy_lc_tj.json
+  read -r lc_total lc_written <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_lc_tj.json')); print(d['chunks_total'], d['chunks_written'])")"
+  lc_stored=$(lc_count)
+  [ "$lcstatus" = completed ] && [ "$lc_total" = "$lc_written" ] && [ "$lc_written" = "$lc_stored" ] \
+    && [ "$lc_written" -gt "$chunks" ]
+  check "#312: re-chunking it completes, chunks_total = chunks_written = the collection's count" $? \
+    "status=$lcstatus total=$lc_total written=$lc_written stored=$lc_stored before=$chunks"
+  ingest "$LC" fixed 1000 0 "$LCFIX/small/corpus.jsonl.gz"
+  read -r status replaced stored_now <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], d.get('chunks_replaced'), d['chunks_stored'])")"
+  lc_stored=$(lc_count)
+  [ "$status" = completed ] && [ "$replaced" = "$lc_written" ] && [ "$lc_stored" = "$stored_now" ]
+  check "#312: re-ingesting the name replaces every re-chunked chunk" $? \
+    "status=$status replaced=$replaced (want $lc_written) stored=$lc_stored (want $stored_now)"
+  lc_retained "$small_digest" "$small_size" "$big_digest"
+  check "#312: ...and its retained original, the large blob removed" $?
+  drop_collection "$LC"
+  rm -rf "$LCFIX" /tmp/vfy_lc_tj.json
+fi
 
 # ── job status transitions ───────────────────────────────────────────────────
 # `queued` is only observable when the executor is saturated, so this asserts

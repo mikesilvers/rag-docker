@@ -1018,6 +1018,13 @@ cutover, from staging to the new collection; every readback check, including
 whether the original is intact after a failed cutover, compares against that
 snapshot.
 
+Re-chunking, and re-embedding with chunking parameters, read the retained
+originals one file part at a time (#312): each part is parsed, chunked and
+inserted into staging before the next is read, so neither holds the new chunks
+of the whole collection. Every check that needs no parsing, a retained original
+missing from disk included, runs before staging starts; a parse failure, or a
+rebuild that produces no chunks, fails before the original is replaced.
+
 ### 7.5 Weaviate unreadable at a tune route
 
 A tune route that can't read Weaviate answers HTTP 503 `SERVICE_UNAVAILABLE` as a JSON
