@@ -19,9 +19,9 @@ Code from forks is built or run only after a clean security review and the maint
 - An RD ticket's summary ends `(rag-docker #N)`, its description starts with `GitHub:` and `GitHub labels:` lines, its parent is the release epic (RD-6 for a workflow ticket with no release), and its Fix Version says when it ships. Search Jira first, so no duplicate is made.
 - Every question to the maintainer, and the answer, goes on the ticket as a dated Q/A comment, including questions asked in chat. A decision that changes scope or acceptance is also posted on the GitHub issue as a "Decision (maintainer, date)" comment.
 - Moving a ticket to Done also closes its GitHub issue, if it is still open.
-- A new GitHub issue gets the current release's label only when it is an urgent bug. Otherwise leave it unlabelled and ask the maintainer which release. Never add `Triage` to an issue we open.
+- A new GitHub issue gets the current release's label only when it is an urgent bug, or a "Follow-ups from #N" issue for a PR in a triaged release (below). Otherwise leave it unlabelled and ask the maintainer which release. Never add `Triage` to an issue we open.
 - A ready patch from the rag-pr-review tests reviewer (every test in it ran and passed) goes into the PR before it merges, on a PR by `mikesilvers` that isn't from a fork, READY or NOT READY, whatever the finding's severity: the coordinating session sends it to the PR's fix agent, and the new head gets its own evaluation, patch-only when it adds only the patch (`.claude/skills/rag-pr-review/reference.md`, "Reviewer patches before merge").
-- After a PR merges, its Medium and Low findings with no ready reviewer patch become a "Follow-ups from #N" issue. For a PR by `joefeser`, Joe's agents open that issue instead (`AGENTS.md` §6), and we create its RD ticket.
+- After a PR merges, its Medium and Low findings with no ready reviewer patch become a "Follow-ups from #N" issue. If the merge rule covers the PR (by `mikesilvers`, not from a fork) and it is in a triaged release ("Merging into `develop`"), that issue goes into the current release without asking: its `release:` label, plus an RD ticket under the release epic (maintainer decision, 2026-11-24, #900). For a PR by `joefeser`, Joe's agents open that issue instead (`AGENTS.md` §6), and we create its RD ticket.
 - The details are in the `rag-jira` skill.
 
 ## Working with Joe's agents
@@ -56,7 +56,7 @@ Every fix starts in a fresh agent run with the `rag-fix` skill (`rag-fix RD-<n>`
 
 ## Merging into `develop`
 
-The maintainer merges PRs into `develop`, with one exception: the coordinating session may merge a PR that `rag-pr-review` found READY TO MERGE, whose GitHub author is `mikesilvers` and which isn't from a fork, but only after the maintainer's explicit go-ahead in the session for that PR, by number, at its current head. No other agent or session merges, and `rag-pr-review` never merges. PRs by `joefeser`, PRs from forks and `develop` → `main` release PRs are never covered: the maintainer merges them.
+The maintainer merges PRs into `develop`, with one exception: the coordinating session may merge a PR whose GitHub author is `mikesilvers`, which isn't from a fork, and which `rag-pr-review` found READY TO MERGE at its current head, with any ready reviewer patch already in (that evaluation left no ready patch to apply). If the PR is in a triaged release, the session merges it without asking, then carries on (maintainer decision, 2026-11-24, #900). A PR is in a triaged release when it names at least one issue with `Closes #N` or `Part of #N`, and every issue it names has a release's `release: v<x.y.z>` label and an RD ticket under that release's epic. Any other such PR waits for the maintainer's explicit go-ahead in the session for that PR, by number, at its current head. No other agent or session merges, and `rag-pr-review` never merges. PRs by `joefeser`, PRs from forks and `develop` → `main` release PRs are never covered: the maintainer merges them.
 
 Just before merging, run every check again:
 
