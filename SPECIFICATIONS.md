@@ -2755,6 +2755,10 @@ GET /tune/job/{job_id}
 Reports `status`, `chunks_total`, `chunks_written`, `notes` (including how many
 gold-standard sessions were marked stale) and, on failure, `error_code`. For a re-chunk, or a
 re-embed with chunking parameters, `chunks_total` counts the chunks staged so far (#312).
+A job whose run is cancelled reads `failed` with `error_code` `TUNE_FAILED` and an `error`
+saying it was cancelled before it finished. A cancellation after cutover runs the failure path's
+recovery reporting: the error names the retained copy, and `error_detail` holds `recovered_as`
+and `sidecar_snapshots` (#870).
 
 ---
 
