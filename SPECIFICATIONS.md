@@ -2147,8 +2147,9 @@ before the job, as they do at API startup after an interrupted job.
 **What a preparation does**, per document:
 
 1. *Extract* with ingest's own readers; a file ingest would refuse (§5.1: invalid JSON, a JSON Lines line over
-   the limit, `.json` over 30,000,000 bytes, more than 1,000,000 records, a record over 10,000,000 characters,
-   an unreadable encoding, a CSV header over half a part) fails with ingest's reason. A document with no text
+   the limit, `.json` over 30,000,000 bytes, more than 1,000,000 records (10,000,000 lines for JSON Lines), a
+   record over 10,000,000 characters, an unreadable encoding, a CSV header over half a part) fails with ingest's
+   reason. A document with no text
    fails `has no text to prepare`.
 2. *Normalise*: UTF-8 without a byte-order mark, LF, NFC, NUL and other C0 control characters except tab and
    newline, and DEL, removed. JSON and JSON Lines get the encoding only, so records stay unchanged.
