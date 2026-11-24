@@ -51203,6 +51203,8 @@ for op in rechunk reembed; do
     "$(jfield "['error_code']" < /tmp/vfy_tjs.json)" "SOURCES_REQUIRED"
   check_eq "#190 ... and names the source file with no retained original" \
     "$(jfield "['error_detail']['uncovered_source_files']" < /tmp/vfy_tjs.json)" "['policies.txt']"
+  check_eq "#190 ... and omits none" \
+    "$(jfield "['error_detail']['uncovered_source_files_omitted']" < /tmp/vfy_tjs.json)" "0"
   check_eq "#190 ... and leaves every stored chunk in place" "$(mixed_count)" "$mixed_before"
   check_eq "#190 ... and leaves both source files' chunks in place" "$(mixed_files)" "$files_before"
   check_eq "#190 ... and leaves no staging or recovery collection behind" "$(mixed_names)" "$names_before"
