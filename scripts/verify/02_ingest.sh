@@ -736,6 +736,11 @@ print([j.get("status") for j in jobs], st["names"])
 sys.exit(0 if all(j.get("status") == "completed" for j in jobs)
          and st["names"] == ["policies.md", "policies.txt"] else 1)
 ENDPY
+# Same-collection ingests are already serialized (collection_writes), so this
+# check would also pass without the source-index lock (#882). The lock's
+# regression proof is the host thread test
+# test_concurrent_stores_into_one_collection_keep_both_entries in
+# scripts/tests/test_reingest.py.
 check "two ingests of different files started together both keep their retained entries (#52)" $?
 si_index break
 check "replaced the retained index with text that isn't JSON" $?

@@ -143,6 +143,26 @@ class RetentionTests(Folders):
         self.assertEqual(sources.load_index(COLL)["documents"], {})
         self.assertFalse(sources.blob_path(COLL, kept).exists())
 
+    def test_a_path_blob_is_fsynced_before_the_index_882(self):
+        path = write_blocks(self.files / "synced.jsonl", 2 * MIB)
+        real_fsync, synced = os.fsync, []
+
+        def fsync(fd):
+            synced.append(fd)
+            return real_fsync(fd)
+
+        with patch.object(sources.os, "fsync", side_effect=fsync):
+            digest = sources.store(COLL, "synced.jsonl", path, replace=True)
+        self.assertEqual(len(synced), 2)            # the blob, then the index
+        self.assertEqual(file_sha256(sources.blob_path(COLL, digest)), digest)
+
+    def test_an_unreadable_path_releases_its_name_880(self):
+        old = sources.store(COLL, "corpus.jsonl", b"v1 text", replace=True)
+        with self.assertRaises(OSError):
+            sources.store(COLL, "corpus.jsonl", self.files / "missing.jsonl", replace=True)
+        self.assertEqual(sources.digests_for_filename(COLL, "corpus.jsonl"), [])
+        self.assertFalse(sources.blob_path(COLL, old).exists())
+
     def test_bytes_and_a_path_of_the_same_bytes_are_retained_alike(self):
         data = b'{"bill": "HR-1"}\n' * 1000
         path = self.files / "same.jsonl"
