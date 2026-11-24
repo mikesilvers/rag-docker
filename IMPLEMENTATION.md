@@ -3304,12 +3304,14 @@ def _publish_file(path: Path, source: Path, digest: str) -> None:
 
 
 @telemetry.traced("rag.retain")
-def store(collection: str, filename: str, data: Union[bytes, str, os.PathLike],
+def store(collection: str, filename: str, data: Union[bytes, os.PathLike],
           media_type: str | None = None, *, replace: bool = False) -> str:
     """Retain one accepted upload. Returns its sha256.
 
-    `data` is the file's bytes, or its path: a path is hashed and copied in
-    blocks, so retaining a large file never holds it in memory (#312).
+    `data` is the file's bytes, or its path as an os.PathLike (a Path): a path
+    is hashed and copied in blocks, so retaining a large file never holds it in
+    memory (#312). A str is refused with TypeError (#893), so text or a name is
+    never taken for a path.
 
     With replace=True (ingest, #22) the filename is first released from every
     other digest, and digests left with no names are dropped. That release is
@@ -3322,6 +3324,11 @@ def store(collection: str, filename: str, data: Union[bytes, str, os.PathLike],
     before anything is written: an unreadable or invalid index raises
     ValueError and leaves the folder exactly as it was.
     """
+    if isinstance(data, str):
+        # A str is never taken for a path (#893): before #891 data was the
+        # content, and a name or text read as a path would retain any file.
+        raise TypeError("sources.store takes the file's bytes or an os.PathLike "
+                        "path, not a str")
     if isinstance(data, (bytes, bytearray)):
         path = None
         digest, size = hashlib.sha256(data).hexdigest(), len(data)
@@ -3423,8 +3430,9 @@ def remove_interrupted_saves() -> None:
     file, so a leftover is never used, only disk space. Called once at startup,
     before any request, so no save is in progress. Only names _temporary makes
     are removed, in each collection folder that isn't a link; a leftover that
-    can't be removed is logged and kept. An error listing the folders is the
-    whole sweep failing, which the caller logs.
+    can't be removed is logged and kept. An error listing the sources folder
+    itself is the whole sweep failing, which the caller logs; a collection
+    folder that can't be listed is logged and skipped (#892).
     """
     root = _root()
     if not root.is_dir():
@@ -3432,7 +3440,14 @@ def remove_interrupted_saves() -> None:
     for folder in root.iterdir():
         if folder.is_symlink() or not folder.is_dir():
             continue
-        for leftover in folder.iterdir():
+        try:
+            names = list(folder.iterdir())
+        except OSError:
+            # One collection folder that can't be listed doesn't stop the
+            # sweep of the others (#892).
+            log.exception("Could not list source folder %s for interrupted writes", folder)
+            continue
+        for leftover in names:
             if _LEFTOVER.fullmatch(leftover.name):
                 try:
                     leftover.unlink()
@@ -16369,6 +16384,11 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
     never held in memory, and a bad file found then fails the rebuild while the
     live collection is still untouched (it is only replaced once staging
     succeeds). `list(reader)` gives every chunk, in order.
+
+    Its `rag.chunk` span covers only these checks and the reader's creation
+    (#893): the parsing and chunking run as the rebuild consumes the reader,
+    inside `rag.rebuild`, where the chunker's own `rag.chunk` spans appear per
+    part.
     """
     index = sources.load_index(collection)
     documents = index.get("documents") or {}
@@ -30355,9 +30375,10 @@ line-cap message and stores nothing.
 
 `scripts/tests/test_large_corpus.py` (#312) checks, with Weaviate mocked, that retention
 hashes and copies a file passed by path in blocks (its digest, size and bytes, a traced peak
-that doesn't grow with the file, replace, and a file that changes while it is copied
-publishing nothing), that a 48 MiB retained original goes through export and the import's
-source restore byte for byte in bounded memory, that the re-chunk reader gives the chunks a
+that doesn't grow with the file, replace, a file that changes while it is copied
+publishing nothing, and a `str` refused with `TypeError`, writing nothing (#893)), that a
+48 MiB retained original goes through export and the import's source restore byte for byte
+in bounded memory, that the re-chunk reader gives the chunks a
 re-chunk gave, reads a later file only when its part is asked for, keeps a flat traced peak
 over 10 and 40 files, refuses a missing blob before reading anything and keeps its messages,
 and that `chunks_total` follows staging. `02_ingest.sh` runs it in the API image; in full runs
@@ -30365,7 +30386,12 @@ it then ingests a `.jsonl.gz` of 9,000,005 lines (576 MB decompressed, about 1.7
 through the proxy, checks its retained original byte for byte in the API container,
 re-chunks it (`chunks_total` = `chunks_written` = the collection's count) and replaces it with
 a smaller file (`chunks_replaced` is the re-chunk's count; the index lists only the new
-original, the large blob removed).
+original, the large blob removed). That is #690's acceptance (a re-chunk of a collection larger
+than the API container's memory budget completes) shown by proxy, not a memory-limit test: the
+bound comes from the traced-memory tests above (the re-chunk reader's traced peak doesn't grow
+with the number of files), while the full-run corpus is 576 MB decompressed but almost all `{}`
+padding, so its re-chunk holds little text, and the API container has no memory limit in
+`docker-compose.yml`.
 `browser/ui_criteria.js` (suite 06) checks that the Import page's file picker accepts
 `.jsonl` and `.jsonl.gz` and that its hint names JSONL.
 
@@ -30514,7 +30540,8 @@ failed save keeps the previous index; an imported index is published with an ato
 the #882 follow-ups (a new blob is published and fsynced, an existing one isn't rewritten;
 `delete` drops the collection's lock and a later store makes a new one; the startup sweep
 removes only `*.<16 hex>.tmp` leftovers in collection folders, skips a linked folder, logs and
-keeps one it can't remove, and needs no sources folder), and
+keeps one it can't remove, logs a collection folder it can't list and sweeps the others (#892),
+and needs no sources folder), and
 rechunk coverage and per-(digest, name) rebuilds, rebuilding only names with stored chunks
 while a missing blob is still refused (#311), also for one blob under 50 names with one
 stored and a digest with none (only the stored name is parsed). A collection whose retained
