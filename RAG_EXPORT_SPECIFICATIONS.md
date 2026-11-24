@@ -1007,7 +1007,8 @@ failure after cutover that leaves the original unverified marks the sessions
 `stale` and records that decision, so a restart doesn't flag them again. If the
 cutover record itself can't be written, the job fails `TUNE_FAILED`, says so and
 that the original collection is unchanged, and the retained copy is discarded
-(#263).
+(#263). A cancellation of the rebuild runs the same reporting and stale marking
+as a failure, and the job reads `failed` (#870).
 
 Re-embedding from stored chunk text and re-indexing read the collection a page
 at a time and never hold it in memory (#583). Re-embedding streams the stored

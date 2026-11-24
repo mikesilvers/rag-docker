@@ -16041,6 +16041,16 @@ def get_job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
 
 
+_CANCELLED = "the tuning job was cancelled before it finished"
+
+
+def _cause(exc: BaseException) -> str:
+    """How a job error names what ended it. A cancellation has no message (#870)."""
+    if isinstance(exc, asyncio.CancelledError):
+        return f"{type(exc).__name__}: {_CANCELLED}"
+    return f"{type(exc).__name__}: {exc}"
+
+
 # ── Reading the collection's own chunks ───────────────────────────────────────
 
 class _StoredChunks:
@@ -16542,7 +16552,8 @@ class _SourceChunks:
 @collection_writes.serialized("collection")
 def _rebuild(collection: str, properties: list[dict], index_type: str | None,
              distance_metric: str | None, progress, *, records: list[dict] | None = None,
-             source_collection: str | None = None, before_replace=None, staged=None) -> int:
+             source_collection: str | None = None, before_replace=None, staged=None,
+             cancelled=None) -> int:
     """Stage and verify, then replace the live collection under its writer guard.
 
     Reindex `records` are a fingerprint snapshot of the original (a list is
@@ -16550,6 +16561,10 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
     re-chunk's `properties` is a _SourceChunks reader: each part is inserted
     into staging before the next is read, and `staged(n)` is told the running
     count (#312). Other properties are inserted in one write.
+
+    A cancellation (`asyncio.CancelledError`) runs the same recovery steps as a
+    failure. `cancelled` is then called with the failure's `PackageError`, or
+    None when there is none, and the cancellation is re-raised as it is (#870).
     """
     source_collection = source_collection or collection
     collection = collection_writes.canonical(collection)
@@ -16623,7 +16638,7 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
             progress(written)
         completed = True
         return written
-    except Exception as exc:
+    except (Exception, asyncio.CancelledError) as exc:
         if records is not None and cutover_started:
             try:
                 _verify_records(collection, records)
@@ -16649,23 +16664,33 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
                 collection_recovery.finish_cutover_check(ownership, "stale")
             except Exception:
                 _log.exception("Could not record the cutover decision for %r; startup will check it", staging)
+        failure = None
         if cutover_started and not original_intact and ownership["state"] == "recovery":
-            raise PackageError(
-                "TUNE_FAILED", f"{type(exc).__name__}: {exc}. Verified data is retained as '{staging}'.",
+            failure = PackageError(
+                "TUNE_FAILED", f"{_cause(exc)}. Verified data is retained as '{staging}'.",
                 {"recovered_as": staging,
-                 "sidecar_snapshots": collection_recovery.sidecar_reference(ownership)}) from exc
-        if not cutover_started and ownership["state"] == "recovery":
+                 "sidecar_snapshots": collection_recovery.sidecar_reference(ownership)})
+        elif not cutover_started and ownership["state"] == "recovery":
             # Between retain and cutover run before_replace (stale marking) and
             # begin_cutover (the cutover record). The original was never deleted,
             # so the copy is discarded below.
             if not replace_ready:
-                raise PackageError(
-                    "TUNE_FAILED", f"{type(exc).__name__}: {exc}. Gold-standard sessions could not be "
-                    "marked stale before replacement, so the original collection is unchanged.") from exc
-            marked = " Gold-standard sessions were already marked stale." if before_replace else ""
-            raise PackageError(
-                "TUNE_FAILED", f"{type(exc).__name__}: {exc}. The cutover record could not be "
-                f"written, so the original collection is unchanged.{marked}") from exc
+                failure = PackageError(
+                    "TUNE_FAILED", f"{_cause(exc)}. Gold-standard sessions could not be "
+                    "marked stale before replacement, so the original collection is unchanged.")
+            else:
+                marked = " Gold-standard sessions were already marked stale." if before_replace else ""
+                failure = PackageError(
+                    "TUNE_FAILED", f"{_cause(exc)}. The cutover record could not be "
+                    f"written, so the original collection is unchanged.{marked}")
+        if isinstance(exc, asyncio.CancelledError):
+            # The job reports what a failure would; the cancellation itself
+            # propagates unchanged (#870).
+            if cancelled:
+                cancelled(failure)
+            raise
+        if failure is not None:
+            raise failure from exc
         raise
     finally:
         # Before cutover the original is intact, so a retained copy is not needed.
@@ -16699,6 +16724,12 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
 
     records = None
     properties = None
+    failure_on_cancel = None
+
+    def cancelled(failure: PackageError | None) -> None:
+        nonlocal failure_on_cancel
+        failure_on_cancel = failure
+
     try:
         needs_sources = operation == "rechunk" or (
             operation == "reembed" and params.get("chunking") is not None)
@@ -16761,7 +16792,7 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
         written = _rebuild(
             collection, properties, params.get("index_type"), params.get("distance_metric"),
             progress, records=records, source_collection=source_collection,
-            before_replace=mark_before_replace if reason else None,
+            before_replace=mark_before_replace if reason else None, cancelled=cancelled,
             **({"staged": staged} if streaming else {}))
 
         notes = []
@@ -16783,6 +16814,18 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
         _log.exception("Tuning %r on %r failed", operation, collection)
         finish(status="failed", error_code="TUNE_FAILED",
                error=f"{type(exc).__name__}: {exc}")
+    except asyncio.CancelledError as exc:
+        # A cancellation still ends the job, and one after cutover reports the
+        # retained copy as a failure does (#870). Re-raised so it propagates;
+        # `traced` records the outcome.
+        _log.warning("Tuning %r on %r cancelled", operation, collection)
+        failure = failure_on_cancel
+        if failure is not None:
+            finish(status="failed", error_code=failure.code, error=failure.message,
+                   error_detail=failure.detail)
+        else:
+            finish(status="failed", error_code="TUNE_FAILED", error=f"{_cause(exc)}.")
+        raise
     finally:
         if isinstance(records, _RecordSnapshot):
             records.close()
