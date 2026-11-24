@@ -52,9 +52,15 @@ Export cannot ship what the system throws away. This MUST land before export.
 - `index.json` is only ever replaced whole: each save writes a uniquely named
   temporary file in the collection's folder, fsyncs it and atomically replaces
   the index, so a failed or interrupted save leaves the previous index. Blobs
-  are written through uniquely named temporary files too. One collection's
-  updates (read, update, write, orphan deletion) are serialized within the API
-  process, so concurrent ingests can't lose each other's entries (#52).
+  are written through uniquely named temporary files too. Each blob is
+  published like the index: fsynced, then atomically replaced, before the index
+  that names it is saved (#882). At startup the API removes the temporary files
+  of interrupted saves (`*.<16 hex>.tmp`, the names these saves make) in each
+  collection's folder; a leftover it can't remove is logged and kept, and a
+  collection folder it can't list is logged and the sweep goes on to the next
+  (#882). One collection's updates (read, update, write, orphan deletion) are
+  serialized within the API process, so concurrent ingests can't lose each
+  other's entries (#52).
 
 ### 2.2 Ingest changes
 
@@ -1213,7 +1219,8 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E44 | A default export is a key export (#676): `<stem>.tar.gz.age` with one `X25519` stanza and `<stem>.tar.gz.age.key` (0600, age's identity layout) beside it, a new key every time, no plaintext archive and nothing left by a failure; the package opens with the key file through import and an independent decryption, every vendored CCTV vector with an X25519 key behaves as its `expect:` says, `KEY_FILE_REQUIRED`, `KEY_FILE_INVALID`, `KEY_FILE_NOT_EXPECTED` and `ENCRYPTION_REQUIRED` refuse before any job, a wrong key fails `DECRYPT_FAILED` (`reason` `key`) touching nothing, and the key file is downloaded once and expired on its own, by `test_export_encryption.py`, `test_package_download.py`, `test_query_only.py` and suites 05, 18 and 24 |
 | E45 | Two exports of one collection whose names would be the same (the same `<id8>` in the same second) get distinct names, the later one `-2`, then `-3` (§4.1, #860): both packages and both key files are kept, no export replaces a file in `./exports`, and a name taken after it was chosen fails the export and leaves that file, by `test_export_encryption.py` (`SameSecondNames`) and suite 05's same-second check |
 | E46 | Retained-source index updates (#52): an index that can't be read (invalid JSON, invalid UTF-8, a read error) is refused like an invalid one and left unchanged; a store into it writes nothing; two stores into one collection from different threads both keep their entries; index saves use unique temporary files and a failed save keeps the previous index; `restore_package` publishes its index with an atomic replace; the #389 invalid-index tune checks include the unreadable forms, by `test_reingest.py`. Tuning options answer 409 `SOURCE_INDEX_INVALID`, export refuses, and an ingest completes and leaves the retained folder unchanged, for an index that isn't JSON, by `test_source_index_boundary.py`. Live, suite 02: two ingests of different files started together both keep their retained entries, and with the index replaced by text that isn't JSON, `GET /tune/{collection}` answers 409 `SOURCE_INDEX_INVALID` and an ingest completes leaving the index and the retained files unchanged |
-| E47 | Re-embedding from stored chunk text and reindexing read and copy the collection a page at a time; a reindex verifies every copy against a disk-backed fingerprint snapshot of the original, removed after the job (#583), by `reindex_cases.py`'s `test_reindex_copies_stream_without_holding_the_collection`, `test_reembed_reads_stored_chunks_lazily_on_every_pass` and `test_record_snapshot_is_removed_after_success_and_failure` |
+| E47 | Retained-source releases and the startup sweep (#880, #882): a re-upload of a name with new content whose read for retention, blob write or final index save fails leaves the name released from its earlier version, listed by no digest; when even the release can't be saved, the failure is logged, saying a re-chunk could rebuild the earlier version, and the file still counts as ingested; the startup sweep removes only `*.<16 hex>.tmp` leftovers (the names `_temporary` makes) in collection folders, and a collection folder it can't list is logged and the sweep goes on to the others, by `test_reingest.py` and `test_startup_sweep.py` |
+| E48 | Re-embedding from stored chunk text and reindexing read and copy the collection a page at a time; a reindex verifies every copy against a disk-backed fingerprint snapshot of the original, removed after the job (#583), by `reindex_cases.py`'s `test_reindex_copies_stream_without_holding_the_collection`, `test_reembed_reads_stored_chunks_lazily_on_every_pass` and `test_record_snapshot_is_removed_after_success_and_failure` |
 
 ---
 
