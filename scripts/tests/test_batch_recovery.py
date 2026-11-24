@@ -13,11 +13,11 @@ from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, call, patch
 
 sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api'))
 from config import settings
-from services import batch_write, collection_recovery as recovery, importer, tuning, weaviate_client as wc
+from services import batch_write, collection_recovery as recovery, collection_writes, importer, tuning, weaviate_client as wc
 
 
 def records(n=2):
@@ -49,6 +49,8 @@ class Batch:
 
     def __exit__(self, *args):
         fault = self.collection.fault
+        if fault == 'cancel':
+            raise asyncio.CancelledError()
         if fault == 'reject':
             self.failed_objects = [object()]
             return
@@ -863,6 +865,141 @@ class RecoveryTests(unittest.TestCase):
                         recovery.sweep(self.client)
                     again.assert_not_called()
                     recovery.discard(record, self.client)
+
+    # #870: a cancelled tuning job ends, and after cutover reports what a failure does.
+    CANCELLED = 'CancelledError: the tuning job was cancelled before it finished'
+    STALE_AFTER_CUTOVER = 'collection replacement failed after cutover began; retained pairs require historical review'
+
+    def run_tune(self, job_id, operation, params):
+        tuning._jobs[job_id] = {'job_id': job_id, 'status': 'queued', 'collection': 'Corpus',
+                                'operation': operation, 'chunks_total': 0, 'chunks_written': 0,
+                                'notes': [], 'error': None, 'error_code': None, 'error_detail': None}
+        # As start_tune_job admits it: the delete registration and the one-tune slot.
+        collection_writes.register_job('Corpus', 'tune', job_id)
+        self.addCleanup(collection_writes.end_job, 'tune', job_id)
+        tuning._active.add('Corpus')
+        self.addCleanup(tuning._active.discard, 'Corpus')
+        with self.assertRaises(asyncio.CancelledError):
+            tuning._run(job_id, 'Corpus', operation, params)
+        self.assertNotIn(('tune', job_id), collection_writes.active_jobs('Corpus'))
+        self.assertNotIn('Corpus', tuning._active)
+        return tuning._jobs[job_id]
+
+    def test_cancellation_before_cutover_fails_the_job_and_leaves_the_original(self):
+        before = copy.deepcopy(self.cols.get('Corpus').rows)
+        with patch.object(wc, '_insert_chunks_sync', side_effect=asyncio.CancelledError()), \
+                patch.object(tuning.goldstandard, 'mark_stale') as stale, patch.object(tuning, '_log'):
+            job = self.run_tune('cancel-early', 'reembed', {})
+        self.assertEqual(job['status'], 'failed')
+        self.assertEqual(job['error_code'], 'TUNE_FAILED')
+        self.assertEqual(job['error'], self.CANCELLED + '.')
+        self.assertIsNone(job['error_detail'])
+        self.assertEqual(self.cols.get('Corpus').rows, before)
+        self.assertEqual(list(self.cols.items), ['Corpus'])
+        self.assertFalse(list(recovery._root().glob('*.json')))
+        stale.assert_not_called()
+
+    def test_cancellation_after_cutover_reports_the_retained_copy(self):
+        self.cols.final_fault = 'cancel'
+        with patch.object(tuning.goldstandard, 'mark_stale', return_value=0) as stale, \
+                patch.object(tuning, '_log'):
+            job = self.run_tune('cancel-late', 'reembed', {})
+        record = self.recovery_record()
+        self.assertEqual(job['status'], 'failed')
+        self.assertEqual(job['error_code'], 'TUNE_FAILED')
+        self.assertEqual(job['error'], f"{self.CANCELLED}. Verified data is retained as '{record['staging']}'.")
+        self.assertEqual(job['error_detail']['recovered_as'], record['staging'])
+        self.assertEqual(job['error_detail']['sidecar_snapshots'], recovery.sidecar_reference(record))
+        # The re-embed's own marking runs before replacement; the failure path's after it.
+        self.assertEqual([c for c in stale.call_args_list if c.args[1] == self.STALE_AFTER_CUTOVER],
+                         [call('Corpus', self.STALE_AFTER_CUTOVER)])
+        self.assertEqual(stale.call_count, 2)
+        self.assertFalse(record['cutover_pending'])
+        self.assertEqual(record['cutover_checked'], 'stale')
+        self.assert_retained(record)
+
+    def test_cancellation_after_reindex_cutover_marks_stale_and_reports_the_copy(self):
+        records_ = [{'id': r['id'], 'vector': r['vector'], 'properties': r['properties']} for r in self.original]
+        def write(name, recs):
+            if name == 'Corpus':
+                raise asyncio.CancelledError()
+        verified = []
+        def verify(name, recs):
+            verified.append(name)
+            if len(verified) > 1:
+                raise RuntimeError('readback changed')
+        seen = []
+        with patch.object(wc, '_validate_reindex_vectorizer_sync'), \
+                patch.object(tuning, '_write_records', side_effect=write), \
+                patch.object(tuning, '_verify_records', side_effect=verify), \
+                patch.object(tuning.goldstandard, 'mark_stale') as stale, \
+                self.assertRaises(asyncio.CancelledError):
+            tuning._rebuild('Corpus', [], None, None, None, records=records_, cancelled=seen.append)
+        stale.assert_called_once_with('Corpus', 'reindex replacement failed after cutover began; exact record preservation was not verified')
+        record = self.recovery_record()
+        self.assertFalse(record['cutover_pending'])
+        self.assertEqual(record['cutover_checked'], 'stale')
+        self.assertEqual(len(seen), 1)
+        self.assertIsInstance(seen[0], importer.PackageError)
+        self.assertEqual(seen[0].code, 'TUNE_FAILED')
+        self.assertEqual(seen[0].detail['recovered_as'], record['staging'])
+        self.assertTrue(seen[0].message.startswith(self.CANCELLED + '. '), seen[0].message)
+        self.assertTrue(self.cols.exists(record['staging']))
+
+    # ── reviewer-added (#870): the windows between retain and cutover, and before the rebuild ──
+
+    def test_cancellation_while_marking_stale_leaves_the_original_and_says_so(self):
+        before = copy.deepcopy(self.cols.get('Corpus').rows)
+        with patch.object(tuning.goldstandard, 'mark_stale', side_effect=asyncio.CancelledError()) as stale, \
+                patch.object(tuning, '_log'):
+            job = self.run_tune('cancel-marking', 'reembed', {})
+        self.assertEqual(job['status'], 'failed')
+        self.assertEqual(job['error_code'], 'TUNE_FAILED')
+        self.assertEqual(job['error'], f"{self.CANCELLED}. Gold-standard sessions could not be marked stale "
+                                       "before replacement, so the original collection is unchanged.")
+        self.assertIsNone(job['error_detail'])
+        stale.assert_called_once()
+        self.assertEqual(self.cols.get('Corpus').rows, before)
+        self.assertEqual(list(self.cols.items), ['Corpus'])
+        self.assertEqual(list(recovery._root().iterdir()), [])
+
+    def test_cancellation_at_the_cutover_record_leaves_the_original_and_says_so(self):
+        before = copy.deepcopy(self.cols.get('Corpus').rows)
+        with patch.object(recovery, 'begin_cutover', side_effect=asyncio.CancelledError()), \
+                patch.object(tuning.goldstandard, 'mark_stale', return_value=0), patch.object(tuning, '_log'):
+            job = self.run_tune('cancel-record', 'reembed', {})
+        self.assertEqual(job['status'], 'failed')
+        self.assertEqual(job['error_code'], 'TUNE_FAILED')
+        self.assertEqual(job['error'], f"{self.CANCELLED}. The cutover record could not be written, so the "
+                                       "original collection is unchanged. Gold-standard sessions were already marked stale.")
+        self.assertIsNone(job['error_detail'])
+        self.assertEqual(self.cols.get('Corpus').rows, before)
+        self.assertEqual(list(self.cols.items), ['Corpus'])
+        self.assertEqual(list(recovery._root().iterdir()), [])
+
+    def test_cancellation_before_the_rebuild_fails_the_job(self):
+        before = copy.deepcopy(self.cols.get('Corpus').rows)
+        with patch.object(tuning, '_existing_chunks', side_effect=asyncio.CancelledError()), \
+                patch.object(tuning, '_rebuild') as rebuild, \
+                patch.object(tuning.goldstandard, 'mark_stale') as stale, patch.object(tuning, '_log'):
+            job = self.run_tune('cancel-read', 'reembed', {})
+        self.assertEqual((job['status'], job['error_code'], job['error']), ('failed', 'TUNE_FAILED', self.CANCELLED + '.'))
+        rebuild.assert_not_called()
+        stale.assert_not_called()
+        self.assertEqual(self.cols.get('Corpus').rows, before)
+        self.assertEqual(list(self.cols.items), ['Corpus'])
+
+    def test_a_failure_still_chains_its_cause(self):
+        # The refactor builds the PackageError first; an Exception still raises it `from` its cause.
+        cause = RuntimeError('session store unavailable')
+        def fail_marking():
+            raise cause
+        seen = []
+        with self.assertRaises(importer.PackageError) as error:
+            tuning._rebuild('Corpus', [r['properties'] for r in self.original], None, None, None,
+                            before_replace=fail_marking, cancelled=seen.append)
+        self.assertIs(error.exception.__cause__, cause)
+        self.assertEqual(seen, [])
 
     def test_import_replace_note_counts_canonical_and_alias_sessions(self):
         seen = []
