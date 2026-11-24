@@ -409,6 +409,38 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(list(self.cols.items), ['Corpus'])
         self.assertFalse(list(recovery._root().glob('*.json')))
 
+    def test_a_started_reader_stages_its_first_part_once(self):
+        # _run calls start() before _rebuild (#312): the part read ahead is
+        # staged once, then the rest, and nothing is lost or repeated.
+        files = [(f'f{i}.jsonl', ''.join(
+            json.dumps({'t': f'{i}-{n} ' + 'x' * 400}) + '\n' for n in range(size)).encode())
+            for i, size in enumerate((4, 9, 2))]
+        expected = [c['content'] for c in self.source_reader(files)]
+        reader = self.source_reader(files)
+        reader.start()
+        inserts, patched = self.staging_inserts()
+        staged = []
+        with patched:
+            written = tuning._rebuild('Corpus', reader, None, None, None, staged=staged.append)
+        reader.close()
+        sizes = [count for _, count in inserts]
+        self.assertEqual(len(inserts), 3)
+        self.assertEqual(staged, [sizes[0], sizes[0] + sizes[1], sum(sizes)])
+        self.assertEqual(written, len(expected))
+        self.assertEqual(sorted(r['properties']['content'] for r in self.cols.get('Corpus').rows.values()),
+                         sorted(expected))
+        self.assertFalse(list(Path(settings.upload_dir).glob('rechunk-*')))
+
+    def test_a_started_reader_closed_unread_removes_its_work_folder(self):
+        # _run's finally closes a reader whose rebuild never consumed it (#312).
+        reader = self.source_reader([('a.jsonl', b'{"t": "alpha"}\n'), ('b.jsonl', b'{"t": "beta"}\n')])
+        reader.start()
+        self.assertEqual(len(list(Path(settings.upload_dir).glob('rechunk-*'))), 1)
+        reader.close()
+        reader.close()  # a second close is harmless
+        self.assertFalse(list(Path(settings.upload_dir).glob('rechunk-*')))
+        self.assertEqual(self.cols.get('Corpus').rows, {r['id']: r for r in self.original})
+
     def test_a_reader_that_fails_mid_way_leaves_the_original(self):
         bad = b'{"t": "x"}\n{bad\n'
         # The reader goes by digest: pick a good file whose digest sorts first.
