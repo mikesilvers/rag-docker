@@ -300,7 +300,7 @@ class AllOrNothingTests(JobCase):
         with patch.object(wc, "_delete_new_family_sync", return_value=5, create=True):
             failed = ingest_pipeline._undo_new_chunks(job, "Coll", "big.jsonl.gz",
                                                       datetime.now(), exc, "part", 1, 5)
-        self.assertEqual(str(failed), "part 2: decompresses to more than 512 MB, the limit for "
+        self.assertEqual(str(failed), "part 2: decompresses to more than 2 GiB, the limit for "
                                       "one compressed file; nothing from it was stored")
         self.assertEqual(job["chunks_stored"], 0)
 
@@ -488,7 +488,7 @@ class PartsMapToTheirOriginalTests(unittest.TestCase):
                 patch.object(tuning.wc, "get_client") as client:
             client.return_value.collections.get.return_value.iterator.return_value = \
                 self.objects([("big.jsonl", 3)])
-            out = tuning._chunks_from_sources("Coll", "context_aware", 1000, 0, 0.85, 0)
+            out = list(tuning._chunks_from_sources("Coll", "context_aware", 1000, 0, 0.85, 0))
         names = sorted({c["source_file"] for c in out})
         self.assertEqual(names, ["big.jsonl (part 1)", "big.jsonl (part 2)"])
         self.assertEqual(len(out), 13_000)
@@ -928,7 +928,7 @@ class StoredTextCapTests(JobCase):
                 SimpleNamespace(properties={"source_file": "windows.jsonl", "chunk_index": 0})]
             with self.assertRaisesRegex(ValueError, r"^windows\.jsonl: it would store [\d,]+ "
                                                     r"characters of chunks, more than 10 times"):
-                tuning._chunks_from_sources("Coll", "overlap", 1000, 990, 0.85, 0)
+                list(tuning._chunks_from_sources("Coll", "overlap", 1000, 990, 0.85, 0))
 
 
 class SplitOnlyWhenRefusedTests(JobCase):
@@ -1043,7 +1043,7 @@ class SplitOnlyWhenRefusedTests(JobCase):
             client.return_value.collections.get.return_value.iterator.return_value = [
                 SimpleNamespace(properties={"source_file": "big.jsonl", "chunk_index": 0})]
             with self.assertRaisesRegex(ValueError, r"^big\.jsonl: part 2: owned failure$"):
-                tuning._chunks_from_sources("Coll", "context_aware", 1000, 0, 0.85, 0)
+                list(tuning._chunks_from_sources("Coll", "context_aware", 1000, 0, 0.85, 0))
 
 
 class ReviewerStoredTextCapBoundaryTests(JobCase):

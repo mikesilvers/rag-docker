@@ -59,9 +59,10 @@ and the other files in the job carry on.
 |---|---|---|
 | **Text** | **10,000,000 characters** | Every file and every chunking strategy; over it, the file is split. JSON and JSON Lines are measured after conversion to text (section 3), and one record over it fails the file. |
 | **Chunks** | **10,000 chunks** | Every chunking strategy (section 4); over it, the file is split, and one record over it fails the file |
-| Records | 1,000,000 records | A JSON file's records; a JSON Lines file's lines, blank lines included |
+| Records | 1,000,000 records | A JSON file's records |
+| Lines | 10,000,000 lines | A JSON Lines file's lines, blank lines included |
 | One `.json` file, or one `.json.gz` once decompressed | 30,000,000 bytes | JSON is read whole; anything bigger should be JSON Lines |
-| One `.jsonl.gz` once decompressed | 512 MB | `.jsonl.gz` |
+| One `.jsonl.gz` once decompressed | 2 GiB | `.jsonl.gz` |
 | Sentences | 100,000 sentences | The `semantic` strategy only |
 | Text across the windows, the overlap counted each time | 10,000,000 characters | The `overlap` strategy only; over it, the file is split |
 
@@ -207,10 +208,11 @@ of being split. A file under these targets stays one document under its own name
 | Converted text | at most 7,000,000 characters (70 % of the limit) | 10,000,000 characters |
 | Chunks, counted as in section 4 | at most 8,000 chunks (80 % of the limit) | 10,000 chunks |
 | `overlap` only: text across the chunks, counted as in section 4 | at most 8,000,000 characters (80 % of the limit) | 10,000,000 characters |
-| Records or lines | under the limit | 1,000,000 records |
+| Records in a JSON file | under the limit | 1,000,000 records |
+| Lines in a JSON Lines file, blank lines included | under the limit | 10,000,000 lines |
 | A `.json` file, or a `.json.gz` once decompressed | under the limit; over it, the file fails and is not split | 30,000,000 bytes |
 | One JSON Lines line | under the limit; over it, the file fails and is not split | 10,000,000 bytes |
-| A `.jsonl.gz` once decompressed | under the limit; over it, the file fails and is not split | 512 MB |
+| A `.jsonl.gz` once decompressed | under the limit; over it, the file fails and is not split | 2 GiB |
 
 The app's parts are cut where the limits fall. Split a file yourself when you want to choose
 where it is cut, or what the parts are called:
@@ -229,7 +231,7 @@ where it is cut, or what the parts are called:
 2. Trim the fields you don't need (section 3).
 3. Decide whether a file over the targets (section 5) may be split by the app, or split it
    yourself. A file over a byte limit fails instead of being split: a `.json` over
-   30,000,000 bytes, a JSON Lines line over 10,000,000 bytes, or a `.jsonl.gz` over 512 MB
+   30,000,000 bytes, a JSON Lines line over 10,000,000 bytes, or a `.jsonl.gz` over 2 GiB
    once decompressed.
 4. Give every file a distinct name.
 5. Keep each upload under 512 MB, and its ZIPs under 2 GiB once expanded and 5,000 entries

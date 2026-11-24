@@ -321,20 +321,20 @@ print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name
 check "a malformed line fails the file with its line number and stores nothing" $? \
   "status=$status error=$first_error stored=$stored"
 
-# A JSON Lines file holds at most 1,000,000 lines, records with no text
-# included (#314): a few KB of gzipped `{}` lines fails and stores nothing.
+# A JSON Lines file holds at most 10,000,000 lines, records with no text
+# included (#314, #312): under 100 KB of gzipped `{}` lines fails and stores nothing.
 drop_collection "$C"; make_collection "$C"
 ingest "$C" fixed 1000 0 "$FIX/jsonl_many_records.jsonl.gz"
 read -r status cap_error <<<"$(python3 -c "
 import json; d=json.load(open('/tmp/vfy_job.json'))
-want = ['jsonl_many_records.jsonl.gz: was decompressed, but it has more than 1,000,000 records, '
+want = ['jsonl_many_records.jsonl.gz: was decompressed, but it has more than 10,000,000 records, '
         'the most one file can hold; split the file']
 print(d['status'], 'yes' if d['errors'] == want else repr(d['errors']))")"
 stored=$(api_get "/collections" | python3 -c "
 import json,sys
 print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$C'][0])")
 [ "$status" = failed ] && [ "$cap_error" = yes ] && [ "$stored" = 0 ]
-check "a JSON Lines file over 1,000,000 lines fails with the record cap and stores nothing" $? \
+check "a JSON Lines file over 10,000,000 lines fails with the line cap and stores nothing" $? \
   "status=$status error=$cap_error stored=$stored"
 
 # ── upload size limit at the proxy ───────────────────────────────────────────
