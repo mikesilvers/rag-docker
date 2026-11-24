@@ -941,6 +941,13 @@ rm -rf "$SPLFIX" /tmp/vfy_split_job.json
 # bounded memory.
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_large_corpus.py)
 check "large corpora: streamed retention, one-part re-chunk staging, export and import in bounded memory (#312)" $?
+
+# ── the ingest time estimate (#614) ──────────────────────────────────────────
+# Controlled cases: the rate measured from stored parts and saved across a
+# restart, the time left a job status computes from it, and the per-file
+# progress the job loop records (whole, split, failed, capped).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_ingest_estimate.py)
+check "ingest time estimate: measured rate, time left per file and job, per-file progress (#614)" $?
 # End to end on the stack (full runs only: reading the file twice takes minutes):
 # a .jsonl.gz over the old caps, 9,000,000 lines of 64 bytes (576,000,000 bytes
 # decompressed, over 512 MiB and under 2 GiB; about 1 MB gzipped) after five
