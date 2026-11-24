@@ -15,6 +15,8 @@ failed reindex cutovers flag them when exact identity cannot be verified.
 **Memory.** Re-embedding from stored chunk text and reindexing read and copy the
 collection a page at a time; a reindex verifies every copy against a disk-backed
 fingerprint snapshot of the original, never decoded records in memory (#583).
+Re-chunking, and re-embedding with chunking parameters, stage the new chunks one
+file part at a time as each retained original is read (#312).
 
 **Gold standard.** Anything that changes chunk identity marks every session for
 the collection `stale`, with a reason and a timestamp. Sessions are never
@@ -24,6 +26,7 @@ from __future__ import annotations
 from services import telemetry
 
 import asyncio
+import contextlib
 import copy
 import logging
 import math
@@ -363,15 +366,27 @@ def rechunk_refusal(collection: str) -> str | None:
     return RECHUNK_NOT_COVERED if uncovered else None
 
 
+def _missing_source(collection: str, digest: str) -> PackageError:
+    return PackageError(
+        "SOURCES_REQUIRED",
+        f"Retained source {digest[:12]} is missing from disk, so "
+        f"'{collection}' cannot be rebuilt from its originals.",
+        {"collection": collection, "digest": digest})
+
+
 @telemetry.traced("rag.chunk")
 def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                          chunk_overlap: int, similarity_threshold: float,
-                         min_chunk_size: int) -> list[dict]:
-    """Re-parse and re-chunk every retained original.
+                         min_chunk_size: int) -> "_SourceChunks":
+    """Check that every retained original can be re-parsed and re-chunked, and
+    return a reader that re-chunks them one file part at a time (#312).
 
-    Everything is parsed before the collection is touched: parsing is the
-    failure-prone step, and discovering a bad file after the rebuild has started
-    would cost the collection.
+    Every check that needs no parsing runs here, before any collection is
+    created. Parsing, the failure-prone step, runs as the rebuild consumes the
+    reader: each part is staged before the next is read, so the collection is
+    never held in memory, and a bad file found then fails the rebuild while the
+    live collection is still untouched (it is only replaced once staging
+    succeeds). `list(reader)` gives every chunk, in order.
     """
     index = sources.load_index(collection)
     documents = index.get("documents") or {}
@@ -409,69 +424,103 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
             {"collection": collection,
              "uncovered_source_files": uncovered[:_MAX_NAMED_UNCOVERED],
              "uncovered_source_files_omitted": max(0, len(uncovered) - _MAX_NAMED_UNCOVERED)})
+    # Every blob is checked before anything is parsed or staged (#312), in the
+    # order the reader reaches them.
+    for digest in sorted(documents):
+        if not sources.blob_path(collection, digest).is_file():
+            raise _missing_source(collection, digest)
+    return _SourceChunks(collection, documents, stored, splitter.Settings(
+        strategy, chunk_size, chunk_overlap, similarity_threshold, min_chunk_size))
 
-    out: list[dict] = []
-    now = datetime.now(timezone.utc).isoformat()
-    work = Path(tempfile.mkdtemp(prefix="rechunk-", dir=settings.upload_dir))
-    try:
-        slots = 0
-        for digest, entry in sorted(documents.items()):
-            blob = sources.blob_path(collection, digest)
-            if not blob.is_file():
-                raise PackageError(
-                    "SOURCES_REQUIRED",
-                    f"Retained source {digest[:12]} is missing from disk, so "
-                    f"'{collection}' cannot be rebuilt from its originals.",
-                    {"collection": collection, "digest": digest})
-            for filename in entry["filenames"]:
-                if filename not in stored:
-                    continue
-                # Parsers dispatch on the file extension, so the original name
-                # has to be restored before parsing; each pair is staged in a
-                # directory of its own, so a/report.txt and b/report.txt can't
-                # collide.
-                slots += 1
-                slot = work / str(slots)
-                slot.mkdir()
-                staged = slot / PurePosixPath(filename).name
-                shutil.copyfile(blob, staged)
 
-                source_type = source_type_of(staged)
-                # Split as ingest splits it (#621): a file over the per-file
-                # limits under the new settings is rebuilt as parts, however
-                # many parts it had before.
-                number = 0
-                split_settings = splitter.Settings(strategy, chunk_size, chunk_overlap,
-                                                   similarity_threshold, min_chunk_size)
-                try:
-                    for kind, chunks in splitter.split_file(staged, split_settings, _parse_file, do_chunk):
-                        number += 1
-                        source = filename if kind == "whole" else parts.part_name(filename, number)
-                        out.extend({
-                            "content": c,
-                            "source_file": source,
-                            "source_type": source_type,
-                            "chunk_index": i,
-                            "chunk_strategy": strategy,
-                            "chunk_size": chunk_size,
-                            "chunk_overlap": chunk_overlap,
-                            "created_at": now,
-                        } for i, c in enumerate(chunks))
-                except splitter.PartError as exc:
-                    raise ValueError(f"{filename}: part {exc.number}: {exc}") from exc.cause
-                except splitter.StoredTextTooLarge as exc:
-                    # The same cap as ingest (PR #630): the re-chunk fails whole,
-                    # before the collection is touched.
-                    raise ValueError(f"{filename}: {exc}") from exc
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
+class _SourceChunks:
+    """A re-chunk's new chunks, read from the retained originals one file part
+    at a time (#312).
 
-    if not out:
-        raise PackageError(
-            "SOURCES_REQUIRED",
-            f"Re-chunking '{collection}' produced no chunks; check the chunking "
-            "parameters.", {"collection": collection})
-    return out
+    `parts()` yields each part's chunks as a list, parsing the next part only
+    when asked, so whoever stages a part before asking for the next holds one
+    part (at most the per-file limits) whatever the collection's size. It reads
+    the originals once per call. Iterating gives every chunk in turn.
+    """
+
+    def __init__(self, collection: str, documents: dict, stored: set[str],
+                 split_settings: splitter.Settings) -> None:
+        self.collection = collection
+        self.documents = documents
+        self.stored = stored
+        self.settings = split_settings
+        # One created_at for the whole rebuild.
+        self.now = datetime.now(timezone.utc).isoformat()
+
+    def parts(self):
+        collection, split_settings = self.collection, self.settings
+        produced = 0
+        work = Path(tempfile.mkdtemp(prefix="rechunk-", dir=settings.upload_dir))
+        try:
+            slots = 0
+            for digest, entry in sorted(self.documents.items()):
+                blob = sources.blob_path(collection, digest)
+                if not blob.is_file():
+                    # Removed since _chunks_from_sources checked it.
+                    raise _missing_source(collection, digest)
+                for filename in entry["filenames"]:
+                    if filename not in self.stored:
+                        continue
+                    # Parsers dispatch on the file extension, so the original name
+                    # has to be restored before parsing; each pair is staged in a
+                    # directory of its own, so a/report.txt and b/report.txt can't
+                    # collide.
+                    slots += 1
+                    slot = work / str(slots)
+                    slot.mkdir()
+                    staged = slot / PurePosixPath(filename).name
+                    shutil.copyfile(blob, staged)
+
+                    source_type = source_type_of(staged)
+                    # Split as ingest splits it (#621): a file over the per-file
+                    # limits under the new settings is rebuilt as parts, however
+                    # many parts it had before.
+                    number = 0
+                    try:
+                        for kind, chunks in splitter.split_file(staged, split_settings,
+                                                                _parse_file, do_chunk):
+                            number += 1
+                            source = filename if kind == "whole" else parts.part_name(filename, number)
+                            part = [{
+                                "content": c,
+                                "source_file": source,
+                                "source_type": source_type,
+                                "chunk_index": i,
+                                "chunk_strategy": split_settings.strategy,
+                                "chunk_size": split_settings.chunk_size,
+                                "chunk_overlap": split_settings.chunk_overlap,
+                                "created_at": self.now,
+                            } for i, c in enumerate(chunks)]
+                            del chunks
+                            if part:
+                                produced += len(part)
+                                yield part
+                            # Dropped before the next part is read, so only one
+                            # part is held at a time.
+                            del part
+                    except splitter.PartError as exc:
+                        raise ValueError(f"{filename}: part {exc.number}: {exc}") from exc.cause
+                    except splitter.StoredTextTooLarge as exc:
+                        # The same cap as ingest (PR #630): the re-chunk fails whole,
+                        # before the collection is replaced.
+                        raise ValueError(f"{filename}: {exc}") from exc
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+        if not produced:
+            raise PackageError(
+                "SOURCES_REQUIRED",
+                f"Re-chunking '{collection}' produced no chunks; check the chunking "
+                "parameters.", {"collection": collection})
+
+    def __iter__(self):
+        for part in self.parts():
+            yield from part
 
 
 # ── Rebuilding ────────────────────────────────────────────────────────────────
@@ -480,11 +529,14 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
 @collection_writes.serialized("collection")
 def _rebuild(collection: str, properties: list[dict], index_type: str | None,
              distance_metric: str | None, progress, *, records: list[dict] | None = None,
-             source_collection: str | None = None, before_replace=None) -> int:
+             source_collection: str | None = None, before_replace=None, staged=None) -> int:
     """Stage and verify, then replace the live collection under its writer guard.
 
     Reindex `records` are a fingerprint snapshot of the original (a list is
-    snapshotted here); nothing holds the collection in memory (#583).
+    snapshotted here); nothing holds the collection in memory (#583). A
+    re-chunk's `properties` is a _SourceChunks reader: each part is inserted
+    into staging before the next is read, and `staged(n)` is told the running
+    count (#312). Other properties are inserted in one write.
     """
     source_collection = source_collection or collection
     collection = collection_writes.canonical(collection)
@@ -513,10 +565,22 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
             # backend writers are detected by comparing the source again.
             _verify_records(collection, records)
         else:
-            wc._insert_chunks_sync(staging, properties)
+            produce = getattr(properties, "parts", None)
+            if produce is not None:
+                expected = 0
+                with contextlib.closing(produce()) as produced:
+                    for part in produced:
+                        wc._insert_chunks_sync(staging, part)
+                        expected += len(part)
+                        del part
+                        if staged:
+                            staged(expected)
+            else:
+                wc._insert_chunks_sync(staging, properties)
+                expected = len(properties)
             staged_count = telemetry.call("weaviate.aggregate", client.collections.get(staging).aggregate.over_all, total_count=True).total_count
-            if staged_count != len(properties):
-                raise RuntimeError(f"staged {staged_count} chunks but expected {len(properties)}")
+            if staged_count != expected:
+                raise RuntimeError(f"staged {staged_count} chunks but expected {expected}")
         if source_collection != collection:
             collection_recovery.retain(ownership, source_collection=source_collection)
         else:
@@ -534,14 +598,14 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
             _write_records(collection, records.reading(staging))
             written = len(records)
         else:
-            def staged():
+            def staged_records():
                 return (
                     {"id": str(obj.uuid), "vector": (obj.vector or {}).get("default"),
                      "properties": dict(obj.properties or {})}
                     for obj in telemetry.iterate(client.collections.get(staging).iterator, include_vector=True)
                 )
-            written = batch_write.insert(client.collections.get(collection), staged,
-                                         expected_count=len(properties))
+            written = batch_write.insert(client.collections.get(collection), staged_records,
+                                         expected_count=expected)
         if progress:
             progress(written)
         completed = True
@@ -664,17 +728,24 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
         else:
             raise PackageError("TUNE_UNSUPPORTED", f"Unknown operation '{operation}'.")
 
-        job["chunks_total"] = len(properties)
+        # A re-chunk's reader counts its chunks only as they are staged (#312):
+        # its total starts at 0 and follows staging.
+        streaming = hasattr(properties, "parts")
+        job["chunks_total"] = 0 if streaming else len(properties)
         stale_count = 0
 
         def mark_before_replace() -> None:
             nonlocal stale_count
             stale_count = goldstandard.mark_stale(source_collection, reason, require_durable=True)
 
+        def staged(n: int) -> None:
+            job["chunks_total"] = n
+
         written = _rebuild(
             collection, properties, params.get("index_type"), params.get("distance_metric"),
             progress, records=records, source_collection=source_collection,
-            before_replace=mark_before_replace if reason else None)
+            before_replace=mark_before_replace if reason else None,
+            **({"staged": staged} if streaming else {}))
 
         notes = []
         if reason:
