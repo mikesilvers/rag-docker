@@ -441,6 +441,11 @@ class _SourceChunks:
     when asked, so whoever stages a part before asking for the next holds one
     part (at most the per-file limits) whatever the collection's size. It reads
     the originals once per call. Iterating gives every chunk in turn.
+
+    `start()` reads the first part ahead, before any collection is created, so
+    a re-chunk that produces no chunks, or whose first file can't be read,
+    fails before the rebuild starts, as it did when everything was parsed first;
+    the next `parts()` begins with that part. `close()` ends a started read.
     """
 
     def __init__(self, collection: str, documents: dict, stored: set[str],
@@ -451,8 +456,34 @@ class _SourceChunks:
         self.settings = split_settings
         # One created_at for the whole rebuild.
         self.now = datetime.now(timezone.utc).isoformat()
+        self._started = None
+        self._first = None
+
+    def start(self) -> None:
+        reading = self._read()
+        # An empty read raises the no-chunks error here (see _read).
+        self._first = next(reading)
+        self._started = reading
+
+    def close(self) -> None:
+        if self._started is not None:
+            self._started.close()
+            self._started = self._first = None
 
     def parts(self):
+        if self._started is None:
+            yield from self._read()
+            return
+        reading, first = self._started, self._first
+        self._started = self._first = None
+        try:
+            yield first
+            del first
+            yield from reading
+        finally:
+            reading.close()
+
+    def _read(self):
         collection, split_settings = self.collection, self.settings
         produced = 0
         work = Path(tempfile.mkdtemp(prefix="rechunk-", dir=settings.upload_dir))
@@ -685,6 +716,7 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
         job.update(fields)
 
     records = None
+    properties = None
     try:
         needs_sources = operation == "rechunk" or (
             operation == "reembed" and params.get("chunking") is not None)
@@ -729,8 +761,11 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
             raise PackageError("TUNE_UNSUPPORTED", f"Unknown operation '{operation}'.")
 
         # A re-chunk's reader counts its chunks only as they are staged (#312):
-        # its total starts at 0 and follows staging.
+        # its total starts at 0 and follows staging. Its first part is read
+        # now, so a re-chunk with no chunks fails before any collection exists.
         streaming = hasattr(properties, "parts")
+        if streaming and hasattr(properties, "start"):
+            properties.start()
         job["chunks_total"] = 0 if streaming else len(properties)
         stale_count = 0
 
@@ -769,6 +804,8 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
     finally:
         if isinstance(records, _RecordSnapshot):
             records.close()
+        if isinstance(properties, _SourceChunks):
+            properties.close()
         collection_writes.end_job("tune", job_id)
         with _lock:
             _active.discard(collection)
