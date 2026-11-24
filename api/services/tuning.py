@@ -315,7 +315,9 @@ def _source_index_invalid(collection: str) -> PackageError:
 def _has_stored_listed_name(collection: str, documents: dict) -> bool:
     """Whether any name the index lists has stored chunks; stops at the first."""
     names = _listed_names(documents)
-    for obj in wc.get_client().collections.get(collection).iterator():
+    # Only the property the check reads, not each chunk's text (#888, as #258).
+    for obj in wc.get_client().collections.get(collection).iterator(
+            include_vector=False, return_properties=["source_file"]):
         filename = (obj.properties or {}).get("source_file")
         # A part counts for its original (#621).
         if isinstance(filename, str) and parts.resolve(filename, names) is not None:

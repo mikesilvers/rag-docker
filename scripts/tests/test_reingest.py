@@ -1132,6 +1132,22 @@ class RechunkTests(unittest.TestCase):
         self.assertEqual(calls, [{"include_vector": False,
                                   "return_properties": ["source_file", "chunk_index"]}])
 
+    def test_the_rechunk_check_reads_only_source_file(self):
+        # The up-front re-chunk check stops at the first stored listed name; it
+        # asks for that one property, not each chunk's text (#888).
+        sources.store("Coll", "a.txt", b"alpha", replace=True)
+        calls = []
+
+        def iterator(**kwargs):
+            calls.append(kwargs)
+            return iter([SimpleNamespace(properties={"source_file": "a.txt"})])
+
+        coll = SimpleNamespace(iterator=iterator)
+        with patch.object(wc, "get_client", return_value=SimpleNamespace(
+                collections=SimpleNamespace(get=lambda name: coll))):
+            self.assertTrue(tuning._has_stored_listed_name("Coll", sources.load_index("Coll")["documents"]))
+        self.assertEqual(calls, [{"include_vector": False, "return_properties": ["source_file"]}])
+
 
     def test_a_name_without_stored_chunks_is_not_rebuilt(self):
         # #311: an index can list names the collection never showed; only the
