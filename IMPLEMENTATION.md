@@ -30503,7 +30503,9 @@ original, the large blob removed).
 `scripts/tests/test_ingest_estimate.py` (#614) checks, with Weaviate mocked and the rate file
 in a temporary upload folder, the ingest time estimate: the rate (characters over seconds of
 the last 20 stored parts, weighted by size) saved and read back after a restart, a malformed
-file read as no rate and replaced, ignored and unsaved measurements; the time left a job status
+file read as no rate and replaced, ignored and unsaved measurements, the file named outside
+the startup sweep's prefixes with the older `ingest-rate.json` read until it exists, and a
+failed save logged once (#896); the time left a job status
 computes (none before a measurement, a countdown inside the part being stored never below 0,
 a failed file's 0, the "at least" flag for files not reached, a file still being parsed (#896)
 and split files with more parts, nothing for a job that isn't running, old records); and the
@@ -30514,7 +30516,7 @@ file), a one-file job read before its first part (#896), and the cap on entries.
 runs it in the API image with no network.
 On the stack, `02_ingest.sh` then checks that the six-type job's finished status lists each
 file's chunk and character counts, all stored, with no rate or time left, and that the real
-store left valid measurements in the API's `UPLOAD_DIR/ingest-rate.json`.
+store left valid measurements in the API's `UPLOAD_DIR/embedding-rate.json`.
 `browser/ui_criteria.js` (suite 06) stubs job responses to check the Import page's progress
 panel: "No estimate yet" before a measurement, the rate and "About ... left", "At least ...
 left" for files not chunked yet and for a split file with more parts, and a finished job's
@@ -47542,10 +47544,10 @@ ok=(isinstance(fp,list) and len(fp)==6 and d.get('file_progress_omitted')==0
 sys.exit(0 if ok else 1)"
 check "a finished job lists each file's chunk counts and no rate or time left (#614)" $? \
   "$(python3 -c "import json;d=json.load(open('/tmp/vfy_job.json'));print({k:d.get(k) for k in ('file_progress','files_not_chunked','rate_characters_per_second','seconds_left')})" | cut -c1-400)"
-(cd "$REPO_ROOT" && docker compose exec -T api cat /app/uploads/ingest-rate.json) | python3 -c "
+(cd "$REPO_ROOT" && docker compose exec -T api cat /app/uploads/embedding-rate.json) | python3 -c "
 import json,sys; s=json.load(sys.stdin)['samples']
 sys.exit(0 if 1<=len(s)<=20 and all(isinstance(c,int) and c>0 and t>0 for c,t in s) else 1)"
-check "a real ingest saves its measured rate in UPLOAD_DIR/ingest-rate.json (#614)" $?
+check "a real ingest saves its measured rate in UPLOAD_DIR/embedding-rate.json (#614, #896)" $?
 
 # ── ZIP batch, with unsupported members reported ─────────────────────────────
 drop_collection "$C"; make_collection "$C"

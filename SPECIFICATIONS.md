@@ -993,8 +993,9 @@ stored whole, and for a file split into parts (§5.1.1) only after its last part
 ones. The rate is measured from real ingests only: each stored part (a file stored whole is
 one part) is a measurement of the characters of its chunks over the seconds its store took,
 embedding and the insert check included; a failed store is not one. The instance keeps its
-last 20 measurements in `{UPLOAD_DIR}/ingest-rate.json` (counts and times only), so a restart
-keeps the rate, and `rate_characters_per_second` is their characters over their seconds.
+last 20 measurements in `{UPLOAD_DIR}/embedding-rate.json` (counts and times only; the older
+`ingest-rate.json` is read until that file exists, #896), so a restart keeps the rate, and
+`rate_characters_per_second` is their characters over their seconds.
 Each entry's `seconds_left` is its characters not yet stored over the rate; for the file
 whose part is being stored it counts down by the time that store has been running, never
 below 0, and a failed file's is 0. The job's `seconds_left` is their sum: it counts only work

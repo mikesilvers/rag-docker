@@ -10,9 +10,10 @@ the characters of the chunk texts handed to the store, and the seconds the
 store took, embedding and the insert check included. A failed store is not a
 measurement. The instance keeps its last RATE_WINDOW measurements, and the rate
 is their characters over their seconds, so a large part weighs more than a
-one-chunk file. They are saved in `<UPLOAD_DIR>/ingest-rate.json` (counts and
-times only), so a restart keeps the rate. Until the first measurement there is
-no rate, and the job status says so ("no estimate yet").
+one-chunk file. They are saved in `<UPLOAD_DIR>/embedding-rate.json` (counts and
+times only), so a restart keeps the rate; the older `ingest-rate.json` is read
+until that file exists (#896). Until the first measurement there is no rate,
+and the job status says so ("no estimate yet"). A failed save is logged once.
 
 **The time left** counts only work already chunked and not yet stored. Files
 the job hasn't reached, the file it is still parsing (before its first chunks,
@@ -39,15 +40,24 @@ RATE_WINDOW = 20
 # A ZIP can hold thousands of files, and the job store writes the whole record
 # up to once a second, so the record keeps the newest entries and counts the rest.
 FILE_PROGRESS_LIMIT = 100
-RATE_FILE = "ingest-rate.json"
+RATE_FILE = "embedding-rate.json"
+# The name before #896. It starts with `ingest-`, one of the startup sweep's
+# work-directory prefixes (importer._WORKDIR_PREFIXES), so the rate moved to
+# RATE_FILE; this one is read only while RATE_FILE doesn't exist yet.
+OLD_RATE_FILE = "ingest-rate.json"
 
 _lock = threading.Lock()
 _samples: list[tuple[int, float]] | None = None
 _warned = False
+_save_warned = False
 
 
 def _path() -> Path:
     return Path(settings.upload_dir) / RATE_FILE
+
+
+def _old_path() -> Path:
+    return Path(settings.upload_dir) / OLD_RATE_FILE
 
 
 def _valid(characters, seconds) -> bool:
@@ -56,30 +66,38 @@ def _valid(characters, seconds) -> bool:
             and seconds > 0)
 
 
+def _read(path: Path) -> list[tuple[int, float]]:
+    """One rate file's valid measurements; raises FileNotFoundError when it is
+    missing, and another error when it is unreadable or malformed."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    samples = data["samples"]
+    if not isinstance(samples, list):
+        raise ValueError("samples is not a list")
+    kept = []
+    for sample in samples:
+        if not (isinstance(sample, list) and len(sample) == 2):
+            raise ValueError("a sample is not a [characters, seconds] pair")
+        if _valid(sample[0], sample[1]):
+            kept.append((sample[0], float(sample[1])))
+    return kept[-RATE_WINDOW:]
+
+
 def _load() -> list[tuple[int, float]]:
-    """The saved measurements; none when the file is missing, unreadable or
-    malformed (logged once: the next measurement replaces the file)."""
+    """The saved measurements: from RATE_FILE, or from OLD_RATE_FILE while
+    RATE_FILE doesn't exist; none when neither exists, or when the one read is
+    unreadable or malformed (logged once: the next measurement replaces it)."""
     global _warned
-    path = _path()
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        samples = data["samples"]
-        if not isinstance(samples, list):
-            raise ValueError("samples is not a list")
-        kept = []
-        for sample in samples:
-            if not (isinstance(sample, list) and len(sample) == 2):
-                raise ValueError("a sample is not a [characters, seconds] pair")
-            if _valid(sample[0], sample[1]):
-                kept.append((sample[0], float(sample[1])))
-        return kept[-RATE_WINDOW:]
-    except FileNotFoundError:
-        return []
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        if not _warned:
-            _log.warning("Ignoring the unreadable ingest rate file %s: %s", path, exc)
-            _warned = True
-        return []
+    for path in (_path(), _old_path()):
+        try:
+            return _read(path)
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            if not _warned:
+                _log.warning("Ignoring the unreadable ingest rate file %s: %s", path, exc)
+                _warned = True
+            return []
+    return []
 
 
 def _loaded() -> list[tuple[int, float]]:
@@ -91,7 +109,10 @@ def _loaded() -> list[tuple[int, float]]:
 
 def record(characters: int, seconds: float) -> None:
     """Add one stored part's measurement and save the window. A failure to save
-    is logged and never fails the ingest; the measurement still counts."""
+    never fails the ingest, and the measurement still counts. The first failure
+    in the process is logged with its traceback, later ones only at DEBUG: a
+    process without a writable UPLOAD_DIR fails every save (#896)."""
+    global _save_warned
     if not _valid(characters, seconds):
         return
     with _lock:
@@ -101,7 +122,11 @@ def record(characters: int, seconds: float) -> None:
         try:
             settings_store.publish(_path(), {"samples": [list(s) for s in samples]})
         except Exception:                               # noqa: BLE001
-            _log.warning("Could not save the ingest rate to %s", _path(), exc_info=True)
+            if not _save_warned:
+                _save_warned = True
+                _log.warning("Could not save the ingest rate to %s", _path(), exc_info=True)
+            else:
+                _log.debug("Could not save the ingest rate to %s", _path())
 
 
 def rate() -> float | None:
@@ -114,10 +139,11 @@ def rate() -> float | None:
 
 
 def _reset_for_tests() -> None:
-    global _samples, _warned
+    global _samples, _warned, _save_warned
     with _lock:
         _samples = None
         _warned = False
+        _save_warned = False
 
 
 # ── the job record ───────────────────────────────────────────────────────────

@@ -50,6 +50,10 @@ class UploadDir(unittest.TestCase):
     def rate_file(self):
         return self.dir / ingest_estimate.RATE_FILE
 
+    @property
+    def old_rate_file(self):
+        return self.dir / ingest_estimate.OLD_RATE_FILE
+
     def restart(self):
         """What an API restart does to the store: the memory is gone, the file stays."""
         ingest_estimate._reset_for_tests()
@@ -104,6 +108,35 @@ class RateStoreTests(UploadDir):
             ingest_estimate.record(characters, seconds)
         self.assertIsNone(ingest_estimate.rate())
         self.assertFalse(self.rate_file.exists())
+
+    def test_the_rate_file_is_outside_the_startup_sweep(self):
+        # A name the sweep's prefixes match could be removed on every start (#896).
+        from services import importer
+        self.assertEqual(ingest_estimate.RATE_FILE, "embedding-rate.json")
+        self.assertFalse(ingest_estimate.RATE_FILE.startswith(importer._WORKDIR_PREFIXES))
+
+    def test_the_old_rate_file_is_read_until_the_new_one_exists(self):
+        # An instance that measured before the rename keeps its rate (#896).
+        self.old_rate_file.write_text(json.dumps({"samples": [[1_000, 2.0]]}))
+        self.restart()
+        self.assertAlmostEqual(ingest_estimate.rate(), 500.0)
+        ingest_estimate.record(3_000, 2.0)
+        self.assertEqual(json.loads(self.rate_file.read_text()),
+                         {"samples": [[1_000, 2.0], [3_000, 2.0]]})
+        self.assertTrue(self.old_rate_file.exists())           # left where it is
+        self.old_rate_file.write_text(json.dumps({"samples": [[9, 9.0]]}))
+        self.restart()
+        self.assertAlmostEqual(ingest_estimate.rate(), 1_000.0)   # the new file only
+
+    def test_failed_saves_are_logged_once(self):
+        with patch.object(ingest_estimate.settings_store, "publish", side_effect=OSError("disk full")), \
+                self.assertLogs(ingest_estimate._log, "DEBUG") as logs:
+            ingest_estimate.record(1_000, 4.0)
+            ingest_estimate.record(1_000, 4.0)
+        self.assertEqual([r.levelname for r in logs.records], ["WARNING", "DEBUG"])
+        self.assertIsNotNone(logs.records[0].exc_info)
+        self.assertIsNone(logs.records[1].exc_info)
+        self.assertAlmostEqual(ingest_estimate.rate(), 250.0)   # both counted
 
     def test_a_failed_save_keeps_the_measurement_and_never_raises(self):
         with patch.object(ingest_estimate.settings_store, "publish", side_effect=OSError("disk full")), \
