@@ -7096,7 +7096,8 @@ def _process_job_sync(
             name = logical[index]
             label = (labels or {}).get(path, name)
             # The estimate's per-file progress (#614): an entry once the file's
-            # first chunks exist, ended below however the file ends.
+            # first chunks exist, ended below however the file ends. Until then
+            # the file counts as not chunked (#896).
             ingest_estimate.file_started(job)
             failed_before, has_entry = job["files_failed"], False
             try:
@@ -7228,8 +7229,8 @@ def _process_job_sync(
                 job["errors"].append(f"{label}: {str(exc) or type(exc).__name__}")
                 _log.warning("ingest job %s: %r failed", job_id, label, exc_info=True)
             finally:
-                if has_entry:
-                    ingest_estimate.file_ended(job, failed=job["files_failed"] > failed_before)
+                ingest_estimate.file_ended(job, failed=job["files_failed"] > failed_before,
+                                           has_entry=has_entry)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         # Before the status turns terminal: a client that sees the job end
@@ -7794,6 +7795,7 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
             "file_progress": [],
             "file_progress_omitted": 0,
             "files_started": 0,
+            "file_chunking": False,
             "storing_since": None,
             "errors": [],
             "skipped": skipped,
@@ -30503,11 +30505,13 @@ in a temporary upload folder, the ingest time estimate: the rate (characters ove
 the last 20 stored parts, weighted by size) saved and read back after a restart, a malformed
 file read as no rate and replaced, ignored and unsaved measurements; the time left a job status
 computes (none before a measurement, a countdown inside the part being stored never below 0,
-a failed file's 0, the "at least" flag for files not reached and split files with more parts,
-nothing for a job that isn't running, old records); and the per-file progress the job loop
+a failed file's 0, the "at least" flag for files not reached, a file still being parsed (#896)
+and split files with more parts, nothing for a job that isn't running, old records); and the
+per-file progress the job loop
 records for a whole file, a split file (chunked only after its last part, one measurement a
-part), a failed store (not a measurement), a file failing before any chunks, and the cap on
-entries. `02_ingest.sh` runs it in the API image with no network.
+part), a failed store (not a measurement), a file failing before any chunks (also as the last
+file), a one-file job read before its first part (#896), and the cap on entries. `02_ingest.sh`
+runs it in the API image with no network.
 On the stack, `02_ingest.sh` then checks that the six-type job's finished status lists each
 file's chunk and character counts, all stored, with no rate or time left, and that the real
 store left valid measurements in the API's `UPLOAD_DIR/ingest-rate.json`.

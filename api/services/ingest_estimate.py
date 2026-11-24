@@ -15,9 +15,10 @@ times only), so a restart keeps the rate. Until the first measurement there is
 no rate, and the job status says so ("no estimate yet").
 
 **The time left** counts only work already chunked and not yet stored. Files
-the job hasn't reached, and a split file's later parts (#621), aren't guessed:
-`files_not_chunked` and `seconds_left_is_minimum` say the job's time left is
-then a minimum. Inside a long part the time left counts down by the time the
+the job hasn't reached, the file it is still parsing (before its first chunks,
+`file_chunking`), and a split file's later parts (#621), aren't guessed:
+`files_not_chunked` counts the first two, and `seconds_left_is_minimum` says the
+job's time left is then a minimum. Inside a long part the time left counts down by the time the
 part has been storing (`storing_since`), never below 0. Only a running job has
 a time left; a queued, finished or interrupted one shows its counts alone.
 """
@@ -132,8 +133,9 @@ def _entries(job: dict) -> list[dict]:
 
 
 def file_started(job: dict) -> None:
-    """The job loop has reached a file, whether or not it makes chunks."""
-    job.update({"files_started": (job.get("files_started") or 0) + 1})
+    """The job loop has reached a file, whether or not it makes chunks. Until
+    its first part is chunked it has no entry, and counts as not chunked (#896)."""
+    job.update({"files_started": (job.get("files_started") or 0) + 1, "file_chunking": True})
 
 
 def part_chunked(job: dict, label: str, chunks: int, characters: int, first: bool) -> None:
@@ -153,7 +155,7 @@ def part_chunked(job: dict, label: str, chunks: int, characters: int, first: boo
         last["chunks"] = last.get("chunks", 0) + chunks
         last["characters"] = last.get("characters", 0) + characters
     job.update({"file_progress": entries, "file_progress_omitted": omitted,
-                "storing_since": _now_iso()})
+                "storing_since": _now_iso(), "file_chunking": False})
 
 
 def part_stored(job: dict, chunks: int, characters: int, seconds: float) -> None:
@@ -167,15 +169,18 @@ def part_stored(job: dict, chunks: int, characters: int, seconds: float) -> None
     record(characters, seconds)
 
 
-def file_ended(job: dict, failed: bool) -> None:
-    """The file with the last entry is finished: all chunked, or failed."""
+def file_ended(job: dict, failed: bool, has_entry: bool = True) -> None:
+    """The file is finished: all chunked, or failed. With `has_entry` it is the
+    file with the last entry; without, it ended before any chunks (#896)."""
+    update = {"storing_since": None, "file_chunking": False}
     entries = _entries(job)
-    if entries:
+    if has_entry and entries:
         last = entries[-1]
         last["failed"] = bool(failed)
         if not failed:
             last["chunked"] = True
-    job.update({"file_progress": entries, "storing_since": None})
+        update["file_progress"] = entries
+    job.update(update)
 
 
 # ── the job status ───────────────────────────────────────────────────────────
@@ -197,7 +202,9 @@ def view(job: dict, now: datetime | None = None, current_rate=_UNSET) -> dict:
     """The estimate fields of a job status, computed when it is read."""
     entries = _entries(job)
     started = job.get("files_started")
+    # The files not reached, and the one being parsed before its first chunks.
     not_chunked = (max((job.get("files_total") or 0) - started, 0)
+                   + (1 if job.get("file_chunking") else 0)
                    if isinstance(started, int) else None)
     out = {"file_progress": entries,
            "file_progress_omitted": job.get("file_progress_omitted") or 0,

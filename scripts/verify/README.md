@@ -663,11 +663,13 @@ in a temporary upload folder, the ingest time estimate: the rate (characters ove
 the last 20 stored parts, weighted by size) saved and read back after a restart, a malformed
 file read as no rate and replaced, ignored and unsaved measurements; the time left a job status
 computes (none before a measurement, a countdown inside the part being stored never below 0,
-a failed file's 0, the "at least" flag for files not reached and split files with more parts,
-nothing for a job that isn't running, old records); and the per-file progress the job loop
+a failed file's 0, the "at least" flag for files not reached, a file still being parsed (#896)
+and split files with more parts, nothing for a job that isn't running, old records); and the
+per-file progress the job loop
 records for a whole file, a split file (chunked only after its last part, one measurement a
-part), a failed store (not a measurement), a file failing before any chunks, and the cap on
-entries. `02_ingest.sh` runs it in the API image with no network.
+part), a failed store (not a measurement), a file failing before any chunks (also as the last
+file), a one-file job read before its first part (#896), and the cap on entries. `02_ingest.sh`
+runs it in the API image with no network.
 On the stack, `02_ingest.sh` then checks that the six-type job's finished status lists each
 file's chunk and character counts, all stored, with no rate or time left, and that the real
 store left valid measurements in the API's `UPLOAD_DIR/ingest-rate.json`.

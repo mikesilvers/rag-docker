@@ -998,11 +998,12 @@ keeps the rate, and `rate_characters_per_second` is their characters over their 
 Each entry's `seconds_left` is its characters not yet stored over the rate; for the file
 whose part is being stored it counts down by the time that store has been running, never
 below 0, and a failed file's is 0. The job's `seconds_left` is their sum: it counts only work
-already chunked. `files_not_chunked` is how many files the job hasn't reached, and
-`seconds_left_is_minimum` is `true` while any such file, or any unfinished split file's later
-parts, remain, so the job's time left is then a minimum. Before the instance's first
-measurement the rate and every `seconds_left` are `null` (the Import page says "No estimate
-yet"); there is no default rate. A job that isn't `running` has `null` rate and times and
+already chunked. `files_not_chunked` is how many files the job hasn't reached, plus the file it
+is parsing before its first chunks (#896), and `seconds_left_is_minimum` is `true` while any such
+file, or any unfinished split file's later parts, remain, so the job's time left is then a
+minimum. Before the instance's first measurement the rate and every `seconds_left` are `null`
+(the Import page says "No estimate yet"); there is no default rate. A job that isn't `running`
+has `null` rate and times and
 `seconds_left_is_minimum` `false`; its `file_progress` counts stay. Job records written before
 these fields existed read back with `file_progress: []`, `file_progress_omitted: 0` and the
 other estimate fields `null`/`false`. `GET /ingest/jobs` entries carry `file_progress` as

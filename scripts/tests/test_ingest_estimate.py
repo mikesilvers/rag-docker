@@ -116,7 +116,8 @@ class RateStoreTests(UploadDir):
 def running_job(**fields):
     job = {"job_id": "j1", "status": "running", "files_total": 3, "files_completed": 0,
            "files_failed": 0, "chunks_stored": 0, "errors": [], "file_progress": [],
-           "file_progress_omitted": 0, "files_started": 0, "storing_since": None}
+           "file_progress_omitted": 0, "files_started": 0, "file_chunking": False,
+           "storing_since": None}
     job.update(fields)
     return job
 
@@ -176,6 +177,24 @@ class ViewTests(UploadDir):
         self.assertEqual(view["files_not_chunked"], 0)
         self.assertTrue(view["seconds_left_is_minimum"])
 
+    def test_a_file_being_parsed_is_not_chunked(self):
+        # Started, no entry yet (#896): not chunked, so the time left is a minimum.
+        parsing = running_job(files_total=1, files_started=1, file_chunking=True)
+        view = ingest_estimate.view(parsing, NOW, current_rate=1_000.0)
+        self.assertEqual(view["files_not_chunked"], 1)
+        self.assertEqual(view["seconds_left"], 0.0)
+        self.assertTrue(view["seconds_left_is_minimum"])
+        second = running_job(files_total=2, files_started=2, file_chunking=True, file_progress=[
+            entry("a.txt", 5, 4_000, 5, 4_000, chunked=True)])
+        view = ingest_estimate.view(second, NOW, current_rate=1_000.0)
+        self.assertEqual(view["files_not_chunked"], 1)
+        self.assertTrue(view["seconds_left_is_minimum"])
+        for job in (parsing, second):               # a record without the field, as before
+            del job["file_chunking"]
+            view = ingest_estimate.view(job, NOW, current_rate=1_000.0)
+            self.assertEqual(view["files_not_chunked"], 0)
+            self.assertFalse(view["seconds_left_is_minimum"])
+
     def test_only_a_running_job_has_an_estimate(self):
         ingest_estimate.record(1_000, 1.0)
         for status in ("queued", "completed", "partial", "failed"):
@@ -210,6 +229,7 @@ class ViewTests(UploadDir):
         self.assertEqual((status.seconds_left, status.rate_characters_per_second), (20.0, 50.0))
         self.assertNotIn("storing_since", status.model_dump())
         self.assertNotIn("files_started", status.model_dump())
+        self.assertNotIn("file_chunking", status.model_dump())
         listed = IngestJobEntry.model_validate(job)        # the job list: no computed times
         self.assertEqual(listed.file_progress[0].chunks, 10)
         self.assertIsNone(listed.file_progress[0].seconds_left)
@@ -347,6 +367,34 @@ class JobLoopTests(UploadDir):
         self.assertEqual(job["files_started"], 2)
         self.assertEqual(job["files_failed"], 1)
 
+    def test_a_one_file_job_read_before_its_first_part(self):
+        # With a saved rate, the status while the file is parsed must not read as
+        # nothing left (#896): the file is not chunked yet.
+        ingest_estimate.record(1_000, 1.0)
+        views = []
+        part_chunked = ingest_estimate.part_chunked
+
+        def watch(job, *args, **kwargs):
+            views.append(ingest_estimate.view(job, NOW))
+            part_chunked(job, *args, **kwargs)
+
+        with patch.object(ingest_estimate, "part_chunked", side_effect=watch):
+            job, _ = self.run_job([("a.json", json.dumps({"t": "word " * 500}))])
+        self.assertEqual(job["status"], "completed", job["errors"])
+        first = views[0]
+        self.assertEqual(first["files_not_chunked"], 1)
+        self.assertTrue(first["seconds_left_is_minimum"])
+        self.assertEqual(first["seconds_left"], 0.0)
+        self.assertIs(job["file_chunking"], False)
+        self.assertEqual(ingest_estimate.view(job, NOW)["files_not_chunked"], 0)
+
+    def test_a_last_file_failing_before_any_chunks_clears_the_flag(self):
+        job, _ = self.run_job([("b.json", json.dumps({"t": "ok"})), ("broken.json", "{not json")])
+        self.assertEqual(job["files_failed"], 1)
+        self.assertEqual([f["file"] for f in job["file_progress"]], ["b.json"])
+        self.assertIs(job["file_chunking"], False)
+        self.assertEqual(ingest_estimate.view(job, NOW)["files_not_chunked"], 0)
+
     def test_the_record_keeps_the_newest_entries(self):
         files = [(f"f{i}.json", json.dumps({"t": f"text {i}"})) for i in range(5)]
         with patch.object(ingest_estimate, "FILE_PROGRESS_LIMIT", 2):
@@ -358,7 +406,9 @@ class JobLoopTests(UploadDir):
     def test_a_record_made_without_the_fields_still_works(self):
         job = {"files_failed": 0}
         ingest_estimate.file_started(job)
+        self.assertIs(job["file_chunking"], True)
         ingest_estimate.part_chunked(job, "a", 2, 20, first=True)
+        self.assertIs(job["file_chunking"], False)
         self.assertIsNotNone(job["storing_since"])
         ingest_estimate.part_stored(job, 2, 20, 0.5)
         ingest_estimate.file_ended(job, failed=False)
