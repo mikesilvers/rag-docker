@@ -54,6 +54,27 @@ print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name
 [ "$stored" -ge 6 ]
 check "every type produced at least one chunk" $? "collection holds $stored chunks"
 
+# ── the ingest time estimate on the stack (#614) ─────────────────────────────
+# The finished job's status keeps one entry per file with its chunk counts, and
+# no rate or time left now that it isn't running; the real store (embedding
+# included) left a measurement in the API's saved rate file.
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_job.json'))
+fp=d.get('file_progress')
+ok=(isinstance(fp,list) and len(fp)==6 and d.get('file_progress_omitted')==0
+    and all(f['chunked'] and not f['failed'] and f['chunks']==f['chunks_stored']>0
+            and f['characters']==f['characters_stored']>0 and f['seconds_left'] is None for f in fp)
+    and sum(f['chunks_stored'] for f in fp)==d['chunks_stored']
+    and d.get('files_not_chunked')==0 and d.get('rate_characters_per_second') is None
+    and d.get('seconds_left') is None and d.get('seconds_left_is_minimum') is False)
+sys.exit(0 if ok else 1)"
+check "a finished job lists each file's chunk counts and no rate or time left (#614)" $? \
+  "$(python3 -c "import json;d=json.load(open('/tmp/vfy_job.json'));print({k:d.get(k) for k in ('file_progress','files_not_chunked','rate_characters_per_second','seconds_left')})" | cut -c1-400)"
+(cd "$REPO_ROOT" && docker compose exec -T api cat /app/uploads/ingest-rate.json) | python3 -c "
+import json,sys; s=json.load(sys.stdin)['samples']
+sys.exit(0 if 1<=len(s)<=20 and all(isinstance(c,int) and c>0 and t>0 for c,t in s) else 1)"
+check "a real ingest saves its measured rate in UPLOAD_DIR/ingest-rate.json (#614)" $?
+
 # ── ZIP batch, with unsupported members reported ─────────────────────────────
 drop_collection "$C"; make_collection "$C"
 ingest "$C" fixed 200 40 "$FIX/batch.zip" "$FIX/notes.xyz"

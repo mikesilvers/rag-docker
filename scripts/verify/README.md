@@ -668,6 +668,13 @@ nothing for a job that isn't running, old records); and the per-file progress th
 records for a whole file, a split file (chunked only after its last part, one measurement a
 part), a failed store (not a measurement), a file failing before any chunks, and the cap on
 entries. `02_ingest.sh` runs it in the API image with no network.
+On the stack, `02_ingest.sh` then checks that the six-type job's finished status lists each
+file's chunk and character counts, all stored, with no rate or time left, and that the real
+store left valid measurements in the API's `UPLOAD_DIR/ingest-rate.json`.
+`browser/ui_criteria.js` (suite 06) stubs job responses to check the Import page's progress
+panel: "No estimate yet" before a measurement, the rate and "About ... left", "At least ...
+left" for files not chunked yet and for a split file with more parts, and a finished job's
+per-file counts (failed, done, earlier files not shown) with no estimate.
 `browser/ui_criteria.js` (suite 06) checks that the Import page's file picker accepts
 `.jsonl` and `.jsonl.gz` and that its hint names JSONL.
 

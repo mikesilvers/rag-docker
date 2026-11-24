@@ -1153,6 +1153,75 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     }
   }
 
+  // ── ingest time estimate (#614) ─────────────────────────────────────────────
+  // While a job runs, the progress panel shows the measured rate and the time
+  // left ("No estimate yet" before any measurement, "At least ..." when more
+  // work may follow) and each file's chunk count; a finished job keeps the
+  // per-file counts only. Responses are stubbed.
+  r.section('ingest time estimate');
+  {
+    const fp = (file, chunks, stored, extra) => ({ file, chunks, chunks_stored: stored, characters: chunks * 100,
+      characters_stored: stored * 100, chunked: true, failed: false, seconds_left: null, ...extra });
+    const estimateCases = [
+      ['no rate yet', { status: 'running', files_total: 3, files_completed: 0, files_failed: 0, chunks_stored: 0,
+        file_progress: [fp('a.txt', 10, 0, { chunked: false })], files_not_chunked: 2,
+        rate_characters_per_second: null, seconds_left: null, seconds_left_is_minimum: true },
+        ['No estimate yet', 'a.txt', '10 chunks so far · 0 stored'], ['Embedding rate', 'At least ', 'About ']],
+      ['a measured rate', { status: 'running', files_total: 2, files_completed: 1, files_failed: 0, chunks_stored: 15,
+        file_progress: [fp('a.txt', 5, 5, { seconds_left: 0 }), fp('b.txt', 20, 10, { seconds_left: 1800 })], files_not_chunked: 0,
+        rate_characters_per_second: 500, seconds_left: 5400, seconds_left_is_minimum: false },
+        ['Embedding rate: 500 characters/s', 'About 1 h 30 min left', '5 chunks · 5 stored · done',
+         '20 chunks · 10 stored · about 30 min left'], ['No estimate yet', 'At least ']],
+      ['files not reached', { status: 'running', files_total: 3, files_completed: 0, files_failed: 0, chunks_stored: 0,
+        file_progress: [fp('a.txt', 12, 0, { seconds_left: 120 })], files_not_chunked: 2,
+        rate_characters_per_second: 500, seconds_left: 120, seconds_left_is_minimum: true },
+        ['At least 2 min left (2 files not chunked yet)', 'about 2 min left'], ['No estimate yet', 'About 2 min']],
+      ['a split file with more parts', { status: 'running', files_total: 1, files_completed: 0, files_failed: 0, chunks_stored: 40,
+        file_progress: [fp('big.jsonl', 50, 40, { chunked: false, seconds_left: 30 })], files_not_chunked: 0,
+        rate_characters_per_second: 500, seconds_left: 30, seconds_left_is_minimum: true },
+        ['At least under a minute left (more parts may follow)', '50 chunks so far · 40 stored · about under a minute left'], ['No estimate yet']],
+      ['a finished job', { status: 'partial', files_total: 5, files_completed: 4, files_failed: 1, chunks_stored: 3,
+        file_progress: [fp('bad.txt', 4, 0, { chunked: false, failed: true }), fp('good.txt', 3, 3)], file_progress_omitted: 3,
+        files_not_chunked: 0, rate_characters_per_second: null, seconds_left: null, seconds_left_is_minimum: false },
+        ['3 earlier files not shown', '4 chunks so far · failed', '3 chunks · 3 stored · done'],
+        ['No estimate yet', 'Embedding rate', 'At least ', 'About ']],
+    ];
+    for (const [label, fields, present, absent] of estimateCases) {
+      const fs = require('fs');
+      const small = '/tmp/vfy-estimate.txt';
+      fs.writeFileSync(small, 'Estimate fixture.\n');
+      const jobId = 'vfyest' + estimateCases.findIndex(c => c[0] === label);
+      const s = await session(browser, BASE, 'developer');
+      await s.page.setRequestInterception(true);
+      s.page.on('request', request => {
+        const path = new URL(request.url()).pathname;
+        if (path === '/api/ingest/upload' && request.method() === 'POST')
+          return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'queued', files_queued: 1, collection: 'x' }) });
+        if (path === '/api/ingest/job/' + jobId)
+          return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, errors: [], skipped: [], chunks_replaced: 0, split: [], ...fields }) });
+        return request.continue();
+      });
+      try {
+        await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+        const input = await s.page.$('#file-input');
+        await input.uploadFile(small);
+        await sleep(300);
+        const clicked = await clickByText(s.page, 'Start Ingest');
+        await sleep(4500);
+        const text = await bodyText(s.page);
+        const missing = present.filter(t => !text.includes(t));
+        const extra = absent.filter(t => text.includes(t));
+        r.check(`${label}: the panel shows ${present.map(t => `"${t}"`).join(', ')} and not ${absent.map(t => `"${t}"`).join(', ')} (#614)`,
+                clicked && missing.length === 0 && extra.length === 0,
+                clicked ? `missing ${JSON.stringify(missing)} unexpected ${JSON.stringify(extra)}: ${text.slice(0, 400)}` : 'Start Ingest button not found');
+        r.check(`estimate fixture (${label}) causes no React page errors`, !s.errors.some(e => e.startsWith('pageerror:')));
+      } finally {
+        fs.unlinkSync(small);
+        await s.ctx.close();
+      }
+    }
+  }
+
   // ── health dashboard ───────────────────────────────────────────────────────
   r.section('§10.4 health dashboard');
   {
