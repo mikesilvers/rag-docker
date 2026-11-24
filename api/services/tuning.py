@@ -387,6 +387,11 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
     never held in memory, and a bad file found then fails the rebuild while the
     live collection is still untouched (it is only replaced once staging
     succeeds). `list(reader)` gives every chunk, in order.
+
+    Its `rag.chunk` span covers only these checks and the reader's creation
+    (#893): the parsing and chunking run as the rebuild consumes the reader,
+    inside `rag.rebuild`, where the chunker's own `rag.chunk` spans appear per
+    part.
     """
     index = sources.load_index(collection)
     documents = index.get("documents") or {}
