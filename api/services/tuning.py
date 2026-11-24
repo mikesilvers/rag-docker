@@ -34,6 +34,7 @@ import shutil
 import tempfile
 import threading
 import uuid
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
@@ -154,9 +155,6 @@ class _RecordSnapshot:
         self.close()
 
 
-_DUPLICATE = "Duplicate chunk UUID "
-
-
 def _snapshot(records) -> _RecordSnapshot:
     """Fingerprint a reusable record source once: a zero-argument callable
     returning an iterator, or a list."""
@@ -166,9 +164,9 @@ def _snapshot(records) -> _RecordSnapshot:
         expected.capture(read)
     except BaseException as exc:
         expected.__exit__(None, None, None)
-        if isinstance(exc, ValueError) and str(exc).startswith(_DUPLICATE):
-            raise RuntimeError("Reindex received duplicate stored UUID "
-                               + str(exc)[len(_DUPLICATE):]) from exc
+        # Recognised by its type, not its wording (#890).
+        if isinstance(exc, batch_write.DuplicateRecordError):
+            raise RuntimeError(f"Reindex received duplicate stored UUID {exc.key}") from exc
         raise
     return _RecordSnapshot(expected, read)
 
@@ -570,12 +568,14 @@ class _SourceChunks:
 
 @telemetry.traced("rag.rebuild")
 @collection_writes.serialized("collection")
-def _rebuild(collection: str, properties: list[dict], index_type: str | None,
-             distance_metric: str | None, progress, *, records: list[dict] | None = None,
+def _rebuild(collection: str, properties: Iterable[dict], index_type: str | None,
+             distance_metric: str | None, progress, *, records: _RecordSnapshot | list[dict] | None = None,
              source_collection: str | None = None, before_replace=None, staged=None,
              cancelled=None) -> int:
     """Stage and verify, then replace the live collection under its writer guard.
 
+    `properties` is a list, a _StoredChunks (re-embed from stored text), a
+    _SourceChunks (re-chunk) or, for a reindex, the _RecordSnapshot itself.
     Reindex `records` are a fingerprint snapshot of the original (a list is
     snapshotted here); nothing holds the collection in memory (#583). A
     re-chunk's `properties` is a _SourceChunks reader: each part is inserted

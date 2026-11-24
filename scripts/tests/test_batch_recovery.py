@@ -562,6 +562,24 @@ class RecoveryTests(unittest.TestCase):
                     config.unlink()
                     config.write_bytes(saved)
 
+    def test_duplicate_uuid_is_a_typed_refusal(self):
+        # #890: a repeated UUID is refused with a ValueError subclass carrying
+        # the key, and the reindex snapshot recognises it by type, not wording.
+        rows = records()
+        rows.append(copy.deepcopy(rows[0]))
+        key = rows[0]['id']
+        with batch_write.ExpectedRecords() as expected, \
+                self.assertRaises(batch_write.DuplicateRecordError) as error:
+            expected.capture(rows)
+        self.assertIsInstance(error.exception, ValueError)
+        self.assertEqual(error.exception.key, key)
+        self.assertEqual(str(error.exception), f'Duplicate chunk UUID {key}')
+        with self.assertRaises(RuntimeError) as refused:
+            tuning._snapshot(rows)
+        self.assertEqual(str(refused.exception), f'Reindex received duplicate stored UUID {key}')
+        self.assertIsInstance(refused.exception.__cause__, batch_write.DuplicateRecordError)
+        self.assertFalse(list(Path(settings.upload_dir).glob('batch-verify-*')))
+
     def test_dangling_session_link_is_refused_naming_its_path(self):
         # #886: a gold-standard session that is a dangling link can't be read, so
         # it counts as the collection's; the rebuild is refused before cutover and

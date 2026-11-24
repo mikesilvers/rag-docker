@@ -101,6 +101,14 @@ def _factory(records):
     return lambda: iter(records)
 
 
+class DuplicateRecordError(ValueError):
+    """A record UUID repeated within one capture; `key` is that UUID (#890)."""
+
+    def __init__(self, key: str):
+        self.key = key
+        super().__init__(f"Duplicate chunk UUID {key}")
+
+
 class ExpectedRecords:
     """UUIDs and SHA-256 fingerprints on disk; no corpus vectors held in RAM.
 
@@ -147,7 +155,7 @@ class ExpectedRecords:
                 self.db.execute("INSERT INTO expected(position,id,properties,vector) VALUES (?,?,?,?)",
                                 (position, key, _property_digest(record["properties"]), vector))
             except sqlite3.IntegrityError as exc:
-                raise ValueError(f"Duplicate chunk UUID {key}") from exc
+                raise DuplicateRecordError(key) from exc
         if expected_count is not None and self.count != expected_count:
             raise ValueError(f"Package contains {self.count} objects but declares {expected_count}")
         self.db.commit()
