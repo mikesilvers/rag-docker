@@ -269,12 +269,14 @@ def _publish_file(path: Path, source: Path, digest: str) -> None:
 
 
 @telemetry.traced("rag.retain")
-def store(collection: str, filename: str, data: Union[bytes, str, os.PathLike],
+def store(collection: str, filename: str, data: Union[bytes, os.PathLike],
           media_type: str | None = None, *, replace: bool = False) -> str:
     """Retain one accepted upload. Returns its sha256.
 
-    `data` is the file's bytes, or its path: a path is hashed and copied in
-    blocks, so retaining a large file never holds it in memory (#312).
+    `data` is the file's bytes, or its path as an os.PathLike (a Path): a path
+    is hashed and copied in blocks, so retaining a large file never holds it in
+    memory (#312). A str is refused with TypeError (#893), so text or a name is
+    never taken for a path.
 
     With replace=True (ingest, #22) the filename is first released from every
     other digest, and digests left with no names are dropped. That release is
@@ -287,6 +289,11 @@ def store(collection: str, filename: str, data: Union[bytes, str, os.PathLike],
     before anything is written: an unreadable or invalid index raises
     ValueError and leaves the folder exactly as it was.
     """
+    if isinstance(data, str):
+        # A str is never taken for a path (#893): before #891 data was the
+        # content, and a name or text read as a path would retain any file.
+        raise TypeError("sources.store takes the file's bytes or an os.PathLike "
+                        "path, not a str")
     if isinstance(data, (bytes, bytearray)):
         path = None
         digest, size = hashlib.sha256(data).hexdigest(), len(data)
@@ -388,8 +395,9 @@ def remove_interrupted_saves() -> None:
     file, so a leftover is never used, only disk space. Called once at startup,
     before any request, so no save is in progress. Only names _temporary makes
     are removed, in each collection folder that isn't a link; a leftover that
-    can't be removed is logged and kept. An error listing the folders is the
-    whole sweep failing, which the caller logs.
+    can't be removed is logged and kept. An error listing the sources folder
+    itself is the whole sweep failing, which the caller logs; a collection
+    folder that can't be listed is logged and skipped (#892).
     """
     root = _root()
     if not root.is_dir():
@@ -397,7 +405,14 @@ def remove_interrupted_saves() -> None:
     for folder in root.iterdir():
         if folder.is_symlink() or not folder.is_dir():
             continue
-        for leftover in folder.iterdir():
+        try:
+            names = list(folder.iterdir())
+        except OSError:
+            # One collection folder that can't be listed doesn't stop the
+            # sweep of the others (#892).
+            log.exception("Could not list source folder %s for interrupted writes", folder)
+            continue
+        for leftover in names:
             if _LEFTOVER.fullmatch(leftover.name):
                 try:
                     leftover.unlink()
