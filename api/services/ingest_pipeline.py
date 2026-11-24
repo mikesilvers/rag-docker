@@ -11,6 +11,7 @@ import os
 import posixpath
 import shutil
 import tempfile
+import time
 import uuid
 import zipfile
 import zlib
@@ -22,7 +23,7 @@ from services import batch_write, collection_writes, jobstore
 from config import settings
 from models.schemas import IngestConfig
 from services.chunker import MAX_TEXT_CHARACTERS, chunk as do_chunk
-from services import parts, sources, splitter
+from services import ingest_estimate, parts, sources, splitter
 from services import weaviate_client as wc
 
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".csv", ".json", ".jsonl"}
@@ -842,6 +843,10 @@ def _process_job_sync(
         for index, path in enumerate(file_paths):
             name = logical[index]
             label = (labels or {}).get(path, name)
+            # The estimate's per-file progress (#614): an entry once the file's
+            # first chunks exist, ended below however the file ends.
+            ingest_estimate.file_started(job)
+            failed_before, has_entry = job["files_failed"], False
             try:
                 source_type = source_type_of(path)
                 settings = splitter.Settings(strategy, chunk_size, chunk_overlap,
@@ -878,9 +883,14 @@ def _process_job_sync(
                             }
                             for i, c in enumerate(chunks)
                         ]
+                        characters = sum(len(c) for c in chunks)
+                        ingest_estimate.part_chunked(job, label, len(chunks), characters,
+                                                     first=not has_entry)
+                        has_entry = True
                         # Insert first, then remove the earlier chunks, never the
                         # other way round: a failed insert leaves the earlier
                         # version whole.
+                        started = time.monotonic()
                         try:
                             _store_chunks(collection, weaviate_chunks)
                         except Exception as exc:
@@ -890,6 +900,9 @@ def _process_job_sync(
                         # later, a clean job would show its counts apart until
                         # then (#324).
                         _count_writes(job, len(chunks), len(chunks), len(chunks))
+                        # A stored part is the rate's measurement (#614).
+                        ingest_estimate.part_stored(job, len(chunks), characters,
+                                                    time.monotonic() - started)
                         stored += len(chunks)
                         del weaviate_chunks, chunks
                 except (_CollectionDeleted, _StaleMarkFailed, _StaleLookupFailed):
@@ -962,6 +975,9 @@ def _process_job_sync(
                 job["files_failed"] += 1
                 job["errors"].append(f"{label}: {str(exc) or type(exc).__name__}")
                 _log.warning("ingest job %s: %r failed", job_id, label, exc_info=True)
+            finally:
+                if has_entry:
+                    ingest_estimate.file_ended(job, failed=job["files_failed"] > failed_before)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         # Before the status turns terminal: a client that sees the job end
@@ -1522,6 +1538,11 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
             "chunks_replaced": 0,
             # Files over the per-file limits, stored as parts (#621).
             "split": [],
+            # Per-file progress for the time estimate (#614; ingest_estimate).
+            "file_progress": [],
+            "file_progress_omitted": 0,
+            "files_started": 0,
+            "storing_since": None,
             "errors": [],
             "skipped": skipped,
             # For the job lists (#617): where, what and who, as the client sent

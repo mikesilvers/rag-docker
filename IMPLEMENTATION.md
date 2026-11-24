@@ -2190,6 +2190,21 @@ class IngestUploadResponse(BaseModel):
     collection: str
 
 
+class FileProgress(BaseModel):
+    """One file of an ingest job, for its time estimate (#614)."""
+    file: str
+    # Chunks (and their characters) made from the file so far, and those stored.
+    chunks: int = 0
+    chunks_stored: int = 0
+    characters: int = 0
+    characters_stored: int = 0
+    # The whole file is chunked; false while a split file may have more parts.
+    chunked: bool = False
+    failed: bool = False
+    # Computed when the status is read, while the job runs; else null.
+    seconds_left: float | None = None
+
+
 class JobStatusResponse(BaseModel):
     job_id: str
     status: str
@@ -2213,6 +2228,18 @@ class JobStatusResponse(BaseModel):
     # Files over the per-file limits, stored as parts `<name> (part N)` (#621):
     # one entry per such file that completed. Older records read back as [].
     split: list[str] = []
+    # The time estimate (#614; services/ingest_estimate): each file's chunk
+    # count once it is chunked, at most the newest 100 (file_progress_omitted
+    # counts the rest). The rate is the instance's, measured from stored parts;
+    # it and the times left are null when nothing has been measured yet and
+    # whenever the job isn't running. The job's time left counts only work
+    # already chunked: seconds_left_is_minimum says when more may follow.
+    file_progress: list[FileProgress] = []
+    file_progress_omitted: int = 0
+    files_not_chunked: int | None = None
+    rate_characters_per_second: float | None = None
+    seconds_left: float | None = None
+    seconds_left_is_minimum: bool = False
 
 
 class IngestConfig(BaseModel):
@@ -6251,6 +6278,7 @@ import os
 import posixpath
 import shutil
 import tempfile
+import time
 import uuid
 import zipfile
 import zlib
@@ -6262,7 +6290,7 @@ from services import batch_write, collection_writes, jobstore
 from config import settings
 from models.schemas import IngestConfig
 from services.chunker import MAX_TEXT_CHARACTERS, chunk as do_chunk
-from services import parts, sources, splitter
+from services import ingest_estimate, parts, sources, splitter
 from services import weaviate_client as wc
 
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".csv", ".json", ".jsonl"}
@@ -7082,6 +7110,10 @@ def _process_job_sync(
         for index, path in enumerate(file_paths):
             name = logical[index]
             label = (labels or {}).get(path, name)
+            # The estimate's per-file progress (#614): an entry once the file's
+            # first chunks exist, ended below however the file ends.
+            ingest_estimate.file_started(job)
+            failed_before, has_entry = job["files_failed"], False
             try:
                 source_type = source_type_of(path)
                 settings = splitter.Settings(strategy, chunk_size, chunk_overlap,
@@ -7118,9 +7150,14 @@ def _process_job_sync(
                             }
                             for i, c in enumerate(chunks)
                         ]
+                        characters = sum(len(c) for c in chunks)
+                        ingest_estimate.part_chunked(job, label, len(chunks), characters,
+                                                     first=not has_entry)
+                        has_entry = True
                         # Insert first, then remove the earlier chunks, never the
                         # other way round: a failed insert leaves the earlier
                         # version whole.
+                        started = time.monotonic()
                         try:
                             _store_chunks(collection, weaviate_chunks)
                         except Exception as exc:
@@ -7130,6 +7167,9 @@ def _process_job_sync(
                         # later, a clean job would show its counts apart until
                         # then (#324).
                         _count_writes(job, len(chunks), len(chunks), len(chunks))
+                        # A stored part is the rate's measurement (#614).
+                        ingest_estimate.part_stored(job, len(chunks), characters,
+                                                    time.monotonic() - started)
                         stored += len(chunks)
                         del weaviate_chunks, chunks
                 except (_CollectionDeleted, _StaleMarkFailed, _StaleLookupFailed):
@@ -7202,6 +7242,9 @@ def _process_job_sync(
                 job["files_failed"] += 1
                 job["errors"].append(f"{label}: {str(exc) or type(exc).__name__}")
                 _log.warning("ingest job %s: %r failed", job_id, label, exc_info=True)
+            finally:
+                if has_entry:
+                    ingest_estimate.file_ended(job, failed=job["files_failed"] > failed_before)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         # Before the status turns terminal: a client that sees the job end
@@ -7762,6 +7805,11 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
             "chunks_replaced": 0,
             # Files over the per-file limits, stored as parts (#621).
             "split": [],
+            # Per-file progress for the time estimate (#614; ingest_estimate).
+            "file_progress": [],
+            "file_progress_omitted": 0,
+            "files_started": 0,
+            "storing_since": None,
             "errors": [],
             "skipped": skipped,
             # For the job lists (#617): where, what and who, as the client sent
@@ -17413,7 +17461,7 @@ from pydantic import ValidationError
 from models.schemas import (CollectionName, IngestConfig, IngestConfigResponse,
                             IngestJobEntry, IngestJobList, IngestUploadResponse,
                             JobStatusResponse)
-from services import audit, ingest_config, job_lists
+from services import audit, ingest_config, ingest_estimate, job_lists
 from services import ingest_pipeline
 from services import weaviate_client as wc
 from services.collection_writes import CollectionDeletingError, canonical
@@ -17528,7 +17576,10 @@ async def job_status(job_id: str, request: Request = None):
     # A job on a collection the caller may not use answers as a missing one (#606).
     if job is None or (job.get("collection") and not await access.check(request, job["collection"], "JOB_NOT_FOUND")):
         return api_error(404, "JOB_NOT_FOUND", f"Job '{job_id}' not found.")
-    return JobStatusResponse(**job)
+    # The time estimate (#614) is computed as the status is read; its first
+    # read of the saved rate is a file read, so it runs off the event loop.
+    estimate = await asyncio.to_thread(ingest_estimate.view, job)
+    return JobStatusResponse(**{**job, **estimate})
 
 
 @router.get("/config/{collection}", response_model=IngestConfigResponse)
@@ -24758,6 +24809,14 @@ export interface Group { name: string; created_at: string; users: string[]; serv
 export interface CreateCollectionBody {
   name: string; index_type: string; distance_metric: string; hnsw_config: { efConstruction: number; maxConnections: number; ef: number }
 }
+// One file of an ingest job, for its time estimate (#614).
+export interface FileProgress {
+  file: string; chunks: number; chunks_stored: number; characters: number; characters_stored: number
+  // False while a split file may still have more parts.
+  chunked: boolean; failed: boolean
+  // Null when no rate has been measured yet, and whenever the job isn't running.
+  seconds_left?: number | null
+}
 export interface JobStatus {
   job_id: string; status: string; files_total: number; files_completed: number; files_failed: number; chunks_stored: number; errors: string[]
   // Files that could not be parsed at all, or that a later file with the same
@@ -24771,6 +24830,16 @@ export interface JobStatus {
   // written before the fields existed. chunks_stored counts the checked ones.
   chunks_submitted?: number | null
   chunks_accepted?: number | null
+  // The time estimate (#614): each file's chunk count once it is chunked (the
+  // newest 100; file_progress_omitted counts the rest), the instance's measured
+  // rate and the time left, null until a part has been measured and whenever the
+  // job isn't running. The job's time left counts only work already chunked.
+  file_progress?: FileProgress[]
+  file_progress_omitted?: number
+  files_not_chunked?: number | null
+  rate_characters_per_second?: number | null
+  seconds_left?: number | null
+  seconds_left_is_minimum?: boolean
 }
 export interface IngestConfig {
   collection: string; chunking_strategy: string; chunk_size: number; chunk_overlap: number; similarity_threshold: number | null; min_chunk_size: number; is_default: boolean
@@ -25226,7 +25295,25 @@ export default function CitationsPanel({ citations }: { citations: Citation[] })
 ### ui/src/components/ProgressPanel.tsx
 
 ```typescript
-import { JobStatus } from '../api/client'
+import { FileProgress, JobStatus } from '../api/client'
+
+// A time left as people read it, never more precise than a minute (#614).
+function formatDuration(seconds: number): string {
+  if (seconds < 60) return 'under a minute'
+  const minutes = Math.round(seconds / 60)
+  if (minutes < 60) return `${minutes} min`
+  const hours = Math.floor(minutes / 60)
+  const rest = minutes % 60
+  return rest ? `${hours} h ${rest} min` : `${hours} h`
+}
+
+function fileState(f: FileProgress, running: boolean): string {
+  if (f.failed) return 'failed'
+  const stored = `${f.chunks_stored.toLocaleString()} stored`
+  if (f.chunked && f.chunks_stored >= f.chunks) return `${stored} · done`
+  if (running && typeof f.seconds_left === 'number') return `${stored} · about ${formatDuration(f.seconds_left)} left`
+  return stored
+}
 
 export default function ProgressPanel({ job }: { job: JobStatus }) {
   const pct = job.files_total > 0 ? Math.round((job.files_completed / job.files_total) * 100) : 0
@@ -25235,6 +25322,14 @@ export default function ProgressPanel({ job }: { job: JobStatus }) {
   const counted = typeof job.chunks_submitted === 'number' && typeof job.chunks_accepted === 'number'
   const writesDiffer = counted &&
     !(job.chunks_submitted === job.chunks_stored && job.chunks_accepted === job.chunks_stored)
+  // The time estimate (#614): only while the job runs; the per-file counts stay.
+  const running = job.status === 'running'
+  const files = job.file_progress ?? []
+  const omitted = job.file_progress_omitted ?? 0
+  const rate = job.rate_characters_per_second
+  const hasRate = typeof rate === 'number'
+  const left = job.seconds_left
+  const notChunked = job.files_not_chunked ?? 0
   return (
     <div className="mt-4 p-4 border rounded bg-gray-50">
       <div className="flex justify-between text-sm mb-1">
@@ -25247,6 +25342,42 @@ export default function ProgressPanel({ job }: { job: JobStatus }) {
       <div className="w-full bg-gray-200 rounded h-2">
         <div className="bg-blue-500 h-2 rounded transition-all" style={{ width: `${pct}%` }} />
       </div>
+      {running && (
+        <div className="mt-2 text-xs text-gray-700" data-testid="ingest-estimate">
+          <p>
+            {hasRate
+              ? `Embedding rate: ${Math.round(rate!).toLocaleString()} characters/s`
+              : 'No estimate yet: the rate is measured when the first part is stored'}
+          </p>
+          {hasRate && typeof left === 'number' && (
+            <p className="font-medium">
+              {job.seconds_left_is_minimum
+                ? `At least ${formatDuration(left)} left (${notChunked > 0
+                    ? `${notChunked} file${notChunked === 1 ? '' : 's'} not chunked yet`
+                    : 'more parts may follow'})`
+                : `About ${formatDuration(left)} left`}
+            </p>
+          )}
+        </div>
+      )}
+      {files.length > 0 && (
+        // Each file's chunk count once it is chunked, and its time left (#614).
+        <div className="mt-2 text-xs text-gray-700 max-h-48 overflow-y-auto" data-testid="file-progress">
+          {omitted > 0 && (
+            <p className="text-gray-500">{omitted} earlier file{omitted === 1 ? '' : 's'} not shown</p>
+          )}
+          <ul className="space-y-1">
+            {files.map((f, i) => (
+              <li key={i} className="flex justify-between gap-2">
+                <span className="truncate">{f.file}</span>
+                <span className={`whitespace-nowrap ${f.failed ? 'text-red-600' : ''}`}>
+                  {f.chunks.toLocaleString()} chunk{f.chunks === 1 ? '' : 's'}{f.chunked ? '' : ' so far'} · {fileState(f, running)}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
       {writesDiffer && (
         <p className="mt-2 text-xs text-gray-600">
           Submitted {job.chunks_submitted} · accepted {job.chunks_accepted} · stored {job.chunks_stored}
@@ -30392,6 +30523,24 @@ bound comes from the traced-memory tests above (the re-chunk reader's traced pea
 with the number of files), while the full-run corpus is 576 MB decompressed but almost all `{}`
 padding, so its re-chunk holds little text, and the API container has no memory limit in
 `docker-compose.yml`.
+
+`scripts/tests/test_ingest_estimate.py` (#614) checks, with Weaviate mocked and the rate file
+in a temporary upload folder, the ingest time estimate: the rate (characters over seconds of
+the last 20 stored parts, weighted by size) saved and read back after a restart, a malformed
+file read as no rate and replaced, ignored and unsaved measurements; the time left a job status
+computes (none before a measurement, a countdown inside the part being stored never below 0,
+a failed file's 0, the "at least" flag for files not reached and split files with more parts,
+nothing for a job that isn't running, old records); and the per-file progress the job loop
+records for a whole file, a split file (chunked only after its last part, one measurement a
+part), a failed store (not a measurement), a file failing before any chunks, and the cap on
+entries. `02_ingest.sh` runs it in the API image with no network.
+On the stack, `02_ingest.sh` then checks that the six-type job's finished status lists each
+file's chunk and character counts, all stored, with no rate or time left, and that the real
+store left valid measurements in the API's `UPLOAD_DIR/ingest-rate.json`.
+`browser/ui_criteria.js` (suite 06) stubs job responses to check the Import page's progress
+panel: "No estimate yet" before a measurement, the rate and "About ... left", "At least ...
+left" for files not chunked yet and for a split file with more parts, and a finished job's
+per-file counts (failed, done, earlier files not shown) with no estimate.
 `browser/ui_criteria.js` (suite 06) checks that the Import page's file picker accepts
 `.jsonl` and `.jsonl.gz` and that its hint names JSONL.
 
@@ -30752,6 +30901,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_reingest.py` | controlled re-ingest replacement, exact-name selection (#622), same-name upload, macOS ZIP metadata, retention and rechunk-coverage regressions, registered by ingest |
 | `../tests/test_split_parts.py` | controlled regressions for files over the per-file limits stored as parts (#621): the reviewer's 13,000 records, files over 10,000,000 characters, family replacement, all or nothing, cuts, CSV, Markdown, encoding, `overlap` sizing, re-chunk and export links, registered by ingest |
 | `../tests/test_large_corpus.py` | controlled large-corpus regressions (#312): retention by path in blocks, a large retained original through export and import, the re-chunk reader staging one part at a time and its refusals, `chunks_total` following staging; registered by ingest in the API image with the repository mounted |
+| `../tests/test_ingest_estimate.py` | controlled ingest time-estimate regressions (#614): the measured rate saved across restarts, the time left per file and job, per-file progress from the job loop; registered by ingest in the API image with no network |
 | `split_parts.py` | helper for ingest (#621), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, files over the per-file limits are stored as parts, a smaller re-upload replaces every part, and a bad line after part 1 stores nothing; the collection is removed afterwards |
 | `exact_source.py` | helper for ingest (#622), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, replacing `report.pdf` deletes only its earlier chunks and `_source_has_chunks_sync` answers by exact name, with a few word matches (`page`), over 10,000 (`walk`), and over 10,000 earlier chunks of the name itself, deleted in batches of 10,000 (`bulk`); the collection is removed afterwards |
 | `../tests/test_collection_spelling.py` | controlled regressions for per-collection state keyed by the stored collection name (#372), registered by ingest |
@@ -47399,6 +47549,27 @@ print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name
 [ "$stored" -ge 6 ]
 check "every type produced at least one chunk" $? "collection holds $stored chunks"
 
+# ── the ingest time estimate on the stack (#614) ─────────────────────────────
+# The finished job's status keeps one entry per file with its chunk counts, and
+# no rate or time left now that it isn't running; the real store (embedding
+# included) left a measurement in the API's saved rate file.
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_job.json'))
+fp=d.get('file_progress')
+ok=(isinstance(fp,list) and len(fp)==6 and d.get('file_progress_omitted')==0
+    and all(f['chunked'] and not f['failed'] and f['chunks']==f['chunks_stored']>0
+            and f['characters']==f['characters_stored']>0 and f['seconds_left'] is None for f in fp)
+    and sum(f['chunks_stored'] for f in fp)==d['chunks_stored']
+    and d.get('files_not_chunked')==0 and d.get('rate_characters_per_second') is None
+    and d.get('seconds_left') is None and d.get('seconds_left_is_minimum') is False)
+sys.exit(0 if ok else 1)"
+check "a finished job lists each file's chunk counts and no rate or time left (#614)" $? \
+  "$(python3 -c "import json;d=json.load(open('/tmp/vfy_job.json'));print({k:d.get(k) for k in ('file_progress','files_not_chunked','rate_characters_per_second','seconds_left')})" | cut -c1-400)"
+(cd "$REPO_ROOT" && docker compose exec -T api cat /app/uploads/ingest-rate.json) | python3 -c "
+import json,sys; s=json.load(sys.stdin)['samples']
+sys.exit(0 if 1<=len(s)<=20 and all(isinstance(c,int) and c>0 and t>0 for c,t in s) else 1)"
+check "a real ingest saves its measured rate in UPLOAD_DIR/ingest-rate.json (#614)" $?
+
 # ── ZIP batch, with unsupported members reported ─────────────────────────────
 drop_collection "$C"; make_collection "$C"
 ingest "$C" fixed 200 40 "$FIX/batch.zip" "$FIX/notes.xyz"
@@ -48286,6 +48457,13 @@ rm -rf "$SPLFIX" /tmp/vfy_split_job.json
 # bounded memory.
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_large_corpus.py)
 check "large corpora: streamed retention, one-part re-chunk staging, export and import in bounded memory (#312)" $?
+
+# ── the ingest time estimate (#614) ──────────────────────────────────────────
+# Controlled cases: the rate measured from stored parts and saved across a
+# restart, the time left a job status computes from it, and the per-file
+# progress the job loop records (whole, split, failed, capped).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_ingest_estimate.py)
+check "ingest time estimate: measured rate, time left per file and job, per-file progress (#614)" $?
 # End to end on the stack (full runs only: reading the file twice takes minutes):
 # a .jsonl.gz over the old caps, 9,000,000 lines of 64 bytes (576,000,000 bytes
 # decompressed, over 512 MiB and under 2 GiB; about 1 MB gzipped) after five
@@ -54340,6 +54518,75 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     } finally {
       fs.unlinkSync(small);
       await s.ctx.close();
+    }
+  }
+
+  // ── ingest time estimate (#614) ─────────────────────────────────────────────
+  // While a job runs, the progress panel shows the measured rate and the time
+  // left ("No estimate yet" before any measurement, "At least ..." when more
+  // work may follow) and each file's chunk count; a finished job keeps the
+  // per-file counts only. Responses are stubbed.
+  r.section('ingest time estimate');
+  {
+    const fp = (file, chunks, stored, extra) => ({ file, chunks, chunks_stored: stored, characters: chunks * 100,
+      characters_stored: stored * 100, chunked: true, failed: false, seconds_left: null, ...extra });
+    const estimateCases = [
+      ['no rate yet', { status: 'running', files_total: 3, files_completed: 0, files_failed: 0, chunks_stored: 0,
+        file_progress: [fp('a.txt', 10, 0, { chunked: false })], files_not_chunked: 2,
+        rate_characters_per_second: null, seconds_left: null, seconds_left_is_minimum: true },
+        ['No estimate yet', 'a.txt', '10 chunks so far · 0 stored'], ['Embedding rate', 'At least ', 'About ']],
+      ['a measured rate', { status: 'running', files_total: 2, files_completed: 1, files_failed: 0, chunks_stored: 15,
+        file_progress: [fp('a.txt', 5, 5, { seconds_left: 0 }), fp('b.txt', 20, 10, { seconds_left: 1800 })], files_not_chunked: 0,
+        rate_characters_per_second: 500, seconds_left: 5400, seconds_left_is_minimum: false },
+        ['Embedding rate: 500 characters/s', 'About 1 h 30 min left', '5 chunks · 5 stored · done',
+         '20 chunks · 10 stored · about 30 min left'], ['No estimate yet', 'At least ']],
+      ['files not reached', { status: 'running', files_total: 3, files_completed: 0, files_failed: 0, chunks_stored: 0,
+        file_progress: [fp('a.txt', 12, 0, { seconds_left: 120 })], files_not_chunked: 2,
+        rate_characters_per_second: 500, seconds_left: 120, seconds_left_is_minimum: true },
+        ['At least 2 min left (2 files not chunked yet)', 'about 2 min left'], ['No estimate yet', 'About 2 min']],
+      ['a split file with more parts', { status: 'running', files_total: 1, files_completed: 0, files_failed: 0, chunks_stored: 40,
+        file_progress: [fp('big.jsonl', 50, 40, { chunked: false, seconds_left: 30 })], files_not_chunked: 0,
+        rate_characters_per_second: 500, seconds_left: 30, seconds_left_is_minimum: true },
+        ['At least under a minute left (more parts may follow)', '50 chunks so far · 40 stored · about under a minute left'], ['No estimate yet']],
+      ['a finished job', { status: 'partial', files_total: 5, files_completed: 4, files_failed: 1, chunks_stored: 3,
+        file_progress: [fp('bad.txt', 4, 0, { chunked: false, failed: true }), fp('good.txt', 3, 3)], file_progress_omitted: 3,
+        files_not_chunked: 0, rate_characters_per_second: null, seconds_left: null, seconds_left_is_minimum: false },
+        ['3 earlier files not shown', '4 chunks so far · failed', '3 chunks · 3 stored · done'],
+        ['No estimate yet', 'Embedding rate', 'At least ', 'About ']],
+    ];
+    for (const [label, fields, present, absent] of estimateCases) {
+      const fs = require('fs');
+      const small = '/tmp/vfy-estimate.txt';
+      fs.writeFileSync(small, 'Estimate fixture.\n');
+      const jobId = 'vfyest' + estimateCases.findIndex(c => c[0] === label);
+      const s = await session(browser, BASE, 'developer');
+      await s.page.setRequestInterception(true);
+      s.page.on('request', request => {
+        const path = new URL(request.url()).pathname;
+        if (path === '/api/ingest/upload' && request.method() === 'POST')
+          return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'queued', files_queued: 1, collection: 'x' }) });
+        if (path === '/api/ingest/job/' + jobId)
+          return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, errors: [], skipped: [], chunks_replaced: 0, split: [], ...fields }) });
+        return request.continue();
+      });
+      try {
+        await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+        const input = await s.page.$('#file-input');
+        await input.uploadFile(small);
+        await sleep(300);
+        const clicked = await clickByText(s.page, 'Start Ingest');
+        await sleep(4500);
+        const text = await bodyText(s.page);
+        const missing = present.filter(t => !text.includes(t));
+        const extra = absent.filter(t => text.includes(t));
+        r.check(`${label}: the panel shows ${present.map(t => `"${t}"`).join(', ')} and not ${absent.map(t => `"${t}"`).join(', ')} (#614)`,
+                clicked && missing.length === 0 && extra.length === 0,
+                clicked ? `missing ${JSON.stringify(missing)} unexpected ${JSON.stringify(extra)}: ${text.slice(0, 400)}` : 'Start Ingest button not found');
+        r.check(`estimate fixture (${label}) causes no React page errors`, !s.errors.some(e => e.startsWith('pageerror:')));
+      } finally {
+        fs.unlinkSync(small);
+        await s.ctx.close();
+      }
     }
   }
 

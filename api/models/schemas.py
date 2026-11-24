@@ -120,6 +120,21 @@ class IngestUploadResponse(BaseModel):
     collection: str
 
 
+class FileProgress(BaseModel):
+    """One file of an ingest job, for its time estimate (#614)."""
+    file: str
+    # Chunks (and their characters) made from the file so far, and those stored.
+    chunks: int = 0
+    chunks_stored: int = 0
+    characters: int = 0
+    characters_stored: int = 0
+    # The whole file is chunked; false while a split file may have more parts.
+    chunked: bool = False
+    failed: bool = False
+    # Computed when the status is read, while the job runs; else null.
+    seconds_left: float | None = None
+
+
 class JobStatusResponse(BaseModel):
     job_id: str
     status: str
@@ -143,6 +158,18 @@ class JobStatusResponse(BaseModel):
     # Files over the per-file limits, stored as parts `<name> (part N)` (#621):
     # one entry per such file that completed. Older records read back as [].
     split: list[str] = []
+    # The time estimate (#614; services/ingest_estimate): each file's chunk
+    # count once it is chunked, at most the newest 100 (file_progress_omitted
+    # counts the rest). The rate is the instance's, measured from stored parts;
+    # it and the times left are null when nothing has been measured yet and
+    # whenever the job isn't running. The job's time left counts only work
+    # already chunked: seconds_left_is_minimum says when more may follow.
+    file_progress: list[FileProgress] = []
+    file_progress_omitted: int = 0
+    files_not_chunked: int | None = None
+    rate_characters_per_second: float | None = None
+    seconds_left: float | None = None
+    seconds_left_is_minimum: bool = False
 
 
 class IngestConfig(BaseModel):
