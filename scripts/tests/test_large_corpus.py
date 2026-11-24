@@ -163,6 +163,20 @@ class RetentionTests(Folders):
         self.assertEqual(sources.digests_for_filename(COLL, "corpus.jsonl"), [])
         self.assertFalse(sources.blob_path(COLL, old).exists())
 
+    def test_a_str_is_refused_and_nothing_is_written_893(self):
+        # #893: a str is never taken for a path, so text or a name can't make
+        # the API retain whatever file it names.
+        old = sources.store(COLL, "corpus.jsonl", b"v1 text", replace=True)
+        path = self.files / "named.jsonl"
+        path.write_bytes(b'{"k": "v"}\n')
+        folder = sources.collection_dir(COLL)
+        before = {p.name: p.read_bytes() for p in folder.iterdir()}
+        for replace in (False, True):
+            with self.subTest(replace=replace), self.assertRaises(TypeError):
+                sources.store(COLL, "corpus.jsonl", str(path), replace=replace)
+        self.assertEqual({p.name: p.read_bytes() for p in folder.iterdir()}, before)
+        self.assertEqual(sources.digests_for_filename(COLL, "corpus.jsonl"), [old])
+
     def test_bytes_and_a_path_of_the_same_bytes_are_retained_alike(self):
         data = b'{"bill": "HR-1"}\n' * 1000
         path = self.files / "same.jsonl"

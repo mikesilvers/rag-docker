@@ -892,6 +892,36 @@ class SourcesTests(unittest.TestCase):
         self.assertFalse(other.exists())
         self.assertIn(f"Could not remove interrupted source write {stuck}", "\n".join(logged.output))
 
+    def test_a_folder_that_cant_be_listed_is_logged_and_the_sweep_goes_on_892(self):
+        # #892: one collection folder that can't be listed used to stop the
+        # sweep for every later one. Each of the two is the blocked one in turn,
+        # so the listing order doesn't matter.
+        names = ("Coll", "Other")
+        for name in names:
+            sources.store(name, "p.txt", name.encode(), replace=True)
+        real = Path.iterdir
+        for blocked in names:
+            with self.subTest(blocked=blocked):
+                stuck = sources.collection_dir(blocked)
+                leftovers = {n: sources.collection_dir(n) / f"{sources.INDEX_NAME}.0123456789abcdef.tmp"
+                             for n in names}
+                for path in leftovers.values():
+                    path.write_bytes(b"partial")
+
+                def iterdir(path):
+                    if path == stuck:
+                        raise PermissionError("not listable")
+                    return real(path)
+
+                with patch.object(Path, "iterdir", iterdir), \
+                        self.assertLogs(sources.log, "ERROR") as logged:
+                    sources.remove_interrupted_saves()
+                swept = next(n for n in names if n != blocked)
+                self.assertFalse(leftovers[swept].exists())
+                self.assertTrue(leftovers[blocked].exists())
+                self.assertIn(f"Could not list source folder {stuck}", "\n".join(logged.output))
+                leftovers[blocked].unlink()
+
     def test_the_startup_sweep_needs_no_sources_folder_882(self):
         with patch.object(settings, "sources_dir", str(Path(settings.sources_dir) / "missing")):
             sources.remove_interrupted_saves()
