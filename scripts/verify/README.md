@@ -657,6 +657,24 @@ through the proxy, checks its retained original byte for byte in the API contain
 re-chunks it (`chunks_total` = `chunks_written` = the collection's count) and replaces it with
 a smaller file (`chunks_replaced` is the re-chunk's count; the index lists only the new
 original, the large blob removed).
+
+`scripts/tests/test_ingest_estimate.py` (#614) checks, with Weaviate mocked and the rate file
+in a temporary upload folder, the ingest time estimate: the rate (characters over seconds of
+the last 20 stored parts, weighted by size) saved and read back after a restart, a malformed
+file read as no rate and replaced, ignored and unsaved measurements; the time left a job status
+computes (none before a measurement, a countdown inside the part being stored never below 0,
+a failed file's 0, the "at least" flag for files not reached and split files with more parts,
+nothing for a job that isn't running, old records); and the per-file progress the job loop
+records for a whole file, a split file (chunked only after its last part, one measurement a
+part), a failed store (not a measurement), a file failing before any chunks, and the cap on
+entries. `02_ingest.sh` runs it in the API image with no network.
+On the stack, `02_ingest.sh` then checks that the six-type job's finished status lists each
+file's chunk and character counts, all stored, with no rate or time left, and that the real
+store left valid measurements in the API's `UPLOAD_DIR/ingest-rate.json`.
+`browser/ui_criteria.js` (suite 06) stubs job responses to check the Import page's progress
+panel: "No estimate yet" before a measurement, the rate and "About ... left", "At least ...
+left" for files not chunked yet and for a split file with more parts, and a finished job's
+per-file counts (failed, done, earlier files not shown) with no estimate.
 `browser/ui_criteria.js` (suite 06) checks that the Import page's file picker accepts
 `.jsonl` and `.jsonl.gz` and that its hint names JSONL.
 
@@ -1016,6 +1034,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_reingest.py` | controlled re-ingest replacement, exact-name selection (#622), same-name upload, macOS ZIP metadata, retention and rechunk-coverage regressions, registered by ingest |
 | `../tests/test_split_parts.py` | controlled regressions for files over the per-file limits stored as parts (#621): the reviewer's 13,000 records, files over 10,000,000 characters, family replacement, all or nothing, cuts, CSV, Markdown, encoding, `overlap` sizing, re-chunk and export links, registered by ingest |
 | `../tests/test_large_corpus.py` | controlled large-corpus regressions (#312): retention by path in blocks, a large retained original through export and import, the re-chunk reader staging one part at a time and its refusals, `chunks_total` following staging; registered by ingest in the API image with the repository mounted |
+| `../tests/test_ingest_estimate.py` | controlled ingest time-estimate regressions (#614): the measured rate saved across restarts, the time left per file and job, per-file progress from the job loop; registered by ingest in the API image with no network |
 | `split_parts.py` | helper for ingest (#621), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, files over the per-file limits are stored as parts, a smaller re-upload replaces every part, and a bad line after part 1 stores nothing; the collection is removed afterwards |
 | `exact_source.py` | helper for ingest (#622), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, replacing `report.pdf` deletes only its earlier chunks and `_source_has_chunks_sync` answers by exact name, with a few word matches (`page`), over 10,000 (`walk`), and over 10,000 earlier chunks of the name itself, deleted in batches of 10,000 (`bulk`); the collection is removed afterwards |
 | `../tests/test_collection_spelling.py` | controlled regressions for per-collection state keyed by the stored collection name (#372), registered by ingest |

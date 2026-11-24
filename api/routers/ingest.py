@@ -7,7 +7,7 @@ from pydantic import ValidationError
 from models.schemas import (CollectionName, IngestConfig, IngestConfigResponse,
                             IngestJobEntry, IngestJobList, IngestUploadResponse,
                             JobStatusResponse)
-from services import audit, ingest_config, job_lists
+from services import audit, ingest_config, ingest_estimate, job_lists
 from services import ingest_pipeline
 from services import weaviate_client as wc
 from services.collection_writes import CollectionDeletingError, canonical
@@ -122,7 +122,10 @@ async def job_status(job_id: str, request: Request = None):
     # A job on a collection the caller may not use answers as a missing one (#606).
     if job is None or (job.get("collection") and not await access.check(request, job["collection"], "JOB_NOT_FOUND")):
         return api_error(404, "JOB_NOT_FOUND", f"Job '{job_id}' not found.")
-    return JobStatusResponse(**job)
+    # The time estimate (#614) is computed as the status is read; its first
+    # read of the saved rate is a file read, so it runs off the event loop.
+    estimate = await asyncio.to_thread(ingest_estimate.view, job)
+    return JobStatusResponse(**{**job, **estimate})
 
 
 @router.get("/config/{collection}", response_model=IngestConfigResponse)
