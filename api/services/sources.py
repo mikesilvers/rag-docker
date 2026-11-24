@@ -120,6 +120,11 @@ def _temporary(path: Path) -> Path:
     return path.with_name(f"{path.name}.{secrets.token_hex(8)}.tmp")
 
 
+# The names _temporary makes. Only a crash or kill between creating one and
+# replacing its target leaves one behind (#882).
+_LEFTOVER = re.compile(r".+\.[0-9a-f]{16}\.tmp\Z")
+
+
 def _publish(path: Path, payload: bytes) -> None:
     """Replace path whole: a uniquely named temporary file in the same folder,
     fsynced, then os.replace. A failure before the replace removes the
@@ -176,15 +181,61 @@ def _drop_blobs(collection: str, digests: list[str]) -> None:
                       digest[:12], collection, exc)
 
 
+def _release(index: dict, filename: str, keep: str | None = None) -> tuple[bool, list[str]]:
+    """Remove filename from every digest but keep, and drop each digest left
+    with no names from the index. Returns whether the index changed and the
+    dropped digests, whose blobs are deleted only after the index is saved."""
+    changed = False
+    orphans: list[str] = []
+    for other, entry in list(index["documents"].items()):
+        if other != keep and filename in entry["filenames"]:
+            changed = True
+            entry["filenames"] = [n for n in entry["filenames"] if n != filename]
+            if not entry["filenames"]:
+                del index["documents"][other]
+                orphans.append(other)
+    return changed, orphans
+
+
+def _save_release(collection: str, index: dict, filename: str) -> None:
+    """Save an index that releases filename. When even that fails, the name
+    still points at its earlier version, which a re-chunk would rebuild (#880):
+    best effort, so that is logged loudly and the error raised."""
+    try:
+        _save_index(collection, index)
+    except OSError as exc:
+        log.error("Could not release %r from its earlier version in %r; a re-chunk could "
+                  "rebuild that earlier version: %s", filename, collection, exc)
+        raise
+
+
+def release(collection: str, filename: str) -> None:
+    """Release filename from every digest (#880): ingest calls this when the
+    re-uploaded file can't be read for retention, so the name never keeps
+    claiming the version whose chunks it replaced.
+
+    Holds the collection's lock (#52). An unreadable or invalid index raises
+    ValueError, and nothing is written then or when no digest lists the name.
+    """
+    with _collection_lock(collection):
+        index = load_index(collection)
+        changed, orphans = _release(index, filename)
+        if changed:
+            _save_release(collection, index, filename)
+            _drop_blobs(collection, orphans)
+
+
 @telemetry.traced("rag.retain")
 def store(collection: str, filename: str, data: bytes, media_type: str | None = None,
           *, replace: bool = False) -> str:
     """Retain one accepted upload. Returns its sha256.
 
     With replace=True (ingest, #22) the filename is first released from every
-    other digest, and digests left with no names are dropped. That happens even
-    when writing the new blob fails, so the name never keeps claiming the
-    version it replaced, which a rechunk would otherwise rebuild.
+    other digest, and digests left with no names are dropped. That release is
+    saved before the new blob is written (#880), so a failed blob write or a
+    failed final save still leaves the name released: it never keeps claiming
+    the version it replaced, which a rechunk would otherwise rebuild. When the
+    release itself can't be saved, that is logged and the error raised.
 
     The whole cycle holds the collection's lock (#52), and the index is loaded
     before anything is written: an unreadable or invalid index raises
@@ -196,33 +247,16 @@ def store(collection: str, filename: str, data: bytes, media_type: str | None = 
         target.parent.mkdir(parents=True, exist_ok=True)
 
         index = load_index(collection)
-        orphans: list[str] = []
         if replace:
-            for other, entry in list(index["documents"].items()):
-                if other != digest and filename in entry["filenames"]:
-                    entry["filenames"] = [n for n in entry["filenames"] if n != filename]
-                    if not entry["filenames"]:
-                        del index["documents"][other]
-                        orphans.append(other)
-
-        try:
-            if not target.exists():
-                tmp = _temporary(target)
-                try:
-                    tmp.touch(exist_ok=False)     # created exclusively: never shared
-                    tmp.write_bytes(data)
-                    os.replace(tmp, target)
-                except BaseException:
-                    try:
-                        tmp.unlink()
-                    except OSError:
-                        pass
-                    raise
-        except BaseException:
-            if replace:
-                _save_index(collection, index)
+            changed, orphans = _release(index, filename, keep=digest)
+            if changed:
+                _save_release(collection, index, filename)
                 _drop_blobs(collection, orphans)
-            raise
+
+        if not target.exists():
+            # Published like an index (#882): fsynced before the index that
+            # names it, so a power loss can't leave it empty or truncated.
+            _publish(target, data)
 
         now = datetime.now(timezone.utc).isoformat()
         entry = index["documents"].get(digest)
@@ -239,7 +273,6 @@ def store(collection: str, filename: str, data: bytes, media_type: str | None = 
                 entry["filenames"].append(filename)
             entry["last_seen"] = now
         _save_index(collection, index)
-        _drop_blobs(collection, orphans)
     return digest
 
 
@@ -272,4 +305,33 @@ def delete(collection: str) -> None:
     Called when the collection is deleted. Without this the volume leaks
     silently: it is surfaced nowhere in the UI.
     """
-    shutil.rmtree(collection_dir(collection), ignore_errors=True)
+    directory = collection_dir(collection)
+    shutil.rmtree(directory, ignore_errors=True)
+    # Its lock goes too (#882), so the map doesn't keep one per collection
+    # ever stored into; a later store into the same name makes a new one.
+    with _locks_guard:
+        _locks.pop(str(directory), None)
+
+
+def remove_interrupted_saves() -> None:
+    """Remove the temporary files of saves a crash or kill interrupted (#882).
+
+    Every index and blob is written whole through a uniquely named temporary
+    file, so a leftover is never used, only disk space. Called once at startup,
+    before any request, so no save is in progress. Only names _temporary makes
+    are removed, in each collection folder that isn't a link; a leftover that
+    can't be removed is logged and kept. An error listing the folders is the
+    whole sweep failing, which the caller logs.
+    """
+    root = _root()
+    if not root.is_dir():
+        return
+    for folder in root.iterdir():
+        if folder.is_symlink() or not folder.is_dir():
+            continue
+        for leftover in folder.iterdir():
+            if _LEFTOVER.fullmatch(leftover.name):
+                try:
+                    leftover.unlink()
+                except OSError:
+                    log.exception("Could not remove interrupted source write %s", leftover)

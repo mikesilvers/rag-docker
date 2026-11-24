@@ -73,8 +73,13 @@ no longer the storage key, which `index.json` exists to solve.
 **Same name, new content replaces (#22).** A logical filename belongs to one digest at a
 time. When ingest retains a file, its name is first removed from every other digest's
 `filenames`; a digest left with no names is removed from `index.json`, and its blob is
-deleted after the index is saved. This happens even if writing the new blob fails, so the
-name never keeps pointing at the version it replaced (re-chunking would rebuild that).
+deleted after the index is saved. That release is saved before the new blob is written, so a
+failed blob write or a failed final index save still leaves the name released, and a
+re-upload whose file can't be read for retention releases the name too (#880): the name never
+keeps pointing at the version it replaced (re-chunking would rebuild that; a stored name that
+no digest lists is refused instead). This is best effort: when even the release can't be
+saved, the failure is logged, saying a re-chunk could rebuild the earlier version, and the
+file still counts as ingested.
 Ingest replaces the name's chunks the same way (`SPECIFICATIONS.md` §3.1.3), so the
 retained originals keep matching the chunks. The same content under two names is still one
 blob listing both names. Logical names of ZIP members include their folders inside the

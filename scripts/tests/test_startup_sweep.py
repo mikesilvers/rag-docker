@@ -264,6 +264,11 @@ class LifespanTests(SweepTestCase):
         write(self.exports / ".build-k2" / "f.txt", size=2 * MB)
         write(self.exports / ".ragpkg-docs-1.tar.gz.partial", size=MB)
         package = write(self.exports / "ragpkg-docs-1.tar.gz", size=MB)
+        # A source-index save a crash interrupted (#882), beside the index it
+        # never replaced.
+        index = write(self.base / "sources" / "Docs" / "index.json", text="{}")
+        interrupted = write(self.base / "sources" / "Docs" / "index.json.0123456789abcdef.tmp",
+                            text="{")
         script = """
 import asyncio, sys
 from unittest.mock import AsyncMock, patch
@@ -288,6 +293,8 @@ asyncio.run(run())
         self.assertIn("Removed 2 leftover(s) of an interrupted export from the exports folder: "
                       ".build-k2 (2 MB), .ragpkg-docs-1.tar.gz.partial (1 MB)", result.stderr)
         self.assertIn("ingest-k1 (1 MB)", result.stderr)
+        self.assertFalse(interrupted.exists())
+        self.assertEqual(index.read_text(), "{}")
 
     def test_a_failing_export_sweep_is_logged_and_startup_carries_on(self):
         write(self.uploads / "ingest-k3" / "upload.txt", size=MB)
@@ -319,6 +326,35 @@ asyncio.run(run())
         self.assertFalse((self.uploads / "ingest-k3").exists())
         self.assertTrue(build.exists())
 
+
+    def test_a_failing_source_sweep_is_logged_and_startup_carries_on(self):
+        # Reviewer-added (#882): the source-index sweep failing as a whole is
+        # logged, and startup and the other sweeps carry on.
+        write(self.uploads / "ingest-k5" / "upload.txt", size=MB)
+        script = """
+import asyncio, sys
+from unittest.mock import AsyncMock, patch
+sys.path.insert(0, sys.argv[1])
+from main import app, lifespan
+from services import importer, sources, weaviate_client as wc
+async def run():
+    with patch.object(wc, 'sweep_staging', new=AsyncMock(return_value=[])), \\
+         patch.object(importer, 'sweep_interrupted_imports', return_value=[]), \\
+         patch.object(sources, 'remove_interrupted_saves', side_effect=OSError('sources unreadable')), \\
+         patch.object(wc, 'close_client'):
+        async with lifespan(app):
+            print('SERVING')
+asyncio.run(run())
+"""
+        env = {**os.environ, "UPLOAD_DIR": str(self.uploads), "EXPORTS_DIR": str(self.exports),
+               "SOURCES_DIR": str(self.base / "sources")}
+        result = subprocess.run([sys.executable, "-c", script, API_DIR], capture_output=True,
+                                text=True, timeout=120, cwd=API_DIR, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("SERVING", result.stdout)
+        self.assertIn("Startup sweep of interrupted source-index writes failed", result.stderr)
+        self.assertIn("sources unreadable", result.stderr)
+        self.assertFalse((self.uploads / "ingest-k5").exists())
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
