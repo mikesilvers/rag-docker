@@ -1060,6 +1060,29 @@ class RechunkTests(unittest.TestCase):
             self.assertEqual(tuning._uncovered_source_files("Coll", sources.load_index("Coll")["documents"]),
                              ["p.txt"])
 
+    def test_a_failed_reupload_save_makes_rechunk_refuse_the_name_880(self):
+        # Reviewer-added (#880): the final index save of a re-upload fails
+        # after the new chunks are stored. Re-chunk must refuse the name, not
+        # rebuild the earlier version's text in place of the new chunks.
+        sources.store("Coll", "kept.txt", b"kept text", replace=True)
+        sources.store("Coll", "p.txt", b"old text", replace=True)
+        real, new = sources._save_index, hashlib.sha256(b"new text").hexdigest()
+
+        def final_save_fails(collection, index):
+            # The save that adds the new version's entry fails.
+            if new in index["documents"]:
+                raise OSError("disk full")
+            return real(collection, index)
+
+        with patch.object(sources, "_save_index", side_effect=final_save_fails), \
+                self.assertRaises(OSError):
+            sources.store("Coll", "p.txt", b"new text", replace=True)
+        with self.stored(("kept.txt", 0), ("p.txt", 0)):
+            with self.assertRaises(tuning.PackageError) as refused:
+                tuning._chunks_from_sources("Coll", "fixed", 1000, 0, 0.85, 0)
+        self.assertEqual(refused.exception.code, "SOURCES_REQUIRED")
+        self.assertEqual(refused.exception.detail["uncovered_source_files"], ["p.txt"])
+
     def test_a_second_name_is_covered(self):
         sources.store("Coll", "a.txt", b"same", replace=True)
         sources.store("Coll", "b.txt", b"same", replace=True)
