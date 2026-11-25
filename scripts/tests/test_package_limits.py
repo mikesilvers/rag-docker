@@ -24,11 +24,14 @@ from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from pydantic import ValidationError
+
 sys.path.insert(0, os.environ.get("RAG_TEST_API_DIR") or str(Path(__file__).resolve().parents[2] / "api"))
 # Before config is imported: the settings read the environment once.
 os.environ.setdefault("MAX_PACKAGE_EXPANDED_BYTES", "1048576")
 os.environ.setdefault("MAX_PACKAGE_MEMBERS", "20")
 
+import config
 from config import settings
 from services import age_stream, importer, packager
 from services import weaviate_client as wc
@@ -195,6 +198,62 @@ def under(folders):
     return f"{TOP}/" + "".join(f"d{i:02d}/" for i in range(folders)) + "f"
 
 
+def pax_negative_tar(regular):
+    """Like negative_size_tar, but the -10 MiB size comes from a PAX `size` record.
+
+    `regular` puts it on a regular file instead of the directory.
+    """
+    out = io.BytesIO()
+    with tarfile.open(fileobj=out, mode="w:gz", format=tarfile.PAX_FORMAT) as tar:
+        top = tarfile.TarInfo(TOP)
+        top.type = tarfile.DIRTYPE
+        top.mode = 0o755
+        tar.addfile(top)
+        info = tarfile.TarInfo(f"{TOP}/manifest.json")
+        info.size = len(MANIFEST)
+        tar.addfile(info, io.BytesIO(MANIFEST))
+        hole = tarfile.TarInfo(f"{TOP}/hole")
+        if not regular:
+            hole.type = tarfile.DIRTYPE
+            hole.mode = 0o755
+        hole.pax_headers = {"size": str(-10 * CAP_BYTES)}
+        tar.addfile(hole)
+        big = tarfile.TarInfo(f"{TOP}/big.bin")
+        big.size = 2 * CAP_BYTES
+        tar.addfile(big, io.BytesIO(b"\0" * big.size))
+    return out.getvalue()
+
+
+# One file under this many one-letter folders: more than os.makedirs can make at once
+# under the recursion limit the deep-chain tests set, and short enough for macOS's
+# 1,024-byte path limit.
+DEEP_CHAIN = 300
+
+
+def deep_chain():
+    return folder_tar([f"{TOP}/" + "a/" * DEEP_CHAIN + "f"])
+
+
+class ShallowRecursion:
+    """The member cap raised past DEEP_CHAIN and a recursion limit 100 frames above the
+    caller, so making DEEP_CHAIN folders at once raises RecursionError (#599)."""
+
+    def __enter__(self):
+        self.limit = sys.getrecursionlimit()
+        self.cap = patch.object(settings, "max_package_members", 10 * DEEP_CHAIN)
+        self.cap.start()
+        depth, frame = 0, sys._getframe()
+        while frame is not None:
+            depth, frame = depth + 1, frame.f_back
+        sys.setrecursionlimit(depth + 100)
+        return self
+
+    def __exit__(self, *exc):
+        sys.setrecursionlimit(self.limit)
+        self.cap.stop()
+        return False
+
+
 def encrypt(data):
     out = io.BytesIO()
     enc = age_stream.Encryptor(out, PASSPHRASE, LOW)
@@ -255,6 +314,24 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(packager._limit_text(16 * 1024 ** 3), "16,384 MB")
         self.assertEqual(packager._limit_text(1048576), "1 MB")
         self.assertEqual(packager._limit_text(1000), "1,000 bytes")
+
+    def test_each_cap_is_at_least_one(self):
+        # 0 or less would refuse every import (#599).
+        for field in ("max_package_expanded_bytes", "max_package_members"):
+            with self.subTest(field=field):
+                with self.assertRaises(ValidationError) as caught:
+                    type(settings)(**{field: 0})
+                self.assertEqual(config.refusal_lines(caught.exception),
+                                 [f"Settings refused: {field.upper()} must be at least 1"])
+                self.assertEqual(getattr(type(settings)(**{field: 1}), field), 1)
+
+
+class DefaultTests(unittest.TestCase):
+    def test_the_defaults_in_config(self):
+        # Reviewer (#589): the code defaults, used when the environment sets nothing.
+        fields = type(settings).model_fields
+        self.assertEqual(fields["max_package_expanded_bytes"].default, 16 * 1024 ** 3)
+        self.assertEqual(fields["max_package_members"].default, 100000)
 
 
 class OpenPackageTests(Fixture):
@@ -405,6 +482,149 @@ class OpenPackageTests(Fixture):
                 if not encrypted:
                     self.assertEqual(list(dest.iterdir()), [])
 
+    def test_a_file_before_its_folder_counts_the_folder_once(self):
+        # 17 files in a, then a's own entry: the folder counted for the first file is the
+        # entry, so with the top directory and the manifest that is 20 entries (#599).
+        names = [f"{TOP}/a/f{i:02d}" for i in range(17)] + [f"{TOP}/a/"]
+        for encrypted in (False, True):
+            with self.subTest(encrypted=encrypted):
+                dest, run = self.open(self.package(None, encrypted, folder_tar(names)))
+                run()
+                self.assertTrue((dest / TOP / "a").is_dir())
+                self.assertEqual(len(list(dest.rglob("*"))), CAP_MEMBERS)
+
+    def test_a_dot_directory_name_counts_once(self):
+        # 'd/.' names the folder d, its entry: with 17 files in it, 20 entries (#599).
+        names = [f"{TOP}/d/./"] + [f"{TOP}/d/f{i:02d}" for i in range(17)]
+        for encrypted in (False, True):
+            with self.subTest(encrypted=encrypted):
+                dest, run = self.open(self.package(None, encrypted, folder_tar(names)))
+                run()
+                self.assertEqual(len(list(dest.rglob("*"))), CAP_MEMBERS)
+
+    def test_a_repeated_directory_entry_counts_each_time(self):
+        # Every entry is read, so a repeated one still counts: 19 of them make 21 (#599).
+        for encrypted in (False, True):
+            with self.subTest(encrypted=encrypted):
+                archive = self.package(None, encrypted, folder_tar([f"{TOP}/r/"] * 19))
+                error, _dest = self.refused(archive, "PACKAGE_TOO_MANY_MEMBERS")
+                self.assertEqual(error.detail, {"limit": CAP_MEMBERS})
+
+    def test_folders_implied_by_a_directory_entry_count(self):
+        # A directory entry 18 folders deep: its own folder is its entry and the 17 above
+        # it are implied, so with the top directory and the manifest there are 20 entries.
+        # One folder deeper is 21. (Reviewer test, #589.)
+        def deep(n):
+            return f"{TOP}/" + "".join(f"p{i:02d}/" for i in range(n))
+        for encrypted in (False, True):
+            with self.subTest(encrypted=encrypted, at="cap"):
+                dest, run = self.open(self.package(None, encrypted, folder_tar([deep(18)])))
+                run()
+                self.assertTrue((dest / deep(18)).is_dir())
+                self.assertEqual(len(list(dest.rglob("*"))), CAP_MEMBERS)
+            with self.subTest(encrypted=encrypted, at="over"):
+                archive = self.package(None, encrypted, folder_tar([deep(19)]))
+                error, dest = self.refused(archive, "PACKAGE_TOO_MANY_MEMBERS")
+                self.assertEqual(error.detail, {"limit": CAP_MEMBERS})
+                self.assertFalse((dest / TOP / "p00").exists())
+
+    def test_a_path_back_through_the_work_directory_is_refused(self):
+        # '../<work dir>/' leads back into the work directory, but a name with a '..'
+        # component is refused before its folders are counted (#597): its 18 folders would
+        # take it past the cap, and it is refused as unreadable instead, with none made.
+        for encrypted in (False, True):
+            with self.subTest(encrypted=encrypted):
+                dest = self.root / ("work-" + uuid.uuid4().hex[:6])
+                dest.mkdir()
+                name = f"../{dest.name}/{under(18)}"
+                archive = self.package(None, encrypted, folder_tar([name]))
+                with self.assertRaises(packager.PackageError) as caught:
+                    packager.open_package(archive, dest, PASSPHRASE if encrypted else None)
+                self.assertEqual(caught.exception.code, "PACKAGE_UNREADABLE", caught.exception.message)
+                self.assertEqual(caught.exception.message, f"Package contains a path with a '..' "
+                                                           f"component ('{name}'), which is not allowed.")
+                self.assertEqual(caught.exception.detail, {"member": name})
+                self.assertFalse((dest / TOP / "d00").exists())
+                if not encrypted:
+                    self.assertEqual(list(dest.iterdir()), [])
+
+    def test_dot_and_empty_parts_are_not_folders(self):
+        # 'TOP/./d00//d01//...//d16//f' makes 17 folders under the top directory: with the
+        # top directory, the manifest and the file, 20 entries. (#589 testing reviewer.)
+        name = f"{TOP}/./" + "//".join(f"d{i:02d}" for i in range(17)) + "//f"
+        for encrypted in (False, True):
+            with self.subTest(encrypted=encrypted):
+                dest, run = self.open(self.package(None, encrypted, folder_tar([name])))
+                run()
+                self.assertTrue((dest / under(17)).is_file())
+                self.assertEqual(len(list(dest.rglob("*"))), CAP_MEMBERS)
+
+    def test_the_checks_run_in_the_specified_order(self):
+        # §6.2: count the member, check it, count its new folders, then add its size.
+        # (Reviewer test, #589.)
+        def raw(*members):
+            return gzip.compress(gnu_header(TOP, 0, tarfile.DIRTYPE)
+                                 + gnu_header(f"{TOP}/manifest.json", len(MANIFEST)) + block(MANIFEST)
+                                 + b"".join(members) + b"\0" * 1024)
+        deep = under(18).rsplit("/", 1)[0]
+        big = CAP_BYTES + 1
+        cases = (
+            # The 21st entry is a link: it is counted before it is checked.
+            ("count, then check", raw(*[gnu_header(f"{TOP}/f{i:02d}", 0) for i in range(18)],
+                                       gnu_header(f"{TOP}/link", 0, tarfile.SYMTYPE)),
+             "PACKAGE_TOO_MANY_MEMBERS"),
+            # A link under 18 new folders: it is checked before its folders are counted.
+            ("check, then folders", raw(gnu_header(f"{deep}/link", 0, tarfile.SYMTYPE)),
+             "PACKAGE_UNREADABLE"),
+            # A file over the size cap under 18 new folders: folders before size.
+            ("folders, then size", raw(gnu_header(f"{deep}/f", big) + block(b"\0" * big)),
+             "PACKAGE_TOO_MANY_MEMBERS"),
+        )
+        for label, data, code in cases:
+            for encrypted in (False, True):
+                with self.subTest(order=label, encrypted=encrypted):
+                    _error, dest = self.refused(self.package(None, encrypted, data), code)
+                    if not encrypted:
+                        self.assertEqual(list(dest.iterdir()), [])
+
+    def test_a_negative_pax_size_never_passes_the_cap(self):
+        # Reviewer (#589): the negative-size bypass through a PAX `size` record, for both
+        # package kinds. On a directory it is refused like the base-256 one. On a regular
+        # file, tarfile may end the archive at that header, so the package may open, but
+        # the 2 MiB file after it is never extracted and the cap holds either way.
+        for regular in (False, True):
+            for encrypted in (False, True):
+                with self.subTest(regular=regular, encrypted=encrypted):
+                    data = pax_negative_tar(regular)
+                    archive = self.exports / (f"ragpkg-pax-{int(regular)}.tar.gz"
+                                              + (".age" if encrypted else ""))
+                    archive.write_bytes(encrypt(data) if encrypted else data)
+                    if not regular:
+                        error, dest = self.refused(archive, "PACKAGE_UNREADABLE")
+                        self.assertEqual(error.detail, {"member": f"{TOP}/hole"})
+                        if not encrypted:
+                            self.assertEqual(list(dest.iterdir()), [])
+                    else:
+                        dest, run = self.open(archive)
+                        try:
+                            run()
+                        except packager.PackageError as error:
+                            self.assertEqual(error.code, "PACKAGE_UNREADABLE", error.message)
+                    self.assertFalse((dest / TOP / "big.bin").exists())
+                    self.assertLessEqual(self.written(dest), CAP_BYTES)
+
+    def test_a_folder_chain_deeper_than_the_recursion_limit_is_unreadable(self):
+        # os.makedirs recurses once per missing folder: a RecursionError while extracting
+        # refuses the package instead of failing the job (#599).
+        for encrypted in (False, True):
+            with self.subTest(encrypted=encrypted):
+                archive = self.package(None, encrypted, deep_chain())
+                with ShallowRecursion():
+                    error, _dest = self.refused(archive, "PACKAGE_UNREADABLE")
+                self.assertEqual(error.message, f"'{archive.name}' is not a readable "
+                                                f"{'encrypted ' if encrypted else ''}.tar.gz archive.")
+                self.assertTrue(error.detail["reason"].startswith("RecursionError: "), error.detail)
+
     def test_a_link_before_the_caps_still_refuses_as_unreadable(self):
         out = io.BytesIO()
         with tarfile.open(fileobj=out, mode="w:gz") as tar:
@@ -432,7 +652,7 @@ class RunTests(Fixture):
             side_effect=AssertionError("no Weaviate client may be opened"))))
         self.stack.enter_context(patch.object(importer, "_log"))
 
-    def run_import(self, archive):
+    def run_import(self, archive, passphrase=None):
         job_id = "job" + uuid.uuid4().hex[:5]
         importer._jobs[job_id] = {"job_id": job_id, "status": "queued", "filename": archive.name,
                                   "on_conflict": "rename", "collection": None,
@@ -442,18 +662,62 @@ class RunTests(Fixture):
                                   "error_detail": None}
         with importer._lock:
             importer._active.add(archive.name)
-        importer._run(job_id, archive.name, "rename")
+        importer._run(job_id, archive.name, "rename", passphrase)
         return importer._jobs[job_id]
+
+    def test_an_encrypted_refusal_fails_the_job_and_removes_what_was_extracted(self):
+        # A .tar.gz.age is extracted member by member, so a refusal part-way leaves
+        # members in the job's work directory; the job must remove it (#317). (Reviewer
+        # test, #589.)
+        half = (CAP_BYTES - len(MANIFEST)) // 2
+        cases = (("PACKAGE_TOO_MANY_MEMBERS", at_count(CAP_MEMBERS + 1), self.too_many_message,
+                  lambda a: {"limit": CAP_MEMBERS}),
+                 ("PACKAGE_TOO_LARGE", [half, half, 4096], self.too_large_message,
+                  lambda a: {"limit": CAP_BYTES, "member": f"{TOP}/fill-002.bin"}))
+        for code, fillers, message, detail in cases:
+            with self.subTest(code=code):
+                archive = self.package(fillers, encrypted=True)
+                extracted = []
+                real_extract = tarfile.TarFile.extract
+
+                def spy(tar, member, *args, **kwargs):
+                    extracted.append(member.name)
+                    return real_extract(tar, member, *args, **kwargs)
+
+                with patch.object(tarfile.TarFile, "extract", spy):
+                    job = self.run_import(archive, PASSPHRASE)
+                self.assertEqual((job["status"], job["error_code"]), ("failed", code), job["error"])
+                self.assertEqual(job["error"], message(archive))
+                self.assertEqual(job["error_detail"], detail(archive))
+                # Members really were written before the refusal, so the clean-up is exercised.
+                self.assertGreater(len(extracted), 1)
+                self.create.assert_not_called()
+                self.assertEqual(sorted(p.name for p in self.uploads.glob("import-*")), [])
+                self.assertNotIn(archive.name, importer._active)
+
+    def test_a_folder_chain_deeper_than_the_recursion_limit_fails_as_a_refusal(self):
+        # Before #599 the RecursionError failed the job as IMPORT_FAILED.
+        for encrypted in (False, True):
+            with self.subTest(encrypted=encrypted):
+                archive = self.package(None, encrypted, deep_chain())
+                with ShallowRecursion():
+                    job = self.run_import(archive, PASSPHRASE if encrypted else None)
+                self.assertEqual((job["status"], job["error_code"]), ("failed", "PACKAGE_UNREADABLE"),
+                                 job["error"])
+                self.assertTrue(job["error_detail"]["reason"].startswith("RecursionError: "))
+                self.create.assert_not_called()
+                self.assertEqual(sorted(p.name for p in self.uploads.glob("import-*")), [])
 
     def test_each_refusal_fails_the_job_and_leaves_nothing(self):
         cases = (("PACKAGE_TOO_MANY_MEMBERS", at_count(CAP_MEMBERS + 1), self.too_many_message,
                   lambda a: {"limit": CAP_MEMBERS}),
                  ("PACKAGE_TOO_LARGE", at_size(CAP_BYTES + 1), self.too_large_message,
                   lambda a: {"limit": CAP_BYTES, "member": f"{TOP}/fill-000.bin"}))
-        for code, fillers, message, detail in cases:
-            with self.subTest(code=code):
-                archive = self.package(fillers)
-                job = self.run_import(archive)
+        # Both package kinds (E41); the encrypted kind added by the reviewer (#589).
+        for (code, fillers, message, detail), encrypted in [(c, e) for c in cases for e in (False, True)]:
+            with self.subTest(code=code, encrypted=encrypted):
+                archive = self.package(fillers, encrypted)
+                job = self.run_import(archive, PASSPHRASE if encrypted else None)
                 self.assertEqual((job["status"], job["error_code"]), ("failed", code), job["error"])
                 self.assertEqual(job["error"], message(archive))
                 self.assertEqual(job["error_detail"], detail(archive))

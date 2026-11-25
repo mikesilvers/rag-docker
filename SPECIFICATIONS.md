@@ -3603,7 +3603,9 @@ A retained session can be loaded/refreshed by its session ID, including when its
 - Progress while the job runs, then the filename, size, fidelity, whether it is
   encrypted with a key or a passphrase, whether models were bundled and whether `retrieve.py` was generated. Warnings from the job are
   shown in full. A failed export shows its `error_code` (for example
-  `EMBEDDING_MISMATCH`) before the error, as the import half does.
+  `EMBEDDING_MISMATCH`) before the error, as the import half does. While the
+  export waits `queued` for its collection's writer guard (#509), the page says
+  it is waiting for another job on the collection instead of showing progress (#520).
 - A finished key export shows, before the package's Download, a warning to store
   the key apart from the package (anyone with both can read it; it can be
   downloaded once and can't be recovered) and **Download key**, a link to
@@ -3835,8 +3837,8 @@ The `chunk_size` and `min_chunk_size` bounds apply whenever chunk settings are s
 | `max_zip_expanded_bytes` | 2147483648 | — | — | API setting (env `MAX_ZIP_EXPANDED_BYTES`), not a request parameter: the most one upload's ZIPs may expand to in all, gzipped members' output included (§3.1.3, #298) |
 | `max_zip_members` | 5000 | — | — | API setting (env `MAX_ZIP_MEMBERS`), not a request parameter: the most entries one ZIP may hold, folders included (§3.1.3, #28) |
 | `max_zip_member_ratio` | 200 | — | — | API setting (env `MAX_ZIP_MEMBER_RATIO`), not a request parameter: the most a ZIP member of 1 MiB or more may expand relative to its compressed size, declared and as read (§3.1.3, #28) |
-| `max_package_expanded_bytes` | 17179869184 | — | — | API setting (env `MAX_PACKAGE_EXPANDED_BYTES`), not a request parameter: the most an imported package's members may add up to when unpacked; over it the import fails `PACKAGE_TOO_LARGE` (RAG_EXPORT_SPECIFICATIONS.md §6.2, #317) |
-| `max_package_members` | 100000 | — | — | API setting (env `MAX_PACKAGE_MEMBERS`), not a request parameter: the most entries an imported package may hold, folders included; over it the import fails `PACKAGE_TOO_MANY_MEMBERS` (RAG_EXPORT_SPECIFICATIONS.md §6.2, #317) |
+| `max_package_expanded_bytes` | 17179869184 | 1 | — | API setting (env `MAX_PACKAGE_EXPANDED_BYTES`), not a request parameter: the most an imported package's members may add up to when unpacked; over it the import fails `PACKAGE_TOO_LARGE` (RAG_EXPORT_SPECIFICATIONS.md §6.2, #317) |
+| `max_package_members` | 100000 | 1 | — | API setting (env `MAX_PACKAGE_MEMBERS`), not a request parameter: the most entries an imported package may hold, folders included; over it the import fails `PACKAGE_TOO_MANY_MEMBERS` (RAG_EXPORT_SPECIFICATIONS.md §6.2, #317) |
 | `max_preparation_bytes` | 21474836480 | 1048576 | — | API setting (env `MAX_PREPARATION_BYTES`), not a request parameter: the most the preparation area may hold, raw and prepared together; a best-effort cap checked before each write (§3.1.11, #638) |
 | `preparation_dir` | `/app/preparation` | — | — | API setting (env `PREPARATION_DIR`): the preparation area, the `rag_preparation` volume (§3.1.11) |
 

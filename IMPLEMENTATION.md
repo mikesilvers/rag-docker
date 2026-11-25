@@ -1358,6 +1358,14 @@ class Settings(BaseSettings):
             raise ValueError("MAX_PREPARATION_BYTES must be at least 1048576")
         return value
 
+    @field_validator("max_package_expanded_bytes", "max_package_members")
+    @classmethod
+    def _package_cap(cls, value, info):
+        # 0 or less would refuse every package import (#599).
+        if value < 1:
+            raise ValueError(f"{info.field_name.upper()} must be at least 1")
+        return value
+
     @field_validator("export_retention_hours")
     @classmethod
     def _retention_hours(cls, value):
@@ -11735,6 +11743,8 @@ from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN
 from services import age_stream
 from services import goldstandard
 from services import ingest_config
+# One copy of the cap text, shared with the ZIP caps (#599).
+from services.ingest_pipeline import _limit_text
 from services import model_bundle
 from services import parts
 from services import retrieval_config
@@ -11922,17 +11932,22 @@ def _json_default(value: Any) -> Any:
 
 # ── Reading the collection (spec §4.5) ────────────────────────────────────────
 
-def read_chunks(collection: str, documents: dict | None = None) -> Iterator[dict]:
+def read_chunks(collection: str, documents: dict | None = None,
+                shipped: dict | None = None) -> Iterator[dict]:
     """One record per chunk, streamed. Never materialises the collection.
 
     A 100k-chunk corpus is roughly 880 MB of JSON, so nothing here accumulates.
-    `documents` is the retained sources the package ships, by digest; a chunk
-    links only to one of those (#509). None loads the whole index.
+    `documents` is the collection's whole source index, by digest (None loads
+    it), and `shipped` the retained sources the package ships, by digest (None:
+    all of `documents`). A chunk links only to a shipped digest, and only when
+    its name is listed under that one digest in the whole index (#509, #520).
     """
     client = wc.get_client()
     col = client.collections.get(collection)
     if documents is None:
         documents = sources.load_index(collection)["documents"]
+    if shipped is None:
+        shipped = documents
 
     # digests_for_filename() reloads the index on every call, which would be
     # O(chunks x documents). Build the reverse map once.
@@ -11960,8 +11975,9 @@ def read_chunks(collection: str, documents: dict | None = None) -> Iterator[dict
             "vector": vector,
             "properties": props,
             # More than one digest means the same filename was ingested with
-            # different content. Recording null is honest; picking one is not.
-            "source_sha256": digests[0] if len(digests) == 1 else None,
+            # different content. Recording null is honest; picking one is not,
+            # even when only one of those blobs is shipped (#520).
+            "source_sha256": digests[0] if len(digests) == 1 and digests[0] in shipped else None,
         }
 
 
@@ -12254,6 +12270,8 @@ def build(
         # chunk links and sources/ come from it (#509). The exporter holds the
         # writer guard, so no guarded writer changes it meanwhile. A blob missing
         # on disk is not shipped, and chunks naming it get a null source_sha256.
+        # The links are resolved against the whole index, so a name listed under
+        # more than one digest links nowhere, even when only one blob is on disk (#520).
         index = sources.load_index(collection)
         shipped = {}
         for digest, entry in index["documents"].items():
@@ -12272,7 +12290,7 @@ def build(
         def write_chunks(path: Path) -> None:
             nonlocal chunk_count, dimensions, first_props, unresolved
             with path.open("w", encoding="utf-8") as fh:
-                for record in read_chunks(collection, shipped):
+                for record in read_chunks(collection, index["documents"], shipped):
                     if dimensions is None and record["vector"]:
                         dimensions = len(record["vector"])
                     if first_props is None:
@@ -12617,12 +12635,24 @@ def _check_member(member: tarfile.TarInfo, dest: Path, root: Path) -> None:
             {"member": member.name})
 
 
-def _limit_text(limit: int) -> str:
-    """A cap for a message: whole MiB as MB, anything else in bytes."""
-    mib = 1024 * 1024
-    if limit >= mib and limit % mib == 0:
-        return f"{limit // mib:,} MB"
-    return f"{limit:,} bytes"
+class _Folder:
+    """A folder in a package's folder tree, and whether a directory member has named it."""
+
+    __slots__ = ("children", "named")
+
+    def __init__(self) -> None:
+        self.children: dict[str, _Folder] = {}
+        self.named = False
+
+
+def _folder_parts(member: tarfile.TarInfo) -> list[str]:
+    """The folders a member's name leads through, as written, with empty and `.` parts skipped.
+
+    For a directory member the last is its own folder; for any other member they
+    are the folders before the name's last part.
+    """
+    parts = member.name.split("/")
+    return [part for part in (parts if member.isdir() else parts[:-1]) if part not in ("", ".")]
 
 
 class _Budget:
@@ -12632,29 +12662,43 @@ class _Budget:
     on. Every member is counted as its header is read, and so is every folder
     extraction would make for it that no earlier member made: tarfile makes
     the missing parent folders of each path, which no header counts. Folders
-    are read from the name as written, as os.makedirs makes them; a name with a
-    `..` component is refused before its folders are counted (#597). A member's
-    header size is added to a running total; for a member that isn't sparse
-    (sparse files are refused) it is exactly what extraction writes, so the
-    total bounds what is written. Equal to a cap is within it.
+    are read from the name as written, as os.makedirs makes them, with empty
+    and `.` parts skipped. The folder tree starts at the work directory: a name
+    with a `..` component or an absolute name is refused before its folders are
+    counted (#597), so no counted name leads out of it.
+
+    Each folder counts once (#599). A directory member's own folder is its
+    entry, so a directory member whose folder an earlier member's path already
+    counted, and that no directory member has named yet, adds nothing. Every
+    other member counts one entry, a repeated directory member included, so the
+    headers read stay within twice the member cap.
+
+    A member's header size is added to a running total; for a member that isn't
+    sparse (sparse files are refused) it is exactly what extraction writes, so
+    the total bounds what is written. Equal to a cap is within it.
     """
 
-    def __init__(self, archive_name: str, dest: Path):
+    def __init__(self, archive_name: str):
         self.archive_name = archive_name
         self.max_members = settings.max_package_members
         self.max_bytes = settings.max_package_expanded_bytes
         self.members = 0
         self.size = 0
-        # Folders as nested dicts, from the filesystem root. The work directory
-        # and its ancestors exist; every node added later has been counted, so
-        # the tree holds no more than the cap's entries.
-        self._root: dict = {}
-        self._work = [self._root]
-        for part in os.path.abspath(dest).split("/"):
-            if part:
-                self._work.append(self._work[-1].setdefault(part, {}))
+        # The work directory. Every folder added later has been counted, so the
+        # tree holds no more than the cap's entries.
+        self._root = _Folder()
 
     def count(self, member: tarfile.TarInfo) -> None:
+        """Count the member as one entry, unless it names a folder already counted as implied."""
+        if member.isdir():
+            folder = self._root
+            for part in _folder_parts(member):
+                folder = folder.children.get(part)
+                if folder is None:
+                    break
+            if folder is not None and folder is not self._root and not folder.named:
+                folder.named = True
+                return
         self._entry()
 
     def folders(self, member: tarfile.TarInfo) -> None:
@@ -12662,18 +12706,18 @@ class _Budget:
 
         A directory member's own folder is its entry, already counted.
         """
-        parts = member.name.split("/")
-        stack = [self._root] if member.name.startswith("/") else list(self._work)
+        parts = _folder_parts(member)
         last = len(parts) - 1
-        for i, part in enumerate(parts if member.isdir() else parts[:-1]):
-            if part in ("", "."):
-                continue
-            child = stack[-1].get(part)
+        folder = self._root
+        for i, part in enumerate(parts):
+            child = folder.children.get(part)
             if child is None:
-                child = stack[-1][part] = {}
-                if not (i == last and member.isdir()):
+                child = folder.children[part] = _Folder()
+                if i == last and member.isdir():
+                    child.named = True
+                else:
                     self._entry()
-            stack.append(child)
+            folder = child
 
     def _entry(self) -> None:
         self.members += 1
@@ -12717,7 +12761,7 @@ def _safe_extract(tar: tarfile.TarFile, dest: Path, name: str) -> None:
     most the caps' worth of headers, and leaves dest empty (#317).
     """
     root = dest.resolve()
-    budget = _Budget(name, dest)
+    budget = _Budget(name)
     for member in tar:
         _admit(member, dest, root, budget)
     tar.extractall(dest)
@@ -12732,7 +12776,7 @@ def _safe_extract_stream(tar: tarfile.TarFile, dest: Path, name: str) -> None:
     within the caps, and the job removes that directory.
     """
     root = dest.resolve()
-    budget = _Budget(name, dest)
+    budget = _Budget(name)
     for member in tar:
         _admit(member, dest, root, budget)
         tar.extract(member, dest)
@@ -12798,7 +12842,9 @@ def open_package(archive: Path, dest: Path, passphrase: str | None = None,
                 _safe_extract(tar, dest, archive.name)
     except PackageError:
         raise
-    except (tarfile.TarError, OSError, EOFError) as exc:
+    # os.makedirs recurses once per missing folder, so a path that needs about
+    # 1,000 of them at once raises RecursionError (#599).
+    except (tarfile.TarError, OSError, EOFError, RecursionError) as exc:
         raise PackageError("PACKAGE_UNREADABLE",
                            f"'{archive.name}' is not a readable "
                            f"{'encrypted ' if encrypted else ''}.tar.gz archive.",
@@ -28771,6 +28817,7 @@ export default function TransferPage() {
             <p className="text-gray-600">
               {exportJob.status === 'completed' ? 'Done.' :
                exportJob.status === 'failed' ? 'Failed.' :
+               exportJob.status === 'queued' ? 'Queued: waiting for another job on this collection to finish.' :
                `Writing… ${exportJob.chunks_written} chunks so far.`}
             </p>
             {exportJob.status === 'completed' && exportJob.filename && (
@@ -30619,9 +30666,9 @@ Run `python3 scripts/tests/test_session_implementation.py` from the repository r
 
 Suite 05 also runs `scripts/tests/test_batch_implementation.py` on the host (Python and bash).
 
-`05_transfer.sh` registers the ten controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_export_snapshot.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_import_guard.py`, `test_batch_recovery.py`, `test_package_listing.py`, `test_export_encryption.py` and `test_package_download.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links. It also checks (#509) that export writes a `null` `source_sha256` for a chunk whose retained blob is missing on disk, and that import check 3a refuses a chunk whose non-null `source_sha256` isn't a digest of the package's source index (with or without `sources/`) as `PACKAGE_CORRUPT`, `detail` `{"file": "chunks.jsonl", "line": n}`, before the embedding check and any backend work.
+`05_transfer.sh` registers the ten controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_export_snapshot.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_import_guard.py`, `test_batch_recovery.py`, `test_package_listing.py`, `test_export_encryption.py` and `test_package_download.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links. It also checks (#509) that export writes a `null` `source_sha256` for a chunk whose retained blob is missing on disk, and that import check 3a refuses a chunk whose non-null `source_sha256` isn't a digest of the package's source index (with or without `sources/`) as `PACKAGE_CORRUPT`, `detail` `{"file": "chunks.jsonl", "line": n}`, before the embedding check and any backend work. Since #520 it checks that a name the index lists under two digests, one of them missing on disk, exports `null` for its chunks and its parts while a unique name still links; that check 3a refuses a `chunks.jsonl` line that isn't valid JSON, naming its line, and leaves blank lines and non-object records to the insert-time checks; and that bad ingest settings (check 4c) are still refused when the chunks resolve, while a package failing both names `chunks.jsonl`, before models or any backend call.
 
-`scripts/tests/test_export_snapshot.py` (#509, API container) drives `exporter._run` with the real `packager.build` and retained-source store and a mocked Weaviate backend whose iterator reads the stored chunks one at a time. A re-ingest that tries to commit new chunks and a new `doc.txt` source after the first chunk is streamed waits for the export: the package holds the old chunk text and the old source bytes and index, every chunk's `source_sha256` names a blob in `sources/`, and the re-ingest lands after the build. During an export, gold-standard generation preparation answers `COLLECTION_BUSY` (409) and a guarded chunk insert waits; an export started while another writer holds the guard reads `queued` until it is released; and the guard is free again after an export that succeeds, is refused (`PackageError`), fails or is cancelled. An export whose build is cancelled, or ended by another non-`Exception`, reads `failed` with an `error` naming the exception and saying it was cancelled, and the exception still propagates (#521). Orderings use events and the guard's waiter count. On the code before #509 the re-ingest, generation, insert, queued and guard-held checks fail; on the code before #521 the cancelled-status checks fail.
+`scripts/tests/test_export_snapshot.py` (#509, API container) drives `exporter._run` with the real `packager.build` and retained-source store and a mocked Weaviate backend whose iterator reads the stored chunks one at a time. A re-ingest that tries to commit new chunks and a new `doc.txt` source after the first chunk is streamed waits for the export: the package holds the old chunk text and the old source bytes and index, every chunk's `source_sha256` names a blob in `sources/`, and the re-ingest lands after the build. During an export, gold-standard generation preparation answers `COLLECTION_BUSY` (409) and a guarded chunk insert waits; an export started while another writer holds the guard reads `queued` until it is released; and the guard is free again after an export that succeeds, is refused (`PackageError`), fails or is cancelled. An export whose build is cancelled, or ended by another non-`Exception`, reads `failed` with an `error` naming the exception and saying it was cancelled, and the exception still propagates (#521). Orderings use events and the guard's waiter count. On the code before #509 the re-ingest, generation, insert, queued and guard-held checks fail; on the code before #521 the cancelled-status checks fail. Since #520 it also checks that an export blocks only its own collection, so its first-character alias is refused busy and another collection's writer goes ahead; that a replace-import started mid-export waits on the guard and reaches its conflict (existence) check only after the build; and that a query (`rag_pipeline.run_query`, Ollama mocked) completes during the export.
 
 `scripts/tests/test_session_import.py` exercises the real package reader and
 evaluation persistence with disposable fixtures. Model and database mutation
@@ -30659,7 +30706,7 @@ before the #53 bounds, are restored from the checked snapshot and read back
 through `GET /ingest/config`. They also check (#518) that `chunk_size` 1 and
 `min_chunk_size` 0 are accepted, that a symlinked `ingest_config.json` is refused,
 and that the retrieval-settings check runs before the ingest-settings one; and
-(E5x, #515) that an export refuses invalid saved ingest settings before any chunk
+(E52, #515) that an export refuses invalid saved ingest settings before any chunk
 is read, naming the failing field and the Chunking Configuration page, packages
 valid ones as validated, pre-#53 sizes unchanged, and leaves out a file that isn't
 JSON. Run it with the same API dependencies as the session import test.
@@ -30696,12 +30743,20 @@ checks that a `.tar.gz` and a `.tar.gz.age` package exactly at each cap open, an
 or one byte over is refused `PACKAGE_TOO_MANY_MEMBERS` or `PACKAGE_TOO_LARGE` with the exact
 message and `detail`; a negative-size entry before an over-cap file is refused
 `PACKAGE_UNREADABLE`; a sparse file in each of the four formats (old GNU `S`, PAX 0.0, 0.1,
-1.0) is refused `PACKAGE_UNREADABLE`; folders implied by a file's path count as entries
-(at the cap it opens, one folder over is refused `PACKAGE_TOO_MANY_MEMBERS`), while a name with
-a `..` component is refused `PACKAGE_UNREADABLE` before its folders are counted and a folder with
-its own entry counts once; a `.tar.gz` refusal extracts nothing and reads no header past the refusing
-entry, a `.tar.gz.age` refusal leaves at most the cap's bytes, and through `importer._run` each
-refusal fails the job with no collection created and no work directory left. The suite then
+1.0) is refused `PACKAGE_UNREADABLE`, and so is a negative size from a PAX `size` record on a
+directory (on a regular file the file after it is never extracted); folders implied by a file's
+or a directory's path count as entries (at the cap it opens, one folder over is refused
+`PACKAGE_TOO_MANY_MEMBERS`), `.` and empty path parts aren't folders, while a name with a `..`
+component, `../<work dir>/…` included, is refused `PACKAGE_UNREADABLE` before its folders are
+counted; a folder counts once, whether its own entry comes before or after a file inside it and
+for a name like `d/.`, while a repeated directory entry counts each time (#599); the checks run
+in §6.2's order (count, check, folders, size); a path needing more folders at once than the
+recursion limit allows is refused `PACKAGE_UNREADABLE`, not `IMPORT_FAILED` (#599); a `.tar.gz`
+refusal extracts nothing and reads no header past the refusing entry, a `.tar.gz.age` refusal
+leaves at most the cap's bytes, and through `importer._run` each refusal, for both package kinds,
+fails the job with no collection created and no work directory left, a `.tar.gz.age` refused
+after members were extracted included. It also checks the code defaults (16 GiB, 100,000) and
+that a cap below 1 stops the settings (#599). The suite then
 checks that `docker-compose.yml`'s values (16 GiB, 100,000) reach the API.
 `scripts/tests/test_transfer_paths.py` (API container, through the app)
 checks that a missing, `null` or unknown `on_conflict` is 422 `INVALID_PARAMETER`, a second
@@ -31294,7 +31349,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_collection_spelling.py` | controlled regressions for per-collection state keyed by the stored collection name (#372), registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal, unresolvable chunk-source refusal and export read-boundary regressions, and an index that isn't JSON answering `SOURCE_INDEX_INVALID` at the tuning options, refusing export and left unchanged by an ingest (#52), registered by transfer |
-| `../tests/test_export_snapshot.py` | controlled export writer-guard regressions: a mid-export re-ingest can't change the package, busy and waiting writers, guard release (#509), a cancelled export's status (#521), registered by transfer |
+| `../tests/test_export_snapshot.py` | controlled export writer-guard regressions: a mid-export re-ingest can't change the package, busy and waiting writers, guard release (#509), a cancelled export's status (#521), only its own collection blocked, a waiting replace-import and a query during an export (#520), registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
 | `../tests/test_batch_recovery_fixture.py` | controlled check that the import package `batch_recovery.py`'s `write_import_package` writes passes the importer's real digest and source checks; run in the API image with no network and the repository mounted read-only, registered by transfer |
 | `../tests/test_package_listing.py` | controlled package-listing regressions (#383): the listing reads each archive only up to its manifest, new archives put the manifest first, an oversized manifest and other unreadable files are listed `readable: false`, and so is a manifest with a wrongly typed listed value (#451); run in the API image with no network, registered by transfer |
@@ -31328,7 +31383,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_version_agreement.py` | host-only: the first-party version strings agree with each other, not with a fixed version: `ui/package.json`, the root versions in `ui/package-lock.json`, `mcp/mcpapp.py`, the two `service.version` defaults in `api/services/telemetry.py` and `RAG_OTEL_SERVICE_VERSION` in `docker-compose.telemetry.yml` and `docker-compose.telemetry.verify.yml` (#605, #656), registered by infrastructure |
 | `../tests/test_ui_dependencies.py` | host-only: the copy of `ui/package.json` embedded in `IMPLEMENTATION.md` (`### ui/package.json`) is the file, exactly, so a UI dependency bump that misses the copy fails (#532), registered by infrastructure |
 | `../tests/test_tailwind_output.py` | runs from the host, standard library plus the docker CLI: the built UI CSS keeps what the Tailwind 4 migration relies on (RD-157, #773): the `prose` and `prose-sm` rules, `relative`, `hover` on every device with no `@media (hover: hover)`, and the `@source` globs with automatic detection off (a sentinel `.jsx` file under `ui/src/` is scanned, a sentinel `.md` file is not). It builds a scratch copy of `ui/` with `npm ci --ignore-scripts` from the lock file and `vite build` in a throwaway container of the image `ui/Dockerfile` builds with (its `builder` stage), not on the host (#826), so it needs the network unless the image and the npm cache are present, and is skipped, with a message, only when the docker CLI is missing (a docker or build failure fails it); a second class reads `ui/src/index.css`, `NavBar.tsx` and `ui/Dockerfile` directly, and checks that the builder image is an image reference with a tag or a digest (a `--platform` flag, a digest pin and a registry with a port are accepted; a token starting with `-` is refused before it reaches `docker run`); a third checks, with a stub in place of docker, that a build step that times out has its named container removed (#841). Registered by infrastructure |
-| `15_transfer_paths.sh` | transfer and tuning paths with no check before (#387): import refusals, `on_conflict`, unknown job ids, `/packages`, the package file unchanged, export without the model store, `retrieve.py` (E8-E10), E11 retrieval, a re-chunk with no chunks; run by `05_transfer.sh` |
+| `15_transfer_paths.sh` | transfer and tuning paths with no check before (#387): import refusals, `on_conflict`, unknown job ids, `/packages`, the package file unchanged, export without the model store, `retrieve.py` (E8-E10), E11 retrieval, a re-chunk with no chunks; the package expansion caps on import (#317, `test_package_limits.py`) and `docker-compose.yml`'s values for them; run by `05_transfer.sh` |
 | `transfer_packages.py` | helper for suite 15; writes one damaged copy of a package per refusal kind |
 | `../tests/test_package_refusals.py` | controlled import checks 1 and 2, collection-name and `chunks.jsonl` record refusals, registered by suite 15 |
 | `../tests/test_transfer_paths.py` | controlled transfer and tuning route regressions through the app, registered by suite 15 |
@@ -31600,11 +31655,12 @@ completes.
 
 `browser/transfer_page.js`, registered in `06_ui.sh` through `ui_criteria.js`, renders the
 Transfer page with every API call stubbed in the browser and the page's 2 s poll delay cut to
-20 ms (#382). Twenty-seven cases: for each half, a failed poll (a proxy 502) is shown and retried
+20 ms (#382). Twenty-eight cases: for each half, a failed poll (a proxy 502) is shown and retried
 with the button still busy and cleared by the next good poll; 30 failures in a row stop polling,
 show the last error and enable the button again, and a new start clears the message; a poll in
 flight when the page is left schedules no further poll. An export start answered after the page
-is left starts no polling. A 409 `SOURCE_INDEX_INVALID`, 503 or 404 from `/tune` is labelled
+is left starts no polling. An export polled `queued` says it is waiting for another job on the
+collection, not "Writing…", until a poll reads `running` (#520). A 409 `SOURCE_INDEX_INVALID`, 503 or 404 from `/tune` is labelled
 "Fidelity: unknown", a good lookup shows the fidelity, and a late answer for a collection no
 longer selected is ignored. A failed export shows its `error_code`, and a failed package list
 is shown without the empty-folder hint until a good Refresh. Three cases cover encryption (#27):
@@ -51945,9 +52001,9 @@ kpub=$(cd "$REPO_ROOT" && docker compose exec -T api grep '^# public key: ' "/ap
 # Two key builds of one collection in the same second (#860), run in the API
 # container with the build's clock fixed to a past second no export uses: the
 # second gets `-2` (RAG_EXPORT_SPECIFICATIONS.md §4.1) and all four files are
-# kept. The collision is forced: two real builds of one collection can differ
-# in <id8> (chunks.jsonl's key order follows Weaviate's, #863), so both builds
-# are given the first build's plain stem through a wrapped package_stem. Only
+# kept. The collision is forced, so the check doesn't depend on two builds
+# getting the same <id8>: both builds are given the first build's plain stem
+# through a wrapped package_stem. Only
 # these builds are patched; export output is unchanged. Every file the builds open for writing in ./exports is recorded through
 # Python's `open` audit event, so "no unencrypted archive" is checked on each
 # write instead of by sampling the folder (#860): only the encrypted package's
@@ -60129,6 +60185,45 @@ class SourceIndexBoundaryTests(unittest.TestCase):
         packager.verify_digests(pkg, manifest)
         importer._validate_package_sources(pkg, manifest)
 
+    def test_export_writes_null_for_a_name_under_two_digests_with_one_missing(self):
+        # #520: an old index lists doc.txt under two digests and one blob is gone.
+        # The name is still ambiguous, so its chunks and parts link to neither.
+        kept_content, unique_content = b"kept version", b"unique source"
+        kept = hashlib.sha256(kept_content).hexdigest()
+        gone = hashlib.sha256(b"gone version").hexdigest()
+        unique = hashlib.sha256(unique_content).hexdigest()
+        retained = sources.collection_dir("Ambiguous")
+        retained.mkdir(parents=True)
+        (retained / kept).write_bytes(kept_content)
+        (retained / unique).write_bytes(unique_content)
+        (retained / "index.json").write_text(json.dumps({
+            "version": 1, "documents": {
+                kept: {"filenames": ["doc.txt"]},
+                gone: {"filenames": ["doc.txt"]},
+                unique: {"filenames": ["unique.txt"]},
+            }}))
+        stored = [Mock(uuid=f"00000000-0000-4000-8000-00000000000{i}", vector=[0.5],
+                       properties={"content": f"chunk {i}", "source_file": name})
+                  for i, name in enumerate(("doc.txt", "doc.txt (part 2)", "unique.txt"))]
+        backend = Mock()
+        backend.collections.get.return_value.iterator.return_value = iter(stored)
+        with patch.object(packager, "exports_dir", return_value=self.root), \
+             patch.object(packager.wc, "get_client", return_value=backend), \
+             patch.object(packager.wc, "_collection_config_sync", return_value={"embedding_model": settings.embed_model}), \
+             patch.object(packager.wc, "_meta_sync", return_value={}), \
+             patch.object(packager, "_ingest_config", return_value=None), \
+             patch.object(packager, "_export_retrieval_settings", return_value=({}, True)), \
+             patch.object(packager, "_goldstandard_sessions", return_value=[]):
+            result = packager.build("Ambiguous")
+        opened = self.root / "ambiguous"
+        opened.mkdir()
+        pkg, manifest = packager.open_package(self.root / result["filename"], opened)
+        links = [r["source_sha256"] for r in packager.iter_chunks_file(pkg)]
+        self.assertEqual(links, [None, None, unique])
+        self.assertEqual({p.name for p in (pkg / "sources").iterdir()}, {"index.json", kept, unique})
+        packager.verify_digests(pkg, manifest)
+        importer._validate_package_sources(pkg, manifest)
+
     def test_import_refuses_a_chunk_naming_a_source_not_in_the_package(self):
         content = b"retained source"
         digest = hashlib.sha256(content).hexdigest()
@@ -60151,6 +60246,23 @@ class SourceIndexBoundaryTests(unittest.TestCase):
                     importer._validate_package_sources(package, {"fidelity": fidelity})
                 self.assertEqual(raised.exception.code, "PACKAGE_CORRUPT")
                 self.assertEqual(raised.exception.detail, {"file": "chunks.jsonl", "line": line})
+
+    def test_chunk_source_check_refuses_invalid_json_and_skips_blank_lines(self):
+        # Reviewer (#509): check 3a's new parse names the bad line; blank lines and
+        # non-object records are left to the insert-time checks.
+        content = b"retained source"
+        digest = hashlib.sha256(content).hexdigest()
+        (self.package / "sources" / digest).write_bytes(content)
+        (self.package / "sources" / "index.json").write_text(json.dumps(self.index(digest)))
+        good = json.dumps({"id": "00000000-0000-4000-8000-000000000000", "vector": [0.5],
+                           "properties": {"content": "c"}, "source_sha256": digest})
+        (self.package / "chunks.jsonl").write_text(good + "\n\n[1, 2]\n" + good + "\n")
+        importer._validate_package_sources(self.package, {"fidelity": "with-sources"})
+        (self.package / "chunks.jsonl").write_text(good + "\n\n{not json\n")
+        with self.assertRaises(PackageError) as raised:
+            importer._validate_package_sources(self.package, {"fidelity": "with-sources"})
+        self.assertEqual(raised.exception.code, "PACKAGE_CORRUPT")
+        self.assertEqual(raised.exception.detail, {"file": "chunks.jsonl", "line": 3})
 
     def test_unresolvable_chunk_source_fails_before_embedding_or_live_work(self):
         content = b"retained source"
@@ -60175,6 +60287,40 @@ class SourceIndexBoundaryTests(unittest.TestCase):
         check_embedding.assert_not_called()
         models.assert_not_called()
         backend.assert_not_called()
+
+    def test_chunk_source_check_and_ingest_settings_check_coexist(self):
+        # Reviewer (#509 with #510): check 3a runs first; once it passes, the
+        # ingest-settings preflight still refuses malformed settings before models
+        # or any backend call, and a package failing both names chunks.jsonl.
+        content = b"retained source"
+        digest = hashlib.sha256(content).hexdigest()
+        (self.package / "sources" / digest).write_bytes(content)
+        (self.package / "sources" / "index.json").write_text(json.dumps(self.index(digest)))
+        (self.package / "ingest_config.json").write_text('{"chunk_size": "invalid"}')
+        manifest = {"fidelity": "with-sources", "files": {},
+                    "collection": {"name": "Coexist"}}
+        (self.package / "manifest.json").write_text(json.dumps(manifest))
+        absent = hashlib.sha256(b"elsewhere").hexdigest()
+        cases = (((digest, None), {"file": "ingest_config.json"}),
+                 ((digest, absent), {"file": "chunks.jsonl", "line": 2}))
+        for links, detail in cases:
+            with self.subTest(links=links):
+                self.chunks_file(self.package, *links)
+                job = {"status": "queued"}
+                with patch.object(settings, "upload_dir", str(self.root)), \
+                     patch.object(importer, "_jobs", {"owned": job}), \
+                     patch.object(importer, "_active", {"owned.tar.gz"}), \
+                     patch.object(packager, "exports_dir", return_value=self.root), \
+                     patch.object(packager, "open_package", return_value=(self.package, manifest)), \
+                     patch.object(importer, "_check_embedding"), \
+                     patch.object(importer, "_ensure_models") as models, \
+                     patch.object(importer.wc, "get_client") as backend:
+                    importer._run("owned", "owned.tar.gz", "replace")
+                self.assertEqual(job["status"], "failed")
+                self.assertEqual(job["error_code"], "PACKAGE_CORRUPT")
+                self.assertEqual(job["error_detail"], detail)
+                models.assert_not_called()
+                backend.assert_not_called()
 
 
 class ManifestFilesBoundaryTests(unittest.TestCase):
@@ -61899,6 +62045,8 @@ async function startAndPoll(page, half) {
   await release(page, HALVES[half].start, HALVES[half].started, 'POST');
   await pending(page, HALVES[half].poll);
 }
+// What the export panel shows while its job waits `queued` for the collection's writer guard (#520).
+const QUEUED_EXPORT = 'Queued: waiting for another job on this collection to finish.';
 const retrying = half => `Could not check ${HALVES[half].progress}, retrying: ${DOWN}`;
 const stopped = half => `Stopped checking ${HALVES[half].progress} after 30 failed attempts; the ${half} may still be running. Last error: ${DOWN}`;
 
@@ -61971,6 +62119,15 @@ async function runTransferPageTests(browser, base, reporter) {
     await release(page, HALVES.export.start, HALVES.export.started, 'POST');
     await sleep(400);
     assert.equal(await count(page, HALVES.export.poll), 0, 'a poll was sent after the page was left');
+  }]);
+  cases.push(['export: a queued export says it is waiting, not writing, until it runs (#520)', async page => {
+    await startAndPoll(page, 'export');
+    await release(page, HALVES.export.poll, exportJob('queued', { chunks_written: 0 }));
+    await waitText(page, QUEUED_EXPORT);
+    await waitText(page, 'Writing…', true);
+    await release(page, HALVES.export.poll, exportJob('running'));
+    await waitText(page, 'Writing… 1 chunks so far.');
+    await waitText(page, QUEUED_EXPORT, true);
   }]);
   for (const [status, code, msg] of [[409, 'SOURCE_INDEX_INVALID', 'Retained source index is invalid.'],
                                      [503, 'SERVICE_UNAVAILABLE', 'Synthetic tune options failure.'],

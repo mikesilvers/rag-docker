@@ -1548,9 +1548,9 @@ kpub=$(cd "$REPO_ROOT" && docker compose exec -T api grep '^# public key: ' "/ap
 # Two key builds of one collection in the same second (#860), run in the API
 # container with the build's clock fixed to a past second no export uses: the
 # second gets `-2` (RAG_EXPORT_SPECIFICATIONS.md §4.1) and all four files are
-# kept. The collision is forced: two real builds of one collection can differ
-# in <id8> (chunks.jsonl's key order follows Weaviate's, #863), so both builds
-# are given the first build's plain stem through a wrapped package_stem. Only
+# kept. The collision is forced, so the check doesn't depend on two builds
+# getting the same <id8>: both builds are given the first build's plain stem
+# through a wrapped package_stem. Only
 # these builds are patched; export output is unchanged. Every file the builds open for writing in ./exports is recorded through
 # Python's `open` audit event, so "no unencrypted archive" is checked on each
 # write instead of by sampling the folder (#860): only the encrypted package's

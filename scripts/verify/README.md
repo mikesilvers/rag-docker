@@ -386,9 +386,9 @@ Run `python3 scripts/tests/test_session_implementation.py` from the repository r
 
 Suite 05 also runs `scripts/tests/test_batch_implementation.py` on the host (Python and bash).
 
-`05_transfer.sh` registers the ten controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_export_snapshot.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_import_guard.py`, `test_batch_recovery.py`, `test_package_listing.py`, `test_export_encryption.py` and `test_package_download.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links. It also checks (#509) that export writes a `null` `source_sha256` for a chunk whose retained blob is missing on disk, and that import check 3a refuses a chunk whose non-null `source_sha256` isn't a digest of the package's source index (with or without `sources/`) as `PACKAGE_CORRUPT`, `detail` `{"file": "chunks.jsonl", "line": n}`, before the embedding check and any backend work.
+`05_transfer.sh` registers the ten controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_export_snapshot.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_import_guard.py`, `test_batch_recovery.py`, `test_package_listing.py`, `test_export_encryption.py` and `test_package_download.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links. It also checks (#509) that export writes a `null` `source_sha256` for a chunk whose retained blob is missing on disk, and that import check 3a refuses a chunk whose non-null `source_sha256` isn't a digest of the package's source index (with or without `sources/`) as `PACKAGE_CORRUPT`, `detail` `{"file": "chunks.jsonl", "line": n}`, before the embedding check and any backend work. Since #520 it checks that a name the index lists under two digests, one of them missing on disk, exports `null` for its chunks and its parts while a unique name still links; that check 3a refuses a `chunks.jsonl` line that isn't valid JSON, naming its line, and leaves blank lines and non-object records to the insert-time checks; and that bad ingest settings (check 4c) are still refused when the chunks resolve, while a package failing both names `chunks.jsonl`, before models or any backend call.
 
-`scripts/tests/test_export_snapshot.py` (#509, API container) drives `exporter._run` with the real `packager.build` and retained-source store and a mocked Weaviate backend whose iterator reads the stored chunks one at a time. A re-ingest that tries to commit new chunks and a new `doc.txt` source after the first chunk is streamed waits for the export: the package holds the old chunk text and the old source bytes and index, every chunk's `source_sha256` names a blob in `sources/`, and the re-ingest lands after the build. During an export, gold-standard generation preparation answers `COLLECTION_BUSY` (409) and a guarded chunk insert waits; an export started while another writer holds the guard reads `queued` until it is released; and the guard is free again after an export that succeeds, is refused (`PackageError`), fails or is cancelled. An export whose build is cancelled, or ended by another non-`Exception`, reads `failed` with an `error` naming the exception and saying it was cancelled, and the exception still propagates (#521). Orderings use events and the guard's waiter count. On the code before #509 the re-ingest, generation, insert, queued and guard-held checks fail; on the code before #521 the cancelled-status checks fail.
+`scripts/tests/test_export_snapshot.py` (#509, API container) drives `exporter._run` with the real `packager.build` and retained-source store and a mocked Weaviate backend whose iterator reads the stored chunks one at a time. A re-ingest that tries to commit new chunks and a new `doc.txt` source after the first chunk is streamed waits for the export: the package holds the old chunk text and the old source bytes and index, every chunk's `source_sha256` names a blob in `sources/`, and the re-ingest lands after the build. During an export, gold-standard generation preparation answers `COLLECTION_BUSY` (409) and a guarded chunk insert waits; an export started while another writer holds the guard reads `queued` until it is released; and the guard is free again after an export that succeeds, is refused (`PackageError`), fails or is cancelled. An export whose build is cancelled, or ended by another non-`Exception`, reads `failed` with an `error` naming the exception and saying it was cancelled, and the exception still propagates (#521). Orderings use events and the guard's waiter count. On the code before #509 the re-ingest, generation, insert, queued and guard-held checks fail; on the code before #521 the cancelled-status checks fail. Since #520 it also checks that an export blocks only its own collection, so its first-character alias is refused busy and another collection's writer goes ahead; that a replace-import started mid-export waits on the guard and reaches its conflict (existence) check only after the build; and that a query (`rag_pipeline.run_query`, Ollama mocked) completes during the export.
 
 `scripts/tests/test_session_import.py` exercises the real package reader and
 evaluation persistence with disposable fixtures. Model and database mutation
@@ -426,7 +426,7 @@ before the #53 bounds, are restored from the checked snapshot and read back
 through `GET /ingest/config`. They also check (#518) that `chunk_size` 1 and
 `min_chunk_size` 0 are accepted, that a symlinked `ingest_config.json` is refused,
 and that the retrieval-settings check runs before the ingest-settings one; and
-(E5x, #515) that an export refuses invalid saved ingest settings before any chunk
+(E52, #515) that an export refuses invalid saved ingest settings before any chunk
 is read, naming the failing field and the Chunking Configuration page, packages
 valid ones as validated, pre-#53 sizes unchanged, and leaves out a file that isn't
 JSON. Run it with the same API dependencies as the session import test.
@@ -463,12 +463,20 @@ checks that a `.tar.gz` and a `.tar.gz.age` package exactly at each cap open, an
 or one byte over is refused `PACKAGE_TOO_MANY_MEMBERS` or `PACKAGE_TOO_LARGE` with the exact
 message and `detail`; a negative-size entry before an over-cap file is refused
 `PACKAGE_UNREADABLE`; a sparse file in each of the four formats (old GNU `S`, PAX 0.0, 0.1,
-1.0) is refused `PACKAGE_UNREADABLE`; folders implied by a file's path count as entries
-(at the cap it opens, one folder over is refused `PACKAGE_TOO_MANY_MEMBERS`), while a name with
-a `..` component is refused `PACKAGE_UNREADABLE` before its folders are counted and a folder with
-its own entry counts once; a `.tar.gz` refusal extracts nothing and reads no header past the refusing
-entry, a `.tar.gz.age` refusal leaves at most the cap's bytes, and through `importer._run` each
-refusal fails the job with no collection created and no work directory left. The suite then
+1.0) is refused `PACKAGE_UNREADABLE`, and so is a negative size from a PAX `size` record on a
+directory (on a regular file the file after it is never extracted); folders implied by a file's
+or a directory's path count as entries (at the cap it opens, one folder over is refused
+`PACKAGE_TOO_MANY_MEMBERS`), `.` and empty path parts aren't folders, while a name with a `..`
+component, `../<work dir>/…` included, is refused `PACKAGE_UNREADABLE` before its folders are
+counted; a folder counts once, whether its own entry comes before or after a file inside it and
+for a name like `d/.`, while a repeated directory entry counts each time (#599); the checks run
+in §6.2's order (count, check, folders, size); a path needing more folders at once than the
+recursion limit allows is refused `PACKAGE_UNREADABLE`, not `IMPORT_FAILED` (#599); a `.tar.gz`
+refusal extracts nothing and reads no header past the refusing entry, a `.tar.gz.age` refusal
+leaves at most the cap's bytes, and through `importer._run` each refusal, for both package kinds,
+fails the job with no collection created and no work directory left, a `.tar.gz.age` refused
+after members were extracted included. It also checks the code defaults (16 GiB, 100,000) and
+that a cap below 1 stops the settings (#599). The suite then
 checks that `docker-compose.yml`'s values (16 GiB, 100,000) reach the API.
 `scripts/tests/test_transfer_paths.py` (API container, through the app)
 checks that a missing, `null` or unknown `on_conflict` is 422 `INVALID_PARAMETER`, a second
@@ -1061,7 +1069,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_collection_spelling.py` | controlled regressions for per-collection state keyed by the stored collection name (#372), registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal, unresolvable chunk-source refusal and export read-boundary regressions, and an index that isn't JSON answering `SOURCE_INDEX_INVALID` at the tuning options, refusing export and left unchanged by an ingest (#52), registered by transfer |
-| `../tests/test_export_snapshot.py` | controlled export writer-guard regressions: a mid-export re-ingest can't change the package, busy and waiting writers, guard release (#509), a cancelled export's status (#521), registered by transfer |
+| `../tests/test_export_snapshot.py` | controlled export writer-guard regressions: a mid-export re-ingest can't change the package, busy and waiting writers, guard release (#509), a cancelled export's status (#521), only its own collection blocked, a waiting replace-import and a query during an export (#520), registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
 | `../tests/test_batch_recovery_fixture.py` | controlled check that the import package `batch_recovery.py`'s `write_import_package` writes passes the importer's real digest and source checks; run in the API image with no network and the repository mounted read-only, registered by transfer |
 | `../tests/test_package_listing.py` | controlled package-listing regressions (#383): the listing reads each archive only up to its manifest, new archives put the manifest first, an oversized manifest and other unreadable files are listed `readable: false`, and so is a manifest with a wrongly typed listed value (#451); run in the API image with no network, registered by transfer |
@@ -1095,7 +1103,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_version_agreement.py` | host-only: the first-party version strings agree with each other, not with a fixed version: `ui/package.json`, the root versions in `ui/package-lock.json`, `mcp/mcpapp.py`, the two `service.version` defaults in `api/services/telemetry.py` and `RAG_OTEL_SERVICE_VERSION` in `docker-compose.telemetry.yml` and `docker-compose.telemetry.verify.yml` (#605, #656), registered by infrastructure |
 | `../tests/test_ui_dependencies.py` | host-only: the copy of `ui/package.json` embedded in `IMPLEMENTATION.md` (`### ui/package.json`) is the file, exactly, so a UI dependency bump that misses the copy fails (#532), registered by infrastructure |
 | `../tests/test_tailwind_output.py` | runs from the host, standard library plus the docker CLI: the built UI CSS keeps what the Tailwind 4 migration relies on (RD-157, #773): the `prose` and `prose-sm` rules, `relative`, `hover` on every device with no `@media (hover: hover)`, and the `@source` globs with automatic detection off (a sentinel `.jsx` file under `ui/src/` is scanned, a sentinel `.md` file is not). It builds a scratch copy of `ui/` with `npm ci --ignore-scripts` from the lock file and `vite build` in a throwaway container of the image `ui/Dockerfile` builds with (its `builder` stage), not on the host (#826), so it needs the network unless the image and the npm cache are present, and is skipped, with a message, only when the docker CLI is missing (a docker or build failure fails it); a second class reads `ui/src/index.css`, `NavBar.tsx` and `ui/Dockerfile` directly, and checks that the builder image is an image reference with a tag or a digest (a `--platform` flag, a digest pin and a registry with a port are accepted; a token starting with `-` is refused before it reaches `docker run`); a third checks, with a stub in place of docker, that a build step that times out has its named container removed (#841). Registered by infrastructure |
-| `15_transfer_paths.sh` | transfer and tuning paths with no check before (#387): import refusals, `on_conflict`, unknown job ids, `/packages`, the package file unchanged, export without the model store, `retrieve.py` (E8-E10), E11 retrieval, a re-chunk with no chunks; run by `05_transfer.sh` |
+| `15_transfer_paths.sh` | transfer and tuning paths with no check before (#387): import refusals, `on_conflict`, unknown job ids, `/packages`, the package file unchanged, export without the model store, `retrieve.py` (E8-E10), E11 retrieval, a re-chunk with no chunks; the package expansion caps on import (#317, `test_package_limits.py`) and `docker-compose.yml`'s values for them; run by `05_transfer.sh` |
 | `transfer_packages.py` | helper for suite 15; writes one damaged copy of a package per refusal kind |
 | `../tests/test_package_refusals.py` | controlled import checks 1 and 2, collection-name and `chunks.jsonl` record refusals, registered by suite 15 |
 | `../tests/test_transfer_paths.py` | controlled transfer and tuning route regressions through the app, registered by suite 15 |
@@ -1367,11 +1375,12 @@ completes.
 
 `browser/transfer_page.js`, registered in `06_ui.sh` through `ui_criteria.js`, renders the
 Transfer page with every API call stubbed in the browser and the page's 2 s poll delay cut to
-20 ms (#382). Twenty-seven cases: for each half, a failed poll (a proxy 502) is shown and retried
+20 ms (#382). Twenty-eight cases: for each half, a failed poll (a proxy 502) is shown and retried
 with the button still busy and cleared by the next good poll; 30 failures in a row stop polling,
 show the last error and enable the button again, and a new start clears the message; a poll in
 flight when the page is left schedules no further poll. An export start answered after the page
-is left starts no polling. A 409 `SOURCE_INDEX_INVALID`, 503 or 404 from `/tune` is labelled
+is left starts no polling. An export polled `queued` says it is waiting for another job on the
+collection, not "Writing…", until a poll reads `running` (#520). A 409 `SOURCE_INDEX_INVALID`, 503 or 404 from `/tune` is labelled
 "Fidelity: unknown", a good lookup shows the fidelity, and a late answer for a collection no
 longer selected is ignored. A failed export shows its `error_code`, and a failed package list
 is shown without the empty-folder hint until a good Refresh. Three cases cover encryption (#27):
