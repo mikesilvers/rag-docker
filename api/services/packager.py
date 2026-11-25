@@ -221,17 +221,22 @@ def _json_default(value: Any) -> Any:
 
 # ── Reading the collection (spec §4.5) ────────────────────────────────────────
 
-def read_chunks(collection: str, documents: dict | None = None) -> Iterator[dict]:
+def read_chunks(collection: str, documents: dict | None = None,
+                shipped: dict | None = None) -> Iterator[dict]:
     """One record per chunk, streamed. Never materialises the collection.
 
     A 100k-chunk corpus is roughly 880 MB of JSON, so nothing here accumulates.
-    `documents` is the retained sources the package ships, by digest; a chunk
-    links only to one of those (#509). None loads the whole index.
+    `documents` is the collection's whole source index, by digest (None loads
+    it), and `shipped` the retained sources the package ships, by digest (None:
+    all of `documents`). A chunk links only to a shipped digest, and only when
+    its name is listed under that one digest in the whole index (#509, #520).
     """
     client = wc.get_client()
     col = client.collections.get(collection)
     if documents is None:
         documents = sources.load_index(collection)["documents"]
+    if shipped is None:
+        shipped = documents
 
     # digests_for_filename() reloads the index on every call, which would be
     # O(chunks x documents). Build the reverse map once.
@@ -259,8 +264,9 @@ def read_chunks(collection: str, documents: dict | None = None) -> Iterator[dict
             "vector": vector,
             "properties": props,
             # More than one digest means the same filename was ingested with
-            # different content. Recording null is honest; picking one is not.
-            "source_sha256": digests[0] if len(digests) == 1 else None,
+            # different content. Recording null is honest; picking one is not,
+            # even when only one of those blobs is shipped (#520).
+            "source_sha256": digests[0] if len(digests) == 1 and digests[0] in shipped else None,
         }
 
 
@@ -532,6 +538,8 @@ def build(
         # chunk links and sources/ come from it (#509). The exporter holds the
         # writer guard, so no guarded writer changes it meanwhile. A blob missing
         # on disk is not shipped, and chunks naming it get a null source_sha256.
+        # The links are resolved against the whole index, so a name listed under
+        # more than one digest links nowhere, even when only one blob is on disk (#520).
         index = sources.load_index(collection)
         shipped = {}
         for digest, entry in index["documents"].items():
@@ -550,7 +558,7 @@ def build(
         def write_chunks(path: Path) -> None:
             nonlocal chunk_count, dimensions, first_props, unresolved
             with path.open("w", encoding="utf-8") as fh:
-                for record in read_chunks(collection, shipped):
+                for record in read_chunks(collection, index["documents"], shipped):
                     if dimensions is None and record["vector"]:
                         dimensions = len(record["vector"])
                     if first_props is None:

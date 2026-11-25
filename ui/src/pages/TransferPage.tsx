@@ -521,6 +521,7 @@ export default function TransferPage() {
             <p className="text-gray-600">
               {exportJob.status === 'completed' ? 'Done.' :
                exportJob.status === 'failed' ? 'Failed.' :
+               exportJob.status === 'queued' ? 'Queued: waiting for another job on this collection to finish.' :
                `Writing… ${exportJob.chunks_written} chunks so far.`}
             </p>
             {exportJob.status === 'completed' && exportJob.filename && (
