@@ -30,9 +30,9 @@ changes only that function.
 its own, with the package's finish time and collection. It follows the same
 rules by its own name: a full download of it deletes it and only it, a full
 download of the package leaves it, and expiry deletes whichever of the two is
-still there. It is recorded in the same write as its package (#860), so one is
-never recorded without the other. So it is not a companion: deleting it with the package would lose
-the key of a package downloaded first.
+still there. So it is not a companion: deleting it with the package would lose
+the key of a package downloaded first. It is recorded in the same write as its
+package (#860), so one is never recorded without the other.
 
 **The record.** Each entry is `{"finished_at": ..., "collection": ...}`: the
 collection is the one exported, so an encrypted package exported here follows

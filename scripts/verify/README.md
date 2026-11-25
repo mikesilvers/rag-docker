@@ -750,7 +750,9 @@ times; the Engineer sees both; the Developer's export and import are listed for 
 Engineer, not the key. `browser/ui_criteria.js` (suite 06) checks the pages' Running and recent
 jobs lists: a real ingest found again after leaving the Import page, then stubbed lists for a
 running ingest, generation and export that open by themselves, survive leaving the page and show
-their result, row switching, one job per Transfer panel, and the Engineer's owner column.
+their result, row switching, one job per Transfer panel, the Import page's late poll answers
+(#316: two answers in reverse order, a stale failure after success, a change of job and leaving
+the page, each with a lookup held in flight), and the Engineer's owner column.
 
 `scripts/tests/test_jobstore.py` (#23) checks the job store that keeps ingest, export, import
 and tune job records across an API restart: an unbound store (no lifespan) is a plain dict
@@ -1369,7 +1371,7 @@ completes.
 
 `browser/transfer_page.js`, registered in `06_ui.sh` through `ui_criteria.js`, renders the
 Transfer page with every API call stubbed in the browser and the page's 2 s poll delay cut to
-20 ms (#382). Twenty-eight cases: for each half, a failed poll (a proxy 502) is shown and retried
+20 ms (#382). Twenty-nine cases: for each half, a failed poll (a proxy 502) is shown and retried
 with the button still busy and cleared by the next good poll; 30 failures in a row stop polling,
 show the last error and enable the button again, and a new start clears the message; a poll in
 flight when the page is left schedules no further poll. An export start answered after the page
@@ -1385,7 +1387,8 @@ none. Five cases cover the key export (#676): the three choices with a new key f
 "Not encrypted" sending `encryption: "none"`, no "Not encrypted" in LAN mode, Download key
 offered before the package's Download with the store-apart warning and gone once the key is
 downloaded, and a key package asking for its key file, read in the browser and sent as `key`;
-the key is never shown as text. Four cases cover downloading a package (#677):
+the key is never shown as text. One case holds the page's key file read (#860): a read that ends after
+another key package was chosen sets nothing, and Import stays disabled. Four cases cover downloading a package (#677):
 - a finished export offers a Download link to its package with "Expires" in local time, and none
   when it has no expiry;
 - the package list says when a package exported here expires, and its Download link follows the
