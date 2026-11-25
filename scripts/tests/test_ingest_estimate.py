@@ -128,6 +128,14 @@ class RateStoreTests(UploadDir):
         self.restart()
         self.assertAlmostEqual(ingest_estimate.rate(), 1_000.0)   # the new file only
 
+    def test_a_malformed_new_rate_file_does_not_fall_back_to_the_old_one(self):
+        # Only a missing new file falls back (#896); an unreadable one means no rate.
+        self.old_rate_file.write_text(json.dumps({"samples": [[1_000, 2.0]]}))
+        self.rate_file.write_text("not json")
+        self.restart()
+        with self.assertLogs(ingest_estimate._log, "WARNING"):
+            self.assertIsNone(ingest_estimate.rate())
+
     def test_failed_saves_are_logged_once(self):
         with patch.object(ingest_estimate.settings_store, "publish", side_effect=OSError("disk full")), \
                 self.assertLogs(ingest_estimate._log, "DEBUG") as logs:
@@ -427,6 +435,14 @@ class JobLoopTests(UploadDir):
         self.assertEqual([f["file"] for f in job["file_progress"]], ["b.json"])
         self.assertIs(job["file_chunking"], False)
         self.assertEqual(ingest_estimate.view(job, NOW)["files_not_chunked"], 0)
+
+    def test_a_middle_file_failing_before_any_chunks_leaves_earlier_entries_alone(self):
+        job, _ = self.run_job([("a.json", json.dumps({"t": "ok"})), ("broken.json", "{not json"),
+                               ("c.json", json.dumps({"t": "fine"}))])
+        self.assertEqual(job["files_failed"], 1)
+        self.assertEqual([(f["file"], f["failed"], f["chunked"]) for f in job["file_progress"]],
+                         [("a.json", False, True), ("c.json", False, True)])
+        self.assertIs(job["file_chunking"], False)
 
     def test_the_record_keeps_the_newest_entries(self):
         files = [(f"f{i}.json", json.dumps({"t": f"text {i}"})) for i in range(5)]
