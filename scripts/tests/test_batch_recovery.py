@@ -520,6 +520,7 @@ class RecoveryTests(unittest.TestCase):
         with self.assertRaises(ValueError) as error:
             self.rebuild()
         self.assertIn('is a link', str(error.exception))
+        self.assertIn("'Corpus' is a link", str(error.exception))  # #886: named relative to the sources root
         self.assertEqual(self.cols.get('Corpus').rows, {r['id']: r for r in self.original})
         self.assertEqual(list(self.cols.items), ['Corpus'])
         self.assertFalse(list(recovery._root().glob('*.json')))
@@ -543,6 +544,9 @@ class RecoveryTests(unittest.TestCase):
                     with self.assertRaises(ValueError) as error:
                         self.rebuild()
                     self.assertIn('is a link', str(error.exception))
+                    # #886: the error names the path under UPLOAD_DIR, not only the file.
+                    self.assertIn(f"'{kind}_configs/Corpus.json' is a link", str(error.exception))
+                    self.assertNotIn(str(self.root), str(error.exception))
                     self.assertEqual(self.cols.get('Corpus').rows, {r['id']: r for r in self.original})
                     self.assertEqual(list(self.cols.items), ['Corpus'])
                     self.assertFalse(list(recovery._root().glob('*.json')))
@@ -557,6 +561,84 @@ class RecoveryTests(unittest.TestCase):
                 finally:
                     config.unlink()
                     config.write_bytes(saved)
+
+    def test_duplicate_uuid_is_a_typed_refusal(self):
+        # #890: a repeated UUID is refused with a ValueError subclass carrying
+        # the key, and the reindex snapshot recognises it by type, not wording.
+        rows = records()
+        rows.append(copy.deepcopy(rows[0]))
+        key = rows[0]['id']
+        with batch_write.ExpectedRecords() as expected, \
+                self.assertRaises(batch_write.DuplicateRecordError) as error:
+            expected.capture(rows)
+        self.assertIsInstance(error.exception, ValueError)
+        self.assertEqual(error.exception.key, key)
+        self.assertEqual(str(error.exception), f'Duplicate chunk UUID {key}')
+        with self.assertRaises(RuntimeError) as refused:
+            tuning._snapshot(rows)
+        self.assertEqual(str(refused.exception), f'Reindex received duplicate stored UUID {key}')
+        self.assertIsInstance(refused.exception.__cause__, batch_write.DuplicateRecordError)
+        self.assertFalse(list(Path(settings.upload_dir).glob('batch-verify-*')))
+
+    def test_dangling_session_link_is_refused_naming_its_path(self):
+        # #886: a gold-standard session that is a dangling link can't be read, so
+        # it counts as the collection's; the rebuild is refused before cutover and
+        # the error names the session's path under UPLOAD_DIR, never an absolute one.
+        session = Path(settings.upload_dir) / 'goldstandard_sessions' / 'gs_0123abcd.json'
+        session.unlink()
+        session.symlink_to(self.root / 'missing-session.json')
+        with self.assertRaises(ValueError) as error:
+            self.rebuild()
+        self.assertIn("Recovery source 'goldstandard_sessions/gs_0123abcd.json' is a link", str(error.exception))
+        self.assertNotIn(str(self.root), str(error.exception))
+        self.assertEqual(self.cols.get('Corpus').rows, {r['id']: r for r in self.original})
+        self.assertEqual(list(self.cols.items), ['Corpus'])
+        self.assertFalse(list(recovery._root().glob('*.json')))
+        self.assertEqual([p.name for p in Path(settings.sources_dir).iterdir()], ['Corpus'])
+        self.assertTrue(session.is_symlink())
+
+    def test_linked_package_sidecar_is_refused_naming_its_package_path(self):
+        # #886: in an import's replace-mode recovery copy the sidecars come from
+        # the extracted package, so a linked one is named relative to the
+        # package, never by an absolute path, and the original is kept.
+        outside = self.root / 'outside'
+        outside.mkdir()
+        for name in ('goldstandard', 'collection.json', 'manifest.json'):
+            with self.subTest(name=name):
+                pkg, manifest = self.package()
+                entry = pkg / name
+                moved = outside / name
+                entry.rename(moved)
+                entry.symlink_to(moved)
+                try:
+                    with patch.object(self, 'package', return_value=(pkg, manifest)):
+                        job = self.import_replace()
+                    self.assertEqual(job['status'], 'failed')
+                    self.assertIn(f"Recovery source '{name}' is a link", job['error'])
+                    self.assertNotIn(str(self.root), job['error'])
+                    self.assertEqual(self.cols.get('Corpus').rows, {r['id']: r for r in self.original})
+                    self.assertEqual(list(self.cols.items), ['Corpus'])
+                    self.assertFalse(list(recovery._root().glob('*.json')))
+                finally:
+                    entry.unlink()
+                    moved.rename(entry)
+        # A package's linked config is refused earlier, by the import's settings
+        # check; retain() itself still names it relative to the package root.
+        for kind in ('ingest', 'retrieval'):
+            with self.subTest(kind=kind):
+                pkg, _ = self.package()
+                entry = pkg / f'{kind}_config.json'
+                moved = outside / entry.name
+                entry.rename(moved)
+                entry.symlink_to(moved)
+                try:
+                    record = recovery.begin('Corpus', 'import', self.client)
+                    with self.assertRaises(ValueError) as error:
+                        recovery.retain(record, package=pkg)
+                    self.assertEqual(str(error.exception), f"Recovery source '{kind}_config.json' is a link")
+                finally:
+                    entry.unlink()
+                    moved.rename(entry)
 
     def test_dangling_source_link_is_copied_as_a_link(self):
         # #881: copytree(symlinks=True) keeps a dangling link entry as a link

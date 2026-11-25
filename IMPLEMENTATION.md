@@ -3836,6 +3836,14 @@ def _factory(records):
     return lambda: iter(records)
 
 
+class DuplicateRecordError(ValueError):
+    """A record UUID repeated within one capture; `key` is that UUID (#890)."""
+
+    def __init__(self, key: str):
+        self.key = key
+        super().__init__(f"Duplicate chunk UUID {key}")
+
+
 class ExpectedRecords:
     """UUIDs and SHA-256 fingerprints on disk; no corpus vectors held in RAM.
 
@@ -3882,7 +3890,7 @@ class ExpectedRecords:
                 self.db.execute("INSERT INTO expected(position,id,properties,vector) VALUES (?,?,?,?)",
                                 (position, key, _property_digest(record["properties"]), vector))
             except sqlite3.IntegrityError as exc:
-                raise ValueError(f"Duplicate chunk UUID {key}") from exc
+                raise DuplicateRecordError(key) from exc
         if expected_count is not None and self.count != expected_count:
             raise ValueError(f"Package contains {self.count} objects but declares {expected_count}")
         self.db.commit()
@@ -4164,13 +4172,15 @@ def begin(target: str, operation: str, client) -> dict:
     return record
 
 
-def _copy(source: Path, destination: Path) -> None:
+def _copy(source: Path, destination: Path, root: Path) -> None:
     # Never read through a link (#881). A linked source path is refused, as a
     # linked retained-source folder is (sources.blob_path); links inside a
     # copied folder stay links, so the copy refuses them on read as the
     # original does and an outside file's bytes never become retained data.
+    # The refusal names the path relative to the root it lives under, so the
+    # operator can find it, and never an absolute path (#886).
     if source.is_symlink():
-        raise ValueError(f"Recovery source {source.name!r} is a link")
+        raise ValueError(f"Recovery source {source.relative_to(root).as_posix()!r} is a link")
     if source.is_dir():
         shutil.copytree(source, destination, symlinks=True)
     elif source.is_file():
@@ -4187,10 +4197,10 @@ def retain(record: dict, *, package: Path | None = None, source_collection: str 
     if package is not None:
         sources.restore_package(package, staging)
     else:
-        _copy(sources.collection_dir(target), sources.collection_dir(staging))
+        _copy(sources.collection_dir(target), sources.collection_dir(staging), Path(settings.sources_dir))
     for kind in ("ingest", "retrieval"):
         origin = package / f"{kind}_config.json" if package else upload / f"{kind}_configs" / f"{target}.json"
-        _copy(origin, metadata / f"{kind}_config.json")
+        _copy(origin, metadata / f"{kind}_config.json", package or upload)
         if origin.is_file():
             config = json.loads(origin.read_text())
             config["collection"] = staging
@@ -4198,9 +4208,9 @@ def retain(record: dict, *, package: Path | None = None, source_collection: str 
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(json.dumps(config, indent=2, sort_keys=True))
     if package:
-        _copy(package / "goldstandard", metadata / "goldstandard")
-        _copy(package / "collection.json", metadata / "collection.json")
-        _copy(package / "manifest.json", metadata / "manifest.json")
+        _copy(package / "goldstandard", metadata / "goldstandard", package)
+        _copy(package / "collection.json", metadata / "collection.json", package)
+        _copy(package / "manifest.json", metadata / "manifest.json", package)
     else:
         sessions = upload / "goldstandard_sessions"
         for path in sessions.glob("*.json"):
@@ -4210,7 +4220,7 @@ def retain(record: dict, *, package: Path | None = None, source_collection: str 
             except (ValueError, OSError, AttributeError):
                 belongs = True
             if belongs:
-                _copy(path, metadata / "goldstandard" / path.name)
+                _copy(path, metadata / "goldstandard" / path.name, upload)
     # Sources live on a separate named volume. Flush both snapshots before the
     # state transition; a crash before the transition leaves the original safe.
     paths = [metadata, sources.collection_dir(staging)]
@@ -16354,6 +16364,7 @@ import shutil
 import tempfile
 import threading
 import uuid
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
@@ -16474,9 +16485,6 @@ class _RecordSnapshot:
         self.close()
 
 
-_DUPLICATE = "Duplicate chunk UUID "
-
-
 def _snapshot(records) -> _RecordSnapshot:
     """Fingerprint a reusable record source once: a zero-argument callable
     returning an iterator, or a list."""
@@ -16486,9 +16494,9 @@ def _snapshot(records) -> _RecordSnapshot:
         expected.capture(read)
     except BaseException as exc:
         expected.__exit__(None, None, None)
-        if isinstance(exc, ValueError) and str(exc).startswith(_DUPLICATE):
-            raise RuntimeError("Reindex received duplicate stored UUID "
-                               + str(exc)[len(_DUPLICATE):]) from exc
+        # Recognised by its type, not its wording (#890).
+        if isinstance(exc, batch_write.DuplicateRecordError):
+            raise RuntimeError(f"Reindex received duplicate stored UUID {exc.key}") from exc
         raise
     return _RecordSnapshot(expected, read)
 
@@ -16635,7 +16643,9 @@ def _source_index_invalid(collection: str) -> PackageError:
 def _has_stored_listed_name(collection: str, documents: dict) -> bool:
     """Whether any name the index lists has stored chunks; stops at the first."""
     names = _listed_names(documents)
-    for obj in wc.get_client().collections.get(collection).iterator():
+    # Only the property the check reads, not each chunk's text (#888, as #258).
+    for obj in wc.get_client().collections.get(collection).iterator(
+            include_vector=False, return_properties=["source_file"]):
         filename = (obj.properties or {}).get("source_file")
         # A part counts for its original (#621).
         if isinstance(filename, str) and parts.resolve(filename, names) is not None:
@@ -16893,12 +16903,14 @@ class _SourceChunks:
 
 @telemetry.traced("rag.rebuild")
 @collection_writes.serialized("collection")
-def _rebuild(collection: str, properties: list[dict], index_type: str | None,
-             distance_metric: str | None, progress, *, records: list[dict] | None = None,
+def _rebuild(collection: str, properties: Iterable[dict], index_type: str | None,
+             distance_metric: str | None, progress, *, records: _RecordSnapshot | list[dict] | None = None,
              source_collection: str | None = None, before_replace=None, staged=None,
              cancelled=None) -> int:
     """Stage and verify, then replace the live collection under its writer guard.
 
+    `properties` is a list, a _StoredChunks (re-embed from stored text), a
+    _SourceChunks (re-chunk) or, for a reindex, the _RecordSnapshot itself.
     Reindex `records` are a fingerprint snapshot of the original (a list is
     snapshotted here); nothing holds the collection in memory (#583). A
     re-chunk's `properties` is a _SourceChunks reader: each part is inserted
@@ -51502,6 +51514,8 @@ for op in rechunk reembed; do
     "$(jfield "['error_code']" < /tmp/vfy_tjs.json)" "SOURCES_REQUIRED"
   check_eq "#190 ... and names the source file with no retained original" \
     "$(jfield "['error_detail']['uncovered_source_files']" < /tmp/vfy_tjs.json)" "['policies.txt']"
+  check_eq "#190 ... and omits none" \
+    "$(jfield "['error_detail']['uncovered_source_files_omitted']" < /tmp/vfy_tjs.json)" "0"
   check_eq "#190 ... and leaves every stored chunk in place" "$(mixed_count)" "$mixed_before"
   check_eq "#190 ... and leaves both source files' chunks in place" "$(mixed_files)" "$files_before"
   check_eq "#190 ... and leaves no staging or recovery collection behind" "$(mixed_names)" "$names_before"
