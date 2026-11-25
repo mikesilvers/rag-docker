@@ -407,6 +407,63 @@ class ImportGuardTests(unittest.TestCase):
             self.assertTrue(self.wait_finished(loop, first_id))
             self.assertEqual(self.job(first_id)["status"], "completed", self.job(first_id))
 
+    def test_the_target_is_held_during_model_installation(self):
+        # #492's decision: the holder keeps the target for its whole model
+        # install, so a second import is refused while the first still installs.
+        installing = threading.Event()
+        installed = threading.Event()
+        self.addCleanup(installed.set)
+        seen = []
+
+        def install(pkg, manifest):
+            seen.append(Path(pkg).name)
+            if Path(pkg).name == "a.tar.gz":
+                installing.set()
+                assert installed.wait(10)
+            return []
+        with patch.object(importer, "_ensure_models", side_effect=install):
+            loop = self.new_loop()
+            self.packages.update({"a.tar.gz": "Installing", "b.tar.gz": "Installing"})
+            first_id = self.start(loop, "a.tar.gz", "abort")
+            self.assertTrue(wait_until(installing.is_set), self.job(first_id))
+            second_id = self.start(loop, "b.tar.gz", "abort")
+            if not self.wait_finished(loop, second_id, timeout=2.0):
+                # Without the claim the second gets past the install and builds.
+                installed.set()
+                self.release.set()
+                self.assertTrue(self.wait_finished(loop, second_id), self.job(second_id))
+            self.assert_refused(self.job(second_id), "Installing")
+            self.assertEqual(seen, ["a.tar.gz"])
+            self.assertEqual(self.arrived, [])
+            installed.set()
+            self.release.set()
+            self.assertTrue(self.wait_finished(loop, first_id))
+            self.assertEqual(self.job(first_id)["status"], "completed", self.job(first_id))
+            self.assertEqual(self.built, ["Installing"])
+
+    def test_a_target_is_free_again_after_model_installation_fails(self):
+        # A failed model install now happens while the target is claimed: the
+        # job's end still releases it, so the next import of it runs.
+        def install(pkg, manifest):
+            if Path(pkg).name == "a.tar.gz":
+                raise importer.PackageError("EMBEDDING_MODEL_MISSING", "no model",
+                                            {"model": "m"})
+            return []
+        with patch.object(importer, "_ensure_models", side_effect=install):
+            loop = self.new_loop()
+            self.packages.update({"a.tar.gz": "Unmodelled", "b.tar.gz": "Unmodelled"})
+            first_id = self.start(loop, "a.tar.gz", "abort")
+            self.assertTrue(self.wait_finished(loop, first_id))
+            first = self.job(first_id)
+            self.assertEqual((first["status"], first["error_code"]),
+                             ("failed", "EMBEDDING_MODEL_MISSING"), first)
+            self.assertTrue(wait_until(lambda: not getattr(importer, "_targets", {})))
+            self.release.set()
+            second_id = self.start(loop, "b.tar.gz", "abort")
+            self.assertTrue(self.wait_finished(loop, second_id))
+            self.assertEqual(self.job(second_id)["status"], "completed", self.job(second_id))
+            self.assertEqual(self.built, ["Unmodelled"])
+
     def test_a_target_is_free_again_after_its_import_fails(self):
         loop = self.new_loop()
         self.fail_build.add("Broken")

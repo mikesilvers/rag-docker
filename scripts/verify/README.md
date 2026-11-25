@@ -529,9 +529,10 @@ refused job's `POST /import` answers 202 and registers nothing against the
 collection; a target is free again after its import fails; a refused import leaves
 the claim with its holder, so a third import of the target is refused too; the claim
 comes before the `COLLECTION_DELETING` check; a refused import never reaches model
-installation (#492); and a start whose first job record can't be stored releases the
-package name. `05_transfer.sh` runs it in
-the verify project's API container.
+installation, the target stays claimed while its holder installs models, and a
+target is free again after a failed model installation (#492); and a start whose
+first job record can't be stored releases the package name. `05_transfer.sh` runs it
+in the verify project's API container.
 
 `scripts/tests/test_ingest_errors.py` (#290) checks that damaged or unreadable ZIPs are
 refused as a whole with readable 400s naming their unreadable members (truncated archive,
