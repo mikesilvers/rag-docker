@@ -2269,7 +2269,7 @@ class IngestConfigResponse(BaseModel):
     chunking_strategy: str
     chunk_size: int
     chunk_overlap: int
-    similarity_threshold: Optional[float]
+    similarity_threshold: Optional[Annotated[float, Field(allow_inf_nan=False)]]   # JSON has no NaN (#515)
     min_chunk_size: int
     is_default: bool
 
@@ -3501,7 +3501,7 @@ import re
 from pathlib import Path
 
 from config import settings
-from models.schemas import StoredIngestConfig
+from models.schemas import IngestConfigResponse, StoredIngestConfig
 from services import settings_store
 
 log = logging.getLogger(__name__)
@@ -3547,12 +3547,28 @@ def load(collection: str) -> dict | None:
 
 
 def resolve(collection: str) -> tuple[dict, bool]:
-    """Return (config, is_default). Never raises; always usable."""
+    """Return (config, is_default). Never raises; always usable.
+
+    Saved settings that cannot be served, JSON that is not an object, a field of
+    the wrong type, a non-finite similarity_threshold or the response's own
+    is_default key (#515), are logged and give the defaults, like an unreadable
+    file and as retrieval settings do (#439, #477). Values of the right type,
+    including chunk sizes from before the #53 bounds, are served as saved; the
+    next valid save replaces the file, and export still refuses it.
+    """
     saved = load(collection)
     if saved is None:
         return {"collection": collection, **DEFAULTS}, True
-    merged = {"collection": collection, **DEFAULTS, **saved}
-    merged["collection"] = collection
+    try:
+        merged = {"collection": collection, **DEFAULTS, **saved}   # TypeError: not an object
+        merged["collection"] = collection
+        if "is_default" in merged:
+            # Not a setting; the router would get the keyword twice.
+            raise ValueError("saved settings hold is_default")
+        IngestConfigResponse.model_validate({**merged, "is_default": False})
+    except (TypeError, ValueError):   # pydantic's ValidationError is a ValueError
+        log.warning("Invalid ingest config for %r; falling back to defaults", collection)
+        return {"collection": collection, **DEFAULTS}, True
     return merged, False
 
 
@@ -12069,8 +12085,28 @@ def _export_retrieval_settings(collection: str, warnings: list[str]) -> tuple[di
 
 
 def _ingest_config(collection: str) -> dict | None:
-    """The collection's saved chunking settings, or None."""
-    return ingest_config.load(collection)
+    """The collection's saved chunking settings, checked as import check 4c does, or None.
+
+    Runs before any chunk is read, like the retrieval settings, so a package never
+    holds settings its import would refuse (#510, #515). They are packaged as
+    validated; chunk sizes from before the #53 bounds are kept as they are. A file
+    that can't be read or isn't JSON counts as none, as it does on the API.
+    """
+    saved = ingest_config.load(collection)
+    if saved is None:
+        return None
+    try:
+        return ingest_config.validate(saved, collection)
+    except ValidationError as exc:
+        problems = "; ".join(
+            f"{'.'.join(map(str, error['loc']))}: {error['msg']}" if error["loc"] else error["msg"]
+            for error in exc.errors())
+        cause = exc
+    except ValueError as exc:          # validate(): the saved JSON is not an object
+        problems, cause = "the settings file is not a JSON object", exc
+    raise ValueError(f"Saved ingest settings for '{collection}' are invalid: {problems}. "
+                     "Open the Chunking Configuration page, save this collection's settings, "
+                     "then export again.") from cause
 
 
 def _goldstandard_sessions(collection: str) -> list[dict]:
@@ -12199,6 +12235,7 @@ def build(
 
         # Settings first: a bad config fails before any chunk is streamed.
         retrieval_cfg, is_default = _export_retrieval_settings(collection, warnings)
+        ingest_cfg = _ingest_config(collection)
 
         collection_cfg = wc._collection_config_sync(collection)
         stored_model = collection_cfg.get("embedding_model")
@@ -12255,8 +12292,7 @@ def build(
         # 2. collection.json
         b.add_json("collection.json", collection_cfg)
 
-        # 3. configs
-        ingest_cfg = _ingest_config(collection)
+        # 3. configs, checked before the chunks were read
         if ingest_cfg is not None:
             b.add_json("ingest_config.json", ingest_cfg)
 
@@ -30620,7 +30656,13 @@ regressions. Its `IngestImportTests` do the same for `ingest_config.json`
 (E35, #510): malformed ingest settings are refused `PACKAGE_CORRUPT` in every
 conflict mode before any live change, and valid ones, including chunk sizes from
 before the #53 bounds, are restored from the checked snapshot and read back
-through `GET /ingest/config`. Run it with the same API dependencies as the session import test.
+through `GET /ingest/config`. They also check (#518) that `chunk_size` 1 and
+`min_chunk_size` 0 are accepted, that a symlinked `ingest_config.json` is refused,
+and that the retrieval-settings check runs before the ingest-settings one; and
+(E5x, #515) that an export refuses invalid saved ingest settings before any chunk
+is read, naming the failing field and the Chunking Configuration page, packages
+valid ones as validated, pre-#53 sizes unchanged, and leaves out a file that isn't
+JSON. Run it with the same API dependencies as the session import test.
 `05_transfer.sh` registers it and `retrieval_settings.py` (E28), which submits
 15 malformed settings imports across abort/rename/replace and verifies live
 collection counts and saved settings are unchanged. The normal rename import
@@ -31221,7 +31263,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_lan_mode.py` | API image, no network: `RAG_LAN_MODE` parsing, the startup refusal (also through `import main`), the certificate step, both nginx configurations, `lan_stack.py`'s rate-limit check against faked answers (#598), embedded copies (#26) |
 | `docker-compose.lan.verify.yml` | the harness overlay of a `--lan` run: TLS on loopback at the verify port, the verify image for `tls-init`, reserved test names (#26) |
 | `16_api_paths.sh` | ingest, query, metrics and health API paths (#399), run last by suite 01: `NO_SUPPORTED_FILES`, `JOB_NOT_FOUND`, schema rules, the proxy's `/api/` timeouts, `/metrics/latency`, a default query and its metric (LLM); opt-in restart and first-start checks |
-| `../tests/test_api_paths.py` | controlled ingest error, `/query` default, §6 prompt, query metric, retrieval-config file, `/metrics/latency` and `/health` probe regressions (#399), registered by `16_api_paths.sh` |
+| `../tests/test_api_paths.py` | controlled ingest error, `/query` default, §6 prompt, query metric, retrieval-config file, ingest-config file (#515), `/metrics/latency` and `/health` probe regressions (#399), registered by `16_api_paths.sh` |
 | `../tests/test_ollama_entrypoint.py` | `ollama/entrypoint.sh` with stub commands, on the host: skip present models, timed pull, retries (#399), registered by `16_api_paths.sh` |
 | `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure; in full runs, a large JSON Lines corpus ingested, retained, re-chunked and replaced (#312) |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
@@ -31741,7 +31783,11 @@ from the defaults, and one that isn't JSON, can't be read, holds JSON that isn't
 or nested `top_k`) gives the defaults with `is_default: true` and a warning, while coercible
 and out-of-range values are still served as saved (#439); so do a `NaN` or infinite `alpha`
 and a saved `is_default` key, which answered `"alpha": null` and 500 before #477, while a
-finite `alpha` of 1.5 is served as saved. `GET /metrics/latency` is
+finite `alpha` of 1.5 is served as saved. The saved ingest config falls back the same way
+(#515): JSON that isn't an object, a field of the wrong type, a `NaN` or infinite
+`similarity_threshold` or a saved `is_default` key gives the defaults with `is_default: true`
+and a warning, coercible, out-of-range and pre-#53 values are served as saved, and a valid
+save replaces the file. `GET /metrics/latency` is
 checked for its statistics against hand-worked percentiles, its exact-match `collection` and
 `retrieval_mode` filters, and `history_limit` (default 100, 0, 500, 501 refused with 422). A
 Weaviate client check that hangs makes `/health` give up on it after 4 s, and an unreadable
@@ -61089,6 +61135,130 @@ class IngestImportTests(unittest.TestCase):
         self.assertEqual(ingest_config.load('Renamed'), {**validated, 'collection': 'Renamed'})
         self.assertEqual(validated['collection'], 'Corpus')
         self.assertEqual(validated['chunk_size'], 800)
+
+    def test_legacy_bound_edges_and_non_overlap_strategies_are_accepted(self):
+        # Reviewer (#510): the pre-#53 edges, chunk_size 1 and min_chunk_size 0, and
+        # chunk_overlap >= chunk_size for strategies the overlap rule doesn't cover.
+        for data in [{'chunking_strategy': 'fixed', 'chunk_size': 1, 'chunk_overlap': 0,
+                      'min_chunk_size': 0},
+                     {'chunking_strategy': 'semantic', 'chunk_size': 100, 'chunk_overlap': 200,
+                      'similarity_threshold': 0, 'min_chunk_size': 0},
+                     {'chunking_strategy': 'fixed', 'chunk_size': 50, 'chunk_overlap': 50,
+                      'similarity_threshold': 1}]:
+            with self.subTest(data=data):
+                validated = ingest_config.validate(data, 'Corpus')
+                for key, value in data.items():
+                    self.assertEqual(validated[key], value)
+        for data in [{'chunk_size': 1}, {'chunk_size': '0'}, {'min_chunk_size': '-1'}]:
+            with self.subTest(data=data), self.assertRaises(ValueError):
+                ingest_config.validate(data, 'Corpus')
+
+    def test_symlinked_ingest_settings_are_refused(self):
+        # Reviewer (#510): the is_symlink branch of check 4c.
+        target = self.root / 'outside.json'
+        target.write_text('{}')
+        (self.pkg / 'ingest_config.json').symlink_to(target)
+        with self.assertRaises(packager.PackageError) as caught:
+            importer._read_ingest_config(self.pkg, 'Corpus')
+        self.assertEqual(caught.exception.code, 'PACKAGE_CORRUPT')
+        self.assertEqual(caught.exception.detail, {'file': 'ingest_config.json'})
+
+    def test_retrieval_settings_are_checked_before_ingest_settings(self):
+        # Reviewer (#510): check 4c runs after 4b, so 4b's refusal is the one reported.
+        (self.pkg / 'retrieval_config.json').write_text('{')
+        self.archive('{')
+        with patch.object(importer, '_ensure_models') as models, \
+             patch.object(importer, '_build') as build:
+            importer._jobs['test'] = {'status': 'queued'}
+            importer._run('test', 'fixture.tar.gz', 'abort')
+        result = importer._jobs['test']
+        self.assertEqual(result['status'], 'failed', result)
+        self.assertEqual(result['error_detail'], {'file': 'retrieval_config.json'}, result)
+        models.assert_not_called()
+        build.assert_not_called()
+
+    # Export (#515): saved settings are checked as import check 4c does, before any
+    # chunk is read, so a package never holds settings its import would refuse.
+    def export(self):
+        with patch.object(packager, 'read_chunks', return_value=[]) as chunks, \
+             patch.object(packager.wc, '_collection_config_sync',
+                          return_value={'embedding_model': settings.embed_model}) as collection, \
+             patch.object(packager, '_goldstandard_sessions', return_value=[]), \
+             patch.object(packager.sources, 'load_index', return_value={'documents': {}}), \
+             patch.object(packager.wc, '_meta_sync', return_value={'version': 'test'}):
+            try:
+                return packager.build('Corpus'), chunks, collection
+            except ValueError as exc:
+                exc.mocks = (chunks, collection)
+                raise
+
+    def packaged(self, filename):
+        with tarfile.open(self.exports / filename) as archive:
+            archive.extractall(self.root / 'extracted', filter='data')
+        return next((self.root / 'extracted').iterdir())
+
+    def test_export_refuses_invalid_saved_ingest_settings(self):
+        saved = ingest_config._path('Corpus')
+        for value in INVALID_INGEST:
+            if value is None:   # None is no saved settings, not invalid ones.
+                continue
+            with self.subTest(value=value):
+                saved.write_text(json.dumps(value))
+                before = saved.read_bytes()
+                with self.assertRaises(ValueError) as caught:
+                    self.export()
+                message = str(caught.exception)
+                self.assertIn("'Corpus'", message)
+                self.assertIn('Chunking Configuration page', message)
+                if not isinstance(value, dict):
+                    self.assertIn('not a JSON object', message)
+                elif {'chunk_size', 'chunk_overlap'} <= value.keys():   # the overlap rule names no field
+                    self.assertIn('chunk_overlap must be smaller', message)
+                else:
+                    self.assertIn(next(iter(value)), message)
+                for mock in caught.exception.mocks:   # refused before any chunk is read
+                    mock.assert_not_called()
+                self.assertEqual(list(self.exports.iterdir()), [])
+                self.assertEqual(saved.read_bytes(), before)
+
+    def test_export_packages_valid_saved_ingest_settings_as_validated(self):
+        cases = [
+            # Saved before the #53 bounds: exported as it is, never clamped.
+            ({'chunking_strategy': 'fixed', 'chunk_size': 20, 'chunk_overlap': 10,
+              'similarity_threshold': None, 'min_chunk_size': 8000},
+             {'chunking_strategy': 'fixed', 'chunk_size': 20, 'chunk_overlap': 10,
+              'similarity_threshold': None, 'min_chunk_size': 8000}),
+            ({}, dict(ingest_config.DEFAULTS)),
+            ({'collection': 'OldName', 'is_default': True, 'legacy_field': 'ignored',
+              'chunking_strategy': 'fixed', 'chunk_size': '150', 'chunk_overlap': '20',
+              'min_chunk_size': '40'},
+             {**ingest_config.DEFAULTS, 'chunking_strategy': 'fixed', 'chunk_size': 150,
+              'chunk_overlap': 20, 'min_chunk_size': 40}),
+        ]
+        saved = ingest_config._path('Corpus')
+        for data, expected in cases:
+            with self.subTest(data=data):
+                saved.write_text(json.dumps(data))
+                before = saved.read_bytes()
+                result, _, _ = self.export()
+                pkg = self.packaged(result['filename'])
+                packaged = json.loads((pkg / 'ingest_config.json').read_text())
+                self.assertEqual(packaged, {'collection': 'Corpus', **expected})
+                self.assertEqual(importer._read_ingest_config(pkg, 'Corpus'), packaged)
+                manifest = json.loads((pkg / 'manifest.json').read_text())
+                self.assertEqual(manifest['chunking'], {
+                    'strategy': expected['chunking_strategy'],
+                    'chunk_size': expected['chunk_size'],
+                    'chunk_overlap': expected['chunk_overlap']})
+                self.assertEqual(saved.read_bytes(), before)
+                shutil.rmtree(self.root / 'extracted')
+                for leftover in self.exports.iterdir():
+                    leftover.unlink()
+
+    def test_export_leaves_out_unreadable_saved_ingest_settings(self):
+        ingest_config._path('Corpus').write_text('{')
+        result, _, _ = self.export()
+        self.assertFalse((self.packaged(result['filename']) / 'ingest_config.json').exists())
 
 
 if __name__ == '__main__':
