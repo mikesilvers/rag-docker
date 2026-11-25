@@ -382,8 +382,28 @@ def _export_retrieval_settings(collection: str, warnings: list[str]) -> tuple[di
 
 
 def _ingest_config(collection: str) -> dict | None:
-    """The collection's saved chunking settings, or None."""
-    return ingest_config.load(collection)
+    """The collection's saved chunking settings, checked as import check 4c does, or None.
+
+    Runs before any chunk is read, like the retrieval settings, so a package never
+    holds settings its import would refuse (#510, #515). They are packaged as
+    validated; chunk sizes from before the #53 bounds are kept as they are. A file
+    that can't be read or isn't JSON counts as none, as it does on the API.
+    """
+    saved = ingest_config.load(collection)
+    if saved is None:
+        return None
+    try:
+        return ingest_config.validate(saved, collection)
+    except ValidationError as exc:
+        problems = "; ".join(
+            f"{'.'.join(map(str, error['loc']))}: {error['msg']}" if error["loc"] else error["msg"]
+            for error in exc.errors())
+        cause = exc
+    except ValueError as exc:          # validate(): the saved JSON is not an object
+        problems, cause = "the settings file is not a JSON object", exc
+    raise ValueError(f"Saved ingest settings for '{collection}' are invalid: {problems}. "
+                     "Open the Chunking Configuration page, save this collection's settings, "
+                     "then export again.") from cause
 
 
 def _goldstandard_sessions(collection: str) -> list[dict]:
@@ -512,6 +532,7 @@ def build(
 
         # Settings first: a bad config fails before any chunk is streamed.
         retrieval_cfg, is_default = _export_retrieval_settings(collection, warnings)
+        ingest_cfg = _ingest_config(collection)
 
         collection_cfg = wc._collection_config_sync(collection)
         stored_model = collection_cfg.get("embedding_model")
@@ -568,8 +589,7 @@ def build(
         # 2. collection.json
         b.add_json("collection.json", collection_cfg)
 
-        # 3. configs
-        ingest_cfg = _ingest_config(collection)
+        # 3. configs, checked before the chunks were read
         if ingest_cfg is not None:
             b.add_json("ingest_config.json", ingest_cfg)
 
