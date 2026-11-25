@@ -3601,7 +3601,9 @@ A retained session can be loaded/refreshed by its session ID, including when its
 - Progress while the job runs, then the filename, size, fidelity, whether it is
   encrypted with a key or a passphrase, whether models were bundled and whether `retrieve.py` was generated. Warnings from the job are
   shown in full. A failed export shows its `error_code` (for example
-  `EMBEDDING_MISMATCH`) before the error, as the import half does.
+  `EMBEDDING_MISMATCH`) before the error, as the import half does. While the
+  export waits `queued` for its collection's writer guard (#509), the page says
+  it is waiting for another job on the collection instead of showing progress (#520).
 - A finished key export shows, before the package's Download, a warning to store
   the key apart from the package (anyone with both can read it; it can be
   downloaded once and can't be recovered) and **Download key**, a link to

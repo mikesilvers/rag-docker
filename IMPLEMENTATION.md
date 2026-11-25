@@ -28741,6 +28741,7 @@ export default function TransferPage() {
             <p className="text-gray-600">
               {exportJob.status === 'completed' ? 'Done.' :
                exportJob.status === 'failed' ? 'Failed.' :
+               exportJob.status === 'queued' ? 'Queued: waiting for another job on this collection to finish.' :
                `Writing… ${exportJob.chunks_written} chunks so far.`}
             </p>
             {exportJob.status === 'completed' && exportJob.filename && (
@@ -61821,6 +61822,8 @@ async function startAndPoll(page, half) {
   await release(page, HALVES[half].start, HALVES[half].started, 'POST');
   await pending(page, HALVES[half].poll);
 }
+// What the export panel shows while its job waits `queued` for the collection's writer guard (#520).
+const QUEUED_EXPORT = 'Queued: waiting for another job on this collection to finish.';
 const retrying = half => `Could not check ${HALVES[half].progress}, retrying: ${DOWN}`;
 const stopped = half => `Stopped checking ${HALVES[half].progress} after 30 failed attempts; the ${half} may still be running. Last error: ${DOWN}`;
 
@@ -61893,6 +61896,15 @@ async function runTransferPageTests(browser, base, reporter) {
     await release(page, HALVES.export.start, HALVES.export.started, 'POST');
     await sleep(400);
     assert.equal(await count(page, HALVES.export.poll), 0, 'a poll was sent after the page was left');
+  }]);
+  cases.push(['export: a queued export says it is waiting, not writing, until it runs (#520)', async page => {
+    await startAndPoll(page, 'export');
+    await release(page, HALVES.export.poll, exportJob('queued', { chunks_written: 0 }));
+    await waitText(page, QUEUED_EXPORT);
+    await waitText(page, 'Writing…', true);
+    await release(page, HALVES.export.poll, exportJob('running'));
+    await waitText(page, 'Writing… 1 chunks so far.');
+    await waitText(page, QUEUED_EXPORT, true);
   }]);
   for (const [status, code, msg] of [[409, 'SOURCE_INDEX_INVALID', 'Retained source index is invalid.'],
                                      [503, 'SERVICE_UNAVAILABLE', 'Synthetic tune options failure.'],
