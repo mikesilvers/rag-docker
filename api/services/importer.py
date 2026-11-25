@@ -956,11 +956,13 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
         validated_retrieval = _read_retrieval_config(pkg, original, retrieval_notes)
         validated_ingest = _read_ingest_config(pkg, original)
 
+        # One import per target, whatever its conflict mode, claimed before any
+        # model is installed and before the existence check, so a refused import
+        # changes nothing, and held until the job ends (#391, #492).
+        _claim_target(job_id, target)
+
         model_notes = _ensure_models(pkg, manifest)                 # spec §6.3
 
-        # One import per target, whatever its conflict mode, claimed before the
-        # existence check and held until the job ends (#391).
-        _claim_target(job_id, target)
         # Hold one target guard across conflict check, replacement, and sidecars.
         with (collection_writes.guard(target) if on_conflict == "replace" else nullcontext()):
             # Before the existence check: a target the delete hasn't removed yet
