@@ -6,6 +6,7 @@ and the model list that says whether Ollama reports a model.
 import hashlib
 import json
 import os
+import shutil
 import sys
 import tarfile
 import tempfile
@@ -177,7 +178,7 @@ class PostInstallTests(unittest.TestCase):
 
     def test_installed_model_that_ollama_reports_completes(self):
         notes = self.ensure(model_list({self.model}))
-        self.assertIn("model 'review-model' installed from the package", notes)
+        self.assertIn("model 'review-model:latest' installed from the package", notes)
         self.assertTrue(model_bundle.is_installed(self.model))
 
     def test_installed_embedding_model_that_ollama_does_not_report_is_missing(self):
@@ -185,7 +186,7 @@ class PostInstallTests(unittest.TestCase):
             self.ensure(model_list({'something-else:latest'}))
         self.assertEqual(caught.exception.code, 'EMBEDDING_MODEL_MISSING')
         self.assertEqual(caught.exception.message,
-                         "Installed 'review-model' from the package but Ollama does not report it.")
+                         "Installed 'review-model:latest' from the package but Ollama does not report it.")
         self.assertEqual(caught.exception.detail, {'model': 'review-model'})
 
     def test_installed_model_when_ollama_is_unreachable_says_so(self):
@@ -219,7 +220,7 @@ class PostInstallTests(unittest.TestCase):
         present, state = self.present_embedder()
         with state:
             notes = self.ensure(model_list({present, self.model}), embed=present)
-        self.assertIn("model 'review-model' installed from the package", notes)
+        self.assertIn("model 'review-model:latest' installed from the package", notes)
 
     def test_installed_llm_when_ollama_is_unreachable_fails_the_import(self):
         present, state = self.present_embedder()
@@ -228,6 +229,26 @@ class PostInstallTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 'IMPORT_FAILED')
         self.assertIn("couldn't reach Ollama", caught.exception.message)
         self.assertNotIn('does not report', caught.exception.message)
+        self.assertEqual(caught.exception.detail, {'model': 'review-model'})
+
+    def test_unreachable_and_install_failure_messages_name_name_and_tag(self):
+        # #498 decision (2026-11-25): "Could not install" and "Installed ... but
+        # couldn't reach Ollama" name name:tag too; detail keeps the bare name.
+        with self.assertRaises(PackageError) as caught:
+            self.ensure(model_list(error=ConnectionError('ollama unreachable')))
+        self.assertTrue(caught.exception.message.startswith(
+            "Installed 'review-model:latest' from the package but couldn't reach Ollama"),
+            caught.exception.message)
+        self.assertEqual(caught.exception.detail, {'model': 'review-model'})
+        shutil.rmtree(self.store / 'models')  # the first import installed it
+        (self.store / 'models').mkdir()
+        with patch.object(importer.model_bundle, 'install_model',
+                          side_effect=OSError('disk full')), \
+             self.assertRaises(PackageError) as caught:
+            self.ensure(model_list({self.model}))
+        self.assertEqual(caught.exception.code, 'EMBEDDING_MODEL_MISSING')
+        self.assertEqual(caught.exception.message,
+                         "Could not install bundled model 'review-model:latest': disk full")
         self.assertEqual(caught.exception.detail, {'model': 'review-model'})
 
 
