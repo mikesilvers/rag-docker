@@ -12546,12 +12546,14 @@ def listing_fields(manifest: dict) -> dict:
 
 
 def _check_member(member: tarfile.TarInfo, dest: Path, root: Path) -> None:
-    """Refuse a link, anything but a file or directory, a path outside dest, a path with a
-    `..` component, a negative size, or a sparse file.
+    """Refuse a link, anything but a file or directory, a path outside dest, an absolute
+    path, a path with a `..` component, a negative size, or a sparse file.
 
     tarfile makes a member's missing parent folders from its path as written, so a
     `..` lets a path that resolves inside dest name folders outside it, which would
-    be made and never removed (#597). No package this project writes has a `..`.
+    be made and never removed (#597). An absolute path that leads into dest names its
+    folders from `/`, not from dest (#911). No package this project writes has a `..`
+    or an absolute path.
 
     tarfile writes every chunk of a sparse file's map before it truncates the
     file to its size, so a sparse file's size doesn't bound what extracting it
@@ -12572,6 +12574,11 @@ def _check_member(member: tarfile.TarInfo, dest: Path, root: Path) -> None:
         raise PackageError(
             "PACKAGE_UNREADABLE",
             f"Package contains a path outside the archive ('{member.name}').",
+            {"member": member.name})
+    if member.name.startswith("/"):
+        raise PackageError(
+            "PACKAGE_UNREADABLE",
+            f"Package contains an absolute path ('{member.name}'), which is not allowed.",
             {"member": member.name})
     if ".." in member.name.split("/"):
         raise PackageError(
@@ -12714,7 +12721,8 @@ def _safe_extract(tar: tarfile.TarFile, dest: Path, name: str) -> None:
     3.12 has `filter="data"` for this; doing it explicitly keeps the guarantee
     on 3.11 and makes the refusal auditable. Headers are read one at a time and
     each is checked as it is read, so a refusal stops reading there, holds at
-    most the caps' worth of headers, and leaves dest empty (#317).
+    most twice the member cap's worth of headers, and leaves dest empty (#317,
+    #599).
     """
     root = dest.resolve()
     budget = _Budget(name)
@@ -30680,10 +30688,14 @@ top-level directories, and a package with no manifest, a manifest that isn't JSO
 `package_format` (`PACKAGE_FORMAT_UNSUPPORTED`). It also checks that a member with a `..`
 component that resolves inside the package, whether or not it names a folder outside the work
 directory, is refused `PACKAGE_UNREADABLE` for a `.tar.gz` and a `.tar.gz.age` package without
-any of its folders being made, and that dots within a component are allowed (#597). Through
-`importer._run`, with Weaviate and the
-model checks mocked, a digest-valid package naming a collection Weaviate can't use is
-`PACKAGE_FORMAT_UNSUPPORTED` before any lookup, and one with a `chunks.jsonl` line that isn't
+any of its folders being made, and that dots within a component are allowed (#597). A
+directory member with a `..` component (`TOP/d1/../d2`, `TOP/d1/..`) is refused the same way,
+and a member with an absolute name that leads into the work directory is refused
+`PACKAGE_UNREADABLE` and not written, while one outside it keeps the outside-path message
+(#911). Through `importer._run`, with Weaviate and the model checks mocked, the #597 case
+fails `PACKAGE_UNREADABLE` for both package kinds and leaves no `evil` folder in the upload
+directory and no work directory; a digest-valid package naming a collection Weaviate can't use
+is `PACKAGE_FORMAT_UNSUPPORTED` before any lookup, and one with a `chunks.jsonl` line that isn't
 JSON, a bad UUID, properties that aren't an object, a missing or short vector, or a chunk count
 above or below the manifest's is `PACKAGE_CORRUPT` before any collection is created, with
 `abort` and `rename`. `scripts/tests/test_package_limits.py` (API container, with caps of
