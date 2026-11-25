@@ -22,13 +22,13 @@ import uuid
 from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, os.environ.get("RAG_TEST_API_DIR") or str(Path(__file__).resolve().parents[2] / "api"))
 
 from config import settings
 from services import collection_writes as writes
-from services import exporter, goldstandard, packager, sources
+from services import exporter, goldstandard, importer, packager, rag_pipeline, sources
 from services import weaviate_client as wc
 
 COLL = "SnapshotColl"
@@ -81,6 +81,14 @@ class Backend:
 
     def client(self):
         return SimpleNamespace(collections=SimpleNamespace(get=lambda name: self))
+
+    @property
+    def query(self):
+        # A hybrid search answering one stored chunk, as a query would read it.
+        found = SimpleNamespace(properties={"content": "found chunk", "source_file": "doc.txt",
+                                            "chunk_index": 0},
+                                metadata=SimpleNamespace(score=0.9))
+        return SimpleNamespace(hybrid=lambda **kwargs: SimpleNamespace(objects=[found]))
 
 
 class ExportSnapshotTests(unittest.TestCase):
@@ -247,6 +255,95 @@ class ExportSnapshotTests(unittest.TestCase):
         job_id = self.run_export()
         exporter._run(job_id, COLL, False)
         self.assertEqual(seen, {"alias": "busy", "other": "acquired"})
+        self.package(exporter._jobs[job_id])
+
+    def wrapped_build(self, built):
+        real_build = packager.build
+
+        def build(*args, **kwargs):
+            result = real_build(*args, **kwargs)
+            built.set()
+            return result
+        return build
+
+    def test_replace_import_waits_for_the_export_before_its_conflict_check(self):
+        # #520 (spec §6.1): a replace-import of the collection waits for the
+        # export's guard and reaches its conflict check only after the build.
+        built = threading.Event()
+        seen = []
+        import_job = {"job_id": "snapimport", "status": "queued"}
+        package_dir = Path(self.temp.name) / "package"
+        package_dir.mkdir()
+        manifest = {"collection": {"name": COLL}, "fidelity": "chunks-only", "files": {}}
+        (package_dir / "manifest.json").write_text(json.dumps(manifest))
+
+        def exists(target):
+            seen.append(built.is_set())
+            raise packager.PackageError("TEST_STOP", "stopped at the conflict check")
+
+        mocks = ExitStack()
+        self.addCleanup(mocks.close)
+        mocks.enter_context(patch.object(importer, "_jobs", {"snapimport": import_job}))
+        mocks.enter_context(patch.object(importer, "_active", {"snap.tar.gz"}))
+        mocks.enter_context(patch.object(settings, "upload_dir", self.temp.name))
+        mocks.enter_context(patch.object(packager, "open_package", return_value=(package_dir, manifest)))
+        mocks.enter_context(patch.object(packager, "verify_digests"))
+        mocks.enter_context(patch.object(importer, "_validate_package_sources"))
+        mocks.enter_context(patch.object(importer, "_check_embedding"))
+        mocks.enter_context(patch.object(importer, "package_source", return_value=COLL))
+        mocks.enter_context(patch.object(importer, "_read_goldstandard_sessions", return_value=[]))
+        mocks.enter_context(patch.object(importer, "_read_retrieval_config", return_value=None))
+        mocks.enter_context(patch.object(importer, "_read_ingest_config", return_value=None))
+        mocks.enter_context(patch.object(importer, "_ensure_models", return_value=[]))
+        mocks.enter_context(patch.object(importer.wc, "_collection_exists_sync", side_effect=exists))
+        replacer = threading.Thread(target=importer._run, args=("snapimport", "snap.tar.gz", "replace"))
+
+        def after_first():
+            replacer.start()
+            # The import waits on the export's guard, before its conflict check.
+            self.assertTrue(wait_until(lambda: waiters() >= 2 or seen))
+            self.assertEqual(seen, [])
+
+        self.backend.after_first = after_first
+        job_id = self.run_export()
+        with patch.object(packager, "build", self.wrapped_build(built)):
+            exporter._run(job_id, COLL, False)
+        replacer.join(timeout=5)
+        self.assertFalse(replacer.is_alive())
+        self.assertEqual(seen, [True])
+        self.assertEqual((import_job["status"], import_job["error_code"]), ("failed", "TEST_STOP"))
+        self.package(exporter._jobs[job_id])
+        self.assertEqual(waiters(), 0)
+
+    def test_a_query_runs_during_the_export(self):
+        # #520 (spec §6.1): an export never blocks queries of its collection.
+        built = threading.Event()
+        outcome = {}
+
+        def query():
+            try:
+                outcome["result"] = asyncio.run(rag_pipeline.run_query(
+                    "what changed?", COLL, "hybrid", 1, 0.5, False, "end_user"))
+            except Exception as exc:                  # noqa: BLE001 - reported below
+                outcome["error"] = exc
+            outcome["during_build"] = not built.is_set()
+
+        def after_first():
+            thread = threading.Thread(target=query)
+            thread.start()
+            thread.join(timeout=5)
+            outcome["finished"] = not thread.is_alive()
+
+        self.backend.after_first = after_first
+        job_id = self.run_export()
+        with patch.object(packager, "build", self.wrapped_build(built)), \
+             patch.object(rag_pipeline.ollama, "chat", new=AsyncMock(return_value="an answer")):
+            exporter._run(job_id, COLL, False)
+        self.assertTrue(outcome.get("finished"))
+        self.assertNotIn("error", outcome)
+        self.assertTrue(outcome["during_build"])
+        self.assertEqual(outcome["result"]["chunks_retrieved"], 1)
+        self.assertEqual(outcome["result"]["answer"], "an answer")
         self.package(exporter._jobs[job_id])
 
     def test_export_waits_queued_behind_another_writer(self):
