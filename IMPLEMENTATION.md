@@ -11916,17 +11916,22 @@ def _json_default(value: Any) -> Any:
 
 # ── Reading the collection (spec §4.5) ────────────────────────────────────────
 
-def read_chunks(collection: str, documents: dict | None = None) -> Iterator[dict]:
+def read_chunks(collection: str, documents: dict | None = None,
+                shipped: dict | None = None) -> Iterator[dict]:
     """One record per chunk, streamed. Never materialises the collection.
 
     A 100k-chunk corpus is roughly 880 MB of JSON, so nothing here accumulates.
-    `documents` is the retained sources the package ships, by digest; a chunk
-    links only to one of those (#509). None loads the whole index.
+    `documents` is the collection's whole source index, by digest (None loads
+    it), and `shipped` the retained sources the package ships, by digest (None:
+    all of `documents`). A chunk links only to a shipped digest, and only when
+    its name is listed under that one digest in the whole index (#509, #520).
     """
     client = wc.get_client()
     col = client.collections.get(collection)
     if documents is None:
         documents = sources.load_index(collection)["documents"]
+    if shipped is None:
+        shipped = documents
 
     # digests_for_filename() reloads the index on every call, which would be
     # O(chunks x documents). Build the reverse map once.
@@ -11954,8 +11959,9 @@ def read_chunks(collection: str, documents: dict | None = None) -> Iterator[dict
             "vector": vector,
             "properties": props,
             # More than one digest means the same filename was ingested with
-            # different content. Recording null is honest; picking one is not.
-            "source_sha256": digests[0] if len(digests) == 1 else None,
+            # different content. Recording null is honest; picking one is not,
+            # even when only one of those blobs is shipped (#520).
+            "source_sha256": digests[0] if len(digests) == 1 and digests[0] in shipped else None,
         }
 
 
@@ -12227,6 +12233,8 @@ def build(
         # chunk links and sources/ come from it (#509). The exporter holds the
         # writer guard, so no guarded writer changes it meanwhile. A blob missing
         # on disk is not shipped, and chunks naming it get a null source_sha256.
+        # The links are resolved against the whole index, so a name listed under
+        # more than one digest links nowhere, even when only one blob is on disk (#520).
         index = sources.load_index(collection)
         shipped = {}
         for digest, entry in index["documents"].items():
@@ -12245,7 +12253,7 @@ def build(
         def write_chunks(path: Path) -> None:
             nonlocal chunk_count, dimensions, first_props, unresolved
             with path.open("w", encoding="utf-8") as fh:
-                for record in read_chunks(collection, shipped):
+                for record in read_chunks(collection, index["documents"], shipped):
                     if dimensions is None and record["vector"]:
                         dimensions = len(record["vector"])
                     if first_props is None:
@@ -15362,35 +15370,36 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
                 {"model": model, "package_model": pkg_model, "bundled": bundled})
 
         name = model_bundle.split_ref(model)[0]
+        ref = model_bundle.model_ref(model)  # name:tag in every message (#487, #498)
         state = model_bundle.installed_state(model)
         if state == "present":
-            notes.append(f"model '{name}' already present; left untouched")
+            notes.append(f"model '{ref}' already present; left untouched")
             continue
         if state == "corrupt":
             # Installing over it could break other models that share the
             # blobs, so restoring it stays an owner action (§6.3).
             if not required:
-                notes.append(f"model '{name}' is installed but its files don't match "
+                notes.append(f"model '{ref}' is installed but its files don't match "
                              "their checksums; restore or re-pull it before querying")
                 continue
             raise PackageError(
                 "MODEL_INTEGRITY_FAILED",
-                f"The embedding model '{name}' is installed, but its files don't "
+                f"The embedding model '{ref}' is installed, but its files don't "
                 f"match their checksums. Restore it, or re-pull it with "
-                f"`docker compose exec ollama ollama pull {name}`, then import again.",
+                f"`docker compose exec ollama ollama pull {ref}`, then import again.",
                 {"model": name})
         if model_bundle.model_ref(model) not in bundled:
             if not required:
-                notes.append(f"model '{name}' is absent and not bundled; "
+                notes.append(f"model '{ref}' is absent and not bundled; "
                              "queries will fail until it is pulled")
                 continue
             pkg_model = (manifest.get("embedding") or {}).get("model")
             raise PackageError(
                 "EMBEDDING_MODEL_MISSING",
-                f"This instance does not have the embedding model '{name}' and the "
+                f"This instance does not have the embedding model '{ref}' and the "
                 f"package does not bundle it. The vectors in this package were "
                 f"produced by '{pkg_model}', so nothing can embed a query against "
-                f"them. Pull it with `docker compose exec ollama ollama pull {name}`, "
+                f"them. Pull it with `docker compose exec ollama ollama pull {ref}`, "
                 f"or import a package exported with include_models=true.",
                 {"model": name, "package_model": pkg_model, "bundled": bundled})
         try:
@@ -15398,23 +15407,23 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
         except (OSError, ValueError) as exc:
             raise PackageError(
                 "EMBEDDING_MODEL_MISSING" if required else "IMPORT_FAILED",
-                f"Could not install bundled model '{name}': {exc}",
+                f"Could not install bundled model '{ref}': {exc}",
                 {"model": name}) from exc
         # Spec §6.3: confirm through Ollama itself, not the files just written (#390).
         reported = _ollama_reports(model)
         if reported is None:
             raise PackageError(
                 "IMPORT_FAILED",
-                f"Installed '{name}' from the package but couldn't reach Ollama to "
+                f"Installed '{ref}' from the package but couldn't reach Ollama to "
                 f"confirm it is there. Check that the ollama service is running, "
                 f"then import again.",
                 {"model": name})
         if not reported:
             raise PackageError(
                 "EMBEDDING_MODEL_MISSING" if required else "IMPORT_FAILED",
-                f"Installed '{name}' from the package but Ollama does not report it.",
+                f"Installed '{ref}' from the package but Ollama does not report it.",
                 {"model": name})
-        notes.append(f"model '{name}' installed from the package")
+        notes.append(f"model '{ref}' installed from the package")
     return notes
 
 
@@ -16229,8 +16238,8 @@ def export_model(model: str, dest: Path) -> list[tuple[str, Path]]:
     """Files to place under `models/<name>/<tag>/`, as (relative path, source).
 
     Each tag has its own folder, so two tags of one name never overwrite each
-    other's manifest (#487). Returns them rather than copying so the caller can digest each file into the
-    package manifest as it is written.
+    other's manifest (#487). Returns them rather than copying so the caller can
+    digest each file into the package manifest as it is written.
     """
     mp = manifest_path(model)
     if not mp.is_file():
@@ -28781,6 +28790,7 @@ export default function TransferPage() {
             <p className="text-gray-600">
               {exportJob.status === 'completed' ? 'Done.' :
                exportJob.status === 'failed' ? 'Failed.' :
+               exportJob.status === 'queued' ? 'Queued: waiting for another job on this collection to finish.' :
                `Writing… ${exportJob.chunks_written} chunks so far.`}
             </p>
             {exportJob.status === 'completed' && exportJob.filename && (
@@ -30629,9 +30639,9 @@ Run `python3 scripts/tests/test_session_implementation.py` from the repository r
 
 Suite 05 also runs `scripts/tests/test_batch_implementation.py` on the host (Python and bash).
 
-`05_transfer.sh` registers the ten controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_export_snapshot.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_import_guard.py`, `test_batch_recovery.py`, `test_package_listing.py`, `test_export_encryption.py` and `test_package_download.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links. It also checks (#509) that export writes a `null` `source_sha256` for a chunk whose retained blob is missing on disk, and that import check 3a refuses a chunk whose non-null `source_sha256` isn't a digest of the package's source index (with or without `sources/`) as `PACKAGE_CORRUPT`, `detail` `{"file": "chunks.jsonl", "line": n}`, before the embedding check and any backend work.
+`05_transfer.sh` registers the ten controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_export_snapshot.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_import_guard.py`, `test_batch_recovery.py`, `test_package_listing.py`, `test_export_encryption.py` and `test_package_download.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links. It also checks (#509) that export writes a `null` `source_sha256` for a chunk whose retained blob is missing on disk, and that import check 3a refuses a chunk whose non-null `source_sha256` isn't a digest of the package's source index (with or without `sources/`) as `PACKAGE_CORRUPT`, `detail` `{"file": "chunks.jsonl", "line": n}`, before the embedding check and any backend work. Since #520 it checks that a name the index lists under two digests, one of them missing on disk, exports `null` for its chunks and its parts while a unique name still links; that check 3a refuses a `chunks.jsonl` line that isn't valid JSON, naming its line, and leaves blank lines and non-object records to the insert-time checks; and that bad ingest settings (check 4c) are still refused when the chunks resolve, while a package failing both names `chunks.jsonl`, before models or any backend call.
 
-`scripts/tests/test_export_snapshot.py` (#509, API container) drives `exporter._run` with the real `packager.build` and retained-source store and a mocked Weaviate backend whose iterator reads the stored chunks one at a time. A re-ingest that tries to commit new chunks and a new `doc.txt` source after the first chunk is streamed waits for the export: the package holds the old chunk text and the old source bytes and index, every chunk's `source_sha256` names a blob in `sources/`, and the re-ingest lands after the build. During an export, gold-standard generation preparation answers `COLLECTION_BUSY` (409) and a guarded chunk insert waits; an export started while another writer holds the guard reads `queued` until it is released; and the guard is free again after an export that succeeds, is refused (`PackageError`), fails or is cancelled. An export whose build is cancelled, or ended by another non-`Exception`, reads `failed` with an `error` naming the exception and saying it was cancelled, and the exception still propagates (#521). Orderings use events and the guard's waiter count. On the code before #509 the re-ingest, generation, insert, queued and guard-held checks fail; on the code before #521 the cancelled-status checks fail.
+`scripts/tests/test_export_snapshot.py` (#509, API container) drives `exporter._run` with the real `packager.build` and retained-source store and a mocked Weaviate backend whose iterator reads the stored chunks one at a time. A re-ingest that tries to commit new chunks and a new `doc.txt` source after the first chunk is streamed waits for the export: the package holds the old chunk text and the old source bytes and index, every chunk's `source_sha256` names a blob in `sources/`, and the re-ingest lands after the build. During an export, gold-standard generation preparation answers `COLLECTION_BUSY` (409) and a guarded chunk insert waits; an export started while another writer holds the guard reads `queued` until it is released; and the guard is free again after an export that succeeds, is refused (`PackageError`), fails or is cancelled. An export whose build is cancelled, or ended by another non-`Exception`, reads `failed` with an `error` naming the exception and saying it was cancelled, and the exception still propagates (#521). Orderings use events and the guard's waiter count. On the code before #509 the re-ingest, generation, insert, queued and guard-held checks fail; on the code before #521 the cancelled-status checks fail. Since #520 it also checks that an export blocks only its own collection, so its first-character alias is refused busy and another collection's writer goes ahead; that a replace-import started mid-export waits on the guard and reaches its conflict (existence) check only after the build; and that a query (`rag_pipeline.run_query`, Ollama mocked) completes during the export.
 
 `scripts/tests/test_session_import.py` exercises the real package reader and
 evaluation persistence with disposable fixtures. Model and database mutation
@@ -31310,7 +31320,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_collection_spelling.py` | controlled regressions for per-collection state keyed by the stored collection name (#372), registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal, unresolvable chunk-source refusal and export read-boundary regressions, and an index that isn't JSON answering `SOURCE_INDEX_INVALID` at the tuning options, refusing export and left unchanged by an ingest (#52), registered by transfer |
-| `../tests/test_export_snapshot.py` | controlled export writer-guard regressions: a mid-export re-ingest can't change the package, busy and waiting writers, guard release (#509), a cancelled export's status (#521), registered by transfer |
+| `../tests/test_export_snapshot.py` | controlled export writer-guard regressions: a mid-export re-ingest can't change the package, busy and waiting writers, guard release (#509), a cancelled export's status (#521), only its own collection blocked, a waiting replace-import and a query during an export (#520), registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
 | `../tests/test_batch_recovery_fixture.py` | controlled check that the import package `batch_recovery.py`'s `write_import_package` writes passes the importer's real digest and source checks; run in the API image with no network and the repository mounted read-only, registered by transfer |
 | `../tests/test_package_listing.py` | controlled package-listing regressions (#383): the listing reads each archive only up to its manifest, new archives put the manifest first, an oversized manifest and other unreadable files are listed `readable: false`, and so is a manifest with a wrongly typed listed value (#451); run in the API image with no network, registered by transfer |
@@ -31616,11 +31626,12 @@ completes.
 
 `browser/transfer_page.js`, registered in `06_ui.sh` through `ui_criteria.js`, renders the
 Transfer page with every API call stubbed in the browser and the page's 2 s poll delay cut to
-20 ms (#382). Twenty-seven cases: for each half, a failed poll (a proxy 502) is shown and retried
+20 ms (#382). Twenty-eight cases: for each half, a failed poll (a proxy 502) is shown and retried
 with the button still busy and cleared by the next good poll; 30 failures in a row stop polling,
 show the last error and enable the button again, and a new start clears the message; a poll in
 flight when the page is left schedules no further poll. An export start answered after the page
-is left starts no polling. A 409 `SOURCE_INDEX_INVALID`, 503 or 404 from `/tune` is labelled
+is left starts no polling. An export polled `queued` says it is waiting for another job on the
+collection, not "Writing…", until a poll reads `running` (#520). A 409 `SOURCE_INDEX_INVALID`, 503 or 404 from `/tune` is labelled
 "Fidelity: unknown", a good lookup shows the fidelity, and a late answer for a collection no
 longer selected is ignored. A failed export shows its `error_code`, and a failed package list
 is shown without the empty-folder hint until a good Refresh. Three cases cover encryption (#27):
@@ -51957,9 +51968,9 @@ kpub=$(cd "$REPO_ROOT" && docker compose exec -T api grep '^# public key: ' "/ap
 # Two key builds of one collection in the same second (#860), run in the API
 # container with the build's clock fixed to a past second no export uses: the
 # second gets `-2` (RAG_EXPORT_SPECIFICATIONS.md §4.1) and all four files are
-# kept. The collision is forced: two real builds of one collection can differ
-# in <id8> (chunks.jsonl's key order follows Weaviate's, #863), so both builds
-# are given the first build's plain stem through a wrapped package_stem. Only
+# kept. The collision is forced, so the check doesn't depend on two builds
+# getting the same <id8>: both builds are given the first build's plain stem
+# through a wrapped package_stem. Only
 # these builds are patched; export output is unchanged. Every file the builds open for writing in ./exports is recorded through
 # Python's `open` audit event, so "no unencrypted archive" is checked on each
 # write instead of by sampling the folder (#860): only the encrypted package's
@@ -60141,6 +60152,45 @@ class SourceIndexBoundaryTests(unittest.TestCase):
         packager.verify_digests(pkg, manifest)
         importer._validate_package_sources(pkg, manifest)
 
+    def test_export_writes_null_for_a_name_under_two_digests_with_one_missing(self):
+        # #520: an old index lists doc.txt under two digests and one blob is gone.
+        # The name is still ambiguous, so its chunks and parts link to neither.
+        kept_content, unique_content = b"kept version", b"unique source"
+        kept = hashlib.sha256(kept_content).hexdigest()
+        gone = hashlib.sha256(b"gone version").hexdigest()
+        unique = hashlib.sha256(unique_content).hexdigest()
+        retained = sources.collection_dir("Ambiguous")
+        retained.mkdir(parents=True)
+        (retained / kept).write_bytes(kept_content)
+        (retained / unique).write_bytes(unique_content)
+        (retained / "index.json").write_text(json.dumps({
+            "version": 1, "documents": {
+                kept: {"filenames": ["doc.txt"]},
+                gone: {"filenames": ["doc.txt"]},
+                unique: {"filenames": ["unique.txt"]},
+            }}))
+        stored = [Mock(uuid=f"00000000-0000-4000-8000-00000000000{i}", vector=[0.5],
+                       properties={"content": f"chunk {i}", "source_file": name})
+                  for i, name in enumerate(("doc.txt", "doc.txt (part 2)", "unique.txt"))]
+        backend = Mock()
+        backend.collections.get.return_value.iterator.return_value = iter(stored)
+        with patch.object(packager, "exports_dir", return_value=self.root), \
+             patch.object(packager.wc, "get_client", return_value=backend), \
+             patch.object(packager.wc, "_collection_config_sync", return_value={"embedding_model": settings.embed_model}), \
+             patch.object(packager.wc, "_meta_sync", return_value={}), \
+             patch.object(packager, "_ingest_config", return_value=None), \
+             patch.object(packager, "_export_retrieval_settings", return_value=({}, True)), \
+             patch.object(packager, "_goldstandard_sessions", return_value=[]):
+            result = packager.build("Ambiguous")
+        opened = self.root / "ambiguous"
+        opened.mkdir()
+        pkg, manifest = packager.open_package(self.root / result["filename"], opened)
+        links = [r["source_sha256"] for r in packager.iter_chunks_file(pkg)]
+        self.assertEqual(links, [None, None, unique])
+        self.assertEqual({p.name for p in (pkg / "sources").iterdir()}, {"index.json", kept, unique})
+        packager.verify_digests(pkg, manifest)
+        importer._validate_package_sources(pkg, manifest)
+
     def test_import_refuses_a_chunk_naming_a_source_not_in_the_package(self):
         content = b"retained source"
         digest = hashlib.sha256(content).hexdigest()
@@ -60163,6 +60213,23 @@ class SourceIndexBoundaryTests(unittest.TestCase):
                     importer._validate_package_sources(package, {"fidelity": fidelity})
                 self.assertEqual(raised.exception.code, "PACKAGE_CORRUPT")
                 self.assertEqual(raised.exception.detail, {"file": "chunks.jsonl", "line": line})
+
+    def test_chunk_source_check_refuses_invalid_json_and_skips_blank_lines(self):
+        # Reviewer (#509): check 3a's new parse names the bad line; blank lines and
+        # non-object records are left to the insert-time checks.
+        content = b"retained source"
+        digest = hashlib.sha256(content).hexdigest()
+        (self.package / "sources" / digest).write_bytes(content)
+        (self.package / "sources" / "index.json").write_text(json.dumps(self.index(digest)))
+        good = json.dumps({"id": "00000000-0000-4000-8000-000000000000", "vector": [0.5],
+                           "properties": {"content": "c"}, "source_sha256": digest})
+        (self.package / "chunks.jsonl").write_text(good + "\n\n[1, 2]\n" + good + "\n")
+        importer._validate_package_sources(self.package, {"fidelity": "with-sources"})
+        (self.package / "chunks.jsonl").write_text(good + "\n\n{not json\n")
+        with self.assertRaises(PackageError) as raised:
+            importer._validate_package_sources(self.package, {"fidelity": "with-sources"})
+        self.assertEqual(raised.exception.code, "PACKAGE_CORRUPT")
+        self.assertEqual(raised.exception.detail, {"file": "chunks.jsonl", "line": 3})
 
     def test_unresolvable_chunk_source_fails_before_embedding_or_live_work(self):
         content = b"retained source"
@@ -60187,6 +60254,40 @@ class SourceIndexBoundaryTests(unittest.TestCase):
         check_embedding.assert_not_called()
         models.assert_not_called()
         backend.assert_not_called()
+
+    def test_chunk_source_check_and_ingest_settings_check_coexist(self):
+        # Reviewer (#509 with #510): check 3a runs first; once it passes, the
+        # ingest-settings preflight still refuses malformed settings before models
+        # or any backend call, and a package failing both names chunks.jsonl.
+        content = b"retained source"
+        digest = hashlib.sha256(content).hexdigest()
+        (self.package / "sources" / digest).write_bytes(content)
+        (self.package / "sources" / "index.json").write_text(json.dumps(self.index(digest)))
+        (self.package / "ingest_config.json").write_text('{"chunk_size": "invalid"}')
+        manifest = {"fidelity": "with-sources", "files": {},
+                    "collection": {"name": "Coexist"}}
+        (self.package / "manifest.json").write_text(json.dumps(manifest))
+        absent = hashlib.sha256(b"elsewhere").hexdigest()
+        cases = (((digest, None), {"file": "ingest_config.json"}),
+                 ((digest, absent), {"file": "chunks.jsonl", "line": 2}))
+        for links, detail in cases:
+            with self.subTest(links=links):
+                self.chunks_file(self.package, *links)
+                job = {"status": "queued"}
+                with patch.object(settings, "upload_dir", str(self.root)), \
+                     patch.object(importer, "_jobs", {"owned": job}), \
+                     patch.object(importer, "_active", {"owned.tar.gz"}), \
+                     patch.object(packager, "exports_dir", return_value=self.root), \
+                     patch.object(packager, "open_package", return_value=(self.package, manifest)), \
+                     patch.object(importer, "_check_embedding"), \
+                     patch.object(importer, "_ensure_models") as models, \
+                     patch.object(importer.wc, "get_client") as backend:
+                    importer._run("owned", "owned.tar.gz", "replace")
+                self.assertEqual(job["status"], "failed")
+                self.assertEqual(job["error_code"], "PACKAGE_CORRUPT")
+                self.assertEqual(job["error_detail"], detail)
+                models.assert_not_called()
+                backend.assert_not_called()
 
 
 class ManifestFilesBoundaryTests(unittest.TestCase):
@@ -60683,6 +60784,25 @@ class RetrievalImportTests(unittest.TestCase):
         self.assertEqual(self.exported, ['embed:v1'])
         self.assertEqual(manifest['bundled_models'], ['embed:v1'])
 
+    def test_a_name_with_no_path_in_the_store_is_compared_as_written(self):
+        # `user/m` has no folder in the store (split_ref refuses it), so it is
+        # compared by its exact string: named twice it is tried once, named once
+        # it warns and the other model is still bundled whole (#494).
+        for llm in ('user/m', 'chat:v2'):
+            with self.subTest(llm=llm):
+                for leftover in self.exports.iterdir():
+                    leftover.unlink()
+                result, manifest = self.build_with_models(
+                    {'user/m'}, embed_model='user/m', llm_model=llm)
+                pkg, _ = self.extracted(result)
+                self.assertEqual(self.exported, ['user/m'] if llm == 'user/m' else ['user/m', 'chat:v2'])
+                failed = [w for w in manifest['warnings'] if 'could not be bundled' in w]
+                self.assertEqual(len(failed), 1, failed)
+                self.assertTrue(failed[0].startswith("model 'user/m' could not be bundled"))
+                expected = [] if llm == 'user/m' else ['chat:v2']
+                self.assertEqual(manifest['bundled_models'], expected)
+                self.assertEqual(model_bundle.bundled_models(pkg), expected)
+
     def test_a_model_named_with_and_without_its_tag_is_one_model(self):
         # `embed` and `embed:latest` share models/embed/latest/; a second copy
         # failing used to delete the first's files while the manifest kept
@@ -60978,14 +61098,14 @@ class ModelTagFolderTests(unittest.TestCase):
         notes = self.ensure(pkg, manifest, 'foo:a', 'bar:y')
         self.assertEqual(self.installed('foo:a'), self.manifests['foo:a'])
         self.assertIsNone(self.installed('bar:y'))  # develop: bar:x's
-        self.assertIn("model 'bar' is absent and not bundled; queries will fail until it is pulled", notes)
+        self.assertIn("model 'bar:y' is absent and not bundled; queries will fail until it is pulled", notes)
         self.assertEqual(manifest['bundled_models'], ['bar:x', 'foo:a'])
 
     def test_an_old_package_folder_installs_for_the_one_tag_its_manifest_names(self):
         pkg, manifest = self.legacy_package('foo:a', ('foo:a', 'bar:x'))
         notes = self.ensure(pkg, manifest, 'foo:a', 'bar:x')
         self.assertEqual(self.installed('foo:a'), self.manifests['foo:a'])
-        self.assertIn("model 'bar' is absent and not bundled; queries will fail until it is pulled", notes)
+        self.assertIn("model 'bar:x' is absent and not bundled; queries will fail until it is pulled", notes)
         self.assertEqual(model_bundle.bundled_models(pkg, manifest), ['foo:a'])
 
     def test_an_old_package_folder_shared_by_two_tags_counts_as_not_bundled(self):
@@ -61003,10 +61123,80 @@ class ModelTagFolderTests(unittest.TestCase):
         pkg, manifest = self.legacy_package('bar:x', ('foo:a', 'bar:x'))
         shutil.copytree(self.store / 'models', self.target / 'models', dirs_exist_ok=True)  # foo:a present
         notes = self.ensure(pkg, manifest, 'foo:a', 'bar:y')
-        self.assertIn("model 'foo' already present; left untouched", notes)
+        self.assertIn("model 'foo:a' already present; left untouched", notes)
         self.assertIsNone(self.installed('bar:y'))  # develop: bar:x's
-        self.assertIn("model 'bar' is absent and not bundled; queries will fail until it is pulled", notes)
+        self.assertIn("model 'bar:y' is absent and not bundled; queries will fail until it is pulled", notes)
         self.assertEqual(model_bundle.bundled_models(pkg, manifest), ['bar:x'])
+
+    # Reviewer additions (PR #496 testing review).
+    def test_the_embedding_model_under_another_tag_is_refused_as_missing(self):
+        pkg, manifest = self.export('foo:a', 'bar:x')
+        with self.assertRaises(packager.PackageError) as caught:
+            self.ensure(pkg, manifest, 'foo:b', 'bar:x')
+        self.assertEqual(caught.exception.code, 'EMBEDDING_MODEL_MISSING')
+        self.assertIn('does not bundle it', str(caught.exception))
+        self.assertEqual(caught.exception.detail['bundled'], ['bar:x', 'foo:a'])
+        self.assertEqual(caught.exception.detail['package_model'], 'foo:a')
+        self.assertIsNone(self.installed('foo:b'))
+        self.assertIsNone(self.installed('foo:a'))
+
+    def test_an_untagged_model_is_bundled_and_installed_as_latest(self):
+        self.manifests['baz:latest'] = self.put_model('baz:latest')
+        pkg, manifest = self.export('baz', 'foo:b')
+        self.assertEqual(manifest['bundled_models'], ['baz:latest', 'foo:b'])
+        self.assertIn('models/baz/latest/manifest.json', manifest['files'])
+        notes = self.ensure(pkg, manifest, 'baz', 'foo:b')
+        self.assertEqual(self.installed('baz:latest'), self.manifests['baz:latest'])
+        self.assertEqual(self.installed('foo:b'), self.manifests['foo:b'])
+        self.assertEqual(sum('installed from the package' in note for note in notes), 2, notes)
+
+    def test_an_old_package_folder_named_without_a_tag_installs_as_latest(self):
+        self.manifests['baz:latest'] = self.put_model('baz:latest')
+        pkg, manifest = self.legacy_package('baz:latest', ('baz', 'bar:x'))
+        self.assertEqual(model_bundle.bundled_models(pkg, manifest), ['baz:latest'])
+        notes = self.ensure(pkg, manifest, 'baz:latest', 'bar:x')
+        self.assertEqual(self.installed('baz:latest'), self.manifests['baz:latest'])
+        self.assertIn("model 'bar:x' is absent and not bundled; queries will fail until it is pulled", notes)
+
+    def test_an_old_package_folder_without_a_package_manifest_is_not_bundled(self):
+        pkg, _ = self.legacy_package('foo:a', ('foo:a', 'bar:x'))
+        self.assertEqual(model_bundle.bundled_models(pkg), [])
+        self.assertIsNone(model_bundle.bundled_source(pkg, 'foo:a'))
+        with self.assertRaises(FileNotFoundError):
+            with patch.object(settings, 'ollama_models_dir', str(self.target)):
+                model_bundle.install_model(pkg, 'foo:a')
+        self.assertIsNone(self.installed('foo:a'))
+
+    def test_every_message_names_the_model_by_name_and_tag(self):
+        # Every _ensure_models message names name:tag, so a configured foo:b
+        # suggests `ollama pull foo:b`, never foo (foo:latest); `detail` keeps
+        # the bare name (maintainer decision, 2026-11-25, #498).
+        def damage(model):
+            digest = json.loads(self.manifests[model])['layers'][0]['digest']
+            (self.target / 'models' / 'blobs' / digest.replace(':', '-')).write_bytes(b'changed')
+
+        pkg, manifest = self.export('foo:a', 'bar:x')
+        with self.assertRaises(packager.PackageError) as caught:
+            self.ensure(pkg, manifest, 'foo:b', 'bar:x')
+        self.assertEqual(caught.exception.code, 'EMBEDDING_MODEL_MISSING')
+        self.assertIn("embedding model 'foo:b'", str(caught.exception))
+        self.assertIn('ollama pull foo:b`', str(caught.exception))
+        self.assertEqual(caught.exception.detail['model'], 'foo')
+
+        shutil.copytree(self.store / 'models', self.target / 'models', dirs_exist_ok=True)
+        damage('foo:b')
+        with self.assertRaises(packager.PackageError) as caught:
+            self.ensure(pkg, manifest, 'foo:b', 'bar:x')
+        self.assertEqual(caught.exception.code, 'MODEL_INTEGRITY_FAILED')
+        self.assertIn("embedding model 'foo:b'", str(caught.exception))
+        self.assertIn('ollama pull foo:b`', str(caught.exception))
+        self.assertEqual(caught.exception.detail, {'model': 'foo'})
+
+        damage('bar:x')
+        notes = self.ensure(pkg, manifest, 'foo:a', 'bar:x')
+        self.assertIn("model 'foo:a' already present; left untouched", notes)
+        self.assertIn("model 'bar:x' is installed but its files don't match their checksums; "
+                      "restore or re-pull it before querying", notes)
 
 
 # Ingest settings in a package (#510): the save contract, except that chunk_size and
@@ -61787,6 +61977,8 @@ async function startAndPoll(page, half) {
   await release(page, HALVES[half].start, HALVES[half].started, 'POST');
   await pending(page, HALVES[half].poll);
 }
+// What the export panel shows while its job waits `queued` for the collection's writer guard (#520).
+const QUEUED_EXPORT = 'Queued: waiting for another job on this collection to finish.';
 const retrying = half => `Could not check ${HALVES[half].progress}, retrying: ${DOWN}`;
 const stopped = half => `Stopped checking ${HALVES[half].progress} after 30 failed attempts; the ${half} may still be running. Last error: ${DOWN}`;
 
@@ -61859,6 +62051,15 @@ async function runTransferPageTests(browser, base, reporter) {
     await release(page, HALVES.export.start, HALVES.export.started, 'POST');
     await sleep(400);
     assert.equal(await count(page, HALVES.export.poll), 0, 'a poll was sent after the page was left');
+  }]);
+  cases.push(['export: a queued export says it is waiting, not writing, until it runs (#520)', async page => {
+    await startAndPoll(page, 'export');
+    await release(page, HALVES.export.poll, exportJob('queued', { chunks_written: 0 }));
+    await waitText(page, QUEUED_EXPORT);
+    await waitText(page, 'Writing…', true);
+    await release(page, HALVES.export.poll, exportJob('running'));
+    await waitText(page, 'Writing… 1 chunks so far.');
+    await waitText(page, QUEUED_EXPORT, true);
   }]);
   for (const [status, code, msg] of [[409, 'SOURCE_INDEX_INVALID', 'Retained source index is invalid.'],
                                      [503, 'SERVICE_UNAVAILABLE', 'Synthetic tune options failure.'],
