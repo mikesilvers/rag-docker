@@ -169,8 +169,8 @@ def export_model(model: str, dest: Path) -> list[tuple[str, Path]]:
     """Files to place under `models/<name>/<tag>/`, as (relative path, source).
 
     Each tag has its own folder, so two tags of one name never overwrite each
-    other's manifest (#487). Returns them rather than copying so the caller can digest each file into the
-    package manifest as it is written.
+    other's manifest (#487). Returns them rather than copying so the caller can
+    digest each file into the package manifest as it is written.
     """
     mp = manifest_path(model)
     if not mp.is_file():

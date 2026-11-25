@@ -177,7 +177,7 @@ class PostInstallTests(unittest.TestCase):
 
     def test_installed_model_that_ollama_reports_completes(self):
         notes = self.ensure(model_list({self.model}))
-        self.assertIn("model 'review-model' installed from the package", notes)
+        self.assertIn("model 'review-model:latest' installed from the package", notes)
         self.assertTrue(model_bundle.is_installed(self.model))
 
     def test_installed_embedding_model_that_ollama_does_not_report_is_missing(self):
@@ -219,7 +219,7 @@ class PostInstallTests(unittest.TestCase):
         present, state = self.present_embedder()
         with state:
             notes = self.ensure(model_list({present, self.model}), embed=present)
-        self.assertIn("model 'review-model' installed from the package", notes)
+        self.assertIn("model 'review-model:latest' installed from the package", notes)
 
     def test_installed_llm_when_ollama_is_unreachable_fails_the_import(self):
         present, state = self.present_embedder()

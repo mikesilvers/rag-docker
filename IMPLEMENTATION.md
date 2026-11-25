@@ -15316,9 +15316,10 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
                 {"model": model, "package_model": pkg_model, "bundled": bundled})
 
         name = model_bundle.split_ref(model)[0]
+        ref = model_bundle.model_ref(model)  # `name:tag` in notes (#487)
         state = model_bundle.installed_state(model)
         if state == "present":
-            notes.append(f"model '{name}' already present; left untouched")
+            notes.append(f"model '{ref}' already present; left untouched")
             continue
         if state == "corrupt":
             # Installing over it could break other models that share the
@@ -15335,7 +15336,7 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
                 {"model": name})
         if model_bundle.model_ref(model) not in bundled:
             if not required:
-                notes.append(f"model '{name}' is absent and not bundled; "
+                notes.append(f"model '{ref}' is absent and not bundled; "
                              "queries will fail until it is pulled")
                 continue
             pkg_model = (manifest.get("embedding") or {}).get("model")
@@ -15368,7 +15369,7 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
                 "EMBEDDING_MODEL_MISSING" if required else "IMPORT_FAILED",
                 f"Installed '{name}' from the package but Ollama does not report it.",
                 {"model": name})
-        notes.append(f"model '{name}' installed from the package")
+        notes.append(f"model '{ref}' installed from the package")
     return notes
 
 
@@ -16181,8 +16182,8 @@ def export_model(model: str, dest: Path) -> list[tuple[str, Path]]:
     """Files to place under `models/<name>/<tag>/`, as (relative path, source).
 
     Each tag has its own folder, so two tags of one name never overwrite each
-    other's manifest (#487). Returns them rather than copying so the caller can digest each file into the
-    package manifest as it is written.
+    other's manifest (#487). Returns them rather than copying so the caller can
+    digest each file into the package manifest as it is written.
     """
     mp = manifest_path(model)
     if not mp.is_file():
@@ -60619,6 +60620,25 @@ class RetrievalImportTests(unittest.TestCase):
         self.assertEqual(self.exported, ['embed:v1'])
         self.assertEqual(manifest['bundled_models'], ['embed:v1'])
 
+    def test_a_name_with_no_path_in_the_store_is_compared_as_written(self):
+        # `user/m` has no folder in the store (split_ref refuses it), so it is
+        # compared by its exact string: named twice it is tried once, named once
+        # it warns and the other model is still bundled whole (#494).
+        for llm in ('user/m', 'chat:v2'):
+            with self.subTest(llm=llm):
+                for leftover in self.exports.iterdir():
+                    leftover.unlink()
+                result, manifest = self.build_with_models(
+                    {'user/m'}, embed_model='user/m', llm_model=llm)
+                pkg, _ = self.extracted(result)
+                self.assertEqual(self.exported, ['user/m'] if llm == 'user/m' else ['user/m', 'chat:v2'])
+                failed = [w for w in manifest['warnings'] if 'could not be bundled' in w]
+                self.assertEqual(len(failed), 1, failed)
+                self.assertTrue(failed[0].startswith("model 'user/m' could not be bundled"))
+                expected = [] if llm == 'user/m' else ['chat:v2']
+                self.assertEqual(manifest['bundled_models'], expected)
+                self.assertEqual(model_bundle.bundled_models(pkg), expected)
+
     def test_a_model_named_with_and_without_its_tag_is_one_model(self):
         # `embed` and `embed:latest` share models/embed/latest/; a second copy
         # failing used to delete the first's files while the manifest kept
@@ -60914,14 +60934,14 @@ class ModelTagFolderTests(unittest.TestCase):
         notes = self.ensure(pkg, manifest, 'foo:a', 'bar:y')
         self.assertEqual(self.installed('foo:a'), self.manifests['foo:a'])
         self.assertIsNone(self.installed('bar:y'))  # develop: bar:x's
-        self.assertIn("model 'bar' is absent and not bundled; queries will fail until it is pulled", notes)
+        self.assertIn("model 'bar:y' is absent and not bundled; queries will fail until it is pulled", notes)
         self.assertEqual(manifest['bundled_models'], ['bar:x', 'foo:a'])
 
     def test_an_old_package_folder_installs_for_the_one_tag_its_manifest_names(self):
         pkg, manifest = self.legacy_package('foo:a', ('foo:a', 'bar:x'))
         notes = self.ensure(pkg, manifest, 'foo:a', 'bar:x')
         self.assertEqual(self.installed('foo:a'), self.manifests['foo:a'])
-        self.assertIn("model 'bar' is absent and not bundled; queries will fail until it is pulled", notes)
+        self.assertIn("model 'bar:x' is absent and not bundled; queries will fail until it is pulled", notes)
         self.assertEqual(model_bundle.bundled_models(pkg, manifest), ['foo:a'])
 
     def test_an_old_package_folder_shared_by_two_tags_counts_as_not_bundled(self):
@@ -60939,10 +60959,49 @@ class ModelTagFolderTests(unittest.TestCase):
         pkg, manifest = self.legacy_package('bar:x', ('foo:a', 'bar:x'))
         shutil.copytree(self.store / 'models', self.target / 'models', dirs_exist_ok=True)  # foo:a present
         notes = self.ensure(pkg, manifest, 'foo:a', 'bar:y')
-        self.assertIn("model 'foo' already present; left untouched", notes)
+        self.assertIn("model 'foo:a' already present; left untouched", notes)
         self.assertIsNone(self.installed('bar:y'))  # develop: bar:x's
-        self.assertIn("model 'bar' is absent and not bundled; queries will fail until it is pulled", notes)
+        self.assertIn("model 'bar:y' is absent and not bundled; queries will fail until it is pulled", notes)
         self.assertEqual(model_bundle.bundled_models(pkg, manifest), ['bar:x'])
+
+    # Reviewer additions (PR #496 testing review).
+    def test_the_embedding_model_under_another_tag_is_refused_as_missing(self):
+        pkg, manifest = self.export('foo:a', 'bar:x')
+        with self.assertRaises(packager.PackageError) as caught:
+            self.ensure(pkg, manifest, 'foo:b', 'bar:x')
+        self.assertEqual(caught.exception.code, 'EMBEDDING_MODEL_MISSING')
+        self.assertIn('does not bundle it', str(caught.exception))
+        self.assertEqual(caught.exception.detail['bundled'], ['bar:x', 'foo:a'])
+        self.assertEqual(caught.exception.detail['package_model'], 'foo:a')
+        self.assertIsNone(self.installed('foo:b'))
+        self.assertIsNone(self.installed('foo:a'))
+
+    def test_an_untagged_model_is_bundled_and_installed_as_latest(self):
+        self.manifests['baz:latest'] = self.put_model('baz:latest')
+        pkg, manifest = self.export('baz', 'foo:b')
+        self.assertEqual(manifest['bundled_models'], ['baz:latest', 'foo:b'])
+        self.assertIn('models/baz/latest/manifest.json', manifest['files'])
+        notes = self.ensure(pkg, manifest, 'baz', 'foo:b')
+        self.assertEqual(self.installed('baz:latest'), self.manifests['baz:latest'])
+        self.assertEqual(self.installed('foo:b'), self.manifests['foo:b'])
+        self.assertEqual(sum('installed from the package' in note for note in notes), 2, notes)
+
+    def test_an_old_package_folder_named_without_a_tag_installs_as_latest(self):
+        self.manifests['baz:latest'] = self.put_model('baz:latest')
+        pkg, manifest = self.legacy_package('baz:latest', ('baz', 'bar:x'))
+        self.assertEqual(model_bundle.bundled_models(pkg, manifest), ['baz:latest'])
+        notes = self.ensure(pkg, manifest, 'baz:latest', 'bar:x')
+        self.assertEqual(self.installed('baz:latest'), self.manifests['baz:latest'])
+        self.assertIn("model 'bar:x' is absent and not bundled; queries will fail until it is pulled", notes)
+
+    def test_an_old_package_folder_without_a_package_manifest_is_not_bundled(self):
+        pkg, _ = self.legacy_package('foo:a', ('foo:a', 'bar:x'))
+        self.assertEqual(model_bundle.bundled_models(pkg), [])
+        self.assertIsNone(model_bundle.bundled_source(pkg, 'foo:a'))
+        with self.assertRaises(FileNotFoundError):
+            with patch.object(settings, 'ollama_models_dir', str(self.target)):
+                model_bundle.install_model(pkg, 'foo:a')
+        self.assertIsNone(self.installed('foo:a'))
 
 
 # Ingest settings in a package (#510): the save contract, except that chunk_size and

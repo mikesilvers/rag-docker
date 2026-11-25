@@ -512,9 +512,10 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
                 {"model": model, "package_model": pkg_model, "bundled": bundled})
 
         name = model_bundle.split_ref(model)[0]
+        ref = model_bundle.model_ref(model)  # `name:tag` in notes (#487)
         state = model_bundle.installed_state(model)
         if state == "present":
-            notes.append(f"model '{name}' already present; left untouched")
+            notes.append(f"model '{ref}' already present; left untouched")
             continue
         if state == "corrupt":
             # Installing over it could break other models that share the
@@ -531,7 +532,7 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
                 {"model": name})
         if model_bundle.model_ref(model) not in bundled:
             if not required:
-                notes.append(f"model '{name}' is absent and not bundled; "
+                notes.append(f"model '{ref}' is absent and not bundled; "
                              "queries will fail until it is pulled")
                 continue
             pkg_model = (manifest.get("embedding") or {}).get("model")
@@ -564,7 +565,7 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
                 "EMBEDDING_MODEL_MISSING" if required else "IMPORT_FAILED",
                 f"Installed '{name}' from the package but Ollama does not report it.",
                 {"model": name})
-        notes.append(f"model '{name}' installed from the package")
+        notes.append(f"model '{ref}' installed from the package")
     return notes
 
 
