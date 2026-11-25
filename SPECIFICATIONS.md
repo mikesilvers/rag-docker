@@ -993,16 +993,18 @@ stored whole, and for a file split into parts (§5.1.1) only after its last part
 ones. The rate is measured from real ingests only: each stored part (a file stored whole is
 one part) is a measurement of the characters of its chunks over the seconds its store took,
 embedding and the insert check included; a failed store is not one. The instance keeps its
-last 20 measurements in `{UPLOAD_DIR}/ingest-rate.json` (counts and times only), so a restart
-keeps the rate, and `rate_characters_per_second` is their characters over their seconds.
+last 20 measurements in `{UPLOAD_DIR}/embedding-rate.json` (counts and times only; the older
+`ingest-rate.json` is read until that file exists, #896), so a restart keeps the rate, and
+`rate_characters_per_second` is their characters over their seconds.
 Each entry's `seconds_left` is its characters not yet stored over the rate; for the file
 whose part is being stored it counts down by the time that store has been running, never
 below 0, and a failed file's is 0. The job's `seconds_left` is their sum: it counts only work
-already chunked. `files_not_chunked` is how many files the job hasn't reached, and
-`seconds_left_is_minimum` is `true` while any such file, or any unfinished split file's later
-parts, remain, so the job's time left is then a minimum. Before the instance's first
-measurement the rate and every `seconds_left` are `null` (the Import page says "No estimate
-yet"); there is no default rate. A job that isn't `running` has `null` rate and times and
+already chunked. `files_not_chunked` is how many files the job hasn't reached, plus the file it
+is parsing before its first chunks (#896), and `seconds_left_is_minimum` is `true` while any such
+file, or any unfinished split file's later parts, remain, so the job's time left is then a
+minimum. Before the instance's first measurement the rate and every `seconds_left` are `null`
+(the Import page says "No estimate yet"); there is no default rate. A job that isn't `running`
+has `null` rate and times and
 `seconds_left_is_minimum` `false`; its `file_progress` counts stay. Job records written before
 these fields existed read back with `file_progress: []`, `file_progress_omitted: 0` and the
 other estimate fields `null`/`false`. `GET /ingest/jobs` entries carry `file_progress` as
@@ -4358,6 +4360,16 @@ now lives once, in `api/services/ingest_config.py`.
       `test_a_finish_time_after_the_clock_is_listed` lists a finish time an hour ahead, with that
       `finished_at`; `test_finished_at_boundary_of_the_window` lists one exactly 24 hours before the
       request and drops one a second earlier.*
+
+- [x] The ingest time estimate (#614, #896, §3.1.3, "Time estimate"): while an ingest job runs, its
+      status gives each file's chunk counts once it is chunked, the instance's rate measured from
+      stored parts and saved across restarts (a new job uses it from its start), and the time left
+      per file and for the job, a minimum while files not reached, a file being parsed, or a split
+      file's later parts remain; the rate and times are `null` ("no estimate yet") only before the
+      instance's first measurement, and a job that isn't running has no rate or times.
+      *`scripts/tests/test_ingest_estimate.py` (API image, no network, run by `02_ingest.sh`): the
+      rate store across a restart, the time left a running job's status computes, and the per-file
+      progress the job loop records.*
 
 - [x] A write with any record left to `text2vec-ollama` uses `fixed_size(batch_size=10, concurrent_requests=1)` and one whose records all carry vectors `dynamic()`; only objects whose embedding timed out in Weaviate are sent again, at most twice; no other failure is retried; a chunk sent again counts once in `chunks_submitted` (#613, #721).
       *`scripts/tests/test_embed_batching.py` (13 tests, run by `02_ingest.sh` in the API image) checks
