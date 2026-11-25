@@ -61406,6 +61406,12 @@ class IngestImportTests(unittest.TestCase):
         result, _, _ = self.export()
         self.assertFalse((self.packaged(result['filename']) / 'ingest_config.json').exists())
 
+    def test_export_leaves_out_saved_ingest_settings_that_cannot_be_read(self):
+        # Reviewer (#515): a saved path that can't be read counts as no settings too.
+        ingest_config._path('Corpus').mkdir()
+        result, _, _ = self.export()
+        self.assertFalse((self.packaged(result['filename']) / 'ingest_config.json').exists())
+
 
 if __name__ == '__main__':
     unittest.main()
