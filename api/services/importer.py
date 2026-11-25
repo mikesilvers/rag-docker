@@ -512,7 +512,7 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
                 {"model": model, "package_model": pkg_model, "bundled": bundled})
 
         name = model_bundle.split_ref(model)[0]
-        ref = model_bundle.model_ref(model)  # `name:tag` in notes (#487)
+        ref = model_bundle.model_ref(model)  # name:tag in every message (#487, #498)
         state = model_bundle.installed_state(model)
         if state == "present":
             notes.append(f"model '{ref}' already present; left untouched")
@@ -521,14 +521,14 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
             # Installing over it could break other models that share the
             # blobs, so restoring it stays an owner action (§6.3).
             if not required:
-                notes.append(f"model '{name}' is installed but its files don't match "
+                notes.append(f"model '{ref}' is installed but its files don't match "
                              "their checksums; restore or re-pull it before querying")
                 continue
             raise PackageError(
                 "MODEL_INTEGRITY_FAILED",
-                f"The embedding model '{name}' is installed, but its files don't "
+                f"The embedding model '{ref}' is installed, but its files don't "
                 f"match their checksums. Restore it, or re-pull it with "
-                f"`docker compose exec ollama ollama pull {name}`, then import again.",
+                f"`docker compose exec ollama ollama pull {ref}`, then import again.",
                 {"model": name})
         if model_bundle.model_ref(model) not in bundled:
             if not required:
@@ -538,10 +538,10 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
             pkg_model = (manifest.get("embedding") or {}).get("model")
             raise PackageError(
                 "EMBEDDING_MODEL_MISSING",
-                f"This instance does not have the embedding model '{name}' and the "
+                f"This instance does not have the embedding model '{ref}' and the "
                 f"package does not bundle it. The vectors in this package were "
                 f"produced by '{pkg_model}', so nothing can embed a query against "
-                f"them. Pull it with `docker compose exec ollama ollama pull {name}`, "
+                f"them. Pull it with `docker compose exec ollama ollama pull {ref}`, "
                 f"or import a package exported with include_models=true.",
                 {"model": name, "package_model": pkg_model, "bundled": bundled})
         try:
@@ -549,21 +549,21 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
         except (OSError, ValueError) as exc:
             raise PackageError(
                 "EMBEDDING_MODEL_MISSING" if required else "IMPORT_FAILED",
-                f"Could not install bundled model '{name}': {exc}",
+                f"Could not install bundled model '{ref}': {exc}",
                 {"model": name}) from exc
         # Spec §6.3: confirm through Ollama itself, not the files just written (#390).
         reported = _ollama_reports(model)
         if reported is None:
             raise PackageError(
                 "IMPORT_FAILED",
-                f"Installed '{name}' from the package but couldn't reach Ollama to "
+                f"Installed '{ref}' from the package but couldn't reach Ollama to "
                 f"confirm it is there. Check that the ollama service is running, "
                 f"then import again.",
                 {"model": name})
         if not reported:
             raise PackageError(
                 "EMBEDDING_MODEL_MISSING" if required else "IMPORT_FAILED",
-                f"Installed '{name}' from the package but Ollama does not report it.",
+                f"Installed '{ref}' from the package but Ollama does not report it.",
                 {"model": name})
         notes.append(f"model '{ref}' installed from the package")
     return notes

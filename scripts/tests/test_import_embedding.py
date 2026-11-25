@@ -185,7 +185,7 @@ class PostInstallTests(unittest.TestCase):
             self.ensure(model_list({'something-else:latest'}))
         self.assertEqual(caught.exception.code, 'EMBEDDING_MODEL_MISSING')
         self.assertEqual(caught.exception.message,
-                         "Installed 'review-model' from the package but Ollama does not report it.")
+                         "Installed 'review-model:latest' from the package but Ollama does not report it.")
         self.assertEqual(caught.exception.detail, {'model': 'review-model'})
 
     def test_installed_model_when_ollama_is_unreachable_says_so(self):

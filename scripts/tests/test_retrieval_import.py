@@ -768,6 +768,37 @@ class ModelTagFolderTests(unittest.TestCase):
                 model_bundle.install_model(pkg, 'foo:a')
         self.assertIsNone(self.installed('foo:a'))
 
+    def test_every_message_names_the_model_by_name_and_tag(self):
+        # Every _ensure_models message names name:tag, so a configured foo:b
+        # suggests `ollama pull foo:b`, never foo (foo:latest); `detail` keeps
+        # the bare name (maintainer decision, 2026-11-25, #498).
+        def damage(model):
+            digest = json.loads(self.manifests[model])['layers'][0]['digest']
+            (self.target / 'models' / 'blobs' / digest.replace(':', '-')).write_bytes(b'changed')
+
+        pkg, manifest = self.export('foo:a', 'bar:x')
+        with self.assertRaises(packager.PackageError) as caught:
+            self.ensure(pkg, manifest, 'foo:b', 'bar:x')
+        self.assertEqual(caught.exception.code, 'EMBEDDING_MODEL_MISSING')
+        self.assertIn("embedding model 'foo:b'", str(caught.exception))
+        self.assertIn('ollama pull foo:b`', str(caught.exception))
+        self.assertEqual(caught.exception.detail['model'], 'foo')
+
+        shutil.copytree(self.store / 'models', self.target / 'models', dirs_exist_ok=True)
+        damage('foo:b')
+        with self.assertRaises(packager.PackageError) as caught:
+            self.ensure(pkg, manifest, 'foo:b', 'bar:x')
+        self.assertEqual(caught.exception.code, 'MODEL_INTEGRITY_FAILED')
+        self.assertIn("embedding model 'foo:b'", str(caught.exception))
+        self.assertIn('ollama pull foo:b`', str(caught.exception))
+        self.assertEqual(caught.exception.detail, {'model': 'foo'})
+
+        damage('bar:x')
+        notes = self.ensure(pkg, manifest, 'foo:a', 'bar:x')
+        self.assertIn("model 'foo:a' already present; left untouched", notes)
+        self.assertIn("model 'bar:x' is installed but its files don't match their checksums; "
+                      "restore or re-pull it before querying", notes)
+
 
 # Ingest settings in a package (#510): the save contract, except that chunk_size and
 # min_chunk_size from before the #53 bounds are kept (SPECIFICATIONS.md section 8).
