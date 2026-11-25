@@ -597,6 +597,49 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual([p.name for p in Path(settings.sources_dir).iterdir()], ['Corpus'])
         self.assertTrue(session.is_symlink())
 
+    def test_linked_package_sidecar_is_refused_naming_its_package_path(self):
+        # #886: in an import's replace-mode recovery copy the sidecars come from
+        # the extracted package, so a linked one is named relative to the
+        # package, never by an absolute path, and the original is kept.
+        outside = self.root / 'outside'
+        outside.mkdir()
+        for name in ('goldstandard', 'collection.json', 'manifest.json'):
+            with self.subTest(name=name):
+                pkg, manifest = self.package()
+                entry = pkg / name
+                moved = outside / name
+                entry.rename(moved)
+                entry.symlink_to(moved)
+                try:
+                    with patch.object(self, 'package', return_value=(pkg, manifest)):
+                        job = self.import_replace()
+                    self.assertEqual(job['status'], 'failed')
+                    self.assertIn(f"Recovery source '{name}' is a link", job['error'])
+                    self.assertNotIn(str(self.root), job['error'])
+                    self.assertEqual(self.cols.get('Corpus').rows, {r['id']: r for r in self.original})
+                    self.assertEqual(list(self.cols.items), ['Corpus'])
+                    self.assertFalse(list(recovery._root().glob('*.json')))
+                finally:
+                    entry.unlink()
+                    moved.rename(entry)
+        # A package's linked config is refused earlier, by the import's settings
+        # check; retain() itself still names it relative to the package root.
+        for kind in ('ingest', 'retrieval'):
+            with self.subTest(kind=kind):
+                pkg, _ = self.package()
+                entry = pkg / f'{kind}_config.json'
+                moved = outside / entry.name
+                entry.rename(moved)
+                entry.symlink_to(moved)
+                try:
+                    record = recovery.begin('Corpus', 'import', self.client)
+                    with self.assertRaises(ValueError) as error:
+                        recovery.retain(record, package=pkg)
+                    self.assertEqual(str(error.exception), f"Recovery source '{kind}_config.json' is a link")
+                finally:
+                    entry.unlink()
+                    moved.rename(entry)
+
     def test_dangling_source_link_is_copied_as_a_link(self):
         # #881: copytree(symlinks=True) keeps a dangling link entry as a link
         # instead of failing the snapshot on a missing target.
