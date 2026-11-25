@@ -117,6 +117,14 @@ class Settings(BaseSettings):
             raise ValueError("MAX_PREPARATION_BYTES must be at least 1048576")
         return value
 
+    @field_validator("max_package_expanded_bytes", "max_package_members")
+    @classmethod
+    def _package_cap(cls, value, info):
+        # 0 or less would refuse every package import (#599).
+        if value < 1:
+            raise ValueError(f"{info.field_name.upper()} must be at least 1")
+        return value
+
     @field_validator("export_retention_hours")
     @classmethod
     def _retention_hours(cls, value):
