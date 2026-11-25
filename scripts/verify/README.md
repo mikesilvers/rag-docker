@@ -457,12 +457,20 @@ checks that a `.tar.gz` and a `.tar.gz.age` package exactly at each cap open, an
 or one byte over is refused `PACKAGE_TOO_MANY_MEMBERS` or `PACKAGE_TOO_LARGE` with the exact
 message and `detail`; a negative-size entry before an over-cap file is refused
 `PACKAGE_UNREADABLE`; a sparse file in each of the four formats (old GNU `S`, PAX 0.0, 0.1,
-1.0) is refused `PACKAGE_UNREADABLE`; folders implied by a file's path count as entries
-(at the cap it opens, one folder over is refused `PACKAGE_TOO_MANY_MEMBERS`), while a name with
-a `..` component is refused `PACKAGE_UNREADABLE` before its folders are counted and a folder with
-its own entry counts once; a `.tar.gz` refusal extracts nothing and reads no header past the refusing
-entry, a `.tar.gz.age` refusal leaves at most the cap's bytes, and through `importer._run` each
-refusal fails the job with no collection created and no work directory left. The suite then
+1.0) is refused `PACKAGE_UNREADABLE`, and so is a negative size from a PAX `size` record on a
+directory (on a regular file the file after it is never extracted); folders implied by a file's
+or a directory's path count as entries (at the cap it opens, one folder over is refused
+`PACKAGE_TOO_MANY_MEMBERS`), `.` and empty path parts aren't folders, while a name with a `..`
+component, `../<work dir>/…` included, is refused `PACKAGE_UNREADABLE` before its folders are
+counted; a folder counts once, whether its own entry comes before or after a file inside it and
+for a name like `d/.`, while a repeated directory entry counts each time (#599); the checks run
+in §6.2's order (count, check, folders, size); a path needing more folders at once than the
+recursion limit allows is refused `PACKAGE_UNREADABLE`, not `IMPORT_FAILED` (#599); a `.tar.gz`
+refusal extracts nothing and reads no header past the refusing entry, a `.tar.gz.age` refusal
+leaves at most the cap's bytes, and through `importer._run` each refusal, for both package kinds,
+fails the job with no collection created and no work directory left, a `.tar.gz.age` refused
+after members were extracted included. It also checks the code defaults (16 GiB, 100,000) and
+that a cap below 1 stops the settings (#599). The suite then
 checks that `docker-compose.yml`'s values (16 GiB, 100,000) reach the API.
 `scripts/tests/test_transfer_paths.py` (API container, through the app)
 checks that a missing, `null` or unknown `on_conflict` is 422 `INVALID_PARAMETER`, a second
@@ -526,9 +534,13 @@ frees the original. With the target created at the start of the build, as Weavia
 does, a second `abort`, `rename` or `replace` import is still refused
 `IMPORT_IN_PROGRESS`, so the claim is checked to come before the existence check; a
 refused job's `POST /import` answers 202 and registers nothing against the
-collection; a target is free again after its import fails; and a start whose first
-job record can't be stored releases the package name. `05_transfer.sh` runs it in
-the verify project's API container.
+collection; a target is free again after its import fails; a refused import leaves
+the claim with its holder, so a third import of the target is refused too; the claim
+comes before the `COLLECTION_DELETING` check; a refused import never reaches model
+installation, the target stays claimed while its holder installs models, and a
+target is free again after a failed model installation (#492); and a start whose
+first job record can't be stored releases the package name. `05_transfer.sh` runs it
+in the verify project's API container.
 
 `scripts/tests/test_ingest_errors.py` (#290) checks that damaged or unreadable ZIPs are
 refused as a whole with readable 400s naming their unreadable members (truncated archive,
@@ -1085,7 +1097,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_version_agreement.py` | host-only: the first-party version strings agree with each other, not with a fixed version: `ui/package.json`, the root versions in `ui/package-lock.json`, `mcp/mcpapp.py`, the two `service.version` defaults in `api/services/telemetry.py` and `RAG_OTEL_SERVICE_VERSION` in `docker-compose.telemetry.yml` and `docker-compose.telemetry.verify.yml` (#605, #656), registered by infrastructure |
 | `../tests/test_ui_dependencies.py` | host-only: the copy of `ui/package.json` embedded in `IMPLEMENTATION.md` (`### ui/package.json`) is the file, exactly, so a UI dependency bump that misses the copy fails (#532), registered by infrastructure |
 | `../tests/test_tailwind_output.py` | runs from the host, standard library plus the docker CLI: the built UI CSS keeps what the Tailwind 4 migration relies on (RD-157, #773): the `prose` and `prose-sm` rules, `relative`, `hover` on every device with no `@media (hover: hover)`, and the `@source` globs with automatic detection off (a sentinel `.jsx` file under `ui/src/` is scanned, a sentinel `.md` file is not). It builds a scratch copy of `ui/` with `npm ci --ignore-scripts` from the lock file and `vite build` in a throwaway container of the image `ui/Dockerfile` builds with (its `builder` stage), not on the host (#826), so it needs the network unless the image and the npm cache are present, and is skipped, with a message, only when the docker CLI is missing (a docker or build failure fails it); a second class reads `ui/src/index.css`, `NavBar.tsx` and `ui/Dockerfile` directly, and checks that the builder image is an image reference with a tag or a digest (a `--platform` flag, a digest pin and a registry with a port are accepted; a token starting with `-` is refused before it reaches `docker run`); a third checks, with a stub in place of docker, that a build step that times out has its named container removed (#841). Registered by infrastructure |
-| `15_transfer_paths.sh` | transfer and tuning paths with no check before (#387): import refusals, `on_conflict`, unknown job ids, `/packages`, the package file unchanged, export without the model store, `retrieve.py` (E8-E10), E11 retrieval, a re-chunk with no chunks; run by `05_transfer.sh` |
+| `15_transfer_paths.sh` | transfer and tuning paths with no check before (#387): import refusals, `on_conflict`, unknown job ids, `/packages`, the package file unchanged, export without the model store, `retrieve.py` (E8-E10), E11 retrieval, a re-chunk with no chunks; the package expansion caps on import (#317, `test_package_limits.py`) and `docker-compose.yml`'s values for them; run by `05_transfer.sh` |
 | `transfer_packages.py` | helper for suite 15; writes one damaged copy of a package per refusal kind |
 | `../tests/test_package_refusals.py` | controlled import checks 1 and 2, collection-name and `chunks.jsonl` record refusals, registered by suite 15 |
 | `../tests/test_transfer_paths.py` | controlled transfer and tuning route regressions through the app, registered by suite 15 |

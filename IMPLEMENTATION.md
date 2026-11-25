@@ -1358,6 +1358,14 @@ class Settings(BaseSettings):
             raise ValueError("MAX_PREPARATION_BYTES must be at least 1048576")
         return value
 
+    @field_validator("max_package_expanded_bytes", "max_package_members")
+    @classmethod
+    def _package_cap(cls, value, info):
+        # 0 or less would refuse every package import (#599).
+        if value < 1:
+            raise ValueError(f"{info.field_name.upper()} must be at least 1")
+        return value
+
     @field_validator("export_retention_hours")
     @classmethod
     def _retention_hours(cls, value):
@@ -11719,6 +11727,8 @@ from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN
 from services import age_stream
 from services import goldstandard
 from services import ingest_config
+# One copy of the cap text, shared with the ZIP caps (#599).
+from services.ingest_pipeline import _limit_text
 from services import model_bundle
 from services import parts
 from services import retrieval_config
@@ -12581,12 +12591,24 @@ def _check_member(member: tarfile.TarInfo, dest: Path, root: Path) -> None:
             {"member": member.name})
 
 
-def _limit_text(limit: int) -> str:
-    """A cap for a message: whole MiB as MB, anything else in bytes."""
-    mib = 1024 * 1024
-    if limit >= mib and limit % mib == 0:
-        return f"{limit // mib:,} MB"
-    return f"{limit:,} bytes"
+class _Folder:
+    """A folder in a package's folder tree, and whether a directory member has named it."""
+
+    __slots__ = ("children", "named")
+
+    def __init__(self) -> None:
+        self.children: dict[str, _Folder] = {}
+        self.named = False
+
+
+def _folder_parts(member: tarfile.TarInfo) -> list[str]:
+    """The folders a member's name leads through, as written, with empty and `.` parts skipped.
+
+    For a directory member the last is its own folder; for any other member they
+    are the folders before the name's last part.
+    """
+    parts = member.name.split("/")
+    return [part for part in (parts if member.isdir() else parts[:-1]) if part not in ("", ".")]
 
 
 class _Budget:
@@ -12596,29 +12618,43 @@ class _Budget:
     on. Every member is counted as its header is read, and so is every folder
     extraction would make for it that no earlier member made: tarfile makes
     the missing parent folders of each path, which no header counts. Folders
-    are read from the name as written, as os.makedirs makes them; a name with a
-    `..` component is refused before its folders are counted (#597). A member's
-    header size is added to a running total; for a member that isn't sparse
-    (sparse files are refused) it is exactly what extraction writes, so the
-    total bounds what is written. Equal to a cap is within it.
+    are read from the name as written, as os.makedirs makes them, with empty
+    and `.` parts skipped. The folder tree starts at the work directory: a name
+    with a `..` component or an absolute name is refused before its folders are
+    counted (#597), so no counted name leads out of it.
+
+    Each folder counts once (#599). A directory member's own folder is its
+    entry, so a directory member whose folder an earlier member's path already
+    counted, and that no directory member has named yet, adds nothing. Every
+    other member counts one entry, a repeated directory member included, so the
+    headers read stay within twice the member cap.
+
+    A member's header size is added to a running total; for a member that isn't
+    sparse (sparse files are refused) it is exactly what extraction writes, so
+    the total bounds what is written. Equal to a cap is within it.
     """
 
-    def __init__(self, archive_name: str, dest: Path):
+    def __init__(self, archive_name: str):
         self.archive_name = archive_name
         self.max_members = settings.max_package_members
         self.max_bytes = settings.max_package_expanded_bytes
         self.members = 0
         self.size = 0
-        # Folders as nested dicts, from the filesystem root. The work directory
-        # and its ancestors exist; every node added later has been counted, so
-        # the tree holds no more than the cap's entries.
-        self._root: dict = {}
-        self._work = [self._root]
-        for part in os.path.abspath(dest).split("/"):
-            if part:
-                self._work.append(self._work[-1].setdefault(part, {}))
+        # The work directory. Every folder added later has been counted, so the
+        # tree holds no more than the cap's entries.
+        self._root = _Folder()
 
     def count(self, member: tarfile.TarInfo) -> None:
+        """Count the member as one entry, unless it names a folder already counted as implied."""
+        if member.isdir():
+            folder = self._root
+            for part in _folder_parts(member):
+                folder = folder.children.get(part)
+                if folder is None:
+                    break
+            if folder is not None and folder is not self._root and not folder.named:
+                folder.named = True
+                return
         self._entry()
 
     def folders(self, member: tarfile.TarInfo) -> None:
@@ -12626,18 +12662,18 @@ class _Budget:
 
         A directory member's own folder is its entry, already counted.
         """
-        parts = member.name.split("/")
-        stack = [self._root] if member.name.startswith("/") else list(self._work)
+        parts = _folder_parts(member)
         last = len(parts) - 1
-        for i, part in enumerate(parts if member.isdir() else parts[:-1]):
-            if part in ("", "."):
-                continue
-            child = stack[-1].get(part)
+        folder = self._root
+        for i, part in enumerate(parts):
+            child = folder.children.get(part)
             if child is None:
-                child = stack[-1][part] = {}
-                if not (i == last and member.isdir()):
+                child = folder.children[part] = _Folder()
+                if i == last and member.isdir():
+                    child.named = True
+                else:
                     self._entry()
-            stack.append(child)
+            folder = child
 
     def _entry(self) -> None:
         self.members += 1
@@ -12681,7 +12717,7 @@ def _safe_extract(tar: tarfile.TarFile, dest: Path, name: str) -> None:
     most the caps' worth of headers, and leaves dest empty (#317).
     """
     root = dest.resolve()
-    budget = _Budget(name, dest)
+    budget = _Budget(name)
     for member in tar:
         _admit(member, dest, root, budget)
     tar.extractall(dest)
@@ -12696,7 +12732,7 @@ def _safe_extract_stream(tar: tarfile.TarFile, dest: Path, name: str) -> None:
     within the caps, and the job removes that directory.
     """
     root = dest.resolve()
-    budget = _Budget(name, dest)
+    budget = _Budget(name)
     for member in tar:
         _admit(member, dest, root, budget)
         tar.extract(member, dest)
@@ -12762,7 +12798,9 @@ def open_package(archive: Path, dest: Path, passphrase: str | None = None,
                 _safe_extract(tar, dest, archive.name)
     except PackageError:
         raise
-    except (tarfile.TarError, OSError, EOFError) as exc:
+    # os.makedirs recurses once per missing folder, so a path that needs about
+    # 1,000 of them at once raises RecursionError (#599).
+    except (tarfile.TarError, OSError, EOFError, RecursionError) as exc:
         raise PackageError("PACKAGE_UNREADABLE",
                            f"'{archive.name}' is not a readable "
                            f"{'encrypted ' if encrypted else ''}.tar.gz archive.",
@@ -15761,11 +15799,13 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
         validated_retrieval = _read_retrieval_config(pkg, original, retrieval_notes)
         validated_ingest = _read_ingest_config(pkg, original)
 
+        # One import per target, whatever its conflict mode, claimed before any
+        # model is installed and before the existence check, so a refused import
+        # changes nothing, and held until the job ends (#391, #492).
+        _claim_target(job_id, target)
+
         model_notes = _ensure_models(pkg, manifest)                 # spec §6.3
 
-        # One import per target, whatever its conflict mode, claimed before the
-        # existence check and held until the job ends (#391).
-        _claim_target(job_id, target)
         # Hold one target guard across conflict check, replacement, and sidecars.
         with (collection_writes.guard(target) if on_conflict == "replace" else nullcontext()):
             # Before the existence check: a target the delete hasn't removed yet
@@ -30653,12 +30693,20 @@ checks that a `.tar.gz` and a `.tar.gz.age` package exactly at each cap open, an
 or one byte over is refused `PACKAGE_TOO_MANY_MEMBERS` or `PACKAGE_TOO_LARGE` with the exact
 message and `detail`; a negative-size entry before an over-cap file is refused
 `PACKAGE_UNREADABLE`; a sparse file in each of the four formats (old GNU `S`, PAX 0.0, 0.1,
-1.0) is refused `PACKAGE_UNREADABLE`; folders implied by a file's path count as entries
-(at the cap it opens, one folder over is refused `PACKAGE_TOO_MANY_MEMBERS`), while a name with
-a `..` component is refused `PACKAGE_UNREADABLE` before its folders are counted and a folder with
-its own entry counts once; a `.tar.gz` refusal extracts nothing and reads no header past the refusing
-entry, a `.tar.gz.age` refusal leaves at most the cap's bytes, and through `importer._run` each
-refusal fails the job with no collection created and no work directory left. The suite then
+1.0) is refused `PACKAGE_UNREADABLE`, and so is a negative size from a PAX `size` record on a
+directory (on a regular file the file after it is never extracted); folders implied by a file's
+or a directory's path count as entries (at the cap it opens, one folder over is refused
+`PACKAGE_TOO_MANY_MEMBERS`), `.` and empty path parts aren't folders, while a name with a `..`
+component, `../<work dir>/…` included, is refused `PACKAGE_UNREADABLE` before its folders are
+counted; a folder counts once, whether its own entry comes before or after a file inside it and
+for a name like `d/.`, while a repeated directory entry counts each time (#599); the checks run
+in §6.2's order (count, check, folders, size); a path needing more folders at once than the
+recursion limit allows is refused `PACKAGE_UNREADABLE`, not `IMPORT_FAILED` (#599); a `.tar.gz`
+refusal extracts nothing and reads no header past the refusing entry, a `.tar.gz.age` refusal
+leaves at most the cap's bytes, and through `importer._run` each refusal, for both package kinds,
+fails the job with no collection created and no work directory left, a `.tar.gz.age` refused
+after members were extracted included. It also checks the code defaults (16 GiB, 100,000) and
+that a cap below 1 stops the settings (#599). The suite then
 checks that `docker-compose.yml`'s values (16 GiB, 100,000) reach the API.
 `scripts/tests/test_transfer_paths.py` (API container, through the app)
 checks that a missing, `null` or unknown `on_conflict` is 422 `INVALID_PARAMETER`, a second
@@ -30722,9 +30770,13 @@ frees the original. With the target created at the start of the build, as Weavia
 does, a second `abort`, `rename` or `replace` import is still refused
 `IMPORT_IN_PROGRESS`, so the claim is checked to come before the existence check; a
 refused job's `POST /import` answers 202 and registers nothing against the
-collection; a target is free again after its import fails; and a start whose first
-job record can't be stored releases the package name. `05_transfer.sh` runs it in
-the verify project's API container.
+collection; a target is free again after its import fails; a refused import leaves
+the claim with its holder, so a third import of the target is refused too; the claim
+comes before the `COLLECTION_DELETING` check; a refused import never reaches model
+installation, the target stays claimed while its holder installs models, and a
+target is free again after a failed model installation (#492); and a start whose
+first job record can't be stored releases the package name. `05_transfer.sh` runs it
+in the verify project's API container.
 
 `scripts/tests/test_ingest_errors.py` (#290) checks that damaged or unreadable ZIPs are
 refused as a whole with readable 400s naming their unreadable members (truncated archive,
@@ -31281,7 +31333,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_version_agreement.py` | host-only: the first-party version strings agree with each other, not with a fixed version: `ui/package.json`, the root versions in `ui/package-lock.json`, `mcp/mcpapp.py`, the two `service.version` defaults in `api/services/telemetry.py` and `RAG_OTEL_SERVICE_VERSION` in `docker-compose.telemetry.yml` and `docker-compose.telemetry.verify.yml` (#605, #656), registered by infrastructure |
 | `../tests/test_ui_dependencies.py` | host-only: the copy of `ui/package.json` embedded in `IMPLEMENTATION.md` (`### ui/package.json`) is the file, exactly, so a UI dependency bump that misses the copy fails (#532), registered by infrastructure |
 | `../tests/test_tailwind_output.py` | runs from the host, standard library plus the docker CLI: the built UI CSS keeps what the Tailwind 4 migration relies on (RD-157, #773): the `prose` and `prose-sm` rules, `relative`, `hover` on every device with no `@media (hover: hover)`, and the `@source` globs with automatic detection off (a sentinel `.jsx` file under `ui/src/` is scanned, a sentinel `.md` file is not). It builds a scratch copy of `ui/` with `npm ci --ignore-scripts` from the lock file and `vite build` in a throwaway container of the image `ui/Dockerfile` builds with (its `builder` stage), not on the host (#826), so it needs the network unless the image and the npm cache are present, and is skipped, with a message, only when the docker CLI is missing (a docker or build failure fails it); a second class reads `ui/src/index.css`, `NavBar.tsx` and `ui/Dockerfile` directly, and checks that the builder image is an image reference with a tag or a digest (a `--platform` flag, a digest pin and a registry with a port are accepted; a token starting with `-` is refused before it reaches `docker run`); a third checks, with a stub in place of docker, that a build step that times out has its named container removed (#841). Registered by infrastructure |
-| `15_transfer_paths.sh` | transfer and tuning paths with no check before (#387): import refusals, `on_conflict`, unknown job ids, `/packages`, the package file unchanged, export without the model store, `retrieve.py` (E8-E10), E11 retrieval, a re-chunk with no chunks; run by `05_transfer.sh` |
+| `15_transfer_paths.sh` | transfer and tuning paths with no check before (#387): import refusals, `on_conflict`, unknown job ids, `/packages`, the package file unchanged, export without the model store, `retrieve.py` (E8-E10), E11 retrieval, a re-chunk with no chunks; the package expansion caps on import (#317, `test_package_limits.py`) and `docker-compose.yml`'s values for them; run by `05_transfer.sh` |
 | `transfer_packages.py` | helper for suite 15; writes one damaged copy of a package per refusal kind |
 | `../tests/test_package_refusals.py` | controlled import checks 1 and 2, collection-name and `chunks.jsonl` record refusals, registered by suite 15 |
 | `../tests/test_transfer_paths.py` | controlled transfer and tuning route regressions through the app, registered by suite 15 |
