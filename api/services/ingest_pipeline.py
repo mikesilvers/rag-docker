@@ -844,7 +844,8 @@ def _process_job_sync(
             name = logical[index]
             label = (labels or {}).get(path, name)
             # The estimate's per-file progress (#614): an entry once the file's
-            # first chunks exist, ended below however the file ends.
+            # first chunks exist, ended below however the file ends. Until then
+            # the file counts as not chunked (#896).
             ingest_estimate.file_started(job)
             failed_before, has_entry = job["files_failed"], False
             try:
@@ -976,8 +977,8 @@ def _process_job_sync(
                 job["errors"].append(f"{label}: {str(exc) or type(exc).__name__}")
                 _log.warning("ingest job %s: %r failed", job_id, label, exc_info=True)
             finally:
-                if has_entry:
-                    ingest_estimate.file_ended(job, failed=job["files_failed"] > failed_before)
+                ingest_estimate.file_ended(job, failed=job["files_failed"] > failed_before,
+                                           has_entry=has_entry)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         # Before the status turns terminal: a client that sees the job end
@@ -1542,6 +1543,7 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
             "file_progress": [],
             "file_progress_omitted": 0,
             "files_started": 0,
+            "file_chunking": False,
             "storing_since": None,
             "errors": [],
             "skipped": skipped,

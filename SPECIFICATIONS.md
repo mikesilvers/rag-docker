@@ -993,16 +993,18 @@ stored whole, and for a file split into parts (§5.1.1) only after its last part
 ones. The rate is measured from real ingests only: each stored part (a file stored whole is
 one part) is a measurement of the characters of its chunks over the seconds its store took,
 embedding and the insert check included; a failed store is not one. The instance keeps its
-last 20 measurements in `{UPLOAD_DIR}/ingest-rate.json` (counts and times only), so a restart
-keeps the rate, and `rate_characters_per_second` is their characters over their seconds.
+last 20 measurements in `{UPLOAD_DIR}/embedding-rate.json` (counts and times only; the older
+`ingest-rate.json` is read until that file exists, #896), so a restart keeps the rate, and
+`rate_characters_per_second` is their characters over their seconds.
 Each entry's `seconds_left` is its characters not yet stored over the rate; for the file
 whose part is being stored it counts down by the time that store has been running, never
 below 0, and a failed file's is 0. The job's `seconds_left` is their sum: it counts only work
-already chunked. `files_not_chunked` is how many files the job hasn't reached, and
-`seconds_left_is_minimum` is `true` while any such file, or any unfinished split file's later
-parts, remain, so the job's time left is then a minimum. Before the instance's first
-measurement the rate and every `seconds_left` are `null` (the Import page says "No estimate
-yet"); there is no default rate. A job that isn't `running` has `null` rate and times and
+already chunked. `files_not_chunked` is how many files the job hasn't reached, plus the file it
+is parsing before its first chunks (#896), and `seconds_left_is_minimum` is `true` while any such
+file, or any unfinished split file's later parts, remain, so the job's time left is then a
+minimum. Before the instance's first measurement the rate and every `seconds_left` are `null`
+(the Import page says "No estimate yet"); there is no default rate. A job that isn't `running`
+has `null` rate and times and
 `seconds_left_is_minimum` `false`; its `file_progress` counts stay. Job records written before
 these fields existed read back with `file_progress: []`, `file_progress_omitted: 0` and the
 other estimate fields `null`/`false`. `GET /ingest/jobs` entries carry `file_progress` as
@@ -2684,8 +2686,8 @@ ingest default.
   collection does not have. Re-embedding a `chunks-only` collection *with*
   chunking fields is refused rather than half-honoured. Re-chunking is also
   refused when a stored source file has no single retained original (a name
-  uploaded more than once, or a second name for the same content) or a
-  retained original is missing from disk. The coverage refusal's
+  retained under more than one digest, or a name with more than one stored
+  chunk set) or a retained original is missing from disk. The coverage refusal's
   `error_detail.uncovered_source_files` names the stored source files a rebuild
   would not reproduce, at most 10 (the first in sorted order), and
   `uncovered_source_files_omitted` counts the rest (#208).
@@ -4359,6 +4361,16 @@ now lives once, in `api/services/ingest_config.py`.
       `finished_at`; `test_finished_at_boundary_of_the_window` lists one exactly 24 hours before the
       request and drops one a second earlier.*
 
+- [x] The ingest time estimate (#614, #896, §3.1.3, "Time estimate"): while an ingest job runs, its
+      status gives each file's chunk counts once it is chunked, the instance's rate measured from
+      stored parts and saved across restarts (a new job uses it from its start), and the time left
+      per file and for the job, a minimum while files not reached, a file being parsed, or a split
+      file's later parts remain; the rate and times are `null` ("no estimate yet") only before the
+      instance's first measurement, and a job that isn't running has no rate or times.
+      *`scripts/tests/test_ingest_estimate.py` (API image, no network, run by `02_ingest.sh`): the
+      rate store across a restart, the time left a running job's status computes, and the per-file
+      progress the job loop records.*
+
 - [x] A write with any record left to `text2vec-ollama` uses `fixed_size(batch_size=10, concurrent_requests=1)` and one whose records all carry vectors `dynamic()`; only objects whose embedding timed out in Weaviate are sent again, at most twice; no other failure is retried; a chunk sent again counts once in `chunks_submitted` (#613, #721).
       *`scripts/tests/test_embed_batching.py` (13 tests, run by `02_ingest.sh` in the API image) checks
       both batch kinds, the resend, its limit, the write counts and rollback, that no other failure is
@@ -4486,6 +4498,10 @@ now lives once, in `api/services/ingest_config.py`.
       *Controlled restart cases in `test_batch_recovery.py`; startup deliberately does not delete targets using mutable recovery data.*
 - [x] After an interrupted tuning cutover is checked, startup durably records the outcome (`complete`, `stale`, or `other-instance`) and clears `cutover_pending`, preserving the recovery collection and journal. Later startups do not compare or re-flag that operation. An undecidable check or failed outcome write remains pending for retry. A tuning job that handles a failure after cutover and has marked history stale records `stale` itself, so only a hard kill, a failed marking or a failed decision write leaves the check for startup (#263).
       *`test_batch_recovery.py`: `test_startup_check_flags_an_interrupted_cutover_only_once`, `test_complete_cutover_is_not_rechecked_after_later_mutation`, `test_other_instance_decision_is_retired_without_touching_sessions`, `test_unreadable_cutover_stays_pending_until_check_can_finish`, `test_failed_outcome_write_keeps_cutover_pending_for_retry`, `test_handled_failure_after_cutover_records_the_decision` and `test_failed_post_cutover_marking_leaves_the_check_for_startup`.*
+- [x] A tuning job whose run is cancelled ends `failed` `TUNE_FAILED`, never `running`; one cancelled after cutover marks sessions stale, records the cutover decision and reports `recovered_as` and `sidecar_snapshots` as a failure does (#870).
+      *`test_batch_recovery.py`: `test_cancellation_before_cutover_fails_the_job_and_leaves_the_original`, `test_cancellation_after_cutover_reports_the_retained_copy`, `test_cancellation_after_reindex_cutover_marks_stale_and_reports_the_copy`, `test_cancellation_while_marking_stale_leaves_the_original_and_says_so`, `test_cancellation_at_the_cutover_record_leaves_the_original_and_says_so` and `test_cancellation_before_the_rebuild_fails_the_job`.*
+- [x] A tuning rebuild's recovery copy keeps links inside the sources folder as links and never stores an outside file's bytes; a linked retained-sources folder, config or gold-standard session, dangling or not, is refused before cutover, naming its path relative to its volume, and the original is kept (#881, #886).
+      *`test_batch_recovery.py`: `test_failed_cutover_copies_source_links_as_links_never_their_bytes`, `test_linked_sources_folder_is_refused_before_cutover`, `test_success_discards_copied_source_links_without_touching_targets`, `test_linked_config_sidecar_is_refused_before_cutover`, `test_dangling_source_link_is_copied_as_a_link` and `test_dangling_session_link_is_refused_naming_its_path`.*
 - [x] Export includes only approved/edited pairs; excluded count matches rejected + pending.
       *2 approved + 1 edited saved; 1 rejected + 1 pending excluded.*
 - [x] Exported file is valid JSON and each pair matches the RAGAS schema.

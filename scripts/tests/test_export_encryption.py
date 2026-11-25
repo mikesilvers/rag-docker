@@ -564,9 +564,9 @@ class Fixture(unittest.TestCase):
         packager._write_archive(stage or self.stage(), STEM, path, passphrase)
         return path
 
-    def build(self, passphrase=None, key=False):
+    def build(self, passphrase=None, key=False, chunks=()):
         extra = {"key": True} if key else {}
-        with patch.object(packager, "read_chunks", return_value=[]), \
+        with patch.object(packager, "read_chunks", return_value=list(chunks)), \
              patch.object(packager.wc, "_collection_config_sync", return_value={"embedding_model": settings.embed_model}), \
              patch.object(packager, "_ingest_config", return_value=None), \
              patch.object(packager, "_goldstandard_sessions", return_value=[]), \
@@ -1148,6 +1148,47 @@ class SameSecondNames(Fixture):
                                      capture_output=True, text=True, timeout=120)
                 self.assertNotEqual(ran.returncode, 0)
                 self.assertIn("FAIL  E5 filename matches the §4.1 pattern", ran.stdout)
+
+
+class SortedChunkKeys(Fixture):
+    """`chunks.jsonl` lines are written with sorted keys, so the same chunks give
+    the same bytes and the same <id8> whatever key order the vector store
+    returns (#863, spec §4.5)."""
+
+    WHEN = datetime(2026, 11, 25, 12, 0, 0, tzinfo=timezone.utc)
+
+    def setUp(self):
+        super().setUp()
+        self.stack.enter_context(patch.object(packager, "_given", set()))
+        self.stack.enter_context(patch.object(packager, "_now", return_value=self.WHEN))
+
+    def chunk_bytes(self, result):
+        work = self.root / ("open-" + uuid.uuid4().hex[:8])
+        work.mkdir()
+        pkg, manifest = packager.open_package(self.exports / result["filename"], work)
+        packager.verify_digests(pkg, manifest)
+        return (pkg / "chunks.jsonl").read_bytes()
+
+    def test_shuffled_key_order_writes_identical_bytes_and_id8(self):
+        forward = records()
+        backward = [{key: dict(reversed(list(value.items()))) if key == "properties" else value
+                     for key, value in reversed(list(record.items()))} for record in forward]
+        # The two orders really differ, at both levels, so the test can't pass vacuously.
+        self.assertEqual(backward, forward)
+        self.assertNotEqual([list(r) for r in backward], [list(r) for r in forward])
+        self.assertNotEqual([list(r["properties"]) for r in backward],
+                            [list(r["properties"]) for r in forward])
+        first = self.build(chunks=forward)
+        second = self.build(chunks=backward)
+        written = self.chunk_bytes(first)
+        self.assertEqual(self.chunk_bytes(second), written)
+        lines = written.decode("utf-8").splitlines()
+        self.assertEqual(len(lines), len(forward))
+        for line in lines:
+            record = json.loads(line)
+            self.assertEqual(list(record), sorted(record))
+            self.assertEqual(list(record["properties"]), sorted(record["properties"]))
+        self.assertEqual(second["id8"], first["id8"])
 
 
 class KeyApi(Fixture):
