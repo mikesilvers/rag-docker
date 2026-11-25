@@ -52,7 +52,7 @@ Change all four together: the Fix Version, the parent epic, the Jira release lab
 
 ### Open a new GitHub issue
 
-1. An urgent bug that can't wait gets the current release's label. Anything else gets no release label, and you ask the maintainer which release it belongs to.
+1. An urgent bug that can't wait gets the current release's label. So does a "Follow-ups from #N" issue for a merged PR by `mikesilvers`, not from a fork, in a triaged release, without asking (`CLAUDE.md`). Anything else gets no release label, and you ask the maintainer which release it belongs to.
 2. Create its RD ticket under that release, as above. Never add `Triage` ("New GitHub issues").
 
 ### Attach a file
@@ -88,7 +88,7 @@ Joe (GitHub `joefeser`) and his bots also work from Jira. His side adds work onl
 | Moving a ticket to Needs Mike without a comment | Say exactly what he has to decide. |
 | Keeping a decision only in chat | Q/A comment on the ticket; scope decisions also on the GitHub issue. |
 | Closing a GitHub issue without checking it | `gh issue view N --json state` first. |
-| Giving a non-urgent new issue a release label | Leave it unlabelled and ask the maintainer. |
+| Giving a non-urgent new issue a release label | Leave it unlabelled and ask the maintainer, unless it is a follow-up for a merged PR in a triaged release ("New GitHub issues"). |
 | Adding `Triage` to your own issue | Never. It means someone else opened it, and it blocks `rag-pr-review`. |
 | Attaching the same file twice | The MCP can't delete attachments. Attach once. |
 | Moving a ticket to Approved | Approved is the maintainer's only. |

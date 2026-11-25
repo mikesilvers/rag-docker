@@ -180,6 +180,7 @@ gh issue close N --reason "not planned"    # a duplicate or a won't-fix
 When you open a new GitHub issue (a follow-up, or a bug found along the way):
 
 - **An urgent bug that can't wait** gets the current release's label: the release in progress, from the open releases in Jira. Its RD ticket goes under that release, as "Ticket format" says.
+- **A "Follow-ups from #N" issue for a merged PR in a triaged release** (by `mikesilvers`, not from a fork, with its issues in a triaged release, as "Merging into `develop`" in `CLAUDE.md` says) gets the current release's label, without asking the maintainer (maintainer decision, 2026-11-24, #900). Its RD ticket goes under that release, as "Ticket format" says.
 - **Anything else** is opened with no release label. Ask the maintainer which release it belongs to, then add that label and file its ticket under that release.
 - **Never add `Triage`.** It means someone other than the maintainer opened the issue, and it blocks `rag-pr-review`.
 
