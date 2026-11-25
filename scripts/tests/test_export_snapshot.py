@@ -224,6 +224,31 @@ class ExportSnapshotTests(unittest.TestCase):
         self.assertEqual(seen, [True])
         self.package(exporter._jobs[job_id])
 
+    def test_export_blocks_only_its_own_collection_under_any_spelling(self):
+        # Reviewer (#509): the lowercase-first alias is the same collection and is
+        # refused busy; another collection's writer is not blocked.
+        seen = {}
+
+        def probe():
+            try:
+                with writes.guard("snapshotColl", timeout=0.2):
+                    seen["alias"] = "acquired"
+            except writes.CollectionBusyError:
+                seen["alias"] = "busy"
+            with writes.guard("OtherColl", timeout=0.5):
+                seen["other"] = "acquired"
+
+        def after_first():
+            thread = threading.Thread(target=probe)
+            thread.start()
+            thread.join(timeout=5)
+
+        self.backend.after_first = after_first
+        job_id = self.run_export()
+        exporter._run(job_id, COLL, False)
+        self.assertEqual(seen, {"alias": "busy", "other": "acquired"})
+        self.package(exporter._jobs[job_id])
+
     def test_export_waits_queued_behind_another_writer(self):
         job_id = self.run_export()
         runner = threading.Thread(target=exporter._run, args=(job_id, COLL, False))

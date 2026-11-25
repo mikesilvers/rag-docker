@@ -11906,17 +11906,22 @@ def _json_default(value: Any) -> Any:
 
 # ── Reading the collection (spec §4.5) ────────────────────────────────────────
 
-def read_chunks(collection: str, documents: dict | None = None) -> Iterator[dict]:
+def read_chunks(collection: str, documents: dict | None = None,
+                shipped: dict | None = None) -> Iterator[dict]:
     """One record per chunk, streamed. Never materialises the collection.
 
     A 100k-chunk corpus is roughly 880 MB of JSON, so nothing here accumulates.
-    `documents` is the retained sources the package ships, by digest; a chunk
-    links only to one of those (#509). None loads the whole index.
+    `documents` is the collection's whole source index, by digest (None loads
+    it), and `shipped` the retained sources the package ships, by digest (None:
+    all of `documents`). A chunk links only to a shipped digest, and only when
+    its name is listed under that one digest in the whole index (#509, #520).
     """
     client = wc.get_client()
     col = client.collections.get(collection)
     if documents is None:
         documents = sources.load_index(collection)["documents"]
+    if shipped is None:
+        shipped = documents
 
     # digests_for_filename() reloads the index on every call, which would be
     # O(chunks x documents). Build the reverse map once.
@@ -11944,8 +11949,9 @@ def read_chunks(collection: str, documents: dict | None = None) -> Iterator[dict
             "vector": vector,
             "properties": props,
             # More than one digest means the same filename was ingested with
-            # different content. Recording null is honest; picking one is not.
-            "source_sha256": digests[0] if len(digests) == 1 else None,
+            # different content. Recording null is honest; picking one is not,
+            # even when only one of those blobs is shipped (#520).
+            "source_sha256": digests[0] if len(digests) == 1 and digests[0] in shipped else None,
         }
 
 
@@ -12217,6 +12223,8 @@ def build(
         # chunk links and sources/ come from it (#509). The exporter holds the
         # writer guard, so no guarded writer changes it meanwhile. A blob missing
         # on disk is not shipped, and chunks naming it get a null source_sha256.
+        # The links are resolved against the whole index, so a name listed under
+        # more than one digest links nowhere, even when only one blob is on disk (#520).
         index = sources.load_index(collection)
         shipped = {}
         for digest, entry in index["documents"].items():
@@ -12235,7 +12243,7 @@ def build(
         def write_chunks(path: Path) -> None:
             nonlocal chunk_count, dimensions, first_props, unresolved
             with path.open("w", encoding="utf-8") as fh:
-                for record in read_chunks(collection, shipped):
+                for record in read_chunks(collection, index["documents"], shipped):
                     if dimensions is None and record["vector"]:
                         dimensions = len(record["vector"])
                     if first_props is None:
@@ -60077,6 +60085,45 @@ class SourceIndexBoundaryTests(unittest.TestCase):
         packager.verify_digests(pkg, manifest)
         importer._validate_package_sources(pkg, manifest)
 
+    def test_export_writes_null_for_a_name_under_two_digests_with_one_missing(self):
+        # #520: an old index lists doc.txt under two digests and one blob is gone.
+        # The name is still ambiguous, so its chunks and parts link to neither.
+        kept_content, unique_content = b"kept version", b"unique source"
+        kept = hashlib.sha256(kept_content).hexdigest()
+        gone = hashlib.sha256(b"gone version").hexdigest()
+        unique = hashlib.sha256(unique_content).hexdigest()
+        retained = sources.collection_dir("Ambiguous")
+        retained.mkdir(parents=True)
+        (retained / kept).write_bytes(kept_content)
+        (retained / unique).write_bytes(unique_content)
+        (retained / "index.json").write_text(json.dumps({
+            "version": 1, "documents": {
+                kept: {"filenames": ["doc.txt"]},
+                gone: {"filenames": ["doc.txt"]},
+                unique: {"filenames": ["unique.txt"]},
+            }}))
+        stored = [Mock(uuid=f"00000000-0000-4000-8000-00000000000{i}", vector=[0.5],
+                       properties={"content": f"chunk {i}", "source_file": name})
+                  for i, name in enumerate(("doc.txt", "doc.txt (part 2)", "unique.txt"))]
+        backend = Mock()
+        backend.collections.get.return_value.iterator.return_value = iter(stored)
+        with patch.object(packager, "exports_dir", return_value=self.root), \
+             patch.object(packager.wc, "get_client", return_value=backend), \
+             patch.object(packager.wc, "_collection_config_sync", return_value={"embedding_model": settings.embed_model}), \
+             patch.object(packager.wc, "_meta_sync", return_value={}), \
+             patch.object(packager, "_ingest_config", return_value=None), \
+             patch.object(packager, "_export_retrieval_settings", return_value=({}, True)), \
+             patch.object(packager, "_goldstandard_sessions", return_value=[]):
+            result = packager.build("Ambiguous")
+        opened = self.root / "ambiguous"
+        opened.mkdir()
+        pkg, manifest = packager.open_package(self.root / result["filename"], opened)
+        links = [r["source_sha256"] for r in packager.iter_chunks_file(pkg)]
+        self.assertEqual(links, [None, None, unique])
+        self.assertEqual({p.name for p in (pkg / "sources").iterdir()}, {"index.json", kept, unique})
+        packager.verify_digests(pkg, manifest)
+        importer._validate_package_sources(pkg, manifest)
+
     def test_import_refuses_a_chunk_naming_a_source_not_in_the_package(self):
         content = b"retained source"
         digest = hashlib.sha256(content).hexdigest()
@@ -60099,6 +60146,23 @@ class SourceIndexBoundaryTests(unittest.TestCase):
                     importer._validate_package_sources(package, {"fidelity": fidelity})
                 self.assertEqual(raised.exception.code, "PACKAGE_CORRUPT")
                 self.assertEqual(raised.exception.detail, {"file": "chunks.jsonl", "line": line})
+
+    def test_chunk_source_check_refuses_invalid_json_and_skips_blank_lines(self):
+        # Reviewer (#509): check 3a's new parse names the bad line; blank lines and
+        # non-object records are left to the insert-time checks.
+        content = b"retained source"
+        digest = hashlib.sha256(content).hexdigest()
+        (self.package / "sources" / digest).write_bytes(content)
+        (self.package / "sources" / "index.json").write_text(json.dumps(self.index(digest)))
+        good = json.dumps({"id": "00000000-0000-4000-8000-000000000000", "vector": [0.5],
+                           "properties": {"content": "c"}, "source_sha256": digest})
+        (self.package / "chunks.jsonl").write_text(good + "\n\n[1, 2]\n" + good + "\n")
+        importer._validate_package_sources(self.package, {"fidelity": "with-sources"})
+        (self.package / "chunks.jsonl").write_text(good + "\n\n{not json\n")
+        with self.assertRaises(PackageError) as raised:
+            importer._validate_package_sources(self.package, {"fidelity": "with-sources"})
+        self.assertEqual(raised.exception.code, "PACKAGE_CORRUPT")
+        self.assertEqual(raised.exception.detail, {"file": "chunks.jsonl", "line": 3})
 
     def test_unresolvable_chunk_source_fails_before_embedding_or_live_work(self):
         content = b"retained source"
@@ -60123,6 +60187,40 @@ class SourceIndexBoundaryTests(unittest.TestCase):
         check_embedding.assert_not_called()
         models.assert_not_called()
         backend.assert_not_called()
+
+    def test_chunk_source_check_and_ingest_settings_check_coexist(self):
+        # Reviewer (#509 with #510): check 3a runs first; once it passes, the
+        # ingest-settings preflight still refuses malformed settings before models
+        # or any backend call, and a package failing both names chunks.jsonl.
+        content = b"retained source"
+        digest = hashlib.sha256(content).hexdigest()
+        (self.package / "sources" / digest).write_bytes(content)
+        (self.package / "sources" / "index.json").write_text(json.dumps(self.index(digest)))
+        (self.package / "ingest_config.json").write_text('{"chunk_size": "invalid"}')
+        manifest = {"fidelity": "with-sources", "files": {},
+                    "collection": {"name": "Coexist"}}
+        (self.package / "manifest.json").write_text(json.dumps(manifest))
+        absent = hashlib.sha256(b"elsewhere").hexdigest()
+        cases = (((digest, None), {"file": "ingest_config.json"}),
+                 ((digest, absent), {"file": "chunks.jsonl", "line": 2}))
+        for links, detail in cases:
+            with self.subTest(links=links):
+                self.chunks_file(self.package, *links)
+                job = {"status": "queued"}
+                with patch.object(settings, "upload_dir", str(self.root)), \
+                     patch.object(importer, "_jobs", {"owned": job}), \
+                     patch.object(importer, "_active", {"owned.tar.gz"}), \
+                     patch.object(packager, "exports_dir", return_value=self.root), \
+                     patch.object(packager, "open_package", return_value=(self.package, manifest)), \
+                     patch.object(importer, "_check_embedding"), \
+                     patch.object(importer, "_ensure_models") as models, \
+                     patch.object(importer.wc, "get_client") as backend:
+                    importer._run("owned", "owned.tar.gz", "replace")
+                self.assertEqual(job["status"], "failed")
+                self.assertEqual(job["error_code"], "PACKAGE_CORRUPT")
+                self.assertEqual(job["error_detail"], detail)
+                models.assert_not_called()
+                backend.assert_not_called()
 
 
 class ManifestFilesBoundaryTests(unittest.TestCase):
