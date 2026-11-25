@@ -356,6 +356,10 @@ One JSON object per line:
   file is listed under the part's own name.
 - Vectors are JSON numbers. A packed float32 sidecar was measured at only ~12%
   smaller after gzip and is rejected (`RAG_EXPORT_ANALYSIS.md` §6).
+- Each line is written with its keys sorted, at every level (`properties` too),
+  so the same chunks always give the same bytes and the same `chunks.jsonl`
+  digest in `files` (§4.4), whatever order the vector store returns the
+  properties in (#863).
 
 ### 4.6 Encryption (#27, #676)
 

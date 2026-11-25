@@ -555,7 +555,7 @@ def build(
                         first_props = record["properties"]
                     if record["source_sha256"] is None:
                         unresolved += 1
-                    fh.write(json.dumps(record, default=_json_default))
+                    fh.write(json.dumps(record, sort_keys=True, default=_json_default))
                     fh.write("\n")
                     chunk_count += 1
                     if progress and chunk_count % 500 == 0:

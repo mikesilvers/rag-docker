@@ -1300,7 +1300,10 @@ reaches a job record, log or response. Since #860 its `SameSecondNames` tests ch
 of one collection whose names would be the same get distinct names (`-2`, `-3`) and keep every
 file, that a name still taken by a key file or given earlier in the process isn't given again,
 that a name taken during the build fails the export and leaves that file, the fallback where
-hard links aren't supported, and that the build fails when no name is free.
+hard links aren't supported, and that the build fails when no name is free. Since #863 its
+`SortedChunkKeys` test checks that two exports of the same chunks, read with their keys and
+their `properties` keys in different orders, write byte-identical `chunks.jsonl` files whose
+lines have sorted keys, and get the same `<id8>`.
 
 `scripts/tests/test_export_encryption.py`, run by `05_transfer.sh` in the API image with no
 network, checks the module against the vendored C2SP CCTV vectors
