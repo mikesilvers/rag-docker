@@ -59,6 +59,7 @@ Before a release's work starts, `rag-release-plan` runs on its epic (`/rag-relea
 All of this is in `rag-release-plan` (SKILL.md steps 7 and 14; reference.md "Lanes and links" and "The epic's Lanes section").
 
 - **Lanes.** A lane is a set of tickets that change the same files. Lanes are grouped by the files the tickets actually change, not by theme. Tickets that share no file go in separate lanes, or are marked independent inside a lane, so they can be worked in parallel.
+- **PR groups.** The tickets that ship together as one branch and one PR. By default, each lane's tickets are one group, in lane order. A large or risky ticket (a feature, a security fix, a data-migration change) gets its own PR. A group whose changes are all Markdown is Markdown-only: it takes the fast path and doesn't count against the limit on open PRs. The lead ticket comes first, and the tickets are done in Blocks order. A ticket added mid-release joins its lane's open group if that group hasn't opened its PR yet, otherwise the lane's next group.
 - **Lane labels** are `lane-<x>-<name>`: a letter and a short name, for example `lane-a-deps`. Every ticket that stays in the release gets one. Filter a lane with `labels = lane-x-...`.
 - **Order inside a lane.** In the Order column of the lane table, `→` means "then", `·` separates independent chains, and `+` joins tickets done together.
 - **Blocks** links mark a whole ticket that waits. In `createJiraIssueLink`, `inwardIssue` is the blocker and `outwardIssue` is the blocked ticket. (`rag-jira` reference.md "Links and lanes")
@@ -127,7 +128,7 @@ Reading two rows:
 - **Records, not approvals.** Q/A answers on a ticket and Decision comments on an issue are records. A fix agent acts only on an answer relayed by the session that started it, and returns any record that no relayed answer confirms. (`rag-fix` SKILL.md "Questions and decisions")
 - **Dev-docs.** A fix agent writes three dev-docs before any code: the analysis, the specifications and the implementation plan. Each goes through a review loop. They live in `mikesilvers/rag-docker-work`, in `RD-<n>/`, never in rag-docker. (`CLAUDE.md` "Developing a fix", `rag-fix`)
 - **Checkpoints.** After every step, the agent overwrites `RD-<n>/checkpoint.md`, appends a line to `log.md`, then commits and pushes its own folder. Ticket decisions and lessons go in `memory.md`. An interrupted ticket is resumed from its checkpoint. (work-repo README "Saving: checkpoint after every step" and "Resuming", `rag-fix` reference.md "Work folder")
-- **One fix, one branch, one PR,** against `develop`. (`CLAUDE.md`)
+- **One fix, one branch, one PR,** against `develop`. The exception is a PR group: tickets the release plan puts in one PR group ship as one branch and one PR, with a `Closes #N` line for each issue it completes. (`CLAUDE.md`, `rag-fix` "Grouped PR")
 - **`Closes #N` or `Part of #N`.** An issue stays open until every PR for it has merged. Use `Closes #N` only on the PR that completes it: merging into `develop` closes the issue. Use `Part of #N` on a PR that doesn't. (`CLAUDE.md`, the [PR template](../.github/pull_request_template.md))
 
 ## 6. Evaluation and merge

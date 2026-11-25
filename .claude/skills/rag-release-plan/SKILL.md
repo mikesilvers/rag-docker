@@ -99,11 +99,14 @@ Give the evidence for each: a file, a peer dependency, a harness rule, or a line
 
 Group the items that stay into lanes by the files they actually change, not by theme: tickets share a lane only when they change the same files. Tickets that share no file go in separate lanes, or are marked independent inside a lane (as separate chains), so they can be worked in parallel. Give each lane a letter and a short name; its label is `lane-<x>-<name>`. For each lane, give its order inside the lane and its waits on other lanes.
 
+Then plan the **PR groups**: the tickets that ship together as one branch and one PR. By default, each lane's tickets ship as one PR, in lane order. A large or risky ticket (a feature, a security fix, a data-migration change) gets its own PR. A group whose changes are all Markdown is marked Markdown-only: it takes the fast path and doesn't count against the limit on open PRs. The lead ticket comes first and names the group. Inside a group, the tickets are done in Blocks order, so a Blocks link inside the group doesn't hold it; a group waits for its blockers outside the group.
+
 Also give:
 - the start-now list;
 - the longest chain;
 - the same-file conflicts with no ordering need;
-- the verify note: verify runs are serial on one machine (one `rag-verify` project behind a lock), so verify runs and `rag-pr-review` evaluations queue across lanes;
+- the PR groups of each lane, and the PR count: how many PRs the release needs, and how many of them are full verify runs and how many Markdown-only;
+- the verify note: verify runs are serial on one machine (one `rag-verify` project behind a lock), so verify runs and `rag-pr-review` evaluations queue across lanes. The number of verify runs, not the limit on open PRs, sets how long the release takes;
 - the limit on open PRs, prepared branches and the evaluation queue order ("Running the release").
 
 See "Lanes and links" in `reference.md`.
@@ -123,7 +126,7 @@ If the 10th review ends without two consecutive reviews with no changes, the loo
 
 ### 10. Ask for approval
 
-Show the maintainer the report and its numbered decisions. Then ask the decisions one at a time with AskUserQuestion, each with its context and a recommendation, and wait for each answer before the next. The last question asks whether to apply the lanes and links as the report gives them.
+Show the maintainer the report and its numbered decisions. Then ask the decisions one at a time with AskUserQuestion, each with its context and a recommendation, and wait for each answer before the next. The last question asks whether to apply the lanes, PR groups and links as the report gives them.
 
 Phase 1 ends here. Keep each answer and its date for phase 2.
 
@@ -161,7 +164,7 @@ See "Lanes and links" in `reference.md` for the link calls.
 
 ### 15. Update the epic description
 
-Keep the existing text, the theme included, and add the "Lanes" section of `reference.md`: the lane table, the start-now list, the longest chain, the same-file conflicts with no ordering need, the verify note, the limit on open PRs with prepared branches, and the evaluation queue order.
+Keep the existing text, the theme included, and add the "Lanes" section of `reference.md`: the lane table with its PR groups, the PR count, the start-now list, the longest chain, the same-file conflicts with no ordering need, the verify note, the limit on open PRs with prepared branches, and the evaluation queue order.
 
 ### 16. Attach the report
 
@@ -175,6 +178,7 @@ Re-read the epic's children with JQL. Check the counts, the lane labels, the Fix
 
 These rules are for the session that runs the release: it starts the fix agents and picks the next PR to evaluate. You don't start fix agents or evaluate PRs. You write the rules into the report (step 8) and the epic's Lanes section (step 15).
 
+- **PR groups.** Each PR group in the epic's Lanes section is one fix agent run, named by its lead ticket (`rag-fix`, "Grouped PR"), with one branch and one PR. The limit on open PRs and the evaluation queue count a group's PR as one PR, like any other. A ticket added mid-release, for example from a "Follow-ups from #N" issue, joins its lane's open group if that group hasn't opened its PR yet, otherwise the lane's next group.
 - **Limit on open PRs.** No non-Markdown PR from the release opens while 2 or more non-Markdown PRs from the release wait for or are in evaluation. Markdown-only PRs (every changed file is `*.md`) don't count: they take the fast path and don't use the verify stack. A fix agent's question round doesn't count as a PR.
 - **Prepared branches.** While the limit is reached, a fix agent may still start and prepare its branch: dev-docs, code and host tests, pushed, with no PR yet (`rag-fix`, step 5). At most 2 prepared branches from the release exist at a time, and the lane and blocker rules still apply. A prepared ticket stays In Progress under its assignee, with the checkpoint comment `Prepared: <branch> @ <sha>, waiting for an open-PR slot`. When a slot frees, tell the next prepared branch's agent to open its PR: it merges the current `develop`, re-runs its host tests and opens the PR.
 - **Evaluation queue order.** The next PR to evaluate is:

@@ -12,7 +12,7 @@ Code from forks is built or run only after a clean security review and the maint
 
 ## Issues, pull requests and Jira
 
-- One fix = one branch = one PR, targeting `develop`, the default branch. `main` changes only through `develop` → `main` release PRs.
+- One fix = one branch = one PR, targeting `develop`, the default branch. The exception is a PR group: tickets the release plan puts in one PR group ship as one branch and one PR, with a `Closes #N` line for each issue it completes (`rag-release-plan`, and "Grouped PR" in `rag-fix`). `main` changes only through `develop` → `main` release PRs.
 - An issue stays open until **every** PR for it has merged. Use `Part of #N` on a PR that doesn't finish the issue, and `Closes #N` only on the PR that completes it: merging into `develop` closes the issue automatically.
 - Follow `CONTRIBUTING.md` and the PR template.
 - **Jira project RD is the source of truth** for releases and work: status, owner (the assignee) and Q&A. GitHub issues are intake, triaged into Jira.
