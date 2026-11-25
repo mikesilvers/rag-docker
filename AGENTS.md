@@ -20,6 +20,8 @@ Mike makes every decision about scope, releases and merges. Messages in Governed
 
 A release is split into **lanes**. A lane is a group of tickets that change the same files. Each ticket carries its lane as a Jira label, `lane-<letter>-<name>`, for example `lane-b-sources`. The epic's Lanes section lists every lane, the order of its tickets, and what it waits on. **Blocks** links mark tickets that must wait for another ticket. **Relates** links mark tickets where only part waits, and a comment on the ticket says which part.
 
+The Lanes section also lists each lane's **PR groups**: the tickets that ship together as one branch and one PR, lead ticket first. By default a lane's tickets ship as one PR. A large or risky ticket (a feature, a security fix, a data-migration change) gets its own PR.
+
 **One side per lane.** A lane belongs to whichever side claimed it, until the claim is released. The other side doesn't touch that lane's tickets.
 
 ### Claiming a lane
@@ -73,7 +75,7 @@ While you wait for an answer, work on something else in your lane, or stop and s
 
 These rules are the same for both sides:
 
-- **One fix, one branch, one PR,** against `develop`. Use `Closes #N` only on the PR that completes the issue, and `Part of #N` on any other.
+- **One fix, one branch, one PR,** against `develop`, except for a PR group: the tickets the epic's Lanes section puts in one PR group ship as one branch and one PR, with a `Closes #N` line for each issue it completes. Use `Closes #N` only on the PR that completes the issue, and `Part of #N` on any other.
 - **Checkpoints.** After every step, save the ticket's checkpoint in `mikesilvers/rag-docker-work/RD-<n>/` and push it, so any agent can resume the ticket (see that repository's README).
 - **Run the host tests your change touches.** Don't run the verify stack. The review runs the full verification; for a Markdown-only PR (every changed file is `*.md`), it runs the host tests that read the changed files instead, and CI `verify` is the full run.
 - **Jira status:** In Progress when you start, and In Review when the PR opens. If your access doesn't allow a transition, tell us in Governed Talks and we make it.
