@@ -15760,11 +15760,13 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
         validated_retrieval = _read_retrieval_config(pkg, original, retrieval_notes)
         validated_ingest = _read_ingest_config(pkg, original)
 
+        # One import per target, whatever its conflict mode, claimed before any
+        # model is installed and before the existence check, so a refused import
+        # changes nothing, and held until the job ends (#391, #492).
+        _claim_target(job_id, target)
+
         model_notes = _ensure_models(pkg, manifest)                 # spec §6.3
 
-        # One import per target, whatever its conflict mode, claimed before the
-        # existence check and held until the job ends (#391).
-        _claim_target(job_id, target)
         # Hold one target guard across conflict check, replacement, and sidecars.
         with (collection_writes.guard(target) if on_conflict == "replace" else nullcontext()):
             # Before the existence check: a target the delete hasn't removed yet
@@ -30721,8 +30723,11 @@ frees the original. With the target created at the start of the build, as Weavia
 does, a second `abort`, `rename` or `replace` import is still refused
 `IMPORT_IN_PROGRESS`, so the claim is checked to come before the existence check; a
 refused job's `POST /import` answers 202 and registers nothing against the
-collection; a target is free again after its import fails; and a start whose first
-job record can't be stored releases the package name. `05_transfer.sh` runs it in
+collection; a target is free again after its import fails; a refused import leaves
+the claim with its holder, so a third import of the target is refused too; the claim
+comes before the `COLLECTION_DELETING` check; a refused import never reaches model
+installation (#492); and a start whose first job record can't be stored releases the
+package name. `05_transfer.sh` runs it in
 the verify project's API container.
 
 `scripts/tests/test_ingest_errors.py` (#290) checks that damaged or unreadable ZIPs are

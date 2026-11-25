@@ -349,6 +349,64 @@ class ImportGuardTests(unittest.TestCase):
         self.release.set()
         self.assertTrue(self.wait_finished(loop, first_id))
 
+    def test_a_refused_import_leaves_the_claim_with_its_holder(self):
+        # The refused job's own cleanup must not release the first job's claim:
+        # a third import of the target, while the first still builds, is refused too.
+        loop = self.new_loop()
+        self.packages.update({"a.tar.gz": "Held", "b.tar.gz": "Held", "c.tar.gz": "Held"})
+        first_id = self.start(loop, "a.tar.gz", "abort")
+        self.assertTrue(self.wait_arrived(loop, 1), self.job(first_id))
+        second_id = self.start(loop, "b.tar.gz", "abort")
+        self.assertTrue(self.wait_finished(loop, second_id, timeout=2.0), self.job(second_id))
+        self.assert_refused(self.job(second_id), "Held")
+        self.assertEqual(getattr(importer, "_targets", {}), {"Held": first_id})
+        third_id = self.start(loop, "c.tar.gz", "rename")
+        self.assertTrue(self.wait_finished(loop, third_id, timeout=2.0), self.job(third_id))
+        self.assert_refused(self.job(third_id), "Held")
+        self.assertEqual(self.marker_owner("Held"), first_id)
+        self.release.set()
+        self.assertTrue(self.wait_finished(loop, first_id))
+        self.assertEqual(self.job(first_id)["status"], "completed", self.job(first_id))
+        self.assertEqual(self.built, ["Held"])
+
+    def test_the_claim_comes_before_the_deleting_check(self):
+        # The claim is taken before the COLLECTION_DELETING check as well: a
+        # second abort import of a claimed target is refused for the import in
+        # progress, whatever the delete registry says.
+        loop = self.new_loop()
+        self.packages.update({"a.tar.gz": "Gone", "b.tar.gz": "Gone"})
+        first_id = self.start(loop, "a.tar.gz", "abort")
+        self.assertTrue(self.wait_arrived(loop, 1), self.job(first_id))
+        with patch.object(writes, "delete_in_progress", return_value=True):
+            second_id = self.start(loop, "b.tar.gz", "abort")
+            if not self.wait_finished(loop, second_id, timeout=2.0):
+                self.release.set()
+                self.assertTrue(self.wait_finished(loop, second_id), self.job(second_id))
+        self.assert_refused(self.job(second_id), "Gone")
+        self.release.set()
+        self.assertTrue(self.wait_finished(loop, first_id))
+
+    def test_a_refused_import_installs_no_model(self):
+        # The claim comes before model installation: an import refused for the
+        # import in progress never reaches _ensure_models, so it installs nothing.
+        seen = []
+
+        def record(pkg, manifest):
+            seen.append(Path(pkg).name)
+            return []
+        with patch.object(importer, "_ensure_models", side_effect=record):
+            loop = self.new_loop()
+            self.packages.update({"a.tar.gz": "Models", "b.tar.gz": "Models"})
+            first_id = self.start(loop, "a.tar.gz", "abort")
+            self.assertTrue(self.wait_arrived(loop, 1), self.job(first_id))
+            second_id = self.start(loop, "b.tar.gz", "abort")
+            self.assertTrue(self.wait_finished(loop, second_id, timeout=2.0), self.job(second_id))
+            self.assert_refused(self.job(second_id), "Models")
+            self.assertEqual(seen, ["a.tar.gz"])
+            self.release.set()
+            self.assertTrue(self.wait_finished(loop, first_id))
+            self.assertEqual(self.job(first_id)["status"], "completed", self.job(first_id))
+
     def test_a_target_is_free_again_after_its_import_fails(self):
         loop = self.new_loop()
         self.fail_build.add("Broken")
