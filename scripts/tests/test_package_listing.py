@@ -221,6 +221,49 @@ class ListingTestCase(unittest.TestCase):
                 self.assertEqual(listed[path.name], dict(
                     filename=path.name, size_bytes=path.stat().st_size, readable=False, encrypted=False, encryption="none", key_on_server=False, **NULLS))
 
+    def test_structured_values_are_listed_unreadable(self):
+        # An array or object where a listed value belongs is a wrong JSON type too (#451).
+        good = manifest_first(self.exports / f"{STEM}.tar.gz")
+        collection = MANIFEST["collection"]
+        bad = {
+            "collection-array": dict(MANIFEST, collection=[collection]),
+            "name-object": dict(MANIFEST, collection=dict(collection, name={"name": "Policies"})),
+            "count-array": dict(MANIFEST, collection=dict(collection, chunk_count=[12])),
+            "fidelity-array": dict(MANIFEST, fidelity=["chunks-only"]),
+            "created-at-object": dict(MANIFEST, created_at={"at": "2026-09-18T15:31:27Z"}),
+        }
+        for name, manifest in bad.items():
+            manifest_first(self.exports / f"ragpkg-{name}.tar.gz", manifest=manifest)
+        listed = self.listing()
+        self.assertEqual(set(listed), {good.name} | {f"ragpkg-{n}.tar.gz" for n in bad})
+        self.assert_readable(listed[good.name])
+        for name in bad:
+            path = self.exports / f"ragpkg-{name}.tar.gz"
+            with self.subTest(file=name):
+                self.assertEqual(listed[path.name], dict(
+                    filename=path.name, size_bytes=path.stat().st_size, readable=False, encrypted=False, encryption="none", key_on_server=False, **NULLS))
+
+    def test_well_typed_values_are_listed_unchanged(self):
+        # Only JSON types are checked: an int count of any value, and any strings, list as they are.
+        collection = MANIFEST["collection"]
+        cases = {
+            "count-zero": dict(MANIFEST, collection=dict(collection, chunk_count=0)),
+            "count-negative": dict(MANIFEST, collection=dict(collection, chunk_count=-1)),
+            "empty-strings": dict(MANIFEST, collection=dict(collection, name=""), fidelity="", created_at=""),
+        }
+        for name, manifest in cases.items():
+            manifest_first(self.exports / f"ragpkg-{name}.tar.gz", manifest=manifest)
+        listed = self.listing()
+        for name, manifest in cases.items():
+            path = self.exports / f"ragpkg-{name}.tar.gz"
+            with self.subTest(file=name):
+                self.assertEqual(listed[path.name], dict(
+                    filename=path.name, size_bytes=path.stat().st_size, readable=True,
+                    encrypted=False, encryption="none", key_on_server=False,
+                    collection=manifest["collection"]["name"],
+                    chunk_count=manifest["collection"]["chunk_count"],
+                    fidelity=manifest["fidelity"], created_at=manifest["created_at"], expires_at=None))
+
     def test_null_or_absent_fields_list_as_null(self):
         cases = {
             "collection-null": dict(MANIFEST, collection=None, fidelity=None, created_at=None),

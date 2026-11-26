@@ -15424,7 +15424,7 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
                 f"match their checksums. Restore it, or re-pull it with "
                 f"`docker compose exec ollama ollama pull {ref}`, then import again.",
                 {"model": name})
-        if model_bundle.model_ref(model) not in bundled:
+        if ref not in bundled:
             if not required:
                 notes.append(f"model '{ref}' is absent and not bundled; "
                              "queries will fail until it is pulled")
@@ -50522,7 +50522,7 @@ check "bundled-model install safety, E21 install and E22 EMBEDDING_MODEL_MISSING
 check "real embedding model exported, installed and refused when mismatched" $?
 # The package listing reads each manifest without decompressing the package (#383).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_package_listing.py)
-check "the package listing reads only up to each manifest (#383)" $?
+check "the package listing reads only up to each manifest (#383, #451)" $?
 # Passphrase encryption (#27): the age module against the CCTV vectors, export,
 # import, listing and refusals, with no backend.
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_export_encryption.py)
@@ -51453,6 +51453,11 @@ from config import settings
 from services import importer, model_bundle as models
 alias, name = "vfy-install-alias:latest", "vfy-install-alias"
 out = {"error": None}
+if Path(settings.ollama_models_dir) != Path("/ollama"):  # the api mount the guard above inspected (#582)
+    out["error"] = (f"OLLAMA_MODELS_DIR is {settings.ollama_models_dir!r}, not /ollama, "
+                    "the path the mount guard checked; nothing was written")
+    print(json.dumps(out))
+    raise SystemExit(0)
 target = models.manifest_path(alias)
 try:
     own = models.manifest_path(settings.embed_model)
