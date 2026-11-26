@@ -1882,9 +1882,11 @@ class OfflineTests(unittest.TestCase):
         with self.assertRaises(httpx.ConnectError):
             asyncio.run(ollama_client.list_models())
         health = asyncio.run(ollama_client.check_health())
-        # `same_model` is a flag beside the three models (#671).
+        # `same_model` is a flag beside the three models (#671); `version` is the
+        # running Ollama's, None when it can't be read (#673).
         self.assertEqual({model["status"] for model in health.values() if isinstance(model, dict)}, {"error"})
-        self.assertEqual(set(health), {"llm", "build_llm", "embed", "same_model"})
+        self.assertEqual(set(health), {"llm", "build_llm", "embed", "same_model", "version"})
+        self.assertIsNone(health["version"])
 
 
 class MfaUnitTests(unittest.TestCase):

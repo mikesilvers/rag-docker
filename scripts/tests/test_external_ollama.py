@@ -309,6 +309,15 @@ class HealthTests(unittest.TestCase):
         self.assertIsNone(resources["ollama_loaded"])
         self.assertIn("/api/ps", resources["ollama_loaded_note"])
 
+    def test_the_public_route_reads_only_the_model_list(self):
+        # The container healthcheck's route waits on nothing it doesn't use.
+        for on in (False, True):
+            with self.subTest(external=on), external(on), FakeOllama().serving() as fake, \
+                    patch.object(wc, "check_health", AsyncMock(return_value=True)):
+                response = self.client.get("/health")
+            self.assertEqual(response.json(), {"status": "ok"})
+            self.assertEqual({p for _, p, _ in fake.requests}, {"/api/tags"})
+
     def test_a_missing_model_is_still_503_in_external_mode(self):
         with external():
             response = self.details(FakeOllama(models=[settings.embed_model]))

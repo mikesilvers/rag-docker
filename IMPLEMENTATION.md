@@ -5440,9 +5440,10 @@ async def loaded_models() -> list[dict]:
 
 
 @telemetry.traced("ollama.health")
-async def check_health() -> dict:
+async def check_health(with_version: bool = True) -> dict:
     """`llm` is the answer model, `build_llm` the build model (#671). A model is
-    present only when Ollama lists its exact `name:tag` (#673)."""
+    present only when Ollama lists its exact `name:tag` (#673). `with_version`
+    adds `version` (`GET /api/version`), for /health/details."""
     answer, build = settings.answer_model, settings.build_model
     same = same_model(answer, build)
     start = time.monotonic()
@@ -5469,10 +5470,11 @@ async def check_health() -> dict:
             "build_llm": {"status": "error", "latency_ms": latency_ms, "model": build},
             "embed": {"status": "error", "latency_ms": latency_ms, "model": settings.embed_model},
             "same_model": same,
-            "version": None,
+            **({"version": None} if with_version else {}),
         }
     # Information only: the version never decides the status (#673).
-    result["version"] = await version()
+    if with_version:
+        result["version"] = await version()
     return result
 ```
 
@@ -17891,8 +17893,12 @@ router = APIRouter()
 # AI Engineers the full report, with the same 200/503 rule.
 
 
-async def _report() -> tuple[bool, dict]:
-    """Whether every dependency is ok, and the full report."""
+async def _report(details: bool = True) -> tuple[bool, dict]:
+    """Whether every dependency is ok, and the full report.
+
+    `details` False is the public route's: it leaves out the reads that only
+    inform (the Ollama version and, with an external Ollama, what it has
+    loaded), so the container healthcheck waits on nothing it doesn't use (#673)."""
     results = {}
     overall_ok = True
 
@@ -17912,7 +17918,7 @@ async def _report() -> tuple[bool, dict]:
     if not ok:
         overall_ok = False
 
-    ollama_result = await ollama.check_health()
+    ollama_result = await ollama.check_health(with_version=details)
     results["ollama"] = ollama_result
     # `same_model` is a flag, not a service: it never decides the status (#671).
     if any(v["status"] != "ok" for v in ollama_result.values() if isinstance(v, dict)):
@@ -17923,7 +17929,7 @@ async def _report() -> tuple[bool, dict]:
     # requests; failing the endpoint would mark the api container unhealthy and
     # take the whole stack down over a tuning warning.
     resources = {"memory": system_info.memory_info(settings.recommended_memory_gb)}
-    if settings.rag_external_ollama:
+    if settings.rag_external_ollama and details:
         # The LLM runs in the external Ollama, outside Docker, so Docker's memory
         # isn't compared with the recommendation; what that Ollama has loaded,
         # other apps' models included, is reported and never acted on (#673).
@@ -17944,7 +17950,7 @@ async def _report() -> tuple[bool, dict]:
 
 @router.get("/health")
 async def health_check():
-    overall_ok, _ = await _report()
+    overall_ok, _ = await _report(details=False)
     return JSONResponse(status_code=200 if overall_ok else 503,
                         content={"status": "ok" if overall_ok else "degraded"})
 
@@ -40516,6 +40522,15 @@ class HealthTests(unittest.TestCase):
         self.assertIsNone(resources["ollama_loaded"])
         self.assertIn("/api/ps", resources["ollama_loaded_note"])
 
+    def test_the_public_route_reads_only_the_model_list(self):
+        # The container healthcheck's route waits on nothing it doesn't use.
+        for on in (False, True):
+            with self.subTest(external=on), external(on), FakeOllama().serving() as fake, \
+                    patch.object(wc, "check_health", AsyncMock(return_value=True)):
+                response = self.client.get("/health")
+            self.assertEqual(response.json(), {"status": "ok"})
+            self.assertEqual({p for _, p, _ in fake.requests}, {"/api/tags"})
+
     def test_a_missing_model_is_still_503_in_external_mode(self):
         with external():
             response = self.details(FakeOllama(models=[settings.embed_model]))
@@ -42867,9 +42882,11 @@ class OfflineTests(unittest.TestCase):
         with self.assertRaises(httpx.ConnectError):
             asyncio.run(ollama_client.list_models())
         health = asyncio.run(ollama_client.check_health())
-        # `same_model` is a flag beside the three models (#671).
+        # `same_model` is a flag beside the three models (#671); `version` is the
+        # running Ollama's, None when it can't be read (#673).
         self.assertEqual({model["status"] for model in health.values() if isinstance(model, dict)}, {"error"})
-        self.assertEqual(set(health), {"llm", "build_llm", "embed", "same_model"})
+        self.assertEqual(set(health), {"llm", "build_llm", "embed", "same_model", "version"})
+        self.assertIsNone(health["version"])
 
 
 class MfaUnitTests(unittest.TestCase):
@@ -58197,7 +58214,7 @@ class ExternalOllamaJobTests(unittest.TestCase):
         self.assertIn('echo "$OLLAMA_INSTALL_SHA256  $RUNNER_TEMP/install.sh" | sha256sum -c -', step)
         # The check comes before the script runs, and nothing is piped into a shell.
         self.assertLess(step.index('sha256sum -c -'), step.index('sh "$RUNNER_TEMP/install.sh"'))
-        self.assertNotRegex(code(text), r'\|\s*(sudo\s+)?(ba)?sh\b')
+        self.assertNotRegex(code(text), r'\|[ \t]*(sudo[ \t]+)?(ba)?sh\b')
         self.assertIn('0.40.18', (ROOT / 'README.md').read_text())
 
     def test_binds_ollama_to_docker0_never_every_address(self):

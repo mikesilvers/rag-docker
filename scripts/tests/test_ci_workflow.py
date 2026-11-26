@@ -209,7 +209,7 @@ class ExternalOllamaJobTests(unittest.TestCase):
         self.assertIn('echo "$OLLAMA_INSTALL_SHA256  $RUNNER_TEMP/install.sh" | sha256sum -c -', step)
         # The check comes before the script runs, and nothing is piped into a shell.
         self.assertLess(step.index('sha256sum -c -'), step.index('sh "$RUNNER_TEMP/install.sh"'))
-        self.assertNotRegex(code(text), r'\|\s*(sudo\s+)?(ba)?sh\b')
+        self.assertNotRegex(code(text), r'\|[ \t]*(sudo[ \t]+)?(ba)?sh\b')
         self.assertIn('0.40.18', (ROOT / 'README.md').read_text())
 
     def test_binds_ollama_to_docker0_never_every_address(self):

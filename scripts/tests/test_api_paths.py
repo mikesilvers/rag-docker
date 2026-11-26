@@ -528,10 +528,13 @@ class MetricsRouteTests(ApiTestCase):
 
 class HealthProbeTests(ApiTestCase):
     def ollama_ok(self):
-        """Ollama's /api/tags, answered by a mock transport, listing both models."""
+        """Ollama's /api/tags, answered by a mock transport, listing both models as
+        Ollama names them: `name:tag`, `:latest` only for a name without a tag (the
+        check is tag-exact since #673)."""
         def tags(request):
             names = [settings.llm_model, settings.embed_model]
-            return httpx.Response(200, json={"models": [{"name": n + ":latest"} for n in names]})
+            return httpx.Response(200, json={"models": [
+                {"name": n if ":" in n.rsplit("/", 1)[-1] else n + ":latest"} for n in names]})
 
         def client_factory(*args, **kwargs):
             kwargs["transport"] = httpx.MockTransport(tags)
@@ -552,10 +555,10 @@ class HealthProbeTests(ApiTestCase):
             release.wait(60)
             return True
 
-        async def ollama_check():
+        async def ollama_check(*args, **kwargs):
             hung.append(time.monotonic())
             release.set()
-            return await real_ollama_check()
+            return await real_ollama_check(*args, **kwargs)
         # Runs before the client closes (cleanups run last-in first-out), freeing the thread.
         self.addCleanup(release.set)
         with self.ollama_ok(), patch.object(wc, "_check_health_sync", hang), \

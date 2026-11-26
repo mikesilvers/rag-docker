@@ -139,9 +139,10 @@ async def loaded_models() -> list[dict]:
 
 
 @telemetry.traced("ollama.health")
-async def check_health() -> dict:
+async def check_health(with_version: bool = True) -> dict:
     """`llm` is the answer model, `build_llm` the build model (#671). A model is
-    present only when Ollama lists its exact `name:tag` (#673)."""
+    present only when Ollama lists its exact `name:tag` (#673). `with_version`
+    adds `version` (`GET /api/version`), for /health/details."""
     answer, build = settings.answer_model, settings.build_model
     same = same_model(answer, build)
     start = time.monotonic()
@@ -168,8 +169,9 @@ async def check_health() -> dict:
             "build_llm": {"status": "error", "latency_ms": latency_ms, "model": build},
             "embed": {"status": "error", "latency_ms": latency_ms, "model": settings.embed_model},
             "same_model": same,
-            "version": None,
+            **({"version": None} if with_version else {}),
         }
     # Information only: the version never decides the status (#673).
-    result["version"] = await version()
+    if with_version:
+        result["version"] = await version()
     return result
