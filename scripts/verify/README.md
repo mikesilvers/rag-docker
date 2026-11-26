@@ -437,7 +437,13 @@ also checks all saved retrieval fields round-trip. `legacy_retrieval.py` (E28,
 #184) writes a legacy `ef` and other invalid saved settings into the API
 container, then checks through the real API that a legacy `ef` exports and
 imports as `null` with a warning or note, and that other invalid saved settings
-fail the export early with an actionable error and publish nothing. Crafted
+fail the export early with an actionable error and publish nothing.
+`ingest_settings_export.py` (E52, #919) does the same for saved ingest settings: it
+writes a saved file that isn't a JSON object, one with a wrong-typed `chunk_size` and
+one with an invalid `chunk_size` into the API container, and checks through the real
+export job that each export fails with an error naming the collection, the field and
+the Chunking Configuration page, and publishes nothing; it restores the saved file
+afterwards. Crafted
 packages are written under a `.part` name and renamed into place, because on
 Docker Desktop the API can read a freshly written bind-mounted file as empty. Controlled tests complement,
 and do not replace, this live acceptance.
@@ -548,8 +554,11 @@ collection; a target is free again after its import fails; a refused import leav
 the claim with its holder, so a third import of the target is refused too; the claim
 comes before the `COLLECTION_DELETING` check; a refused import never reaches model
 installation, the target stays claimed while its holder installs models, and a
-target is free again after a failed model installation (#492); and a start whose
-first job record can't be stored releases the package name. `05_transfer.sh` runs it
+target is free again after a failed model installation (#492); a start whose
+first job record can't be stored releases the package name; and an import whose task
+is cancelled before its worker runs frees the package name, then reads `failed`
+`IMPORT_FAILED` with the cancelled message, a worker that starts late runs nothing,
+and one that started is left to settle its own job (#871). `05_transfer.sh` runs it
 in the verify project's API container.
 
 `scripts/tests/test_ingest_errors.py` (#290) checks that damaged or unreadable ZIPs are
