@@ -337,6 +337,41 @@ class WorkerTests(unittest.TestCase):
         steps = [c[0] for c in backend.calls if c[0] != "has"]
         self.assertEqual(steps, ["mark", "insert", "delete", "insert", "insert", "delete"])
 
+    def test_a_replacement_marks_retained_sessions_through_the_real_marking(self):
+        # #571: the caller end to end, through the real durable marking.
+        upload = tempfile.TemporaryDirectory()
+        self.addCleanup(upload.cleanup)
+        retained = {
+            "session_id": "gs_57abcdef", "collection": "Coll", "status": "completed",
+            "pairs_total": 1, "pairs_completed": 1,
+            "pairs": [{"pair_id": "pair0", "question": "Inert question", "answer": "Inert answer",
+                       "contexts": ["Inert context"], "ground_truth": "Inert truth",
+                       "source_file": "p.txt", "chunk_index": 0, "status": "approved"}]}
+        backend = FakeCollection(**{"p.txt": ["v1"]})
+        real_mark = goldstandard.mark_stale
+
+        def mark(collection, reason, require_durable=False):
+            backend.calls.append(("mark", reason))
+            return real_mark(collection, reason, require_durable=require_durable)
+
+        reason = "documents were re-ingested, replacing their earlier chunks: p.txt"
+        with patch.object(settings, "upload_dir", upload.name), \
+                patch.object(goldstandard, "_sessions", {}):
+            goldstandard.store_session(retained)
+            job = self.run_job(backend, [("p.txt", "v2")], mark=mark)
+            self.assertEqual((job["status"], job["chunks_replaced"]), ("completed", 1))
+            self.assertEqual([c["content"] for c in backend.chunks["p.txt"]], ["v2"])
+            for reload in (False, True):
+                if reload:
+                    goldstandard._sessions.clear()
+                    goldstandard.load_sessions_from_disk()
+                with self.subTest(reload=reload):
+                    current = goldstandard.get_session("gs_57abcdef")
+                    self.assertTrue(current["stale"])
+                    self.assertEqual(current["stale_reason"], reason)
+        steps = [c[0] for c in backend.calls if c[0] != "has"]
+        self.assertEqual(steps, ["mark", "insert", "delete"])
+
     def real_sources(self):
         """Retention into a temporary sources folder, through the real store."""
         temp = tempfile.TemporaryDirectory()
