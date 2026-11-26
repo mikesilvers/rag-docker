@@ -36,19 +36,45 @@ rb_sha256() {
   fi
 }
 
+# Prints the text the age image's tag hashes (#856, #862): the parser
+# directives of scripts/age/Dockerfile (the `# key=value` lines at its top,
+# up to the first line that isn't one) and its other lines that are neither
+# blank nor a comment, in file order; then, for every other entry of
+# scripts/age that isn't a folder, in byte order of its path there, the line
+# `file <path>` and its content's SHA-256, or `link <path>` and its target.
+rb_age_text() {
+  local dir="$RB_ROOT/scripts/age" rel target
+  awk 'BEGIN { d = 1 }
+       d && /^[[:space:]]*#[[:space:]]*[A-Za-z][A-Za-z0-9_-]*[[:space:]]*=/ { print; next }
+       { d = 0 }
+       /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+       { print }' "$dir/Dockerfile" || return 1
+  # The loop runs in a subshell (the last part of a pipeline): `exit` ends it.
+  (cd "$dir" && find . ! -type d ! -path ./Dockerfile) | sed 's|^\./||' | LC_ALL=C sort |
+    while IFS= read -r rel; do
+      if [ -L "$dir/$rel" ]; then
+        target=$(readlink "$dir/$rel") || exit 1
+        printf 'link %s\n%s\n' "$rel" "$target"
+      else
+        printf 'file %s\n' "$rel"
+        rb_sha256 < "$dir/$rel" || exit 1
+      fi
+    done
+}
+
 # Sets RB_IMAGE, building the image if this machine doesn't have it. The tag
 # holds the age package version and the first 12 hex digits of the SHA-256 of
-# the instruction lines of scripts/age/Dockerfile (comments and blank lines
-# left out), so a change of any instruction, the two pins included, builds a
-# new image instead of reusing the old one; an edit of a comment doesn't.
+# rb_age_text's text, so a change of any instruction (the two pins included),
+# of a parser directive, or of any other file in scripts/age builds a new
+# image instead of reusing the old one; an edit of a comment doesn't.
 rb_image() {
-  local version pinned hash
+  local version pinned text hash
   version=$(sed -n 's/^RUN apk add --no-cache age=\([0-9A-Za-z._-]*\)$/\1/p' "$RB_ROOT/scripts/age/Dockerfile")
   [ -n "$version" ] || rb_die "scripts/age/Dockerfile names no age version"
   pinned=$(sed -n 's/^FROM [^@ ]*@sha256:\([0-9a-f]\{12\}\)[0-9a-f]\{52\}$/\1/p' "$RB_ROOT/scripts/age/Dockerfile")
   [ -n "$pinned" ] || rb_die "scripts/age/Dockerfile names no alpine digest"
-  hash=$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "$RB_ROOT/scripts/age/Dockerfile" | rb_sha256) ||
-    exit 1
+  text=$(rb_age_text) || exit 1
+  hash=$(printf '%s\n' "$text" | rb_sha256) || exit 1
   RB_IMAGE="rag-docker-age:$version-${hash:0:12}"
   if ! docker image inspect "$RB_IMAGE" >/dev/null 2>&1; then
     echo "Building the age image $RB_IMAGE from scripts/age (once; this needs the network)..."

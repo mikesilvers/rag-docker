@@ -119,13 +119,31 @@ def ollama_image():
 
 
 def age_image():
-    """The tag scripts/backup-common.sh gives the age image (#852, #856): the age version and
-    the first 12 hex digits of the SHA-256 of scripts/age/Dockerfile's instruction lines
-    (comments and blank lines left out)."""
-    text = (ROOT / "scripts" / "age" / "Dockerfile").read_text()
+    """The tag scripts/backup-common.sh gives the age image (#852, #856, #862): the age version
+    and the first 12 hex digits of the SHA-256 of rb_age_text's text: scripts/age/Dockerfile's
+    parser directives (the `# key=value` lines at its top) and its lines that are neither blank
+    nor a comment, then `file <path>` and the SHA-256 of each other file of scripts/age
+    (`link <path>` and the target of a link), in byte order of the path."""
+    folder = ROOT / "scripts" / "age"
+    text = (folder / "Dockerfile").read_text()
     version = re.search(r"^RUN apk add --no-cache age=(\S+)$", text, re.M).group(1)
-    lines = [line for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
-    digest = hashlib.sha256("".join(line + "\n" for line in lines).encode()).hexdigest()
+    lines, directives = [], True
+    for line in text.splitlines():
+        if directives and re.match(r"\s*#\s*[A-Za-z][A-Za-z0-9_-]*\s*=", line):
+            lines.append(line)
+            continue
+        directives = False
+        if line.strip() and not line.lstrip().startswith("#"):
+            lines.append(line)
+    hashed = "".join(line + "\n" for line in lines)
+    others = [(p.relative_to(folder).as_posix(), p) for p in folder.rglob("*")
+              if (p.is_symlink() or not p.is_dir()) and p != folder / "Dockerfile"]
+    for rel, path in sorted(others, key=lambda item: item[0].encode()):
+        if path.is_symlink():
+            hashed += f"link {rel}\n{os.readlink(path)}\n"
+        else:
+            hashed += f"file {rel}\n{hashlib.sha256(path.read_bytes()).hexdigest()}\n"
+    digest = hashlib.sha256(hashed.encode()).hexdigest()
     return f"rag-docker-age:{version}-{digest[:12]}"
 
 
