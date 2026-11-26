@@ -60205,6 +60205,60 @@ asyncio.run(run())
             self.assertEqual([p for p in leftovers if p.exists()], [], result.stderr)
             self.assertEqual([p.read_text() for p in saved], ['{"collection": "Kept"}'] * 2)
 
+    def test_a_failed_settings_sweep_is_logged_and_startup_carries_on(self):
+        # Reviewer-added (#488): each folder's sweep failing is logged alone; the
+        # other folder's sweep, the later sweeps and startup carry on.
+        script = """
+import asyncio, logging, sys
+from unittest.mock import AsyncMock, patch
+logging.basicConfig(level=logging.INFO, stream=sys.stderr)
+sys.path.insert(0, sys.argv[1])
+failing = sys.argv[2]
+from main import app, lifespan
+from services import importer, packager, weaviate_client as wc
+from services import ingest_config, retrieval_config
+module = {'ingest_configs': ingest_config, 'retrieval_configs': retrieval_config}[failing]
+staging = AsyncMock(return_value=[])
+async def run():
+    with patch.object(module, 'remove_interrupted_saves',
+                      side_effect=OSError(5, 'injected settings sweep fault')), \\
+         patch.object(wc, 'sweep_staging', new=staging), \\
+         patch.object(importer, 'sweep_interrupted_imports', return_value=[]), \\
+         patch.object(importer, 'sweep_stale_workdirs', return_value=[]), \\
+         patch.object(packager, 'sweep_build_leftovers', return_value=[]), \\
+         patch.object(wc, 'close_client'):
+        async with lifespan(app):
+            print('SERVING')
+    print('LATER SWEEPS RAN' if staging.await_count == 1 else 'LATER SWEEPS SKIPPED')
+asyncio.run(run())
+"""
+        messages = {'ingest_configs': 'Startup sweep of interrupted ingest settings writes failed',
+                    'retrieval_configs': 'Startup sweep of interrupted retrieval settings writes failed'}
+        for failing, other in (('ingest_configs', 'retrieval_configs'),
+                               ('retrieval_configs', 'ingest_configs')):
+            with self.subTest(failing=failing), tempfile.TemporaryDirectory() as directory:
+                uploads = Path(directory) / 'uploads'
+                leftovers = {}
+                for name in (failing, other):
+                    folder = uploads / name
+                    folder.mkdir(parents=True)
+                    leftovers[name] = folder / '.Kept.json.k1x9_q2z.tmp'
+                    leftovers[name].write_text('{"coll')
+                env = {**os.environ, 'UPLOAD_DIR': str(uploads),
+                       'EXPORTS_DIR': str(Path(directory) / 'exports'),
+                       'SOURCES_DIR': str(Path(directory) / 'sources')}
+                result = subprocess.run([sys.executable, '-c', script, API_DIR, failing],
+                                        capture_output=True, text=True, timeout=120,
+                                        cwd=API_DIR, env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('SERVING', result.stdout, result.stderr)
+                self.assertIn('LATER SWEEPS RAN', result.stdout, result.stderr)
+                self.assertIn(messages[failing], result.stderr)
+                self.assertNotIn(messages[other], result.stderr)
+                self.assertIn('injected settings sweep fault', result.stderr)
+                self.assertTrue(leftovers[failing].exists(), result.stderr)
+                self.assertFalse(leftovers[other].exists(), result.stderr)
+
 
 if __name__ == '__main__':
     unittest.main()
