@@ -17,13 +17,13 @@ Each ticket's working state lives in the private repository `mikesilvers/rag-doc
 
 ## A real review
 
-Each review is a separate pass. Re-read from disk:
+Each review is a separate pass. In that pass, re-read with tool calls the document itself and every source it relies on. Content already in context from an earlier pass doesn't count.
 
 | Document | Its sources |
 |---|---|
-| `analysis.md` | the source of truth (the issue and every comment) and the brief |
-| `specifications.md` | `analysis.md` |
-| `implementation-plan.md` | `specifications.md` |
+| `analysis.md` | the issue and every comment (with `gh`), the Jira ticket and its Q/A comments, the brief, and the repository files the analysis cites |
+| `specifications.md` | `analysis.md` and the repository files it cites |
+| `implementation-plan.md` | `specifications.md` and the repository files it cites |
 
 Then read the document itself, in full, and check:
 
@@ -31,16 +31,41 @@ Then read the document itself, in full, and check:
 - nothing the source asks for is missing;
 - the document is accurate about the repository: check facts in the code rather than from memory.
 
-Revise, then add the review's line to the log at the end of the document, with its UTC time:
+Revise, then add the review's line to the log at the end of the document. The line has:
+
+- its UTC time, from `date -u +%Y-%m-%dT%H:%MZ` run in that same pass: never an estimate, and never copied from another line;
+- the sources it re-read;
+- exactly what changed, or "no changes".
 
 ```
-- Review 3 (2026-11-14T21:40Z): S7 now names the README's file table; removed S10's path:line listing, which the analysis doesn't ask for.
-- Review 4 (2026-11-14T21:41Z): no changes (re-read the analysis against S1-S12).
+- Review 3 (2026-11-14T21:40Z): re-read the analysis and README.md's "Layout". S7 now names the README's file table; removed S10's path:line listing, which the analysis doesn't ask for.
+- Review 4 (2026-11-14T21:41Z): no changes (re-read the analysis, S1-S12 and README.md's "Layout").
 ```
+
+Save each review (checkpoint, `log.md` line, commit and push, as "Work folder" says) before the next one starts, so each review has its own commit. The coordinating session checks this ("Checking a loop").
 
 Write "no changes" only when nothing changed. A restart after a maintainer-directed change gets its own line, for example `- Restart (2026-11-15T10:02Z): maintainer decision of 2026-11-15 on RD-<n> changed the analysis's scope; the count starts again at review 1.`
 
 A loop that fails at review 10 is reported to the session that started you: the changes made in the last reviews, copied from the log, and the point that keeps changing.
+
+## Checking a loop (the coordinating session)
+
+Before it evaluates a fix agent's PR, and before it tells a prepared branch's agent to open its PR, the coordinating session checks the ticket's review loops. It pulls the work repository and lists the ticket's commits with their times in UTC, like the log lines:
+
+```bash
+git -C ~/repo/rag-docker-work pull -q
+TZ=UTC git -C ~/repo/rag-docker-work log --reverse --date=format-local:%Y-%m-%dT%H:%M:%SZ --format='%cd %s' -- RD-<n>/
+```
+
+Then, for each dev-doc, it compares the review log at the end of the document with those commits:
+
+- every review in the log has its own commit;
+- no log line's time is later than its commit's time (the line's minute may equal the commit's);
+- every log line names the sources it re-read.
+
+Only these hard failures send a loop back (maintainer decision, 2026-11-26, #930). Note the gaps between review commits, but short gaps don't fail a loop on their own: they can't tell a fast real pass from a batch.
+
+A document whose loop fails goes back to its fix agent (resumed, or a fresh `rag-fix` run that resumes from the checkpoint), which runs that document's loop again as separate passes, starting at review 1. The PR isn't evaluated, and the prepared branch doesn't open its PR, until the check passes.
 
 ## Finding host tests
 
