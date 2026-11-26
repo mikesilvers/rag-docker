@@ -175,6 +175,21 @@ def lan_config(checkout, exports, port='8081'):
     return config
 
 
+def external_config(checkout, exports, port='8081'):
+    """passing_config as stack.sh --external-ollama resolves it (#673): no ollama
+    service, api and weaviate with extra_hosts ollama=host-gateway (as Compose
+    renders it), the api waiting only for weaviate and mounting no model store."""
+    config = passing_config(checkout, exports, port)
+    services = config['services']
+    del services['ollama']
+    services['api']['depends_on'] = {'weaviate': {'condition': 'service_healthy', 'required': True}}
+    services['api']['volumes'] = [m for m in services['api']['volumes'] if m['target'] != '/ollama']
+    for svc in ('api', 'weaviate'):
+        services[svc]['extra_hosts'] = ['ollama=host-gateway']
+    del config['volumes']['ollama_models']
+    return config
+
+
 class Sandbox:
     """Scratch TMPDIR, lock path and stubbed docker/curl for one test."""
 
@@ -695,6 +710,55 @@ class RestartTimingTests(unittest.TestCase):
                 self.assertIn(text, result.stdout)
 
 
+class ExternalOllamaGuardTests(ConfigGuardTests):
+    """#673: in external-Ollama mode the guard allows exactly
+    extra_hosts ollama:host-gateway on api and weaviate, and no ollama service."""
+
+    def guard_external(self, config, port='8081'):
+        path = self.dir / 'config.json'
+        path.write_text(json.dumps(config))
+        return subprocess.run(['python3', '-c', self.block, str(self.checkout), str(self.exports), port, str(path),
+                               str(self.checkout), 'external-ollama'], capture_output=True, text=True)
+
+    def test_the_external_configuration_passes_only_in_its_mode(self):
+        for hosts in (['ollama=host-gateway'], ['ollama:host-gateway']):
+            with self.subTest(hosts=hosts):
+                config = external_config(self.checkout, self.exports)
+                for svc in ('api', 'weaviate'):
+                    config['services'][svc]['extra_hosts'] = hosts
+                result = self.guard_external(config)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = self.guard(external_config(self.checkout, self.exports))
+        self.assertEqual(result.returncode, 2, 'the default mode must refuse extra_hosts')
+        self.assertIn('(h)', result.stdout)
+        self.assertIn('extra_hosts', result.stdout)
+
+    def test_its_adverse_variants_are_refused(self):
+        def mutate(change):
+            config = external_config(self.checkout, self.exports)
+            change(config)
+            return config
+        S = lambda c: c['services']
+        variants = [
+            ('k', 'another host name', mutate(lambda c: S(c)['api'].update(extra_hosts=['ollama=192.168.1.5']))),
+            ('k', 'the live stack by name', mutate(lambda c: S(c)['weaviate'].update(extra_hosts=['rag-docker-api-1=host-gateway']))),
+            ('k', 'a second entry', mutate(lambda c: S(c)['api'].update(extra_hosts=['ollama=host-gateway', 'x=host-gateway']))),
+            ('k', 'a mapping of another name', mutate(lambda c: S(c)['api'].update(extra_hosts={'other': 'host-gateway'}))),
+            ('h', 'extra_hosts on the ui', mutate(lambda c: S(c)['ui'].update(extra_hosts=['ollama=host-gateway']))),
+            ('h', 'extra_hosts on the proxy', mutate(lambda c: S(c)['proxy'].update(extra_hosts=['ollama=host-gateway']))),
+            ('h', 'network_mode host', mutate(lambda c: S(c)['api'].update(network_mode='host'))),
+            ('k', 'the ollama service still there', mutate(lambda c: S(c).update(
+                ollama=passing_config(self.checkout, self.exports)['services']['ollama']))),
+            ('c', 'a published Ollama port', mutate(lambda c: S(c)['weaviate'].update(
+                ports=[{'host_ip': '127.0.0.1', 'target': 11434, 'published': '11434', 'protocol': 'tcp'}]))),
+        ]
+        for rule, name, config in variants:
+            with self.subTest(rule=rule, variant=name):
+                result = self.guard_external(config)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn('({})'.format(rule), result.stdout + result.stderr)
+
+
 class StackArgumentTests(unittest.TestCase):
     """S7 and S8: bad arguments are refused before any Docker command."""
 
@@ -744,6 +808,11 @@ class StackArgumentTests(unittest.TestCase):
             (['query-only-mode', '--package', 'notes.txt'],
              {'RAG_VERIFY_LOCK_HELD': '1', 'RAG_VERIFY_QUERY_ONLY': '1'}),
             (['query-only-mode'], {'RAG_VERIFY_LOCK_HELD': '1', 'RAG_VERIFY_QUERY_ONLY': '1'}),
+            # External-Ollama mode (#673): its own option, on up and run only, alone.
+            (['down', '--external-ollama'], {}),
+            (['run', '--external-ollama', '--lan'], {}),
+            (['up', '--telemetry', '--external-ollama'], {}),
+            (['run', '--query-only', '--external-ollama'], {}),
             (['bogus'], {}),
             ([], {}),
         ]
@@ -753,6 +822,49 @@ class StackArgumentTests(unittest.TestCase):
                 result = box.run(['bash', str(STACK), *argv], **env)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertEqual(box.calls(), [])
+
+
+class ExternalOllamaPreflightTests(unittest.TestCase):
+    """#673: --external-ollama checks the host's Ollama before any Docker command."""
+
+    def sandbox(self, listening, curl_code):
+        box = Sandbox(self)
+        stubs = {
+            'uname': 'echo Darwin',
+            'lsof': ('printf "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\\n'
+                     'ollama 1 u 3u IPv4 0x1 0t0 TCP %s:11434 (LISTEN)\\n" ' + listening) if listening else 'exit 1',
+        }
+        for name, body in stubs.items():
+            path = box.bin / name
+            path.write_text('#!/bin/bash\n' + body + '\n')
+            path.chmod(0o755)
+        box.env['STUB_CURL_CODE'] = curl_code
+        return box
+
+    def test_a_host_that_doesnt_follow_the_guide_is_refused_before_docker(self):
+        for listening, code, needle in (('', '200', 'nothing listens on port 11434'),
+                                        ("'*'", '200', 'listens on every address'),
+                                        ('192.168.1.5', '200', 'other machines'),
+                                        ('127.0.0.1', '000', 'no Ollama answers at http://127.0.0.1:11434')):
+            with self.subTest(listening=listening, code=code):
+                box = self.sandbox(listening, code)
+                result = box.run(['bash', str(STACK), 'up', '--external-ollama'])
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn(needle, result.stdout + result.stderr)
+                self.assertEqual([c for c in box.calls() if c[0] == 'docker'], [])
+
+    def test_up_uses_no_model_copy_and_shows_the_api_check_on_failure(self):
+        box = self.sandbox('127.0.0.1', '200')
+        (box.root / 'config.json').write_text(json.dumps(external_config(ROOT, box.exports)))
+        result = box.run(['bash', str(STACK), 'up', '--external-ollama'])
+        # The stub's `up` fails, so the start fails: after the guard and build.
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertNotIn('configuration is refused', result.stdout + result.stderr)
+        docker = [c[1:] for c in box.calls() if c[0] == 'docker']
+        self.assertFalse([c for c in docker if c[:1] == ['run']], 'the model copy must not run')
+        self.assertFalse([c for c in docker if 'rag-docker_ollama_models' in ' '.join(c)])
+        self.assertIn(['compose', '-p', 'rag-verify', 'exec', '-T', 'api', 'python', '-m', 'ollama_check'], docker)
+        self.assertTrue([c for c in docker if 'build' in c])
 
 
 class StackDockerCallTests(unittest.TestCase):
