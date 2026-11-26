@@ -1,3 +1,4 @@
+import re
 import sys
 
 from pydantic import ValidationError, field_validator
@@ -12,6 +13,18 @@ class Settings(BaseSettings):
     weaviate_port: int = 8080
     ollama_host: str = "localhost"
     ollama_port: int = 11434
+    # External Ollama mode (#673), set only by docker-compose.external-ollama.yml.
+    # When true the stack runs no Ollama of its own: the API uses one on the host
+    # (usually a native install shared with other apps), never reads or writes a
+    # model store, and refuses exports with models.
+    rag_external_ollama: bool = False
+    # Sent with rag-docker's own Ollama requests in both modes (#673), never set
+    # on the Ollama server, which may be shared: num_ctx with the LLM chat
+    # requests only (an embedding request keeps the model's own context), and
+    # keep_alive with every request. The defaults are Ollama 0.3.14's, so the
+    # contained stack's results don't change.
+    ollama_num_ctx: int = 2048
+    ollama_keep_alive: str = "5m"
     # Two LLMs (#671): the build model prepares documents and writes gold
     # standard pairs; the answer model answers questions. Each is its own
     # setting when set and not empty, else LLM_MODEL, else DEFAULT_LLM_MODEL.
@@ -91,7 +104,8 @@ class Settings(BaseSettings):
     # briefly (maintainer's decision, #638).
     max_preparation_bytes: int = 20 * 1024 * 1024 * 1024
 
-    @field_validator("auth_cookie_secure", "rag_lan_mode", "rag_query_only", "audit_log_questions", mode="before")
+    @field_validator("auth_cookie_secure", "rag_lan_mode", "rag_query_only", "rag_external_ollama",
+                     "audit_log_questions", mode="before")
     @classmethod
     def _exact_boolean(cls, value, info):
         # pydantic would read "1", "yes" or "on" as true. A typo in a security
@@ -101,6 +115,23 @@ class Settings(BaseSettings):
         if value in ("true", "false"):
             return value == "true"
         raise ValueError(f"{info.field_name.upper()} must be exactly true or false")
+
+    @field_validator("ollama_num_ctx")
+    @classmethod
+    def _num_ctx(cls, value):
+        if not 256 <= value <= 1048576:
+            raise ValueError("OLLAMA_NUM_CTX must be 256 to 1048576")
+        return value
+
+    @field_validator("ollama_keep_alive")
+    @classmethod
+    def _keep_alive(cls, value):
+        # A duration as Ollama reads it: whole seconds (`300`, `-1`), or units
+        # (`5m`, `1h30m`, `500ms`). Anything else would fail every request.
+        if not (re.fullmatch(r"-?[0-9]+", value)
+                or re.fullmatch(r"-?([0-9]+(\.[0-9]+)?(ms|s|m|h))+", value)):
+            raise ValueError("OLLAMA_KEEP_ALIVE must be a duration such as 5m, 1h30m, 300 or -1")
+        return value
 
     @field_validator("audit_log_max_bytes")
     @classmethod

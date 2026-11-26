@@ -73,7 +73,13 @@ def blob_path(digest: str) -> Path:
 
 
 def store_available() -> bool:
-    """False when the model store is not mounted, e.g. an older compose file."""
+    """False when the model store is not mounted, e.g. an older compose file.
+
+    Always False with an external Ollama (#673): its models are its own, and
+    rag-docker never reads or writes a model store it doesn't run, whatever is
+    mounted."""
+    if settings.rag_external_ollama:
+        return False
     return _root().is_dir()
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 from services import telemetry
+import logging
 import time
 
 import httpx
@@ -7,17 +8,38 @@ import httpx
 from config import settings
 
 _BASE = f"http://{settings.ollama_host}:{settings.ollama_port}"
+_log = logging.getLogger(__name__)
+
+# Set once /api/embeddings answers 404: an Ollama that has dropped the older
+# endpoint, superseded by /api/embed (#673). Every later embedding goes to
+# /api/embed, the endpoint Weaviate's text2vec-ollama calls.
+_use_embed = False
 
 
 @telemetry.traced("ollama.embed")
 async def embed(text: str) -> list[float]:
+    # keep_alive only: the embedding model keeps its own context (num_ctx), as
+    # Weaviate's own embedding calls do (#673).
+    global _use_embed
     async with httpx.AsyncClient(timeout=60.0) as client:
+        if not _use_embed:
+            resp = await client.post(
+                f"{_BASE}/api/embeddings",
+                json={"model": settings.embed_model, "prompt": text,
+                      "keep_alive": settings.ollama_keep_alive},
+            )
+            if resp.status_code != 404:
+                resp.raise_for_status()
+                return resp.json()["embedding"]
+            _use_embed = True
+            _log.warning("Ollama answered 404 for /api/embeddings; using /api/embed from now on")
         resp = await client.post(
-            f"{_BASE}/api/embeddings",
-            json={"model": settings.embed_model, "prompt": text},
+            f"{_BASE}/api/embed",
+            json={"model": settings.embed_model, "input": text,
+                  "keep_alive": settings.ollama_keep_alive},
         )
         resp.raise_for_status()
-        return resp.json()["embedding"]
+        return resp.json()["embeddings"][0]
 
 
 async def _chat(model: str, system: str, user: str) -> str:
@@ -31,6 +53,9 @@ async def _chat(model: str, system: str, user: str) -> str:
                     {"role": "user", "content": user},
                 ],
                 "stream": False,
+                # In the request, never on the server, which may be shared (#673).
+                "options": {"num_ctx": settings.ollama_num_ctx},
+                "keep_alive": settings.ollama_keep_alive,
             },
         )
         resp.raise_for_status()
@@ -59,6 +84,15 @@ def same_model(a: str, b: str) -> bool:
     return _tagged(a) == _tagged(b)
 
 
+def required_models() -> list[str]:
+    """The embedding, answer and build models, `name:tag`, each once, in that order."""
+    seen: list[str] = []
+    for model in (settings.embed_model, settings.answer_model, settings.build_model):
+        if _tagged(model) not in seen:
+            seen.append(_tagged(model))
+    return seen
+
+
 @telemetry.traced("ollama.models")
 async def list_models() -> set[str]:
     """Full names (`name:tag`) of the models Ollama reports."""
@@ -68,9 +102,46 @@ async def list_models() -> set[str]:
         return {m["name"] for m in resp.json().get("models", [])}
 
 
+async def missing_models() -> list[str] | None:
+    """The required models Ollama doesn't list, tag-exact (#673), or None when it
+    can't be asked."""
+    try:
+        reported = {_tagged(name) for name in await list_models()}
+    except Exception:                                 # noqa: BLE001
+        return None
+    return [model for model in required_models() if model not in reported]
+
+
+@telemetry.traced("ollama.models")
+async def version() -> str | None:
+    """The running Ollama's version (`GET /api/version`), or None (#673)."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{_BASE}/api/version")
+            resp.raise_for_status()
+            value = resp.json().get("version")
+            return value if isinstance(value, str) and value else None
+    except Exception:                                 # noqa: BLE001
+        return None
+
+
+@telemetry.traced("ollama.models")
+async def loaded_models() -> list[dict]:
+    """What Ollama has loaded (`GET /api/ps`), for information only (#673).
+
+    The Ollama may be shared with other apps: nothing here, or anywhere in
+    rag-docker, unloads or changes another model."""
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        resp = await client.get(f"{_BASE}/api/ps")
+        resp.raise_for_status()
+        return [{key: m.get(key) for key in ("name", "size", "size_vram", "expires_at")}
+                for m in resp.json().get("models", []) if isinstance(m, dict)]
+
+
 @telemetry.traced("ollama.health")
 async def check_health() -> dict:
-    """`llm` is the answer model, `build_llm` the build model (#671)."""
+    """`llm` is the answer model, `build_llm` the build model (#671). A model is
+    present only when Ollama lists its exact `name:tag` (#673)."""
     answer, build = settings.answer_model, settings.build_model
     same = same_model(answer, build)
     start = time.monotonic()
@@ -79,17 +150,16 @@ async def check_health() -> dict:
             resp = await client.get(f"{_BASE}/api/tags")
             resp.raise_for_status()
             latency_ms = int((time.monotonic() - start) * 1000)
-            models = {m["name"].split(":")[0] for m in resp.json().get("models", [])}
+            models = {_tagged(m["name"]) for m in resp.json().get("models", [])}
 
             def entry(model: str) -> dict:
-                ok = model.split(":")[0] in models
+                ok = _tagged(model) in models
                 return {"status": "ok" if ok else "error", "latency_ms": latency_ms, "model": model}
 
             result = {"llm": entry(answer), "build_llm": entry(build),
                       "embed": entry(settings.embed_model), "same_model": same}
             if any(result[k]["status"] != "ok" for k in ("llm", "build_llm", "embed")):
                 telemetry.outcome("error")
-            return result
     except Exception as exc:
         telemetry.outcome("error", exc)
         latency_ms = int((time.monotonic() - start) * 1000)
@@ -98,4 +168,8 @@ async def check_health() -> dict:
             "build_llm": {"status": "error", "latency_ms": latency_ms, "model": build},
             "embed": {"status": "error", "latency_ms": latency_ms, "model": settings.embed_model},
             "same_model": same,
+            "version": None,
         }
+    # Information only: the version never decides the status (#673).
+    result["version"] = await version()
+    return result

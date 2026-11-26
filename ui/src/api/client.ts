@@ -431,15 +431,22 @@ export interface HealthResult {
       build_llm: { status: string; latency_ms: number; model: string }
       embed: { status: string; latency_ms: number; model: string }
       same_model: boolean
+      // The running Ollama's version, or null when it can't be read (#673).
+      version?: string | null
     }
   }
   resources?: {
+    // With an external Ollama (#673) the status is "external" and there is no
+    // recommendation or allocated figure.
     memory: {
       status: string
-      allocated_gb: number | null
-      recommended_minimum_gb: number
+      allocated_gb?: number | null
+      recommended_minimum_gb?: number
       note?: string
     }
+    // External Ollama only (#673): what it has loaded, for information.
+    ollama_loaded?: Array<{ name: string | null; size: number | null; size_vram: number | null; expires_at: string | null }> | null
+    ollama_loaded_note?: string
   }
 }
 

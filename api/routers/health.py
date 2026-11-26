@@ -51,6 +51,17 @@ async def _report() -> tuple[bool, dict]:
     # requests; failing the endpoint would mark the api container unhealthy and
     # take the whole stack down over a tuning warning.
     resources = {"memory": system_info.memory_info(settings.recommended_memory_gb)}
+    if settings.rag_external_ollama:
+        # The LLM runs in the external Ollama, outside Docker, so Docker's memory
+        # isn't compared with the recommendation; what that Ollama has loaded,
+        # other apps' models included, is reported and never acted on (#673).
+        resources = {"memory": system_info.external_memory_info()}
+        try:
+            resources["ollama_loaded"] = await ollama.loaded_models()
+        except Exception:                             # noqa: BLE001
+            resources["ollama_loaded"] = None
+            resources["ollama_loaded_note"] = (
+                "Couldn't read what the external Ollama has loaded (/api/ps).")
 
     return overall_ok, {
         "status": "ok" if overall_ok else "degraded",

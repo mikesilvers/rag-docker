@@ -473,6 +473,8 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
     The LLM is this instance's answer model; the build model is neither checked
     nor installed (#671).
     """
+    if settings.rag_external_ollama:
+        return _ensure_models_external(pkg, manifest)
     notes: list[str] = []
     if not model_bundle.store_available():
         # Nothing can be installed or checked; say so rather than guess.
@@ -575,6 +577,55 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
                 {"model": name})
         notes.append(f"model '{ref}' installed from the package")
     return notes
+
+
+def _ensure_models_external(pkg: Path, manifest: dict) -> list[str]:
+    """Spec §6.3 with an external Ollama (#673): check, never install.
+
+    The models are asked of the external Ollama (`/api/tags`, tag-exact); no
+    model store is read or written, and models a package bundles are left in it.
+    The embedding model decides the import; the answer model is a note.
+    """
+    notes: list[str] = []
+    try:
+        bundled = model_bundle.bundled_models(pkg, manifest)
+    except OSError:
+        bundled = []
+    if bundled:
+        notes.append("the package bundles models; with an external Ollama they are not installed")
+    embed_ref = _tag_ref(settings.embed_model)
+    reported = _ollama_reports(settings.embed_model)
+    if reported is None:
+        raise PackageError(
+            "IMPORT_FAILED",
+            f"Couldn't reach the external Ollama to confirm the embedding model "
+            f"'{embed_ref}' is there. Run scripts/check-external-ollama.sh, then import again.",
+            {"model": embed_ref})
+    if not reported:
+        pkg_model = (manifest.get("embedding") or {}).get("model")
+        raise PackageError(
+            "EMBEDDING_MODEL_MISSING",
+            f"This instance uses an external Ollama, which does not have the embedding "
+            f"model '{embed_ref}'. On the Ollama host, run `ollama pull {embed_ref}`, "
+            f"then import again.",
+            {"model": embed_ref, "package_model": pkg_model, "bundled": bundled})
+    notes.append(f"model '{embed_ref}' reported by the external Ollama")
+    answer_ref = _tag_ref(settings.answer_model)
+    answer = _ollama_reports(settings.answer_model)
+    if answer is None:
+        notes.append(f"model '{answer_ref}' wasn't checked: the external Ollama couldn't "
+                     "be reached to confirm it is there")
+    elif answer:
+        notes.append(f"model '{answer_ref}' reported by the external Ollama")
+    else:
+        notes.append(f"model '{answer_ref}' is absent from the external Ollama; pull it "
+                     f"there with `ollama pull {answer_ref}` before querying")
+    return notes
+
+
+def _tag_ref(model: str) -> str:
+    """`name:tag`, a name without a tag being `:latest`, as Ollama lists it."""
+    return model if ":" in model.rsplit("/", 1)[-1] else f"{model}:latest"
 
 
 # ── Building ──────────────────────────────────────────────────────────────────

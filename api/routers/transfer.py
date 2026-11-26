@@ -50,6 +50,13 @@ async def start_export(body: ExportRequest, request: Request = None):
         return api_error(400, "ENCRYPTION_REQUIRED",
                          "LAN mode exports only encrypted packages: use a new key (the default) "
                          "or a passphrase.")
+    # With an external Ollama rag-docker reads no model store, so it has no
+    # model files to put in a package (#673).
+    if settings.rag_external_ollama and body.include_models:
+        return api_error(400, "MODELS_NOT_EXPORTABLE",
+                         "This instance uses an external Ollama, whose model files rag-docker "
+                         "doesn't read. Export without models, and pull the models on the "
+                         "machine that imports the package.")
     # A collection the caller may not use answers as one that doesn't exist (#606).
     if not await access.check(request, body.collection):
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{body.collection}' not found.")
