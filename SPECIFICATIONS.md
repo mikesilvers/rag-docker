@@ -5214,6 +5214,10 @@ bash install-offline.sh
    image just loaded — so the restore depends on no image the bundle does not
    carry.
 4. `docker compose up -d --no-build` — nothing is pulled or compiled.
+5. Wait up to 5 minutes (60 polls, 5 s apart) for every service to be running
+   (`docker compose up` has already waited for weaviate, ollama and api to
+   report healthy), and fail otherwise, naming how many of how many are
+   running (#490).
 
 ### 11.5 Why the offline path reproduces exactly
 

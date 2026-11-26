@@ -30861,7 +30861,12 @@ the cleanup with `Directory not empty` (#696). The excluded files are planted un
 in a real checkout, so the tests show `git archive` leaves them out, a top-level
 `.env.<suffix>` such as `.env.local` included (SPECIFICATIONS.md section 11.2 excludes
 `.env*`). Its
-`install-offline.sh` wait test records that the wait counts running services, not healthy ones.
+`install-offline.sh` wait test checks that the wait counts running services (compose has
+already waited for the healthchecked ones) and that the script fails, naming how many are
+running, when one is still missing after 60 polls (#490). It also runs
+`transfer_packages.py` on small packages of its own: an absolute name, a `..`, a symbolic or a
+hard link is refused with nothing written, on every Python, and a safe package is damaged
+(#490).
 
 The live checks: unknown job ids, `on_conflict` 422s, `GET /packages` with a junk
 `ragpkg-*.tar.gz`, seventeen crafted copies of the suite's package written by
@@ -31473,7 +31478,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_package_refusals.py` | controlled import checks 1 and 2, collection-name and `chunks.jsonl` record refusals, registered by suite 15 |
 | `../tests/test_transfer_paths.py` | controlled transfer and tuning route regressions through the app, registered by suite 15 |
 | `../tests/test_retrieve_script.py` | controlled `retrieve.py` defaults, flags and exit codes against a stub API, registered by suite 15 |
-| `../tests/test_distribution.py` | `package.sh`, `package-offline.sh` and `install-offline.sh` with stubbed `docker`, and the image list, on the host, registered by suite 15; the offline bundle also saves the backup scripts' age image, built from the bundle's own `scripts/age` when missing, and a failed build saves nothing (#852) |
+| `../tests/test_distribution.py` | `package.sh`, `package-offline.sh` and `install-offline.sh` with stubbed `docker`, and the image list, on the host, registered by suite 15; the offline bundle also saves the backup scripts' age image, built from the bundle's own `scripts/age` when missing, and a failed build saves nothing (#852); the Ollama image the script runs is the one in its image list, the install fails when a service is still not running after 60 polls, and `transfer_packages.py` refuses a package with an unsafe member (#490) |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types, the Import page's corpus preparation rules download (#615), the page controls of #400 (see "UI control browser checks") and, last, the login page against nginx's real login rate limit (#577) |
 | `14_reindex.sh` | exact-record reindex: a host check that the embedded sources match the real files (`../tests/test_reindex_preservation.py`), 30 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
 | `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures, canonical local session IDs and exact successful-creation ownership. Verifier collection names deliberately lie outside the parent prefix-sweep namespace. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves a durable exact-name fixture receipt/directory before standalone exit; inspection must confirm terminal writer state before exact-name cleanup |
@@ -52648,6 +52653,10 @@ Kinds, by the import check that refuses them:
   records, PACKAGE_CORRUPT:  badline baduuid badprops novector wrongwidth countup countdown
 The record kinds re-sign `chunks.jsonl` in the manifest, so the digests still match and only
 the record decides; `countup`/`countdown` change only the manifest, which is not digested.
+
+Every member of the package is checked before anything is extracted, on every Python (#490):
+an absolute name, a `..` in a name, or a member that is neither a regular file nor a
+directory (a link, a device, a FIFO) refuses the package, and nothing is written.
 """
 import hashlib
 import io
@@ -52662,11 +52671,27 @@ KINDS = ("nongzip", "truncated", "symlink", "hardlink", "dotdot", "twodirs", "no
          "wrongwidth", "countup", "countdown")
 
 
+def unsafe(member):
+    """Why a package member may not be extracted, or None (#490): an absolute name, a `..`
+    component, or anything but a regular file or a directory (a link, a device, a FIFO)."""
+    if member.name.startswith("/"):
+        return "an absolute name"
+    if ".." in pathlib.PurePosixPath(member.name).parts:
+        return "a '..' in its name"
+    if not (member.isfile() or member.isdir()):
+        return "not a regular file or a directory"
+    return None
+
+
 def extract(src, work):
     with tarfile.open(src) as tar:
+        for member in tar.getmembers():
+            reason = unsafe(member)
+            if reason:
+                sys.exit(f"{src.name}: refused member '{member.name}': {reason}; nothing was written")
         if hasattr(tarfile, "data_filter"):
             tar.extractall(work, filter="data")
-        else:                                   # the suite's own package, before 3.9.17
+        else:                                   # before 3.9.17: every member was checked above
             tar.extractall(work)
     return next(p for p in work.iterdir() if p.is_dir())
 
@@ -56802,13 +56827,19 @@ else
 fi
 
 echo
-echo "Waiting for services to report healthy..."
+EXPECTED=$((5 + TELEMETRY))
+echo "Waiting for the $EXPECTED services to be running (docker compose up has already waited for weaviate, ollama and api to report healthy)..."
+running=0
 for i in $(seq 1 60); do
   running=$(docker compose ps --services --filter status=running | wc -l | tr -d ' ')
-  [ "$running" = "$((5 + TELEMETRY))" ] && break
+  [ "$running" = "$EXPECTED" ] && break
   sleep 5
 done
 docker compose ps
+if [ "$running" != "$EXPECTED" ]; then
+  echo "ERROR: only $running of $EXPECTED services are running after 5 minutes. See 'docker compose ps' above, and 'docker compose logs <service>' for one that isn't running." >&2
+  exit 1
+fi
 
 echo
 echo "If the requested services are up, open http://localhost:8080"

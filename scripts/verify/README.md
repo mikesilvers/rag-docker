@@ -509,7 +509,12 @@ the cleanup with `Directory not empty` (#696). The excluded files are planted un
 in a real checkout, so the tests show `git archive` leaves them out, a top-level
 `.env.<suffix>` such as `.env.local` included (SPECIFICATIONS.md section 11.2 excludes
 `.env*`). Its
-`install-offline.sh` wait test records that the wait counts running services, not healthy ones.
+`install-offline.sh` wait test checks that the wait counts running services (compose has
+already waited for the healthchecked ones) and that the script fails, naming how many are
+running, when one is still missing after 60 polls (#490). It also runs
+`transfer_packages.py` on small packages of its own: an absolute name, a `..`, a symbolic or a
+hard link is refused with nothing written, on every Python, and a safe package is damaged
+(#490).
 
 The live checks: unknown job ids, `on_conflict` 422s, `GET /packages` with a junk
 `ragpkg-*.tar.gz`, seventeen crafted copies of the suite's package written by
@@ -1121,7 +1126,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_package_refusals.py` | controlled import checks 1 and 2, collection-name and `chunks.jsonl` record refusals, registered by suite 15 |
 | `../tests/test_transfer_paths.py` | controlled transfer and tuning route regressions through the app, registered by suite 15 |
 | `../tests/test_retrieve_script.py` | controlled `retrieve.py` defaults, flags and exit codes against a stub API, registered by suite 15 |
-| `../tests/test_distribution.py` | `package.sh`, `package-offline.sh` and `install-offline.sh` with stubbed `docker`, and the image list, on the host, registered by suite 15; the offline bundle also saves the backup scripts' age image, built from the bundle's own `scripts/age` when missing, and a failed build saves nothing (#852) |
+| `../tests/test_distribution.py` | `package.sh`, `package-offline.sh` and `install-offline.sh` with stubbed `docker`, and the image list, on the host, registered by suite 15; the offline bundle also saves the backup scripts' age image, built from the bundle's own `scripts/age` when missing, and a failed build saves nothing (#852); the Ollama image the script runs is the one in its image list, the install fails when a service is still not running after 60 polls, and `transfer_packages.py` refuses a package with an unsafe member (#490) |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types, the Import page's corpus preparation rules download (#615), the page controls of #400 (see "UI control browser checks") and, last, the login page against nginx's real login rate limit (#577) |
 | `14_reindex.sh` | exact-record reindex: a host check that the embedded sources match the real files (`../tests/test_reindex_preservation.py`), 30 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
 | `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures, canonical local session IDs and exact successful-creation ownership. Verifier collection names deliberately lie outside the parent prefix-sweep namespace. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves a durable exact-name fixture receipt/directory before standalone exit; inspection must confirm terminal writer state before exact-name cleanup |
