@@ -1071,10 +1071,12 @@ class _CountedMember:
     the member's compressed size after every block, as a backstop to the
     declared ratio check (#28). With CPython's zipfile it does not trigger:
     zipfile stops reading a member at its declared uncompressed size, so a
-    header that understates the size fails the member's CRC check and is
-    refused as damaged (ARCHIVE_UNREADABLE), not for its ratio. These are the
-    ZIP layer's bytes only: a gzipped member's output counts toward the total,
-    not toward its ratio.
+    header that understates the size usually fails the member's CRC check and
+    is refused as damaged (ARCHIVE_UNREADABLE), not for its ratio. A header
+    whose CRC matches the truncated data reads as a shorter member and isn't
+    refused, which is still safe: nothing beyond the declared size is
+    decompressed. These are the ZIP layer's bytes only: a gzipped member's
+    output counts toward the total, not toward its ratio.
     """
 
     def __init__(self, data: Any, budget: _ExpansionBudget,
@@ -1576,8 +1578,17 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
                 if job and job["status"] not in ("completed", "partial", "failed"):
                     # The error first: the status change is the write that saves
                     # the record (#23), and an in-place append is not seen alone.
-                    job["errors"].append(str(exc))
-                    job["status"] = "failed"
+                    if isinstance(exc, Exception):
+                        job["errors"].append(str(exc))
+                        job["status"] = "failed"
+                    else:
+                        # A cancellation (or another non-Exception) has no message of
+                        # its own; the files it stored count, as after a restart (#529).
+                        job["errors"].append(f"{type(exc).__name__}: the ingest was cancelled "
+                                             "before it finished. Re-upload the files to try again.")
+                        completed = job.get("files_completed")
+                        job["status"] = ("partial" if isinstance(completed, int) and completed > 0
+                                         else "failed")
 
     future = asyncio.get_running_loop().run_in_executor(
         None,

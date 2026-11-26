@@ -394,7 +394,7 @@ Suite 05 also runs `scripts/tests/test_batch_implementation.py` on the host (Pyt
 
 `05_transfer.sh` registers the ten controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_export_snapshot.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_import_guard.py`, `test_batch_recovery.py`, `test_package_listing.py`, `test_export_encryption.py` and `test_package_download.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links. It also checks (#509) that export writes a `null` `source_sha256` for a chunk whose retained blob is missing on disk, and that import check 3a refuses a chunk whose non-null `source_sha256` isn't a digest of the package's source index (with or without `sources/`) as `PACKAGE_CORRUPT`, `detail` `{"file": "chunks.jsonl", "line": n}`, before the embedding check and any backend work. Since #520 it checks that a name the index lists under two digests, one of them missing on disk, exports `null` for its chunks and its parts while a unique name still links; that check 3a refuses a `chunks.jsonl` line that isn't valid JSON, naming its line, and leaves blank lines and non-object records to the insert-time checks; and that bad ingest settings (check 4c) are still refused when the chunks resolve, while a package failing both names `chunks.jsonl`, before models or any backend call.
 
-`scripts/tests/test_export_snapshot.py` (#509, API container) drives `exporter._run` with the real `packager.build` and retained-source store and a mocked Weaviate backend whose iterator reads the stored chunks one at a time. A re-ingest that tries to commit new chunks and a new `doc.txt` source after the first chunk is streamed waits for the export: the package holds the old chunk text and the old source bytes and index, every chunk's `source_sha256` names a blob in `sources/`, and the re-ingest lands after the build. During an export, gold-standard generation preparation answers `COLLECTION_BUSY` (409) and a guarded chunk insert waits; an export started while another writer holds the guard reads `queued` until it is released; and the guard is free again after an export that succeeds, is refused (`PackageError`), fails or is cancelled. An export whose build is cancelled, or ended by another non-`Exception`, reads `failed` with an `error` naming the exception and saying it was cancelled, and the exception still propagates (#521). Orderings use events and the guard's waiter count. On the code before #509 the re-ingest, generation, insert, queued and guard-held checks fail; on the code before #521 the cancelled-status checks fail. Since #520 it also checks that an export blocks only its own collection, so its first-character alias is refused busy and another collection's writer goes ahead; that a replace-import started mid-export waits on the guard and reaches its conflict (existence) check only after the build; and that a query (`rag_pipeline.run_query`, Ollama mocked) completes during the export.
+`scripts/tests/test_export_snapshot.py` (#509, API container) drives `exporter._run` with the real `packager.build` and retained-source store and a mocked Weaviate backend whose iterator reads the stored chunks one at a time. A re-ingest that tries to commit new chunks and a new `doc.txt` source after the first chunk is streamed waits for the export: the package holds the old chunk text and the old source bytes and index, every chunk's `source_sha256` names a blob in `sources/`, and the re-ingest lands after the build. During an export, gold-standard generation preparation answers `COLLECTION_BUSY` (409) and a guarded chunk insert waits; an export started while another writer holds the guard reads `queued` until it is released; and the guard is free again after an export that succeeds, is refused (`PackageError`), fails or is cancelled. An export whose build is cancelled, or ended by another non-`Exception`, reads `failed` with an `error` naming the exception and saying it was cancelled, and the exception still propagates (#521). Such an export also frees its one-export slot and its delete registration, and the registration has ended when the status turns terminal (#529). Orderings use events and the guard's waiter count. On the code before #509 the re-ingest, generation, insert, queued and guard-held checks fail; on the code before #521 the cancelled-status checks fail. Since #520 it also checks that an export blocks only its own collection, so its first-character alias is refused busy and another collection's writer goes ahead; that a replace-import started mid-export waits on the guard and reaches its conflict (existence) check only after the build; and that a query (`rag_pipeline.run_query`, Ollama mocked) completes during the export.
 
 `scripts/tests/test_session_import.py` exercises the real package reader and
 evaluation persistence with disposable fixtures. Model and database mutation
@@ -697,22 +697,22 @@ in a temporary upload folder, the ingest time estimate: the rate (characters ove
 the last 20 stored parts, weighted by size) saved and read back after a restart, a malformed
 file read as no rate and replaced, ignored and unsaved measurements, the file named outside
 the startup sweep's prefixes with the older `ingest-rate.json` read until it exists, and a
-failed save logged once (#896); the time left a job status
-computes (none before a measurement, a countdown inside the part being stored never below 0,
-a failed file's 0, the "at least" flag for files not reached, a file still being parsed (#896)
-and split files with more parts, nothing for a job that isn't running, old records); and the
-per-file progress the job loop
+failed save logged once (#896); the time left a job status computes (none before a measurement,
+a countdown inside the part being stored never below 0, a failed file's 0, the "at least" flag
+for files not reached, a file still being parsed (#896) and split files with more parts,
+nothing for a job that isn't running, old records); and the per-file progress the job loop
 records for a whole file, a split file (chunked only after its last part, one measurement a
 part), a failed store (not a measurement), a file failing before any chunks (also as the last
 file), a one-file job read before its first part (#896), and the cap on entries. `02_ingest.sh`
-runs it in the API image with no network.
-On the stack, `02_ingest.sh` then checks that the six-type job's finished status lists each
-file's chunk and character counts, all stored, with no rate or time left, and that the real
-store left valid measurements in the API's `UPLOAD_DIR/embedding-rate.json`.
+runs it in the API image with no network. On the stack, `02_ingest.sh` then checks that the
+six-type job's finished status lists each file's chunk and character counts, all stored, with
+no rate or time left, and that the real store left valid measurements in the API's
+`UPLOAD_DIR/embedding-rate.json`.
 `browser/ui_criteria.js` (suite 06) stubs job responses to check the Import page's progress
 panel: "No estimate yet" before a measurement, the rate and "About ... left" ("Under a minute
-left" without "about", #896), "At least ... left" for files not chunked yet and for a split file with more parts, and a finished job's
-per-file counts (failed, done, earlier files not shown) with no estimate.
+left" without "about", #896), "At least ... left" for files not chunked yet and for a split
+file with more parts, and a finished job's per-file counts (failed, done, earlier files not
+shown) with no estimate.
 `browser/ui_criteria.js` (suite 06) checks that the Import page's file picker accepts
 `.jsonl` and `.jsonl.gz` and that its hint names JSONL.
 
@@ -790,6 +790,13 @@ exports of other collections never wait. The wait is bounded (#338): past it, th
 start gives up holding nothing and the route answers `409 EXPORT_STARTING` with no job id.
 The bound counts once, from the second start's first wait: when the first start's write fails
 and another start takes the slot, waiting again on that one doesn't restart it (#347).
+An export task cancelled before its worker starts frees the collection's export slot and its
+delete registration, then reads `failed` with the cancelled message and `error_code` `null`,
+as does one whose task fails before its worker starts (the message names the error's type),
+and a worker that starts late does nothing; one whose worker has started is left to the worker,
+and one that ends normally leaves no bookkeeping behind (#529). An error that escapes the ingest worker is saved with the `failed` status, and a
+cancellation that escapes it is named in `errors` and reads `partial` when files completed,
+otherwise `failed` (#529).
 `02_ingest.sh` runs it in the API container. With
 `RAG_ALLOW_RESTART=1`, `02_ingest.sh` also restarts the API
 (`docker compose restart --timeout 0 api`) while two uploads are part-way and checks that a
@@ -1071,7 +1078,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_json_ingest.py` | controlled ordinary-JSON conversion regressions, registered by ingest |
 | `../tests/test_jsonl_ingest.py` | controlled JSON Lines reading, conversion, limit and gzip regressions, registered by ingest |
 | `../tests/test_delete_busy.py` | controlled delete-while-busy registry, request-ordering and job-report regressions, registered by ingest |
-| `../tests/test_jobstore.py` | controlled job-record persistence, throttling, startup marking and retention regressions, registered by ingest |
+| `../tests/test_jobstore.py` | controlled job-record persistence, throttling, startup marking and retention regressions, and cancelled export and ingest jobs (#529), registered by ingest |
 | `../tests/test_reingest.py` | controlled re-ingest replacement, exact-name selection (#622), same-name upload, macOS ZIP metadata, retention and rechunk-coverage regressions, registered by ingest |
 | `../tests/test_split_parts.py` | controlled regressions for files over the per-file limits stored as parts (#621): the reviewer's 13,000 records, files over 10,000,000 characters, family replacement, all or nothing, cuts, CSV, Markdown, encoding, `overlap` sizing, re-chunk and export links, registered by ingest |
 | `../tests/test_large_corpus.py` | controlled large-corpus regressions (#312): retention by path in blocks, a large retained original through export and import, the re-chunk reader staging one part at a time and its refusals, `chunks_total` following staging; registered by ingest in the API image with the repository mounted |
@@ -1081,7 +1088,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_collection_spelling.py` | controlled regressions for per-collection state keyed by the stored collection name (#372), registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal, unresolvable chunk-source refusal and export read-boundary regressions, and an index that isn't JSON answering `SOURCE_INDEX_INVALID` at the tuning options, refusing export and left unchanged by an ingest (#52), registered by transfer |
-| `../tests/test_export_snapshot.py` | controlled export writer-guard regressions: a mid-export re-ingest can't change the package, busy and waiting writers, guard release (#509), a cancelled export's status (#521), only its own collection blocked, a waiting replace-import and a query during an export (#520), registered by transfer |
+| `../tests/test_export_snapshot.py` | controlled export writer-guard regressions: a mid-export re-ingest can't change the package, busy and waiting writers, guard release (#509), a cancelled export's status (#521) and its slot and registration (#529), only its own collection blocked, a waiting replace-import and a query during an export (#520), registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
 | `../tests/test_batch_recovery_fixture.py` | controlled check that the import package `batch_recovery.py`'s `write_import_package` writes passes the importer's real digest and source checks; run in the API image with no network and the repository mounted read-only, registered by transfer |
 | `../tests/test_package_listing.py` | controlled package-listing regressions (#383): the listing reads each archive only up to its manifest, new archives put the manifest first, an oversized manifest and other unreadable files are listed `readable: false`, and so is a manifest with a wrongly typed listed value (#451); run in the API image with no network, registered by transfer |
