@@ -3,6 +3,7 @@ import errno
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -12,7 +13,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
-sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api'))
+API_DIR = os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api')
+sys.path.insert(0, API_DIR)
 from config import settings
 from services import ingest_config, retrieval_config, settings_store
 
@@ -293,6 +295,104 @@ class SettingsPersistenceTests(unittest.TestCase):
                     service.save({**old, 'unserializable': object()})
                 self.assertEqual(service.load(old['collection']), old)
                 self.assertEqual(list(service._dir().glob('*.tmp')), [])
+
+    def test_the_temporary_file_is_fsynced_before_the_replacement(self):
+        # #488: like the registry save, the temporary file is on disk before it
+        # replaces the saved settings.
+        for service in SERVICES:
+            with self.subTest(service=service.__name__), self.fixture(service):
+                old, attempted, _ = self.values(service)
+                service.save(old)
+                events = []
+                with self.recorded(events):
+                    service.save(attempted)
+                names = [event[0] for event in events]
+                self.assertEqual(names.count('replace'), 1, events)
+                self.assertIn('fsync file', names[:names.index('replace')], events)
+                self.assertEqual(service.load(old['collection']), attempted)
+
+    def test_a_failed_temporary_file_sync_preserves_old_value(self):
+        real_fsync = os.fsync
+
+        def fsync(fd):
+            if not stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(errno.EIO, 'injected file sync fault')
+            return real_fsync(fd)
+
+        for service in SERVICES:
+            with self.subTest(service=service.__name__):
+                self.assert_failure_preserves_old_value(service,
+                    patch.object(os, 'fsync', side_effect=fsync), OSError)
+
+    def test_the_startup_sweep_removes_only_interrupted_saves(self):
+        # #488: only the temporary names publish makes, at the top of the folder.
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            folder = base / 'ingest_configs'
+            folder.mkdir()
+            outside = base / 'outside.json'
+            outside.write_text('keep')
+            removed = ['.A.json.abcd_123.tmp', '.Some_Name_2.json.zz9_x0yq.tmp']
+            for name in removed:
+                (folder / name).write_text('{"chunk_')
+            (folder / '.B.json.linkleft.tmp').symlink_to(outside)
+            kept = ['A.json', '.A.json.abc.tmp', '.A.json.abcdefgh.tmpx', 'A.json.abcdefgh.tmp',
+                    '.A-b.json.abcdefgh.tmp', '.A.json.ABCDEFGH.tmp', '.A.txt.abcdefgh.tmp']
+            for name in kept:
+                (folder / name).write_text('keep')
+            (folder / 'sub').mkdir()
+            (folder / 'sub' / '.C.json.abcdefgh.tmp').write_text('keep')
+            stuck = folder / '.D.json.abcdefgh.tmp'
+            stuck.mkdir()
+            with self.assertLogs('services.settings_store', 'ERROR') as logs:
+                settings_store.remove_interrupted_saves(folder)
+            self.assertEqual(sorted(p.name for p in folder.iterdir()),
+                             sorted(kept + ['sub', stuck.name]))
+            self.assertIn(str(stuck), '\n'.join(logs.output))
+            self.assertEqual(outside.read_text(), 'keep')
+            self.assertEqual((folder / 'sub' / '.C.json.abcdefgh.tmp').read_text(), 'keep')
+            missing = base / 'retrieval_configs'
+            settings_store.remove_interrupted_saves(missing)
+            self.assertFalse(missing.exists())
+
+    def test_startup_removes_interrupted_settings_saves(self):
+        # #488: a real lifespan run, in a child process with the backend sweeps
+        # mocked, removes leftovers in both settings folders and keeps the saves.
+        script = """
+import asyncio, sys
+from unittest.mock import AsyncMock, patch
+sys.path.insert(0, sys.argv[1])
+from main import app, lifespan
+from services import importer, packager, weaviate_client as wc
+async def run():
+    with patch.object(wc, 'sweep_staging', new=AsyncMock(return_value=[])), \\
+         patch.object(importer, 'sweep_interrupted_imports', return_value=[]), \\
+         patch.object(importer, 'sweep_stale_workdirs', return_value=[]), \\
+         patch.object(packager, 'sweep_build_leftovers', return_value=[]), \\
+         patch.object(wc, 'close_client'):
+        async with lifespan(app):
+            print('SERVING')
+asyncio.run(run())
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            uploads = Path(directory) / 'uploads'
+            saved, leftovers = [], []
+            for name in ('ingest_configs', 'retrieval_configs'):
+                folder = uploads / name
+                folder.mkdir(parents=True)
+                (folder / 'Kept.json').write_text('{"collection": "Kept"}')
+                saved.append(folder / 'Kept.json')
+                leftovers.append(folder / '.Kept.json.k1x9_q2z.tmp')
+                leftovers[-1].write_text('{"coll')
+            env = {**os.environ, 'UPLOAD_DIR': str(uploads),
+                   'EXPORTS_DIR': str(Path(directory) / 'exports'),
+                   'SOURCES_DIR': str(Path(directory) / 'sources')}
+            result = subprocess.run([sys.executable, '-c', script, API_DIR], capture_output=True,
+                                    text=True, timeout=120, cwd=API_DIR, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('SERVING', result.stdout, result.stderr)
+            self.assertEqual([p for p in leftovers if p.exists()], [], result.stderr)
+            self.assertEqual([p.read_text() for p in saved], ['{"collection": "Kept"}'] * 2)
 
 
 if __name__ == '__main__':
