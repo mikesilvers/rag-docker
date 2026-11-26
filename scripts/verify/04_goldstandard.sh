@@ -322,11 +322,23 @@ sys.exit(0 if ok else 1)
 ENDPY
       check "hard stop settles generation with a plain reason and retained pairs" $?
       pid2=$(python3 -c "import json;print(json.load(open('/tmp/vfy_gen2_post.json'))['pairs'][0]['pair_id'])")
-      _rag_require_lock_owner
-      code=$(curl -s -m 1920 -o /tmp/vfy_gen2_regen.json -w '%{http_code}' -X POST \
-        "$API/goldstandard/regenerate" -H 'Content-Type: application/json' \
-        -d "{\"session_id\":\"$SID2\",\"pair_id\":\"$pid2\"}")
-      check_eq "regeneration succeeds after startup settlement" "$code" "200"
+      # The settlement unblocked regeneration unless it answers 409. A 502
+      # PAIR_GENERATION_FAILED is the model's reply being unusable, which the API
+      # says to try again, so only that answer is tried again, 3 attempts at most (#483).
+      regen_error=""
+      for attempt in 1 2 3; do
+        _rag_require_lock_owner
+        code=$(curl -s -m 1920 -o /tmp/vfy_gen2_regen.json -w '%{http_code}' -X POST \
+          "$API/goldstandard/regenerate" -H 'Content-Type: application/json' \
+          -d "{\"session_id\":\"$SID2\",\"pair_id\":\"$pid2\"}")
+        regen_error=$(python3 -c "import json
+try: print(json.load(open('/tmp/vfy_gen2_regen.json'))['error']['code'])
+except Exception: print('')" 2>/dev/null)
+        { [ "$code" = 502 ] && [ "$regen_error" = PAIR_GENERATION_FAILED ]; } || break
+      done
+      [ "$code" = 200 ]
+      check "regeneration succeeds after startup settlement" $? \
+        "HTTP $code${regen_error:+ $regen_error} after $attempt attempt(s)"
       api_get "/goldstandard/session/$SID2" > /tmp/vfy_gen2_final.json
       python3 - "$pid2" <<'ENDPY'
 import json,sys

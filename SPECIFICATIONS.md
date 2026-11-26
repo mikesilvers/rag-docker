@@ -1142,9 +1142,15 @@ acknowledges that request's complete value was published; a later successful sav
 may supersede it. Serialization, temporary write/close or replacement failure
 does not acknowledge success and leaves the last valid configuration readable.
 Failed saves clean up their own temporary file when filesystem permissions
-allow. After the replacement the folder is fsynced, so a power loss right after a
+allow. The temporary file is fsynced before it replaces the saved configuration
+(#488), and a failed fsync is a failed save that leaves the last valid
+configuration. After the replacement the folder is fsynced, so a power loss right after a
 save doesn't lose it (#445); a failed folder fsync doesn't acknowledge the save
-either, though the new value is then already in place. Package import publishes ingest settings through this same lock and
+either, though the new value is then already in place. At startup, before the
+first request, the API removes the temporary files (`.<name>.json.<8 random>.tmp`)
+of saves a crash interrupted in `ingest_configs/` and `retrieval_configs/`; one it
+can't remove is logged and kept, and a sweep that fails is logged and startup
+carries on (#488). Package import publishes ingest settings through this same lock and
 atomic writer. Published files use mode 0600 (API owner read/write), including
 replacements of older files.
 
@@ -3988,6 +3994,7 @@ rag-docker/
 │   │   ├── sources.py           # Retained original documents (content-addressed)
 │   │   ├── retrieval_config.py  # Per-collection retrieval settings (atomic JSON)
 │   │   ├── settings_store.py    # Shared serialized settings publication
+│   │   ├── folder_sync.py       # The folder fsync the atomic saves share (#488)
 │   │   ├── packager.py          # Package format: naming, digests, manifest, reader
 │   │   ├── age_stream.py        # Streaming age encryption of packages: a new X25519 key (#676) or a passphrase (#27)
 │   │   ├── exporter.py          # Export job lifecycle and the per-collection guard
@@ -4754,6 +4761,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       *Evidence: `scripts/tests/test_collection_registry.py` in the built API image with `--network none` (suite 01); its save and unreadable-registry checks fail on the code before #388.*
 - [x] The collection registry and settings saves fsync their folder after the replacement, and a failed folder fsync fails the save; API startup removes the `.collection_registry.json.*.tmp` files of interrupted registry saves, keeping the registry and every other file (#445).
       *Evidence: `scripts/tests/test_collection_registry.py` (suite 01) and `scripts/tests/test_settings_persistence.py` (suite 07); the folder-fsync checks and the startup check (a leftover still there after the lifespan) fail on the code before #445.*
+- [x] A settings save fsyncs its temporary file before the replacement, and a failed fsync fails the save with the old value kept and no temporary file; API startup removes the `.<name>.json.<8 random>.tmp` files of interrupted settings saves in `ingest_configs/` and `retrieval_configs/`, keeping the saved settings, look-alike names and sub-folders, removing a link without following it, logging one it can't remove and not creating a missing folder; a registry sweep that fails at startup is logged and startup and the later sweeps carry on; the API's five folder fsyncs share one helper (#488).
+      *Evidence: `scripts/tests/test_settings_persistence.py` (suite 07: the temporary-file fsync before the replace, a failed one, the sweep's names, and a real lifespan run removing leftovers in both folders) and `scripts/tests/test_collection_registry.py` (suite 01: a lifespan run whose registry sweep raises); the settings checks fail on the code before #488, and the registry one fails without the try/except around that sweep.*
 - [x] `GET /packages` reads each package only up to its top-level manifest, with the manifest read bounded at 16 MiB; new packages put `manifest.json` first in the archive; a package with an oversized, missing or unreadable manifest is listed `readable: false` while the listing still answers 200 (#383).
       *Evidence: `scripts/tests/test_package_listing.py` in the built API image with `--network none` (suite 05): a package cut off after its manifest still lists, listing reads under 1 MiB of a package carrying 8 MiB after its manifest, an oversized manifest is refused unread, a manifest of exactly 16 MiB lists while one byte more is refused, and seven kinds of unreadable file are each listed `readable: false`; its cut-off, bytes-read, oversized-manifest, JSON-array and archive-order checks fail on the code before #383. `validate_package.py` checks a real export puts the manifest first, and suite 05 checks that `GET /packages` lists that export as readable with its collection, chunk count, fidelity and creation time.*
 - [x] `GET /packages` lists a package whose manifest has a wrongly typed listed value (`collection` not an object, `name`, `fidelity` or `created_at` not a string, `chunk_count` not an integer) as `readable: false` with null metadata, never coercing it, and still answers 200; a `null` or absent value is listed as `null` (#451).

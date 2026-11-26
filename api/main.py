@@ -38,6 +38,18 @@ async def lifespan(app: FastAPI):
             await asyncio.to_thread(collection_routes.remove_interrupted_saves)
         except Exception:                                 # noqa: BLE001
             log.exception("Startup sweep of interrupted collection registry writes failed")
+        # Settings saves a crash interrupted leave temporary files beside the
+        # saved settings (#488). Each folder's sweep failing is logged alone.
+        try:
+            from services import ingest_config
+            await asyncio.to_thread(ingest_config.remove_interrupted_saves)
+        except Exception:                                 # noqa: BLE001
+            log.exception("Startup sweep of interrupted ingest settings writes failed")
+        try:
+            from services import retrieval_config
+            await asyncio.to_thread(retrieval_config.remove_interrupted_saves)
+        except Exception:                                 # noqa: BLE001
+            log.exception("Startup sweep of interrupted retrieval settings writes failed")
         try:
             from services import sources
             await asyncio.to_thread(sources.remove_interrupted_saves)
