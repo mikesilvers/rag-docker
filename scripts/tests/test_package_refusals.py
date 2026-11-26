@@ -181,19 +181,19 @@ class OpenPackageTests(Fixture):
         self.assert_nothing_extracted(dest)
         self.assertFalse((dest.parent / "escape-387.txt").exists())
 
-    def dotdot_case(self, name, encrypted):
+    def dotdot_case(self, name, encrypted, **fields):
         """A valid package with an extra member `name`, and the passphrase to open it."""
-        archive = self.with_member(name)
+        archive = self.with_member(name, **fields)
         if not encrypted:
             return archive, None
         sealed = archive.with_name(archive.name + ".age")
         sealed.write_bytes(encrypt(archive.read_bytes()))
         return sealed, PASSPHRASE
 
-    def dotdot_refused(self, name, encrypted):
-        archive, passphrase = self.dotdot_case(name, encrypted)
+    def dotdot_refused(self, name, encrypted, work=None, **fields):
+        archive, passphrase = self.dotdot_case(name, encrypted, **fields)
         error, dest = self.refused(archive, "PACKAGE_UNREADABLE", passphrase,
-                                   work=f"work-{encrypted}")
+                                   work=work or f"work-{encrypted}")
         self.assertEqual(error.message, f"Package contains a path with a '..' component "
                                         f"('{name}'), which is not allowed.")
         self.assertEqual(error.detail, {"member": name})
@@ -218,6 +218,41 @@ class OpenPackageTests(Fixture):
             with self.subTest(encrypted=encrypted):
                 dest = self.dotdot_refused(name, encrypted)
                 self.assertFalse((dest / TOP / "x1").exists())
+
+    def test_a_dotdot_directory_member_is_refused(self):
+        # A directory entry makes its own folder and its parents as written: d1 would be made
+        # on the way to TOP/d2, and a final '..' is a component too (#597, #601).
+        for i, name in enumerate((f"{TOP}/d1/../d2", f"{TOP}/d1/..")):
+            for encrypted in (False, True):
+                with self.subTest(name=name, encrypted=encrypted):
+                    dest = self.dotdot_refused(name, encrypted, work=f"work-dir{i}-{encrypted}",
+                                               type=tarfile.DIRTYPE)
+                    self.assertFalse((dest / TOP / "d1").exists())
+                    self.assertFalse((dest / TOP / "d2").exists())
+
+    def test_an_absolute_name_is_refused(self):
+        # An absolute name that leads into the work directory would name its folders from
+        # '/', not from the work directory (#911). One outside it is refused as outside first.
+        for encrypted in (False, True):
+            with self.subTest(encrypted=encrypted, leads="inside"):
+                work = f"work-abs-{encrypted}"
+                name = f"{(self.root / work / 'dest').resolve()}/{TOP}/f-911.txt"
+                archive, passphrase = self.dotdot_case(name, encrypted)
+                error, dest = self.refused(archive, "PACKAGE_UNREADABLE", passphrase, work=work)
+                self.assertEqual(error.message, f"Package contains an absolute path ('{name}'), "
+                                                f"which is not allowed.")
+                self.assertEqual(error.detail, {"member": name})
+                self.assertFalse((dest / TOP / "f-911.txt").exists())
+                if not encrypted:
+                    self.assert_nothing_extracted(dest)
+            with self.subTest(encrypted=encrypted, leads="outside"):
+                name = "/rd-911-outside/f.txt"
+                archive, passphrase = self.dotdot_case(name, encrypted)
+                error, _dest = self.refused(archive, "PACKAGE_UNREADABLE", passphrase,
+                                            work=f"work-absout-{encrypted}")
+                self.assertEqual(error.message,
+                                 f"Package contains a path outside the archive ('{name}').")
+                self.assertEqual(error.detail, {"member": name})
 
     def test_dots_within_a_component_are_allowed(self):
         name = f"{TOP}/a..b/..c.../f..txt"
@@ -285,7 +320,7 @@ class RunTests(Fixture):
         self.stack.enter_context(patch.object(wc, "get_client", self.client))
         self.stack.enter_context(patch.object(importer, "_log"))
 
-    def run_import(self, archive, on_conflict="rename"):
+    def run_import(self, archive, on_conflict="rename", passphrase=None):
         job_id = "job" + uuid.uuid4().hex[:5]
         importer._jobs[job_id] = {"job_id": job_id, "status": "queued", "filename": archive.name,
                                   "on_conflict": on_conflict, "collection": None,
@@ -295,7 +330,7 @@ class RunTests(Fixture):
                                   "error_detail": None}
         with importer._lock:
             importer._active.add(archive.name)
-        importer._run(job_id, archive.name, on_conflict)
+        importer._run(job_id, archive.name, on_conflict, passphrase)
         return importer._jobs[job_id]
 
     def assert_corrupt(self, archive, fragment, detail=None):
@@ -355,6 +390,39 @@ class RunTests(Fixture):
                 self.assert_corrupt(self.package(count=declared),
                                     f"Package contains {len(records())} objects but declares {declared}",
                                     {"file": "chunks.jsonl"})
+
+    def test_a_dotdot_member_leaves_no_folder_in_the_upload_dir(self):
+        # The #597 case through the job: the name resolves inside the job's work directory but
+        # names `evil` beside it, in upload_dir, which the job's cleanup never removes (#601).
+        # The work directory's name is fixed so the package can name it.
+        for encrypted in (False, True):
+            with self.subTest(encrypted=encrypted):
+                work = self.uploads / f"import-597-{encrypted}"
+                name = f"../evil/../{work.name}/{TOP}/f-597.txt"
+                archive = self.exports / f"ragpkg-dotdot-{encrypted}.tar.gz"
+                with tarfile.open(self.package(), "r:gz") as src, \
+                        tarfile.open(archive, "w:gz") as tar:
+                    for member in src.getmembers():
+                        tar.addfile(member, src.extractfile(member) if member.isfile() else None)
+                    add_bytes(tar, name, b"outside")
+                passphrase = None
+                if encrypted:
+                    sealed = archive.with_name(archive.name + ".age")
+                    sealed.write_bytes(encrypt(archive.read_bytes()))
+                    archive, passphrase = sealed, PASSPHRASE
+
+                def fixed_work(*_args, _work=work, **_kwargs):
+                    _work.mkdir()
+                    return str(_work)
+
+                with patch.object(importer.tempfile, "mkdtemp", side_effect=fixed_work):
+                    job = self.run_import(archive, "rename", passphrase)
+                self.assertFalse((self.uploads / "evil").exists())
+                self.assertEqual((job["status"], job["error_code"]),
+                                 ("failed", "PACKAGE_UNREADABLE"), job["error"])
+                self.assertEqual(job["error_detail"], {"member": name})
+                self.assertEqual(sorted(p.name for p in self.uploads.glob("import-*")), [])
+                self.create.assert_not_called()
 
     def test_a_collection_name_weaviate_cannot_use_is_unsupported(self):
         for name in ("1bad", "bad-name"):

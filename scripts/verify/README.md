@@ -451,10 +451,14 @@ top-level directories, and a package with no manifest, a manifest that isn't JSO
 `package_format` (`PACKAGE_FORMAT_UNSUPPORTED`). It also checks that a member with a `..`
 component that resolves inside the package, whether or not it names a folder outside the work
 directory, is refused `PACKAGE_UNREADABLE` for a `.tar.gz` and a `.tar.gz.age` package without
-any of its folders being made, and that dots within a component are allowed (#597). Through
-`importer._run`, with Weaviate and the
-model checks mocked, a digest-valid package naming a collection Weaviate can't use is
-`PACKAGE_FORMAT_UNSUPPORTED` before any lookup, and one with a `chunks.jsonl` line that isn't
+any of its folders being made, and that dots within a component are allowed (#597). A
+directory member with a `..` component (`TOP/d1/../d2`, `TOP/d1/..`) is refused the same way,
+and a member with an absolute name that leads into the work directory is refused
+`PACKAGE_UNREADABLE` and not written, while one outside it keeps the outside-path message
+(#911). Through `importer._run`, with Weaviate and the model checks mocked, the #597 case
+fails `PACKAGE_UNREADABLE` for both package kinds and leaves no `evil` folder in the upload
+directory and no work directory; a digest-valid package naming a collection Weaviate can't use
+is `PACKAGE_FORMAT_UNSUPPORTED` before any lookup, and one with a `chunks.jsonl` line that isn't
 JSON, a bad UUID, properties that aren't an object, a missing or short vector, or a chunk count
 above or below the manifest's is `PACKAGE_CORRUPT` before any collection is created, with
 `abort` and `rename`. `scripts/tests/test_package_limits.py` (API container, with caps of
@@ -467,8 +471,8 @@ message and `detail`; a negative-size entry before an over-cap file is refused
 directory (on a regular file the file after it is never extracted); folders implied by a file's
 or a directory's path count as entries (at the cap it opens, one folder over is refused
 `PACKAGE_TOO_MANY_MEMBERS`), `.` and empty path parts aren't folders, while a name with a `..`
-component, `../<work dir>/…` included, is refused `PACKAGE_UNREADABLE` before its folders are
-counted; a folder counts once, whether its own entry comes before or after a file inside it and
+component, `../<work dir>/…` included, or an absolute name that leads into the work directory
+(#911), is refused `PACKAGE_UNREADABLE` before its folders are counted; a folder counts once, whether its own entry comes before or after a file inside it and
 for a name like `d/.`, while a repeated directory entry counts each time (#599); the checks run
 in §6.2's order (count, check, folders, size); a path needing more folders at once than the
 recursion limit allows is refused `PACKAGE_UNREADABLE`, not `IMPORT_FAILED` (#599); a `.tar.gz`
