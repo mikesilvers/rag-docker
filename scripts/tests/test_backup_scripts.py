@@ -186,6 +186,57 @@ class StaticTests(unittest.TestCase):
             self.assertIn('scripts/age/Dockerfile names no alpine digest', run.stderr)
             self.assertNotIn('build', log.read_text())
 
+    def test_the_tag_follows_links_and_nested_files_in_the_age_folder(self):
+        # rb_age_text hashes every entry of scripts/age but its folders: a file in a
+        # subfolder by its path there, and a link by its target, not by what it points
+        # at (#862, reviewer).
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder).resolve()
+            age = folder / 'scripts' / 'age'
+            age.mkdir(parents=True)
+            shutil.copy2(str(ROOT / 'scripts/backup-common.sh'), str(folder / 'scripts'))
+            (age / 'Dockerfile').write_text(dockerfile())
+            stub = folder / 'bin' / 'docker'
+            stub.parent.mkdir()
+            stub.write_text(STUB_DOCKER)
+            stub.chmod(0o755)
+            env = dict(os.environ, PATH=str(stub.parent) + os.pathsep + os.environ['PATH'],
+                       STUB_LOG=str(folder / 'docker.log'))
+
+            def tag():
+                run = subprocess.run(['bash', '-c', '. scripts/backup-common.sh; rb_image; echo "tag=$RB_IMAGE"'],
+                                     cwd=str(folder), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     universal_newlines=True)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                found = re.search(r'^tag=(\S+)$', run.stdout, re.M).group(1)
+                self.assertEqual(found, age_image(None, age))
+                return found
+
+            original = tag()
+            self.assertEqual(original, age_image())
+            # An empty subfolder is not in the tag; a file in it is, by its path.
+            (age / 'sub').mkdir()
+            self.assertEqual(tag(), original)
+            (age / 'sub' / 'a.txt').write_text('one\n')
+            nested = tag()
+            self.assertNotEqual(nested, original)
+            (age / 'sub' / 'a.txt').rename(age / 'a.txt')
+            moved = tag()
+            self.assertNotIn(moved, {original, nested})
+            # A link is hashed by its target: a new link, then a new target, each give a new tag.
+            (age / 'link').symlink_to('a.txt')
+            linked = tag()
+            self.assertNotIn(linked, {original, nested, moved})
+            (age / 'link').unlink()
+            (age / 'link').symlink_to('Dockerfile')
+            retargeted = tag()
+            self.assertNotIn(retargeted, {original, nested, moved, linked})
+            # Removing them all gives today's tag back.
+            (age / 'link').unlink()
+            (age / 'a.txt').unlink()
+            (age / 'sub').rmdir()
+            self.assertEqual(tag(), original)
+
     def test_the_tag_without_sha256sum_uses_shasum_and_without_either_stops(self):
         # rb_sha256 falls back to shasum where there is no sha256sum, with the same
         # tag, and with neither it stops before building anything (#856).

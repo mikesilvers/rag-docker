@@ -649,6 +649,39 @@ class TransferPackagesTests(unittest.TestCase):
                 self.assertEqual(result.stdout, "")
                 self.assertEqual(sorted(p.name for p in self.temp.iterdir()), [self.STEM + ".tar.gz"])
 
+    def test_an_unsafe_member_writes_nothing_where_it_points(self):
+        # The work folder is made under TMPDIR, so with TMPDIR inside the test's folder a
+        # `..` would land there, and an absolute name points there too: refused, nothing is
+        # written anywhere, on the Python running the test. A FIFO and a character device are
+        # refused as well (#490, reviewer).
+        work = self.temp / "tmp"
+        work.mkdir()
+
+        def special(name, kind):
+            info = tarfile.TarInfo(name)
+            info.type = kind
+            return info
+        cases = {
+            "an absolute name": tarfile.TarInfo(str(self.temp / "abs-490.txt")),
+            "a '..' in its name": tarfile.TarInfo(self.STEM + "/../../escape-490.txt"),
+            "not a regular file or a directory (FIFO)": special(self.STEM + "/fifo", tarfile.FIFOTYPE),
+            "not a regular file or a directory (character device)":
+                special(self.STEM + "/null", tarfile.CHRTYPE),
+        }
+        for case, member in cases.items():
+            with self.subTest(case):
+                path = self.package(member)
+                result = subprocess.run(
+                    [sys.executable, str(ROOT / "scripts" / "verify" / "transfer_packages.py"),
+                     str(path), "badmanifest"],
+                    capture_output=True, text=True, timeout=60, env=dict(os.environ, TMPDIR=str(work)))
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(f"refused member '{member.name}': {case.split(' (')[0]}; nothing was written",
+                              result.stderr)
+                written = sorted(str(p.relative_to(self.temp)) for p in self.temp.rglob("*"))
+                self.assertEqual(written, [self.STEM + ".tar.gz", "tmp"])
+                path.unlink()
+
     def test_a_safe_package_gives_its_damaged_copy(self):
         result = self.damage(self.package())
         self.assertEqual(result.returncode, 0, result.stderr)
