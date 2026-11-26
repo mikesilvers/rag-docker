@@ -1008,11 +1008,10 @@ is parsing before its first chunks (#896), and `seconds_left_is_minimum` is `tru
 file, or any unfinished split file's later parts, remain, so the job's time left is then a
 minimum. Before the instance's first measurement the rate and every `seconds_left` are `null`
 (the Import page says "No estimate yet"); there is no default rate. A job that isn't `running`
-has `null` rate and times and
-`seconds_left_is_minimum` `false`; its `file_progress` counts stay. Job records written before
-these fields existed read back with `file_progress: []`, `file_progress_omitted: 0` and the
-other estimate fields `null`/`false`. `GET /ingest/jobs` entries carry `file_progress` as
-recorded, without the computed times.
+has `null` rate and times and `seconds_left_is_minimum` `false`; its `file_progress` counts
+stay. Job records written before these fields existed read back with `file_progress: []`,
+`file_progress_omitted: 0` and the other estimate fields `null`/`false`. `GET /ingest/jobs`
+entries carry `file_progress` as recorded, without the computed times.
 
 `status` values: `"queued"`, `"running"`, `"completed"`, `"partial"` (some files failed),
 `"failed"`.
