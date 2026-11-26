@@ -863,6 +863,141 @@ class StartTests(StoreTestCase):
         self.assertEqual(exporter._starting, {})
         self.release_export(name, started[0])
 
+    def test_an_export_cancelled_before_its_worker_runs_is_settled(self):
+        # #529: a task ended before its worker thread started frees the slot and
+        # the registration, then reads failed with the #521 message, error_code null.
+        module, store, calls = self.harness("export")
+        name = "Vfy529Queued"
+        seen = []
+        changed = store._changed
+
+        def spy(record, status_changed):
+            if status_changed:
+                seen.append((("export", record["job_id"]) in collection_writes.active_jobs(name),
+                             exporter._active.get(name)))
+            changed(record, status_changed)
+
+        async def run():
+            before = asyncio.all_tasks()
+            job_id = await exporter.start_export_job(name)
+            (task,) = asyncio.all_tasks() - before - {asyncio.current_task()}
+            task.cancel()                    # it hasn't run a step: no worker is submitted
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            for _ in range(500):
+                if store[job_id]["status"] in jobstore.TERMINAL:
+                    break
+                await asyncio.sleep(0.01)
+            return job_id
+
+        with patch.object(store, "_changed", side_effect=spy):
+            job_id = asyncio.run(run())
+        record = self.on_disk("export", job_id)
+        self.assertEqual(record["status"], "failed")
+        self.assertEqual(record["error"], "CancelledError: the export was cancelled before it "
+                                          "finished. Start the export again.")
+        self.assertIsNone(record.get("error_code"))
+        self.assertEqual(seen, [(False, None)])
+        self.assertIsNone(exporter.active_job_for(name))
+        self.assertEqual(collection_writes.active_jobs(name), [])
+        self.assertEqual(calls, [])
+        # a worker that starts late finds its job settled and does nothing
+        exporter._worker(job_id, name, False)
+        self.assertEqual(calls, [])
+        self.assertNotIn(job_id, exporter._abandoned)
+        self.assertNotIn(job_id, exporter._started)
+
+    def test_an_export_whose_worker_started_is_not_settled_by_its_task(self):
+        # #529: once the worker runs, it settles its own job, even if its task
+        # is cancelled meanwhile (the thread carries on).
+        module, store, calls = self.harness("export")
+        name = "Vfy529Running"
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def worker(*args, **kwargs):
+            entered.set()
+            release.wait(10)
+
+        async def run():
+            loop = asyncio.get_running_loop()
+            before = asyncio.all_tasks()
+            job_id = await exporter.start_export_job(name)
+            (task,) = asyncio.all_tasks() - before - {asyncio.current_task()}
+            self.assertTrue(await loop.run_in_executor(None, entered.wait, 10))
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            await asyncio.sleep(0)               # the done callback has run
+            state = (store[job_id]["status"], exporter._active.get(name),
+                     job_id in exporter._started, job_id in exporter._abandoned)
+            release.set()
+            return job_id, state
+
+        with patch.object(exporter, "_run", side_effect=worker):
+            job_id, state = asyncio.run(run())
+        self.assertEqual(state, ("queued", job_id, False, False))
+        self.release_export(name, job_id)
+
+    def test_an_export_whose_task_fails_before_its_worker_runs_is_settled(self):
+        # #529: a task that ends with an error before its worker runs (to_thread
+        # itself raised, as when the executor is shut down) is settled like a
+        # cancelled one: slot and registration freed, then failed, error_code null,
+        # and the error names the exception's type.
+        module, store, calls = self.harness("export")
+        name = "Vfy529Refused"
+        real = asyncio.to_thread
+
+        async def refusing(fn, *args, **kwargs):
+            if getattr(fn, "__name__", "") == "_worker":
+                raise RuntimeError("cannot schedule new futures after shutdown")
+            return await real(fn, *args, **kwargs)
+
+        async def run():
+            before = asyncio.all_tasks()
+            job_id = await exporter.start_export_job(name)
+            (task,) = asyncio.all_tasks() - before - {asyncio.current_task()}
+            with self.assertRaises(RuntimeError):
+                await task
+            for _ in range(500):
+                if store[job_id]["status"] in jobstore.TERMINAL:
+                    break
+                await asyncio.sleep(0.01)
+            return job_id
+
+        with patch.object(asyncio, "to_thread", side_effect=refusing):
+            job_id = asyncio.run(run())
+        self.addCleanup(exporter._abandoned.discard, job_id)
+        record = self.on_disk("export", job_id)
+        self.assertEqual(record["status"], "failed")
+        self.assertEqual(record["error"], "RuntimeError: the export was cancelled before it "
+                                          "finished. Start the export again.")
+        self.assertIsNone(record.get("error_code"))
+        self.assertIsNone(exporter.active_job_for(name))
+        self.assertEqual(collection_writes.active_jobs(name), [])
+        self.assertEqual(calls, [])
+
+    def test_an_export_that_runs_to_the_end_leaves_no_bookkeeping(self):
+        # #529: a worker that ran and a task that ended normally leave neither
+        # set holding the job, and the done callback doesn't touch its status.
+        module, store, calls = self.harness("export")
+        name = "Vfy529Done"
+
+        async def run():
+            before = asyncio.all_tasks()
+            job_id = await exporter.start_export_job(name)
+            (task,) = asyncio.all_tasks() - before - {asyncio.current_task()}
+            await task
+            await asyncio.sleep(0)               # the done callback has run
+            return job_id
+
+        job_id = asyncio.run(run())
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn(job_id, exporter._started)
+        self.assertNotIn(job_id, exporter._abandoned)
+        self.assertEqual(store[job_id]["status"], "queued")   # the stub worker wrote nothing
+        self.release_export(name, job_id)
+
     def test_the_route_answers_export_starting_with_no_job_id(self):
         from unittest.mock import AsyncMock
         from models.schemas import ExportRequest
@@ -880,27 +1015,47 @@ class StartTests(StoreTestCase):
 
 
 class IngestFallbackTests(StoreTestCase):
-    def test_an_error_that_escapes_the_worker_is_saved_with_the_status(self):
+    def on_done(self, record, exc):
+        """Runs `_on_done` on a stored ingest record and a future that failed with
+        `exc`, and returns the record as saved."""
         store = self.bound("ingest")
+        job_id = record["job_id"]
         with patch.object(ingest_pipeline, "_jobs", store):
-            store["ffff0001"] = {"job_id": "ffff0001", "status": "running", "files_total": 1,
-                                 "files_completed": 0, "files_failed": 0, "chunks_stored": 0,
-                                 "errors": [], "skipped": []}
+            store[job_id] = record
             source = Path(ingest_pipeline.__file__).read_text()
             start = source.index("    def _on_done(future")
             end = source.index("    future = asyncio.get_running_loop()", start)
             namespace = {"collection_writes": ingest_pipeline.collection_writes,
-                         "_log": ingest_pipeline._log, "_jobs": store, "job_id": "ffff0001",
+                         "_log": ingest_pipeline._log, "_jobs": store, "job_id": job_id,
                          "asyncio": asyncio, "telemetry": ingest_pipeline.telemetry}
             exec("\n".join(line[4:] for line in source[start:end].splitlines()), namespace)
             loop = asyncio.new_event_loop()
             future = loop.create_future()
-            future.set_exception(RuntimeError("worker crashed"))
+            future.set_exception(exc)
             namespace["_on_done"](future)
             loop.close()
-        record = self.on_disk("ingest", "ffff0001")
+        return self.on_disk("ingest", job_id)
+
+    def test_an_error_that_escapes_the_worker_is_saved_with_the_status(self):
+        record = self.on_done({"job_id": "ffff0001", "status": "running", "files_total": 1,
+                               "files_completed": 0, "files_failed": 0, "chunks_stored": 0,
+                               "errors": [], "skipped": []}, RuntimeError("worker crashed"))
         self.assertEqual((record["status"], record["errors"]), ("failed", ["worker crashed"]))
 
+    def test_a_cancellation_that_escapes_the_worker_is_named_and_counts_stored_files(self):
+        # #529: a cancellation has no message of its own, and the files stored
+        # before it count, as after a restart: partial if any completed.
+        message = ("CancelledError: the ingest was cancelled before it finished. "
+                   "Re-upload the files to try again.")
+        for completed, status in ((0, "failed"), (2, "partial")):
+            with self.subTest(files_completed=completed):
+                job_id = f"ffff052{completed}"
+                record = self.on_done({"job_id": job_id, "status": "running", "files_total": 3,
+                                       "files_completed": completed, "files_failed": 0,
+                                       "chunks_stored": 0, "errors": [], "skipped": []},
+                                      asyncio.CancelledError())
+                self.assertEqual((record["status"], record["errors"], record["files_completed"]),
+                                 (status, [message], completed))
 
 if __name__ == "__main__":
     if not os.environ.get("RAG_TEST_LOG_LEVEL"):

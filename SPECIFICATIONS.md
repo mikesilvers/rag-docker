@@ -1012,6 +1012,10 @@ recorded, without the computed times.
 
 `status` values: `"queued"`, `"running"`, `"completed"`, `"partial"` (some files failed),
 `"failed"`.
+An ingest whose worker is ended by a cancellation (`CancelledError`, or another exception that
+isn't an `Exception`) gets "`<ExceptionType>`: the ingest was cancelled before it finished.
+Re-upload the files to try again." in `errors` and reads `partial` when `files_completed > 0`,
+otherwise `failed`, as an interrupted ingest does (#529); its counters stay as they were.
 
 **Job records survive an API restart (#23).** Ingest, export, import and tune job records are
 kept in `{UPLOAD_DIR}/jobs/{kind}/{job_id}.json` (owner-only, atomic replacement), so
@@ -2524,7 +2528,10 @@ that file is still in `./exports`; `GET /export/jobs` entries carry both (#676).
 collection's writer guard reads `queued` (#509). On failure `error`
 carries the reason and `filename` stays null. An export whose build is cancelled
 reads `failed`, with an `error` saying it was cancelled before it finished and to
-start it again (#521). Export, import and tune job records persist
+start it again (#521); its `error_code` and `error_detail` stay `null`, as on the generic
+failure path (there is no dedicated code). An export whose task is cancelled before its worker
+starts reads `failed` the same way, and its collection's export slot and delete registration
+are released before the status changes (#529). Export, import and tune job records persist
 across an API restart like ingest's (§3.1.3); a job the restart interrupted reads `failed`
 with `error_code` `INTERRUPTED` and an `error` saying the API restarted while it was running. A failed build leaves nothing
 behind: the staging directory and the partial archive are both removed, and the
@@ -4595,12 +4602,13 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       newer charts; its JSON-200, empty-200 and three late-response checks fail on the code before
       #415. `test_health.py` also checks Weaviate and Ollama down together, and that memory below
       the recommendation or unreadable leaves `/health` at 200 `ok`.*
-- [x] The Transfer page keeps polling through failed polls with the button busy, stops after 30 failures in a row with the button enabled again, sends no poll after it unmounts, labels a fidelity it cannot read instead of hiding it, shows an export's `error_code`, and shows a failed package list (#382).
+- [x] The Transfer page keeps polling through failed polls with the button busy, stops after 30 failures in a row with the button enabled again, sends no poll after it unmounts, labels a fidelity it cannot read instead of hiding it, shows an export's `error_code`, says an export polled `queued` is waiting for another job on the collection ("Queued: waiting for another job on this collection to finish.", #520), and shows a failed package list (#382).
       *Evidence: `scripts/verify/browser/transfer_page.js` (suite 06, through `ui_criteria.js`)
       stubs every API call in the browser: proxy 502s while polling either half, a poll in
       flight and an export start answered after the page is left, 409, 503 and 404 from
       `/tune`, a late fidelity answer for another collection, an `EMBEDDING_MISMATCH` export
-      and a 500 from `/packages`. 13 of its 14 checks fail on the code before #382.*
+      and a 500 from `/packages`. 13 of its 14 checks fail on the code before #382. Its #520
+      case answers a `queued` export job and checks the queued message until the job runs.*
 - [x] Delete collection requires typed confirmation before calling API.
       *Confirm button starts disabled and stays disabled for a wrong name; no
       DELETE is sent until the collection name is typed exactly.*
@@ -4707,7 +4715,7 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   *Evidence: suite 01 creates 140 schema changes, waits for a snapshot, writes a tail, restarts, and checks the restored snapshot index and data.*
 
 - [x] Job records persist under `{UPLOAD_DIR}/jobs/{kind}/`: status changes and terminal records are written at once and atomically, progress at most once a second but never left unwritten, a failed write never fails the job, startup marks jobs left `queued` or `running` as interrupted, unreadable records are kept and logged, and the newest 200 per kind are kept, at startup and while the API runs, never removing an unfinished job (#23, #309). The first record is written off the event loop, and a start cancelled during it leaves no record or guard (#309).
-  *Evidence: `test_jobstore.py` (35 cases in the API image, run by `02_ingest.sh`), including a real lifespan run over a stored running job, the four job starts and their cancellation, retention ordered by real writes, an abandoned first write that fails, a second export start waiting for the first one's record (#326), and that wait's error paths and its bound with `EXPORT_STARTING` (#338); with `RAG_ALLOW_RESTART=1`, live restarts of ingest (`partial` and `failed`), export and import jobs.*
+  *Evidence: `test_jobstore.py` (40 cases in the API image, run by `02_ingest.sh`), including a real lifespan run over a stored running job, the four job starts and their cancellation, an export task cancelled, or failed, before its worker starts and an ingest ended by a cancellation (#529), retention ordered by real writes, an abandoned first write that fails, a second export start waiting for the first one's record (#326), and that wait's error paths and its bound with `EXPORT_STARTING` (#338); with `RAG_ALLOW_RESTART=1`, live restarts of ingest (`partial` and `failed`), export and import jobs.*
 
 - [x] At startup, before the first request, what a killed job left behind is removed (#377): an interrupted ingest's upload staging (`{UPLOAD_DIR}/ingest-*`), document preparation's temporary files (`{UPLOAD_DIR}/prepare-*.zip` and `prepare-*.json`, regular files only; #640), and an interrupted export's staging directory (`{UPLOAD_DIR}/export-*`, #549, or `.build-*` in `EXPORTS_DIR` left by earlier versions), and its `.<stem>.tar.gz.partial` archive (`.<stem>.tar.gz.age.partial` for an encrypted export, #27) in `EXPORTS_DIR`. Only those names at the top of each folder, and only a real directory or regular file as the name says, are removed: completed packages, look-alike names and anything in a sub-folder are kept, and a symlink is never followed. What is removed is logged by name and size; a removal that fails is logged and not reported as removed. An export sweep that fails is logged and startup carries on, with the ingest staging still swept (#423).
   *Evidence: `test_startup_sweep.py` (16 cases in the API image, run by `02_ingest.sh`), including an export's staging created as `export-*` in `UPLOAD_DIR` and removed there, and an encrypted export's `.tar.gz.age.partial` archive removed while look-alikes are kept (#549), preparation's `prepare-*.zip` and `prepare-*.json` files removed while other suffixes, links and sub-folders are kept (#640), a real lifespan run that removes both kinds and logs them, and one whose export sweep raises: the error is logged, the API still starts and the ingest staging is removed (#423). With `RAG_ALLOW_RESTART=1`, `02_ingest.sh` checks that its two killed ingests' `ingest-*` staging existed before the restart and is gone after it (#423), and `05_transfer.sh` that the killed export's staging directory and temporary archive are gone after its restart, with the completed package kept. `test_export_encryption.py` (suite 05) also checks that the sweep removes an encrypted export's partial archive and keeps packages (`test_the_startup_sweep_removes_encrypted_partials_only`).*

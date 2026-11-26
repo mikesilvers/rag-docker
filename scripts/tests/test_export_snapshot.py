@@ -407,6 +407,34 @@ class ExportSnapshotTests(unittest.TestCase):
                     self.assertIsNone(job.get("error_code"))
                     self.assertIsNone(job.get("error_detail"))
 
+    def test_cancelled_export_releases_slot_and_registration_before_terminal(self):
+        # A cancelled export frees its one-export slot and its delete registration,
+        # and the registration has ended by the time the status turns terminal (#40, #521).
+        for kind in (asyncio.CancelledError, Stopped):
+            with self.subTest(exception=kind.__name__):
+                job_id = self.run_export()
+                exporter._active[COLL] = job_id
+                self.addCleanup(lambda j=job_id: exporter._active.pop(COLL, None)
+                                if exporter._active.get(COLL) == j else None)
+                writes.register_job(COLL, "export", job_id)
+                self.addCleanup(writes.end_job, "export", job_id)
+                seen = []
+
+                class Record(dict):
+                    def update(self, *args, **kwargs):
+                        seen.append(("export", self["job_id"]) in writes.active_jobs(COLL))
+                        dict.update(self, *args, **kwargs)
+
+                record = Record(exporter._jobs[job_id])
+                exporter._jobs[job_id] = record
+                with patch.object(packager, "build", side_effect=kind()):
+                    with self.assertRaises(kind):
+                        exporter._run(job_id, COLL, False)
+                self.assertEqual(seen, [False])
+                self.assertEqual(record["status"], "failed")
+                self.assertIsNone(exporter.active_job_for(COLL))
+                self.assertNotIn(("export", job_id), writes.active_jobs(COLL))
+
 
 if __name__ == "__main__":
     unittest.main()
