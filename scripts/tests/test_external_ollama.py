@@ -488,7 +488,9 @@ class OllamaCheckTests(unittest.TestCase):
     def test_mode_off_is_a_problem(self):
         status, lines = self.run_check(FakeOllama(), on=False)
         self.assertEqual(status, 1)
-        self.assertIn("external Ollama mode is off", lines[0])
+        self.assertTrue(lines[0].startswith(
+            "ollama-check: problem: external mode is off: start the stack with docker-compose.external-ollama.yml"),
+            lines[0])
 
     def test_it_only_reads(self):
         fake = FakeOllama()

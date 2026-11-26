@@ -32,7 +32,7 @@ def run(client: httpx.Client, out=sys.stdout) -> int:
     if settings.rag_external_ollama:
         say("ok", "external Ollama mode is on (RAG_EXTERNAL_OLLAMA=true)")
     else:
-        say("problem", "external Ollama mode is off: start the stack with "
+        say("problem", "external mode is off: start the stack with "
                        "docker-compose.external-ollama.yml (README \"External Ollama (native)\")")
     try:
         resp = client.get(f"{base}/api/version")
