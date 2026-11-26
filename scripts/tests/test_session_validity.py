@@ -483,6 +483,25 @@ class ValidityServiceTests(unittest.TestCase):
         self.assertTrue(gs.get_session('gs_11111111')['stale'])
         self.assertFalse(gs.get_session('gs_22222222').get('stale', False))
 
+    def test_unreadable_earlier_marker_on_an_unsaved_session_is_historical_until_restart(self):
+        # #571: gs_22222222 failed both writes and its earlier pending marker
+        # can't be read, so its marker lives only in memory: it stays stale
+        # there, and the diagnostic says historical only until restart.
+        self._two_spellings()
+        real_text = gs._pending_marker_text
+        def text(sid):
+            if sid == 'gs_22222222':
+                raise OSError('Synthetic read fault')
+            return real_text(sid)
+        save, marker = self._failing_writes(lambda s: s['session_id'] == 'gs_22222222', {'gs_22222222'})
+        with save, marker, patch.object(gs, '_pending_marker_text', side_effect=text), self.assertRaises(gs.GoldStandardError):
+            gs.mark_stale('ValidityFixture', 'Synthetic replacement', require_durable=True)
+        self.assertTrue(gs.get_session('gs_22222222')['stale'])
+        self.assertEqual(gs._diagnostics[str(gs._session_key('gs_22222222'))]['message'], gs._ROLLBACK_UNTIL_RESTART_MESSAGE)
+        self.assertFalse(gs.get_session('gs_11111111').get('stale', False))
+        gs._sessions = {}; gs.load_sessions_from_disk()
+        self.assertFalse(gs.get_session('gs_22222222').get('stale', False))
+
     def test_request_validation_errors_use_project_envelope_without_input(self):
         from fastapi.testclient import TestClient
         from main import app
