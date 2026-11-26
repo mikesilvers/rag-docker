@@ -939,6 +939,136 @@ class IngestImportTests(unittest.TestCase):
         self.assertEqual(validated['collection'], 'Corpus')
         self.assertEqual(validated['chunk_size'], 800)
 
+    def test_legacy_bound_edges_and_non_overlap_strategies_are_accepted(self):
+        # Reviewer (#510): the pre-#53 edges, chunk_size 1 and min_chunk_size 0, and
+        # chunk_overlap >= chunk_size for strategies the overlap rule doesn't cover.
+        for data in [{'chunking_strategy': 'fixed', 'chunk_size': 1, 'chunk_overlap': 0,
+                      'min_chunk_size': 0},
+                     {'chunking_strategy': 'semantic', 'chunk_size': 100, 'chunk_overlap': 200,
+                      'similarity_threshold': 0, 'min_chunk_size': 0},
+                     {'chunking_strategy': 'fixed', 'chunk_size': 50, 'chunk_overlap': 50,
+                      'similarity_threshold': 1}]:
+            with self.subTest(data=data):
+                validated = ingest_config.validate(data, 'Corpus')
+                for key, value in data.items():
+                    self.assertEqual(validated[key], value)
+        for data in [{'chunk_size': 1}, {'chunk_size': '0'}, {'min_chunk_size': '-1'}]:
+            with self.subTest(data=data), self.assertRaises(ValueError):
+                ingest_config.validate(data, 'Corpus')
+
+    def test_symlinked_ingest_settings_are_refused(self):
+        # Reviewer (#510): the is_symlink branch of check 4c.
+        target = self.root / 'outside.json'
+        target.write_text('{}')
+        (self.pkg / 'ingest_config.json').symlink_to(target)
+        with self.assertRaises(packager.PackageError) as caught:
+            importer._read_ingest_config(self.pkg, 'Corpus')
+        self.assertEqual(caught.exception.code, 'PACKAGE_CORRUPT')
+        self.assertEqual(caught.exception.detail, {'file': 'ingest_config.json'})
+
+    def test_retrieval_settings_are_checked_before_ingest_settings(self):
+        # Reviewer (#510): check 4c runs after 4b, so 4b's refusal is the one reported.
+        (self.pkg / 'retrieval_config.json').write_text('{')
+        self.archive('{')
+        with patch.object(importer, '_ensure_models') as models, \
+             patch.object(importer, '_build') as build:
+            importer._jobs['test'] = {'status': 'queued'}
+            importer._run('test', 'fixture.tar.gz', 'abort')
+        result = importer._jobs['test']
+        self.assertEqual(result['status'], 'failed', result)
+        self.assertEqual(result['error_detail'], {'file': 'retrieval_config.json'}, result)
+        models.assert_not_called()
+        build.assert_not_called()
+
+    # Export (#515): saved settings are checked as import check 4c does, before any
+    # chunk is read, so a package never holds settings its import would refuse.
+    def export(self):
+        with patch.object(packager, 'read_chunks', return_value=[]) as chunks, \
+             patch.object(packager.wc, '_collection_config_sync',
+                          return_value={'embedding_model': settings.embed_model}) as collection, \
+             patch.object(packager, '_goldstandard_sessions', return_value=[]), \
+             patch.object(packager.sources, 'load_index', return_value={'documents': {}}), \
+             patch.object(packager.wc, '_meta_sync', return_value={'version': 'test'}):
+            try:
+                return packager.build('Corpus'), chunks, collection
+            except ValueError as exc:
+                exc.mocks = (chunks, collection)
+                raise
+
+    def packaged(self, filename):
+        with tarfile.open(self.exports / filename) as archive:
+            archive.extractall(self.root / 'extracted', filter='data')
+        return next((self.root / 'extracted').iterdir())
+
+    def test_export_refuses_invalid_saved_ingest_settings(self):
+        saved = ingest_config._path('Corpus')
+        for value in INVALID_INGEST:
+            if value is None:   # None is no saved settings, not invalid ones.
+                continue
+            with self.subTest(value=value):
+                saved.write_text(json.dumps(value))
+                before = saved.read_bytes()
+                with self.assertRaises(ValueError) as caught:
+                    self.export()
+                message = str(caught.exception)
+                self.assertIn("'Corpus'", message)
+                self.assertIn('Chunking Configuration page', message)
+                if not isinstance(value, dict):
+                    self.assertIn('not a JSON object', message)
+                elif {'chunk_size', 'chunk_overlap'} <= value.keys():   # the overlap rule names no field
+                    self.assertIn('chunk_overlap must be smaller', message)
+                else:
+                    self.assertIn(next(iter(value)), message)
+                for mock in caught.exception.mocks:   # refused before any chunk is read
+                    mock.assert_not_called()
+                self.assertEqual(list(self.exports.iterdir()), [])
+                self.assertEqual(saved.read_bytes(), before)
+
+    def test_export_packages_valid_saved_ingest_settings_as_validated(self):
+        cases = [
+            # Saved before the #53 bounds: exported as it is, never clamped.
+            ({'chunking_strategy': 'fixed', 'chunk_size': 20, 'chunk_overlap': 10,
+              'similarity_threshold': None, 'min_chunk_size': 8000},
+             {'chunking_strategy': 'fixed', 'chunk_size': 20, 'chunk_overlap': 10,
+              'similarity_threshold': None, 'min_chunk_size': 8000}),
+            ({}, dict(ingest_config.DEFAULTS)),
+            ({'collection': 'OldName', 'is_default': True, 'legacy_field': 'ignored',
+              'chunking_strategy': 'fixed', 'chunk_size': '150', 'chunk_overlap': '20',
+              'min_chunk_size': '40'},
+             {**ingest_config.DEFAULTS, 'chunking_strategy': 'fixed', 'chunk_size': 150,
+              'chunk_overlap': 20, 'min_chunk_size': 40}),
+        ]
+        saved = ingest_config._path('Corpus')
+        for data, expected in cases:
+            with self.subTest(data=data):
+                saved.write_text(json.dumps(data))
+                before = saved.read_bytes()
+                result, _, _ = self.export()
+                pkg = self.packaged(result['filename'])
+                packaged = json.loads((pkg / 'ingest_config.json').read_text())
+                self.assertEqual(packaged, {'collection': 'Corpus', **expected})
+                self.assertEqual(importer._read_ingest_config(pkg, 'Corpus'), packaged)
+                manifest = json.loads((pkg / 'manifest.json').read_text())
+                self.assertEqual(manifest['chunking'], {
+                    'strategy': expected['chunking_strategy'],
+                    'chunk_size': expected['chunk_size'],
+                    'chunk_overlap': expected['chunk_overlap']})
+                self.assertEqual(saved.read_bytes(), before)
+                shutil.rmtree(self.root / 'extracted')
+                for leftover in self.exports.iterdir():
+                    leftover.unlink()
+
+    def test_export_leaves_out_unreadable_saved_ingest_settings(self):
+        ingest_config._path('Corpus').write_text('{')
+        result, _, _ = self.export()
+        self.assertFalse((self.packaged(result['filename']) / 'ingest_config.json').exists())
+
+    def test_export_leaves_out_saved_ingest_settings_that_cannot_be_read(self):
+        # Reviewer (#515): a saved path that can't be read counts as no settings too.
+        ingest_config._path('Corpus').mkdir()
+        result, _, _ = self.export()
+        self.assertFalse((self.packaged(result['filename']) / 'ingest_config.json').exists())
+
 
 if __name__ == '__main__':
     unittest.main()

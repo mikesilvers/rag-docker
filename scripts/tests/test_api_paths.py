@@ -38,7 +38,7 @@ from config import settings
 from main import app
 from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import collection_writes, ingest_pipeline, metrics, ollama_client
-from services import rag_pipeline, retrieval_config, system_info
+from services import ingest_config, rag_pipeline, retrieval_config, system_info
 from services import weaviate_client as wc
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -338,6 +338,103 @@ class RetrievalConfigFileTests(ApiTestCase):
                 self.assert_falls_back()
         self.saved_file().write_text(json.dumps({"alpha": 1.5}))
         self.assertEqual(self.get_config(), {**DEFAULTS, "alpha": 1.5, "is_default": False})
+
+
+# ── ingest config file (#515) ─────────────────────────────────────────────────
+
+INGEST_DEFAULTS = {"collection": "Coll", "chunking_strategy": "overlap", "chunk_size": 1000,
+                   "chunk_overlap": 200, "similarity_threshold": None, "min_chunk_size": 100}
+
+
+class IngestConfigFileTests(ApiTestCase):
+    """GET /ingest/config falls back like the retrieval config file above (#515)."""
+
+    def setUp(self):
+        super().setUp()
+        for target, attribute, value in (
+                (ingest_config, "_DIR", None),
+                # The settings routes answer 404 for a collection that doesn't exist (#606).
+                (wc, "collection_exists", AsyncMock(return_value=True))):
+            patcher = patch.object(target, attribute, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def saved_file(self):
+        return ingest_config._dir() / "Coll.json"
+
+    def get_config(self):
+        response = self.client.get("/ingest/config/Coll")
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
+    def assert_falls_back(self, warning="Invalid"):
+        with self.assertLogs("services.ingest_config", "WARNING") as logs:
+            body = self.get_config()
+        self.assertEqual(body, {**INGEST_DEFAULTS, "is_default": True})
+        self.assertIn(f"{warning} ingest config for 'Coll'", "\n".join(logs.output))
+
+    def test_a_file_that_is_not_json_or_cannot_be_read_falls_back_to_the_defaults(self):
+        # Before #515 too: load() reads it as no saved settings.
+        self.saved_file().write_text('{"chunk_size": 800, ')
+        self.assert_falls_back("Unreadable")
+        self.saved_file().unlink()
+        self.saved_file().mkdir()
+        self.assert_falls_back("Unreadable")
+
+    def test_json_that_is_not_an_object_falls_back_to_the_defaults(self):
+        # #515: each made resolve() raise TypeError and the route answer 500.
+        for text in ("[1, 2]", "3", '"settings"', "true"):
+            with self.subTest(saved=text):
+                self.saved_file().write_text(text)
+                self.assert_falls_back()
+
+    def test_a_field_of_the_wrong_type_falls_back_to_the_defaults(self):
+        # #515: a value the GET response can't carry made the route answer 500.
+        for field, value in (("chunk_size", "x"), ("chunk_size", 1.5), ("chunk_size", {"a": 1}),
+                             ("chunk_size", [7]), ("chunking_strategy", 3),
+                             ("chunking_strategy", None), ("chunk_overlap", "x"),
+                             ("similarity_threshold", "x"), ("min_chunk_size", "x")):
+            with self.subTest(field=field, value=value):
+                self.saved_file().write_text(json.dumps({field: value}))
+                self.assert_falls_back()
+
+    def test_a_non_finite_similarity_threshold_falls_back_to_the_defaults(self):
+        # #515: JSON has no NaN or Infinity, so the response sent
+        # `"similarity_threshold": null` with `is_default: false`.
+        for text in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(similarity_threshold=text):
+                self.saved_file().write_text('{"similarity_threshold": %s}' % text)
+                self.assert_falls_back()
+
+    def test_a_saved_is_default_key_falls_back_to_the_defaults(self):
+        # #515: the router's IngestConfigResponse(is_default=..., **cfg) got the keyword
+        # twice and the route answered 500.
+        for value in (True, False):
+            with self.subTest(is_default=value):
+                self.saved_file().write_text(json.dumps({"chunk_size": 800, "is_default": value}))
+                self.assert_falls_back()
+
+    def test_values_the_response_can_carry_are_served_as_saved(self):
+        # Coercible, out-of-range and pre-#53 values (SPECIFICATIONS.md section 8) are
+        # served as saved; export still refuses what the save contract refuses.
+        for saved, served in (
+                ({"chunk_size": "700"}, {"chunk_size": 700}),
+                ({"chunk_size": 20, "min_chunk_size": 8000}, {"chunk_size": 20, "min_chunk_size": 8000}),
+                ({"chunking_strategy": "unknown", "chunk_overlap": 5000, "similarity_threshold": 1.5},
+                 {"chunking_strategy": "unknown", "chunk_overlap": 5000, "similarity_threshold": 1.5})):
+            with self.subTest(saved=saved):
+                self.saved_file().write_text(json.dumps(saved))
+                self.assertEqual(self.get_config(), {**INGEST_DEFAULTS, **served, "is_default": False})
+
+    def test_a_valid_save_replaces_an_invalid_file(self):
+        self.saved_file().write_text("[1]")
+        self.assert_falls_back()
+        body = {**INGEST_DEFAULTS, "chunking_strategy": "fixed", "chunk_size": 800,
+                "chunk_overlap": 0}
+        response = self.client.post("/ingest/config", json=body)
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(json.loads(self.saved_file().read_text()), body)
+        self.assertEqual(self.get_config(), {**body, "is_default": False})
 
 
 # ── GET /metrics/latency (PL:B1, PL:B2, PL:B3) ───────────────────────────────

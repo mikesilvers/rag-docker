@@ -423,7 +423,13 @@ regressions. Its `IngestImportTests` do the same for `ingest_config.json`
 (E35, #510): malformed ingest settings are refused `PACKAGE_CORRUPT` in every
 conflict mode before any live change, and valid ones, including chunk sizes from
 before the #53 bounds, are restored from the checked snapshot and read back
-through `GET /ingest/config`. Run it with the same API dependencies as the session import test.
+through `GET /ingest/config`. They also check (#518) that `chunk_size` 1 and
+`min_chunk_size` 0 are accepted, that a symlinked `ingest_config.json` is refused,
+and that the retrieval-settings check runs before the ingest-settings one; and
+(E52, #515) that an export refuses invalid saved ingest settings before any chunk
+is read, naming the failing field and the Chunking Configuration page, packages
+valid ones as validated, pre-#53 sizes unchanged, and leaves out a file that isn't
+JSON. Run it with the same API dependencies as the session import test.
 `05_transfer.sh` registers it and `retrieval_settings.py` (E28), which submits
 15 malformed settings imports across abort/rename/replace and verifies live
 collection counts and saved settings are unchanged. The normal rename import
@@ -1032,7 +1038,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_lan_mode.py` | API image, no network: `RAG_LAN_MODE` parsing, the startup refusal (also through `import main`), the certificate step, both nginx configurations, `lan_stack.py`'s rate-limit check against faked answers (#598), embedded copies (#26) |
 | `docker-compose.lan.verify.yml` | the harness overlay of a `--lan` run: TLS on loopback at the verify port, the verify image for `tls-init`, reserved test names (#26) |
 | `16_api_paths.sh` | ingest, query, metrics and health API paths (#399), run last by suite 01: `NO_SUPPORTED_FILES`, `JOB_NOT_FOUND`, schema rules, the proxy's `/api/` timeouts, `/metrics/latency`, a default query and its metric (LLM); opt-in restart and first-start checks |
-| `../tests/test_api_paths.py` | controlled ingest error, `/query` default, §6 prompt, query metric, retrieval-config file, `/metrics/latency` and `/health` probe regressions (#399), registered by `16_api_paths.sh` |
+| `../tests/test_api_paths.py` | controlled ingest error, `/query` default, §6 prompt, query metric, retrieval-config file, ingest-config file (#515), `/metrics/latency` and `/health` probe regressions (#399), registered by `16_api_paths.sh` |
 | `../tests/test_ollama_entrypoint.py` | `ollama/entrypoint.sh` with stub commands, on the host: skip present models, timed pull, retries (#399), registered by `16_api_paths.sh` |
 | `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure; in full runs, a large JSON Lines corpus ingested, retained, re-chunked and replaced (#312) |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
@@ -1553,7 +1559,11 @@ from the defaults, and one that isn't JSON, can't be read, holds JSON that isn't
 or nested `top_k`) gives the defaults with `is_default: true` and a warning, while coercible
 and out-of-range values are still served as saved (#439); so do a `NaN` or infinite `alpha`
 and a saved `is_default` key, which answered `"alpha": null` and 500 before #477, while a
-finite `alpha` of 1.5 is served as saved. `GET /metrics/latency` is
+finite `alpha` of 1.5 is served as saved. The saved ingest config falls back the same way
+(#515): JSON that isn't an object, a field of the wrong type, a `NaN` or infinite
+`similarity_threshold` or a saved `is_default` key gives the defaults with `is_default: true`
+and a warning, coercible, out-of-range and pre-#53 values are served as saved, and a valid
+save replaces the file. `GET /metrics/latency` is
 checked for its statistics against hand-worked percentiles, its exact-match `collection` and
 `retrieval_mode` filters, and `history_limit` (default 100, 0, 500, 501 refused with 422). A
 Weaviate client check that hangs makes `/health` give up on it after 4 s, and an unreadable

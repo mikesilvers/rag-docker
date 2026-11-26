@@ -14,7 +14,7 @@ import re
 from pathlib import Path
 
 from config import settings
-from models.schemas import StoredIngestConfig
+from models.schemas import IngestConfigResponse, StoredIngestConfig
 from services import settings_store
 
 log = logging.getLogger(__name__)
@@ -60,12 +60,28 @@ def load(collection: str) -> dict | None:
 
 
 def resolve(collection: str) -> tuple[dict, bool]:
-    """Return (config, is_default). Never raises; always usable."""
+    """Return (config, is_default). Never raises; always usable.
+
+    Saved settings that cannot be served, JSON that is not an object, a field of
+    the wrong type, a non-finite similarity_threshold or the response's own
+    is_default key (#515), are logged and give the defaults, like an unreadable
+    file and as retrieval settings do (#439, #477). Values of the right type,
+    including chunk sizes from before the #53 bounds, are served as saved; the
+    next valid save replaces the file, and export still refuses it.
+    """
     saved = load(collection)
     if saved is None:
         return {"collection": collection, **DEFAULTS}, True
-    merged = {"collection": collection, **DEFAULTS, **saved}
-    merged["collection"] = collection
+    try:
+        merged = {"collection": collection, **DEFAULTS, **saved}   # TypeError: not an object
+        merged["collection"] = collection
+        if "is_default" in merged:
+            # Not a setting; the router would get the keyword twice.
+            raise ValueError("saved settings hold is_default")
+        IngestConfigResponse.model_validate({**merged, "is_default": False})
+    except (TypeError, ValueError):   # pydantic's ValidationError is a ValueError
+        log.warning("Invalid ingest config for %r; falling back to defaults", collection)
+        return {"collection": collection, **DEFAULTS}, True
     return merged, False
 
 
