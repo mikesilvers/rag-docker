@@ -1553,7 +1553,8 @@ retrieval settings files, the query metric and the metrics filter, retained orig
 (`MyDocs`). It fails on the code before #372. Suite 05 then, on the verify stack, creates and
 ingests under a lowercase-first name, reads the tuning options and exports under the stored
 name, re-chunks under the lowercase name and, unless `RAG_SKIP_SLOW=1`, checks a query's
-metrics under both spellings.
+metrics under both spellings, and generates a gold-standard session under the lowercase name and checks that the
+export of the stored name carries it, as `goldstandard/<session id>.json` with the stored name (#472).
 
 Suite 01 also runs `scripts/tests/test_health.py` the same way (#375). It sends `GET /health/details`
 through the app with Ollama's `/api/tags` answered by an httpx mock transport and the Weaviate
