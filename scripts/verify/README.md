@@ -786,8 +786,9 @@ The bound counts once, from the second start's first wait: when the first start'
 and another start takes the slot, waiting again on that one doesn't restart it (#347).
 An export task cancelled before its worker starts frees the collection's export slot and its
 delete registration, then reads `failed` with the cancelled message and `error_code` `null`,
-and a worker that starts late does nothing; one whose worker has started is left to the worker
-(#529). An error that escapes the ingest worker is saved with the `failed` status, and a
+as does one whose task fails before its worker starts (the message names the error's type),
+and a worker that starts late does nothing; one whose worker has started is left to the worker,
+and one that ends normally leaves no bookkeeping behind (#529). An error that escapes the ingest worker is saved with the `failed` status, and a
 cancellation that escapes it is named in `errors` and reads `partial` when files completed,
 otherwise `failed` (#529).
 `02_ingest.sh` runs it in the API container. With

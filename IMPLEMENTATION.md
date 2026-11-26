@@ -31138,8 +31138,9 @@ The bound counts once, from the second start's first wait: when the first start'
 and another start takes the slot, waiting again on that one doesn't restart it (#347).
 An export task cancelled before its worker starts frees the collection's export slot and its
 delete registration, then reads `failed` with the cancelled message and `error_code` `null`,
-and a worker that starts late does nothing; one whose worker has started is left to the worker
-(#529). An error that escapes the ingest worker is saved with the `failed` status, and a
+as does one whose task fails before its worker starts (the message names the error's type),
+and a worker that starts late does nothing; one whose worker has started is left to the worker,
+and one that ends normally leaves no bookkeeping behind (#529). An error that escapes the ingest worker is saved with the `failed` status, and a
 cancellation that escapes it is named in `errors` and reads `partial` when files completed,
 otherwise `failed` (#529).
 `02_ingest.sh` runs it in the API container. With
@@ -72418,6 +72419,65 @@ class StartTests(StoreTestCase):
         with patch.object(exporter, "_run", side_effect=worker):
             job_id, state = asyncio.run(run())
         self.assertEqual(state, ("queued", job_id, False, False))
+        self.release_export(name, job_id)
+
+    def test_an_export_whose_task_fails_before_its_worker_runs_is_settled(self):
+        # #529: a task that ends with an error before its worker runs (to_thread
+        # itself raised, as when the executor is shut down) is settled like a
+        # cancelled one: slot and registration freed, then failed, error_code null,
+        # and the error names the exception's type.
+        module, store, calls = self.harness("export")
+        name = "Vfy529Refused"
+        real = asyncio.to_thread
+
+        async def refusing(fn, *args, **kwargs):
+            if getattr(fn, "__name__", "") == "_worker":
+                raise RuntimeError("cannot schedule new futures after shutdown")
+            return await real(fn, *args, **kwargs)
+
+        async def run():
+            before = asyncio.all_tasks()
+            job_id = await exporter.start_export_job(name)
+            (task,) = asyncio.all_tasks() - before - {asyncio.current_task()}
+            with self.assertRaises(RuntimeError):
+                await task
+            for _ in range(500):
+                if store[job_id]["status"] in jobstore.TERMINAL:
+                    break
+                await asyncio.sleep(0.01)
+            return job_id
+
+        with patch.object(asyncio, "to_thread", side_effect=refusing):
+            job_id = asyncio.run(run())
+        self.addCleanup(exporter._abandoned.discard, job_id)
+        record = self.on_disk("export", job_id)
+        self.assertEqual(record["status"], "failed")
+        self.assertEqual(record["error"], "RuntimeError: the export was cancelled before it "
+                                          "finished. Start the export again.")
+        self.assertIsNone(record.get("error_code"))
+        self.assertIsNone(exporter.active_job_for(name))
+        self.assertEqual(collection_writes.active_jobs(name), [])
+        self.assertEqual(calls, [])
+
+    def test_an_export_that_runs_to_the_end_leaves_no_bookkeeping(self):
+        # #529: a worker that ran and a task that ended normally leave neither
+        # set holding the job, and the done callback doesn't touch its status.
+        module, store, calls = self.harness("export")
+        name = "Vfy529Done"
+
+        async def run():
+            before = asyncio.all_tasks()
+            job_id = await exporter.start_export_job(name)
+            (task,) = asyncio.all_tasks() - before - {asyncio.current_task()}
+            await task
+            await asyncio.sleep(0)               # the done callback has run
+            return job_id
+
+        job_id = asyncio.run(run())
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn(job_id, exporter._started)
+        self.assertNotIn(job_id, exporter._abandoned)
+        self.assertEqual(store[job_id]["status"], "queued")   # the stub worker wrote nothing
         self.release_export(name, job_id)
 
     def test_the_route_answers_export_starting_with_no_job_id(self):
