@@ -14959,6 +14959,14 @@ _active: set[str] = set()
 # imports never build, mark or clean up one collection at once (#391).
 _targets: dict[str, str] = {}
 _lock = threading.Lock()
+# A cancelled import's error (#871); its code is IMPORT_FAILED, as for an
+# unexpected failure.
+_CANCELLED = ("CancelledError: the import was cancelled before it finished. "
+              "Start the import again.")
+# Import workers that have started, and jobs settled before their worker
+# could start (#871): whichever comes first wins, under _lock.
+_started: set[str] = set()
+_abandoned: set[str] = set()
 
 # Weaviate capitalises the first character of a collection name and rejects
 # anything outside [A-Za-z0-9_]. Both were confirmed against the live server.
@@ -15731,11 +15739,16 @@ def _build(target: str, pkg: Path, manifest: dict, progress, instance: str | Non
     _create_from_package(target, pkg, instance)
     try:
         return _insert_chunks(target, pkg, manifest, progress)
-    except Exception as original:
-        # Spec §6.5: a failure part-way leaves no partial collection.
+    except (Exception, asyncio.CancelledError) as original:
+        # Spec §6.5: a failure part-way leaves no partial collection, and so does
+        # a cancellation (#871).
         try:
             telemetry.call("weaviate.delete", wc.get_client().collections.delete, target)
         except Exception as cleanup:
+            if isinstance(original, asyncio.CancelledError):
+                # Re-raised as it is: _run finds the target still there and
+                # keeps its marker for the startup sweep.
+                raise original
             raise PackageError("IMPORT_FAILED", f"{type(original).__name__}: {original}; "
                                f"partial target cleanup failed ({cleanup})",
                                {"collection": target, "cleanup_pending": True}) from original
@@ -15961,6 +15974,23 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
                             f"'{temp_collection}'.")
             job["error_detail"] = {"recovered_as": temp_collection,
                                    "sidecar_snapshots": collection_recovery.sidecar_reference(ownership)}
+    except asyncio.CancelledError:
+        # A cancellation still ends the job (#871), with the code of an
+        # unexpected failure. _build removed a partial target; one it could not
+        # remove (or that Weaviate can't confirm gone) keeps its marker for the
+        # startup sweep. A retained replace copy is reported as on the failure
+        # paths. Re-raised so it propagates; `traced` records the outcome.
+        detail: dict = {}
+        if marked and not built and exists_fail_closed(marked):
+            detail.update(collection=marked, cleanup_pending=True)
+        error = _CANCELLED
+        if staged and temp_collection:
+            error += f" The imported data is available as '{temp_collection}'."
+            detail.update(recovered_as=temp_collection,
+                          sidecar_snapshots=collection_recovery.sidecar_reference(ownership))
+        finish(status="failed", error_code="IMPORT_FAILED", error=error,
+               error_detail=detail or None)
+        raise
     finally:
         # A handled failure already removed the partial collection, so the
         # marker has nothing left to describe. Only a hard kill leaves one
@@ -15997,6 +16027,38 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
         with _lock:
             _active.discard(_package_key(filename))
         _release_targets(job_id)
+
+
+def _worker(job_id: str, filename: str, on_conflict: str, passphrase: str | None = None,
+            identity: "age_stream.Identity | None" = None) -> None:
+    """The import task's worker: runs `_run` unless the task has already settled
+    the job, because it ended before this worker could start (#871)."""
+    with _lock:
+        if job_id in _abandoned:
+            _abandoned.discard(job_id)
+            return
+        _started.add(job_id)
+    if identity is not None:
+        _run(job_id, filename, on_conflict, None, identity)
+    else:
+        _run(job_id, filename, on_conflict, passphrase)
+
+
+def _settle_unstarted(job_id: str, name: str) -> None:
+    """A done callback: settles a job whose task ended before its worker could
+    start (#871), freeing the package claim before the status turns terminal,
+    so a client that sees it fail can import or download the package again. A
+    worker that started settles its own job."""
+    with _lock:
+        if job_id in _started:
+            _started.discard(job_id)
+            return
+        _abandoned.add(job_id)
+        _active.discard(name)
+    job = _jobs.get(job_id)
+    # A small write on the event loop, as ingest's done callback makes (#309).
+    if job is not None and job.get("status") not in jobstore.TERMINAL:
+        job.update(status="failed", error_code="IMPORT_FAILED", error=_CANCELLED)
 
 
 def package_kind(name: str) -> str | None:
@@ -16092,11 +16154,13 @@ async def start_import_job(filename: str, on_conflict: str, passphrase: str | No
         _release_package(name)
         raise
     if identity is not None:
-        asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, filename, on_conflict,
-                                              None, identity))
+        task = asyncio.create_task(asyncio.to_thread(telemetry.admitted(_worker), job_id, filename,
+                                                     on_conflict, None, identity))
     else:
-        asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, filename, on_conflict,
-                                              passphrase))
+        task = asyncio.create_task(asyncio.to_thread(telemetry.admitted(_worker), job_id, filename,
+                                                     on_conflict, passphrase))
+    # A task cancelled before its worker starts still ends its job (#871).
+    task.add_done_callback(lambda _task: _settle_unstarted(job_id, name))
     return job_id
 ```
 
@@ -30851,8 +30915,11 @@ collection; a target is free again after its import fails; a refused import leav
 the claim with its holder, so a third import of the target is refused too; the claim
 comes before the `COLLECTION_DELETING` check; a refused import never reaches model
 installation, the target stays claimed while its holder installs models, and a
-target is free again after a failed model installation (#492); and a start whose
-first job record can't be stored releases the package name. `05_transfer.sh` runs it
+target is free again after a failed model installation (#492); a start whose
+first job record can't be stored releases the package name; and an import whose task
+is cancelled before its worker runs frees the package name, then reads `failed`
+`IMPORT_FAILED` with the cancelled message, a worker that starts late runs nothing,
+and one that started is left to settle its own job (#871). `05_transfer.sh` runs it
 in the verify project's API container.
 
 `scripts/tests/test_ingest_errors.py` (#290) checks that damaged or unreadable ZIPs are

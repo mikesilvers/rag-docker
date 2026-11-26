@@ -548,8 +548,11 @@ collection; a target is free again after its import fails; a refused import leav
 the claim with its holder, so a third import of the target is refused too; the claim
 comes before the `COLLECTION_DELETING` check; a refused import never reaches model
 installation, the target stays claimed while its holder installs models, and a
-target is free again after a failed model installation (#492); and a start whose
-first job record can't be stored releases the package name. `05_transfer.sh` runs it
+target is free again after a failed model installation (#492); a start whose
+first job record can't be stored releases the package name; and an import whose task
+is cancelled before its worker runs frees the package name, then reads `failed`
+`IMPORT_FAILED` with the cancelled message, a worker that starts late runs nothing,
+and one that started is left to settle its own job (#871). `05_transfer.sh` runs it
 in the verify project's API container.
 
 `scripts/tests/test_ingest_errors.py` (#290) checks that damaged or unreadable ZIPs are

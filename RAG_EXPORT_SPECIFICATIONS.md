@@ -903,6 +903,13 @@ error, so the imported data is recoverable rather than lost. It MUST NOT be
 named when the staging build itself failed — there is nothing there to recover,
 and pointing the user at a collection that does not exist is worse than silence.
 
+A cancellation of the import job (`asyncio.CancelledError`) is handled as a
+failure: the partial collection is removed (one whose removal fails keeps its
+marker for the startup sweep, §6.5.1), a retained copy is named in the error with
+`recovered_as` and `sidecar_snapshots`, and the job reads `failed`
+`IMPORT_FAILED` with "CancelledError: the import was cancelled before it
+finished. Start the import again." (#871).
+
 ### 6.5.1 Surviving a hard kill
 
 The guarantees above rely on cleanup code running. A `SIGKILL`, an OOM kill or
