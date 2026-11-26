@@ -1918,6 +1918,184 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
       } finally { await s.ctx.close(); }
     }
 
+    // Transfer, stubbed: opening a finished job while the running job's lookup
+    // is in flight stops that chain too, in both panels (#629). Each lookup of
+    // a running job answers after 1 s; a chain that went on would show the
+    // running job again and look it up again within about 3 s.
+    {
+      const s = await session(browser, BASE, 'developer');
+      try {
+        const mine = { name: 'vfy-developer', kind: 'user' };
+        const exp = (id, done, collection) => ({ job_id: id, status: done ? 'completed' : 'running', collection,
+          chunks_written: done ? 9 : 3, filename: done ? `ragpkg-${id}.tar.gz` : null, size_bytes: done ? 2048 : null,
+          source_document_count: done ? 1 : null, fidelity: done ? 'with-sources' : null, models_bundled: done ? false : null,
+          retrieve_script: done ? true : null, warnings: [], error: null, error_code: null, error_detail: null });
+        const imp = (id, done, filename) => ({ job_id: id, status: done ? 'completed' : 'running', filename, on_conflict: 'rename',
+          collection: done ? 'StubDone629w' : null, original_collection: done ? 'StubDone629w' : null, chunks_written: done ? 4 : 2,
+          fidelity: done ? 'with-sources' : null, renamed: false, notes: [], restored_sessions: [], error: null, error_code: null,
+          error_detail: null });
+        const slow = { '/api/export/job/vfy629we': exp('vfy629we', false, 'StubSlow629'),
+          '/api/import/job/vfy629wi': imp('vfy629wi', false, 'ragpkg-slow629.tar.gz') };
+        const lookups = { '/api/export/job/vfy629we': [], '/api/import/job/vfy629wi': [] };
+        await s.page.setRequestInterception(true);
+        s.page.on('request', request => {
+          const path = new URL(request.url()).pathname;
+          if (path === '/api/export/jobs') return request.respond(json({ jobs: [
+            { ...slow['/api/export/job/vfy629we'], owner: mine, created_at: at(60), finished_at: null },
+            { ...exp('vfy629wf', true, 'StubDone629w'), owner: mine, created_at: at(9000), finished_at: at(8900) }] }));
+          if (path === '/api/import/jobs') return request.respond(json({ jobs: [
+            { ...slow['/api/import/job/vfy629wi'], owner: mine, created_at: at(30), finished_at: null },
+            { ...imp('vfy629wj', true, 'ragpkg-done629w.tar.gz'), owner: mine, created_at: at(9100), finished_at: at(9000) }] }));
+          if (path in lookups) {
+            const lookup = { start: Date.now(), answered: false };
+            lookups[path].push(lookup);
+            setTimeout(() => { lookup.answered = true; request.respond(json(slow[path])).catch(() => {}); }, 1000);
+            return;
+          }
+          if (path === '/api/export/job/vfy629wf') return request.respond(json(exp('vfy629wf', true, 'StubDone629w')));
+          if (path === '/api/import/job/vfy629wj') return request.respond(json(imp('vfy629wj', true, 'ragpkg-done629w.tar.gz')));
+          return request.continue();
+        });
+        await s.page.goto(BASE + '/transfer', { waitUntil: 'networkidle2' });
+        for (const [kind, path, row, shown, running] of [
+          ['export', '/api/export/job/vfy629we', 'StubDone629w', 'ragpkg-vfy629wf.tar.gz', 'Writing… 3 chunks so far.'],
+          ['import', '/api/import/job/vfy629wi', 'ragpkg-done629w.tar.gz', 'Imported as StubDone629w', 'Importing… 2 chunks so far.']]) {
+          const list = lookups[path];
+          const before = list.length;
+          for (let i = 0; i < 100 && list.length === before; i++) await sleep(50);
+          const inflight = list[list.length - 1];
+          const clicked = await clickRow(s.page, row);
+          const clickedAt = Date.now();
+          const inFlight = clicked && list.length > before && !!inflight && !inflight.answered;
+          await sleep(5000);
+          const after = list.filter(l => l.start > clickedAt + 100).length;
+          const text = await bodyText(s.page);
+          r.check(`Transfer: opening another ${kind} while the running one's lookup is in flight stops its polling (#629)`,
+            inFlight && after === 0 && text.includes(shown) && !text.includes(running),
+            `inFlight=${inFlight} lookups after=${after} shown=${text.includes(shown)} running=${text.includes(running)}`);
+        }
+      } finally { await s.ctx.close(); }
+    }
+
+    // Import, stubbed: the Import page polls the job it shows on one chain, and
+    // an answer that arrives after that chain ended changes nothing (#316). The
+    // stub holds every lookup of the jobs named until the check answers it, so
+    // "in flight" is true by construction, as in the #629 checks above. A
+    // chain's first lookup comes 3 s after its job opens.
+    {
+      const mine = { name: 'vfy-developer', kind: 'user' };
+      const ingest = (id, status, done) => ({ job_id: id, status, files_total: 2, files_completed: done, files_failed: 0,
+        chunks_stored: done * 3, errors: [], skipped: [] });
+      const listed = (id, status, done, collection, secondsAgo) => ({ ...ingest(id, status, done), collection,
+        files: ['a.txt', 'b.txt'], owner: mine, created_at: at(secondsAgo),
+        finished_at: status === 'running' ? null : at(secondsAgo - 10) });
+      const outage = { status: 500, contentType: 'application/json',
+        body: JSON.stringify({ error: { code: 'STUB_OUTAGE', message: 'stub outage 316' } }) };
+      const until = async (condition, limit = 8000) => {
+        for (let waited = 0; waited < limit && !condition(); waited += 50) await sleep(50);
+        return condition();
+      };
+      // Answers a held lookup. A request the page has already dropped is ignored.
+      const answer = (lookup, body) => { lookup.answered = true; lookup.request.respond(body).catch(() => {}); };
+      // Opens the Import page with this job list. Lookups of the `held` jobs are
+      // kept for the check; the others answer their job's status at once.
+      const open316 = async (jobs, held) => {
+        const s = await session(browser, BASE, 'developer');
+        const lookups = {};
+        for (const id of held) lookups[id] = [];
+        const listReads = [];
+        await s.page.setRequestInterception(true);
+        s.page.on('request', request => {
+          const path = new URL(request.url()).pathname;
+          if (path === '/api/ingest/jobs') { listReads.push(Date.now()); return request.respond(json({ jobs })); }
+          const id = path.startsWith('/api/ingest/job/') ? path.slice('/api/ingest/job/'.length) : null;
+          if (id && id in lookups) { lookups[id].push({ request, start: Date.now(), answered: false }); return; }
+          const entry = id && jobs.find(j => j.job_id === id);
+          if (entry) return request.respond(json(ingest(entry.job_id, entry.status, entry.files_completed)));
+          return request.continue();
+        });
+        // Held lookups keep connections open, so the page is not waited on to go idle.
+        await s.page.goto(BASE + '/import', { waitUntil: 'domcontentloaded' });
+        return { s, lookups, listReads };
+      };
+
+      // Two answers for the same job that complete in reverse order, and a
+      // stale failure that arrives after success: A is opened, then a finished
+      // job, then A again, so A's first chain still has its lookup in flight
+      // when the second chain's lookup answers "completed".
+      for (const [name, stale] of [
+        ['of two answers that complete in reverse order, the older one is ignored', json(ingest('vfy316a', 'running', 1))],
+        ['a stale failure that arrives after success is ignored', outage]]) {
+        const { s, lookups } = await open316([listed('vfy316a', 'running', 1, 'StubRunning316', 60),
+          listed('vfy316f', 'completed', 2, 'StubFinished316', 3600)], ['vfy316a']);
+        try {
+          const a = lookups.vfy316a;
+          const first = await until(() => a.length >= 1);
+          let reopened = first && await clickRow(s.page, 'StubFinished316');
+          await sleep(200);
+          reopened = reopened && await clickRow(s.page, 'StubRunning316');
+          const second = await until(() => a.length >= 2);
+          if (second) answer(a[1], json(ingest('vfy316a', 'completed', 2)));
+          await s.page.waitForFunction(() => document.body.innerText.includes('Files: 2/2'), { timeout: 5000 }).catch(() => {});
+          if (first) answer(a[0], stale);
+          // A chain that went on would look A up again within 3 s.
+          await sleep(4000);
+          const text = await bodyText(s.page);
+          r.check(`Import: ${name} (#316)`,
+            !!reopened && second && a.length === 2 && text.includes('Job ID: vfy316a') && text.includes('Files: 2/2')
+              && !text.includes('Files: 1/2') && !text.includes("Could not check the import's progress"),
+            `reopened=${reopened} lookups=${a.length} text: ${text.slice(0, 300)}`);
+        } finally { await s.ctx.close(); }
+      }
+
+      // A change of job while a poll is in flight: A's lookup is held, B is
+      // opened, then A's lookup answers with A's result.
+      {
+        const { s, lookups } = await open316([listed('vfy316o', 'running', 1, 'StubOld316', 30),
+          listed('vfy316n', 'running', 0, 'StubNew316', 600)], ['vfy316o']);
+        try {
+          const a = lookups.vfy316o;
+          const inFlight = await until(() => a.length >= 1);
+          const clicked = inFlight && await clickRow(s.page, 'StubNew316');
+          await sleep(300);
+          if (inFlight) answer(a[0], json(ingest('vfy316o', 'completed', 2)));
+          await sleep(500);
+          const text = await bodyText(s.page);
+          r.check('Import: an answer for a job no longer shown is ignored, with a change of job while its poll is in flight (#316)',
+            !!clicked && text.includes('Job ID: vfy316n') && text.includes('Files: 0/2') && !text.includes('Job ID: vfy316o')
+              && !text.includes('Files: 2/2'),
+            `inFlight=${inFlight} clicked=${clicked} text: ${text.slice(0, 300)}`);
+        } finally { await s.ctx.close(); }
+      }
+
+      // Unmount while a poll is in flight: the page is left through the app's
+      // navigation (same document), then the held lookup answers "completed".
+      // An answer still acted on would reload the job list or look A up again.
+      {
+        const { s, lookups, listReads } = await open316([listed('vfy316l', 'running', 1, 'StubLeave316', 30)], ['vfy316l']);
+        try {
+          const a = lookups.vfy316l;
+          const inFlight = await until(() => a.length >= 1);
+          const clicked = inFlight && await s.page.evaluate(() => {
+            window.__vfy316Leave = true;
+            const link = document.querySelector('nav a[href="/qa"]');
+            if (!link) return false; link.click(); return true;
+          });
+          const leftAt = Date.now();
+          await sleep(300);
+          if (inFlight) answer(a[0], json(ingest('vfy316l', 'completed', 2)));
+          await sleep(5000);
+          const lookupsAfter = a.filter(l => l.start > leftAt + 100).length;
+          const readsAfter = listReads.filter(t => t > leftAt + 100).length;
+          const where = await s.page.evaluate(() => ({ path: location.pathname, marker: window.__vfy316Leave === true }));
+          r.check('Import: leaving the page with a poll in flight stops polling, and its answer changes nothing (#316)',
+            !!clicked && where.path === '/qa' && where.marker && lookupsAfter === 0 && readsAfter === 0
+              && !s.errors.some(e => e.startsWith('pageerror:')),
+            `inFlight=${inFlight} path=${where.path} sameDocument=${where.marker} lookups after=${lookupsAfter} list reads after=${readsAfter}`);
+        } finally { await s.ctx.close(); }
+      }
+    }
+
     // An Engineer sees the owner of each job: a user, an API key, or unknown.
     {
       const s = await session(browser, BASE, 'engineer');

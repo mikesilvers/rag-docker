@@ -3435,7 +3435,7 @@ The question and the citations toggle are kept.
   - Engineer additionally sees: similarity threshold slider (visible only when `semantic` is selected).
 - "Start Ingest" button → calls `POST /ingest/upload`, displays job ID. The line "Job ID: <job_id>" appears as soon as the upload is accepted and stays while the job runs and after it ends, until a later upload is accepted. Until the first successful poll, a panel in the progress panel's place shows the status the upload was accepted with (`queued`) and "Waiting for the first progress update". With files chosen and no collection selected (none exist, or the list failed to load), the button sends nothing and the page says "Choose a collection to import into first. Use + New to create one." (#394).
 - Running and recent jobs (§7.15, #617): the caller's ingests, the newest running one (else the newest) opened by itself; clicking a row shows that job as a started one is shown.
-- Progress panel: polls `GET /ingest/job/{job_id}` every 3 seconds. Shows files completed/total, chunks stored, errors, "Submitted N · accepted N · stored N" when `chunks_submitted` and `chunks_accepted` are numbers and the three counts are not all equal (#302), "Replaced N chunks from a previous version" when `chunks_replaced` is above 0, the files stored as parts under "N files split into parts:" (each entry names its parts, #621), and the skipped list under "N files skipped:" (each entry gives its reason).
+- Progress panel: polls `GET /ingest/job/{job_id}` one lookup at a time, each 3 seconds after the previous one answered; an answer for a job no longer shown, from an earlier chain of polls, or after the page is left changes nothing (#316). Shows files completed/total, chunks stored, errors, "Submitted N · accepted N · stored N" when `chunks_submitted` and `chunks_accepted` are numbers and the three counts are not all equal (#302), "Replaced N chunks from a previous version" when `chunks_replaced` is above 0, the files stored as parts under "N files split into parts:" (each entry names its parts, #621), and the skipped list under "N files skipped:" (each entry gives its reason).
 
 **Chunking strategy explanations** (shown in an info box when a strategy is selected):
 
@@ -4683,6 +4683,14 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       polling, while its lookup is in flight, starts no second chain.
       *`scripts/verify/browser/ui_criteria.js` (suite 06), section "running and recent jobs (#617)",
       the checks marked (#629), for the export and the import panel.*
+
+- [x] The Import page polls the job it shows on one chain (#316, §7.4): one lookup at a time, each
+      3 s after the previous answer; an answer, success or failure, that arrives after its chain
+      ended (another job opened, an upload accepted, the job opened again, the page left) changes
+      nothing and schedules nothing, so an older answer never replaces a newer one.
+      *`scripts/verify/browser/ui_criteria.js` (suite 06), section "running and recent jobs (#617)",
+      the checks marked (#316): two answers in reverse order, a stale failure after success, a
+      change of job and leaving the page, each with a lookup held in flight.*
 
 - [x] The web UI supports Safari 16.4, Chrome 111 and Firefox 128 or newer, the floor Tailwind CSS 4
       sets, and uses Tailwind 4's default colour palette, font stack and form-field styles (#773,

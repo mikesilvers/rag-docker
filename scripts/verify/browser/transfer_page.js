@@ -376,6 +376,46 @@ async function runTransferPageTests(browser, base, reporter) {
     assert.deepEqual(await sentBody(page, '/api/import'), { filename: KEYED, on_conflict: 'abort', key: keyText });
     assert.ok(!(await text(page)).includes('AGE-SECRET-KEY'), 'the key is shown as text');
   }, { hold: ['GET /api/packages'] }]);
+  cases.push(['import encryption: a key file read that ends after another package was chosen is dropped (#860)', async page => {
+    // A second package encrypted with its own key, so the key file input stays
+    // shown when the selection moves to it.
+    const OTHER = 'ragpkg-vfytransfera-20261021-0000-dddd2222.tar.gz.age';
+    await release(page, '/api/packages', json(200, { packages: [...packagesBody.packages, keyedPackage, { ...keyedPackage, filename: OTHER }] }));
+    await page.waitForFunction(n => [...document.querySelectorAll('option')].some(o => o.value === n), { timeout: 5000 }, OTHER);
+    // The page's file reads are held until the case releases them (#864), so
+    // "the read ends after another package was chosen" is true by construction.
+    await page.evaluate(() => {
+      const read = Blob.prototype.text;
+      window.heldReads = [];
+      Blob.prototype.text = function () { return new Promise(resolve => window.heldReads.push(() => resolve(read.call(this)))); };
+    });
+    const chooseKeyFile = () => page.evaluate(() => {
+      const input = document.querySelector('input[type=file]');
+      const files = new DataTransfer();
+      files.items.add(new File(['# public key: age1vfy\nAGE-SECRET-KEY-1VFYNOTAREALKEY\n'], 'vfy.key'));
+      input.files = files.files;
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    const heldReads = n => page.waitForFunction(k => window.heldReads.length === k, { timeout: 5000 }, n);
+    const releaseRead = () => page.evaluate(() => window.heldReads.shift()());
+    const selected = name => page.waitForFunction(n => [...document.querySelectorAll('select')].some(s => s.value === n), { timeout: 5000 }, name);
+    await selectPackage(page, KEYED);
+    await waitText(page, 'This package is encrypted with its own key.');
+    await chooseKeyFile();
+    await heldReads(1);
+    await selectPackage(page, OTHER);
+    await selected(OTHER);
+    await releaseRead();
+    await sleep(300);
+    assert.ok(!(await text(page)).includes('Chosen: vfy.key.'), 'a key file read for the previous package was kept');
+    assert.deepEqual(await button(page, 'import'), { label: 'Import', disabled: true }, 'Import enabled with the previous package\'s key');
+    // The held read does reach the page: the same file chosen for this package is kept.
+    await chooseKeyFile();
+    await heldReads(1);
+    await releaseRead();
+    await waitText(page, 'Chosen: vfy.key.');
+    await expectButton(page, 'import', false);
+  }, { hold: ['GET /api/packages'] }]);
   cases.push(['import encryption: an encrypted package is labelled, asks for its passphrase and sends it; a plain one sends none (#27)', async page => {
     const label = await page.evaluate(n => [...document.querySelectorAll('option')].find(o => o.value === n)?.textContent || '', SEALED);
     assert.ok(label.includes('encrypted') && !label.includes('null'), label);
