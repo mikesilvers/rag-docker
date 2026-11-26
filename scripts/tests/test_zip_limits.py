@@ -275,7 +275,7 @@ class RatioCapTests(Harness):
         self.assertEqual(status, 202, body)
         self.assertEqual(self.queued_names(), ["big.json.gz"])
 
-    def test_the_bytes_read_are_checked_when_the_header_understates(self):
+    def test_the_bytes_read_are_checked_as_a_backstop(self):
         # With the declared check out of the way, reading still refuses the
         # member, within one block of passing the ratio.
         most = []

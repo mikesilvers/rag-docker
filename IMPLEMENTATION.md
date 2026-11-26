@@ -7645,10 +7645,12 @@ class _CountedMember:
     the member's compressed size after every block, as a backstop to the
     declared ratio check (#28). With CPython's zipfile it does not trigger:
     zipfile stops reading a member at its declared uncompressed size, so a
-    header that understates the size fails the member's CRC check and is
-    refused as damaged (ARCHIVE_UNREADABLE), not for its ratio. These are the
-    ZIP layer's bytes only: a gzipped member's output counts toward the total,
-    not toward its ratio.
+    header that understates the size usually fails the member's CRC check and
+    is refused as damaged (ARCHIVE_UNREADABLE), not for its ratio. A header
+    whose CRC matches the truncated data reads as a shorter member and isn't
+    refused, which is still safe: nothing beyond the declared size is
+    decompressed. These are the ZIP layer's bytes only: a gzipped member's
+    output counts toward the total, not toward its ratio.
     """
 
     def __init__(self, data: Any, budget: _ExpansionBudget,
