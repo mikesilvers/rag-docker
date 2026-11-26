@@ -1142,9 +1142,15 @@ acknowledges that request's complete value was published; a later successful sav
 may supersede it. Serialization, temporary write/close or replacement failure
 does not acknowledge success and leaves the last valid configuration readable.
 Failed saves clean up their own temporary file when filesystem permissions
-allow. After the replacement the folder is fsynced, so a power loss right after a
+allow. The temporary file is fsynced before it replaces the saved configuration
+(#488), and a failed fsync is a failed save that leaves the last valid
+configuration. After the replacement the folder is fsynced, so a power loss right after a
 save doesn't lose it (#445); a failed folder fsync doesn't acknowledge the save
-either, though the new value is then already in place. Package import publishes ingest settings through this same lock and
+either, though the new value is then already in place. At startup, before the
+first request, the API removes the temporary files (`.<name>.json.<8 random>.tmp`)
+of saves a crash interrupted in `ingest_configs/` and `retrieval_configs/`; one it
+can't remove is logged and kept, and a sweep that fails is logged and startup
+carries on (#488). Package import publishes ingest settings through this same lock and
 atomic writer. Published files use mode 0600 (API owner read/write), including
 replacements of older files.
 
@@ -2650,6 +2656,15 @@ GET /import/job/{job_id}
 `error_code` is one of the codes in `RAG_EXPORT_SPECIFICATIONS.md` §11 and
 `error_detail` names the offending file, model or collection.
 
+An import whose run is cancelled reads `failed` with `error_code` `IMPORT_FAILED` and the
+`error` "CancelledError: the import was cancelled before it finished. Start the import again."
+Its partial collection is removed as on a failure. Once a `replace` has retained its staging
+copy, the error adds "The imported data is available as '<staging>'." and `error_detail` holds
+`recovered_as` and `sidecar_snapshots`. A partial target whose removal fails gives
+`error_detail` `collection` and `cleanup_pending: true`, and the startup sweep removes it. An
+import whose task is cancelled before its worker starts frees its package claim, then reads
+`failed` the same way (#871).
+
 Validation order, the conflict policies and the atomicity guarantees are
 specified in `RAG_EXPORT_SPECIFICATIONS.md` §6.
 
@@ -3979,6 +3994,7 @@ rag-docker/
 │   │   ├── sources.py           # Retained original documents (content-addressed)
 │   │   ├── retrieval_config.py  # Per-collection retrieval settings (atomic JSON)
 │   │   ├── settings_store.py    # Shared serialized settings publication
+│   │   ├── folder_sync.py       # The folder fsync the atomic saves share (#488)
 │   │   ├── packager.py          # Package format: naming, digests, manifest, reader
 │   │   ├── age_stream.py        # Streaming age encryption of packages: a new X25519 key (#676) or a passphrase (#27)
 │   │   ├── exporter.py          # Export job lifecycle and the per-collection guard
@@ -4514,6 +4530,8 @@ now lives once, in `api/services/ingest_config.py`.
       *`test_batch_recovery.py`: `test_startup_check_flags_an_interrupted_cutover_only_once`, `test_complete_cutover_is_not_rechecked_after_later_mutation`, `test_other_instance_decision_is_retired_without_touching_sessions`, `test_unreadable_cutover_stays_pending_until_check_can_finish`, `test_failed_outcome_write_keeps_cutover_pending_for_retry`, `test_handled_failure_after_cutover_records_the_decision` and `test_failed_post_cutover_marking_leaves_the_check_for_startup`.*
 - [x] A tuning job whose run is cancelled ends `failed` `TUNE_FAILED`, never `running`; one cancelled after cutover marks sessions stale, records the cutover decision and reports `recovered_as` and `sidecar_snapshots` as a failure does (#870).
       *`test_batch_recovery.py`: `test_cancellation_before_cutover_fails_the_job_and_leaves_the_original`, `test_cancellation_after_cutover_reports_the_retained_copy`, `test_cancellation_after_reindex_cutover_marks_stale_and_reports_the_copy`, `test_cancellation_while_marking_stale_leaves_the_original_and_says_so`, `test_cancellation_at_the_cutover_record_leaves_the_original_and_says_so` and `test_cancellation_before_the_rebuild_fails_the_job`.*
+- [x] An import job whose run is cancelled ends `failed` `IMPORT_FAILED`, never `running`: a partial target is removed, or keeps its marker for the startup sweep when its removal fails, and one cancelled after a `replace` retained its copy reports `recovered_as` and `sidecar_snapshots` as a failure does; an import whose task is cancelled before its worker starts frees its package claim, then ends `failed` the same way, and a worker that starts late does nothing (#871).
+      *`test_batch_recovery.py`: `test_import_cancelled_before_the_target_claim_fails_and_claims_nothing`, `test_import_cancelled_while_building_a_new_target_removes_it`, `test_import_cancelled_with_a_failed_cleanup_keeps_the_marker_for_startup` and `test_import_cancelled_after_the_replace_reports_the_retained_copy`; `test_import_guard.py`: `test_an_import_cancelled_before_its_worker_runs_is_settled` and `test_an_import_whose_worker_started_is_not_settled_by_its_task`.*
 - [x] A tuning rebuild's recovery copy keeps links inside the sources folder as links and never stores an outside file's bytes; a linked retained-sources folder, config or gold-standard session, dangling or not, is refused before cutover, naming its path relative to its volume, and the original is kept (#881, #886).
       *`test_batch_recovery.py`: `test_failed_cutover_copies_source_links_as_links_never_their_bytes`, `test_linked_sources_folder_is_refused_before_cutover`, `test_success_discards_copied_source_links_without_touching_targets`, `test_linked_config_sidecar_is_refused_before_cutover`, `test_dangling_source_link_is_copied_as_a_link` and `test_dangling_session_link_is_refused_naming_its_path`.*
 - [x] Export includes only approved/edited pairs; excluded count matches rejected + pending.
@@ -4743,6 +4761,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       *Evidence: `scripts/tests/test_collection_registry.py` in the built API image with `--network none` (suite 01); its save and unreadable-registry checks fail on the code before #388.*
 - [x] The collection registry and settings saves fsync their folder after the replacement, and a failed folder fsync fails the save; API startup removes the `.collection_registry.json.*.tmp` files of interrupted registry saves, keeping the registry and every other file (#445).
       *Evidence: `scripts/tests/test_collection_registry.py` (suite 01) and `scripts/tests/test_settings_persistence.py` (suite 07); the folder-fsync checks and the startup check (a leftover still there after the lifespan) fail on the code before #445.*
+- [x] A settings save fsyncs its temporary file before the replacement, and a failed fsync fails the save with the old value kept and no temporary file; API startup removes the `.<name>.json.<8 random>.tmp` files of interrupted settings saves in `ingest_configs/` and `retrieval_configs/`, keeping the saved settings, look-alike names and sub-folders, removing a link without following it, logging one it can't remove and not creating a missing folder; a registry sweep that fails at startup is logged and startup and the later sweeps carry on; the API's five folder fsyncs share one helper (#488).
+      *Evidence: `scripts/tests/test_settings_persistence.py` (suite 07: the temporary-file fsync before the replace, a failed one, the sweep's names, and a real lifespan run removing leftovers in both folders) and `scripts/tests/test_collection_registry.py` (suite 01: a lifespan run whose registry sweep raises); the settings checks fail on the code before #488, and the registry one fails without the try/except around that sweep.*
 - [x] `GET /packages` reads each package only up to its top-level manifest, with the manifest read bounded at 16 MiB; new packages put `manifest.json` first in the archive; a package with an oversized, missing or unreadable manifest is listed `readable: false` while the listing still answers 200 (#383).
       *Evidence: `scripts/tests/test_package_listing.py` in the built API image with `--network none` (suite 05): a package cut off after its manifest still lists, listing reads under 1 MiB of a package carrying 8 MiB after its manifest, an oversized manifest is refused unread, a manifest of exactly 16 MiB lists while one byte more is refused, and seven kinds of unreadable file are each listed `readable: false`; its cut-off, bytes-read, oversized-manifest, JSON-array and archive-order checks fail on the code before #383. `validate_package.py` checks a real export puts the manifest first, and suite 05 checks that `GET /packages` lists that export as readable with its collection, chunk count, fidelity and creation time.*
 - [x] `GET /packages` lists a package whose manifest has a wrongly typed listed value (`collection` not an object, `name`, `fidelity` or `created_at` not a string, `chunk_count` not an integer) as `readable: false` with null metadata, never coercing it, and still answers 200; a `null` or absent value is listed as `null` (#451).

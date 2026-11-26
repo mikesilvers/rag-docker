@@ -73,6 +73,7 @@ from pathlib import Path
 
 from config import settings
 from services import audit
+from services.folder_sync import sync_folder as _sync_dir  # shared helper (#488)
 
 _log = logging.getLogger(__name__)
 
@@ -471,11 +472,3 @@ def _read_record(path: Path) -> dict:
     if "job_id" in data and data["job_id"] != path.stem:
         raise ValueError("its job_id doesn't match its name")
     return data
-
-
-def _sync_dir(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)

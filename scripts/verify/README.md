@@ -392,7 +392,13 @@ With API dependencies installed, run
 retrieval save contention, unique temporary paths, first-save directory races,
 failed serialization/create/write/close/replace preservation, and the folder
 fsync after the replacement, including import publication and a failed folder
-fsync (#445). The test also
+fsync (#445). It also checks (#488) that the temporary file is fsynced before the
+replacement and that a failed fsync of it keeps the old value; that the startup
+sweep removes only the `.<name>.json.<8 random>.tmp` files of interrupted saves (a
+link without following it), keeps the saved settings, look-alike names and
+sub-folders, logs and keeps one it can't remove and doesn't create a missing
+folder; and that a real lifespan run (in a child process, backend sweeps mocked)
+removes them in both `ingest_configs/` and `retrieval_configs/`. The test also
 checks affected embedded sources against `IMPLEMENTATION.md`. It uses disposable
 directories and does not connect to Weaviate or Ollama.
 
@@ -463,7 +469,13 @@ also checks all saved retrieval fields round-trip. `legacy_retrieval.py` (E28,
 #184) writes a legacy `ef` and other invalid saved settings into the API
 container, then checks through the real API that a legacy `ef` exports and
 imports as `null` with a warning or note, and that other invalid saved settings
-fail the export early with an actionable error and publish nothing. Crafted
+fail the export early with an actionable error and publish nothing.
+`ingest_settings_export.py` (E52, #919) does the same for saved ingest settings: it
+writes a saved file that isn't a JSON object, one with a wrong-typed `chunk_size` and
+one with an invalid `chunk_size` into the API container, and checks through the real
+export job that each export fails with an error naming the collection, the field and
+the Chunking Configuration page, and publishes nothing; it restores the saved file
+afterwards. Crafted
 packages are written under a `.part` name and renamed into place, because on
 Docker Desktop the API can read a freshly written bind-mounted file as empty. Controlled tests complement,
 and do not replace, this live acceptance.
@@ -574,8 +586,11 @@ collection; a target is free again after its import fails; a refused import leav
 the claim with its holder, so a third import of the target is refused too; the claim
 comes before the `COLLECTION_DELETING` check; a refused import never reaches model
 installation, the target stays claimed while its holder installs models, and a
-target is free again after a failed model installation (#492); and a start whose
-first job record can't be stored releases the package name. `05_transfer.sh` runs it
+target is free again after a failed model installation (#492); a start whose
+first job record can't be stored releases the package name; and an import whose task
+is cancelled before its worker runs frees the package name, then reads `failed`
+`IMPORT_FAILED` with the cancelled message, a worker that starts late runs nothing,
+and one that started is left to settle its own job (#871). `05_transfer.sh` runs it
 in the verify project's API container.
 
 `scripts/tests/test_ingest_errors.py` (#290) checks that damaged or unreadable ZIPs are
@@ -1061,7 +1076,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_package_archives.py` | host-side: `package.sh` and `package-offline.sh` in a scratch git repository with `docker` stubbed hold exactly the tracked files of `HEAD`, and refuse outside a git top level (#384), run in a checkout reached through a symlink, and ignore the user's system and global git config (#447); embedded copies; registered by suite 01 |
 | `../tests/test_health.py` | controlled `/health/details` 503 body for a missing model and an unreachable Ollama or Weaviate, alone or together (#375, #415), and advisory memory (#415); the public `/health`'s status-only body and who may read the details (#750), registered by suite 01 |
 | `../tests/test_installed_authlib.py` | the Authlib installed in the built API image is the version `api/requirements.txt` pins (#565), run in the image with no network; registered by suite 01 |
-| `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388, #445): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged, the folder is fsynced after the replace, startup removes interrupted saves' temporary files; registered by suite 01 |
+| `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388, #445): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged, the folder is fsynced after the replace, startup removes interrupted saves' temporary files, and a failed startup sweep is logged and startup carries on (#488); registered by suite 01 |
 | `memory_override.py` | helper for suite 01, on the host: the in-process `RECOMMENDED_MEMORY_GB` its memory checks raise past the allocation, derived from the `allocated_gb` `/health/details` reports, so the status flips to `below_recommended` on any host (#536) |
 | `../tests/test_memory_override.py` | host-side, standard library: the derived override makes `system_info.memory_info` report `below_recommended` with a note for allocations below and above the 12.35 GB a fixed 13 GB could flip, and no override without a usable allocation (#536); embedded copies; registered by suite 01 |
 | `17_auth.sh` | §10.6 — authentication (#25): the endpoint/role matrix, sessions, origin rules, throttling, the operator command, account administration, service API keys, two-step verification (#607), per-collection access (#606); registers `../tests/test_auth.py`, `../tests/test_collection_access.py`, `../tests/test_auth_enforcement.py` and `../tests/test_verify_auth.py`; opt-in restart check |
@@ -1587,7 +1602,9 @@ fsyncs the registry's folder after the replace and closes it, that a failed fold
 the save with the new file in place and no temporary file, and that API startup (the lifespan,
 in a child process with the backend sweeps mocked) removes `.collection_registry.json.*.tmp`
 leftovers while keeping the registry, other files, files in subfolders and what a link points
-to, logging a leftover it can't remove.
+to, logging a leftover it can't remove. A second lifespan run, whose registry sweep raises,
+logs the failure and still starts, with the later sweeps run and the registry unchanged
+(#488).
 
 Suite 01 ends by running `16_api_paths.sh` (#399), for API paths no other check covered. It
 runs `scripts/tests/test_api_paths.py` the same way as `test_health.py`, with `UPLOAD_DIR` a
