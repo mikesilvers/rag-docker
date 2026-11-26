@@ -41,10 +41,11 @@ The three documents live in the work folder: `analysis.md`, `specifications.md` 
 Each document goes through a review loop before the next one starts, and no code is written before the plan passes:
 
 - **The loop.** Review the document, revise it, and repeat. It passes after **two consecutive reviews with no changes**, with at most **10 reviews**.
-- **Every review is a real pass.** Re-read the document's sources from disk and the document itself, as "A real review" in `reference.md` says. Check every change against the source, so scope neither grows nor drifts. Never batch reviews or log one you didn't do.
-- **The review log.** Each document ends with one line per review: its UTC time and exactly what changed, or "no changes" only when nothing did.
+- **Every review is a real pass.** In each review, re-read with tool calls the document and every source it relies on: the issue and its comments with `gh`, the Jira ticket's Q/A, and the repository files the document cites. What an earlier pass read doesn't count. See "A real review" in `reference.md`. Check every change against the source, so scope neither grows nor drifts. Never batch reviews or log one you didn't do.
+- **The review log.** Each document ends with one line per review: its UTC time, from `date -u` run in that review (never an estimate), the sources it re-read, and exactly what changed, or "no changes" only when nothing did.
 - **A failed loop.** If the 10th review ends without two consecutive reviews with no changes, stop: no further reviews, no next document, no code. Return the changes made in the last reviews, from the log, and the point that keeps changing. The document still ends with its log.
 - **A restart.** A change to a document's source that the maintainer directs (a scope decision) starts a fresh loop of up to 10 reviews for that document, and the log shows where it restarted. Your own drift never restarts the count.
+- **The coordinator's check.** Before your PR is evaluated, or your prepared branch opens its PR, the coordinating session compares your work-folder commits with your review logs ("Checking a loop" in `reference.md`). It sends a loop back when a review has no commit of its own, a log time is later than its commit, or a log line doesn't name the sources it re-read. Then run that document's loop again, from review 1, as separate passes. This holds for every ticket, a workflow ticket with no release included.
 - **Shell writes.** You may write the three dev-docs with a shell heredoc (maintainer approval, 2026-11-04). Check that the file has its content before you commit it.
 
 ### 3. Code

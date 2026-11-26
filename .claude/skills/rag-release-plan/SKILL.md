@@ -186,6 +186,7 @@ These rules are for the session that runs the release: it starts the fix agents 
 
   The same order picks the next ticket a fix agent prepares and the next prepared branch that opens its PR. For a prepared branch, "the oldest" counts from the time it was pushed ready, and its PR keeps that time in the evaluation queue.
 - **Reviewer patches.** When an evaluation of a PR by `mikesilvers` that isn't from a fork ends with a ready reviewer patch, send the patch's path to the PR's fix agent before the merge: resume it, or start a fresh `rag-fix` run that resumes from its checkpoint ("Reviewer patches before merge" in `rag-pr-review` reference.md). Its new head is evaluated in the queue like any other PR, patch-only when it adds only the patch.
+- **Review loops.** The brief that starts a fix agent says explicitly that each dev-doc review re-reads the document and its sources with tool calls in that same pass (what an earlier pass read doesn't count), takes its log time from `date -u` and names the sources it re-read, and that a document passes after two consecutive reviews with no changes, with at most 10 reviews. Before evaluating a fix agent's PR, and before telling a prepared branch's agent to open its PR, check the ticket's loops as "Checking a loop" in `rag-fix` reference.md says. Send a loop back only on the hard failures listed there; short gaps between review commits are noted but don't fail a loop.
 
 ## After the release ships
 
