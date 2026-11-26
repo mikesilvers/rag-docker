@@ -405,13 +405,13 @@ class LiveGuardTests(unittest.TestCase):
         self.assertEqual(self.box.calls(), [], 'no docker or curl call may come before the refusal')
 
     def test_live_project_is_refused(self):
-        for script in ('all.sh', '02_ingest.sh'):
+        for script in ('all.sh', '02_ingest.sh', '25_weaviate_upgrade.sh'):
             with self.subTest(script=script):
                 self.assert_refused(self.box.run(['bash', str(VERIFY / script)],
                                                  COMPOSE_PROJECT_NAME='rag-docker', RAG_API='http://localhost:9/api'))
 
     def test_live_port_is_refused(self):
-        for script in ('all.sh', '02_ingest.sh'):
+        for script in ('all.sh', '02_ingest.sh', '25_weaviate_upgrade.sh'):
             with self.subTest(script=script):
                 self.assert_refused(self.box.run(['bash', str(VERIFY / script)],
                                                  COMPOSE_PROJECT_NAME='rag-verify', RAG_API='http://localhost:8080/api'))
