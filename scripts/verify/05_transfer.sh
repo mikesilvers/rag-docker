@@ -1483,11 +1483,14 @@ else
     python3 - "$EXPORTS/$spgpkg" "$spsid" "$SC" <<'ENDPY'
 import json, sys, tarfile
 pkg, sid, stored = sys.argv[1:]
+want = "goldstandard/%s.json" % sid          # under the package's top folder
 try:
     with tarfile.open(pkg) as t:
-        session = json.load(t.extractfile("goldstandard/%s.json" % sid))
+        member = next(m for m in t.getmembers()
+                      if m.isfile() and (m.name == want or m.name.endswith("/" + want)))
+        session = json.load(t.extractfile(member))
 except Exception as exc:                      # noqa: BLE001 -- reported as the failure
-    print("cannot read goldstandard/%s.json from %s: %s" % (sid, pkg, exc)); sys.exit(1)
+    print("cannot read %s from %s: %s %s" % (want, pkg, type(exc).__name__, exc)); sys.exit(1)
 ok = session.get("session_id") == sid and session.get("collection") == stored
 print("session_id=%s collection=%s" % (session.get("session_id"), session.get("collection")))
 sys.exit(0 if ok else 1)
