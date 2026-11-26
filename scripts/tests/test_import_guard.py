@@ -568,5 +568,24 @@ class ImportGuardTests(unittest.TestCase):
         importer._release_package("r.tar.gz")
 
 
+    def test_a_completed_import_is_not_changed_by_its_task_ending(self):
+        # The done callback of a task whose worker ran leaves the job as its
+        # worker settled it, and keeps no bookkeeping for it (#871).
+        loop = self.new_loop()
+        self.packages["c.tar.gz"] = "Completed"
+        self.release.set()
+        before = asyncio.all_tasks(loop)
+        job_id = self.start(loop, "c.tar.gz", "abort")
+        self.assertTrue(self.wait_finished(loop, job_id))
+        pending = [t for t in asyncio.all_tasks(loop) - before if not t.done()]
+        if pending:
+            loop.run_until_complete(asyncio.wait(pending, timeout=5))
+        loop.run_until_complete(asyncio.sleep(0))      # the done callback has run
+        job = self.job(job_id)
+        self.assertEqual((job["status"], job["error_code"], job["error"]), ("completed", None, None), job)
+        self.assertNotIn(job_id, importer._started)
+        self.assertNotIn(job_id, importer._abandoned)
+        self.assertFalse(importer.package_busy("c.tar.gz"))
+
 if __name__ == "__main__":
     unittest.main()

@@ -1150,6 +1150,27 @@ class RecoveryTests(unittest.TestCase):
         self.assertFalse(importer._marker_path(target).exists())
         self.assertTrue(self.cols.exists('Corpus'))
 
+    def test_import_cancelled_when_weaviate_cannot_confirm_the_removal_keeps_the_marker(self):
+        # The partial target's delete succeeds, but Weaviate then can't answer
+        # whether it is gone: exists_fail_closed counts it as still there (#871).
+        self.cols.staging_fault = 'cancel'
+        actual_exists = wc._collection_exists_sync
+        def unanswered(name):
+            if '_imported_' in name and name in self.cols.deleted:
+                raise OSError('weaviate unavailable')
+            return actual_exists(name)
+        job = self.cancelled_import('rename', patch.object(wc, '_collection_exists_sync', side_effect=unanswered))
+        target = next(n for n in self.cols.deleted if n.startswith('Corpus_imported_'))
+        self.assertEqual((job['status'], job['error_code'], job['error']),
+                         ('failed', 'IMPORT_FAILED', self.CANCELLED_IMPORT))
+        self.assertEqual(job['error_detail'], {'collection': target, 'cleanup_pending': True})
+        self.assertFalse(self.cols.exists(target))
+        self.assertTrue(importer._marker_path(target).exists())
+        # Startup, with Weaviate answering again, finds it gone and retires the marker.
+        self.assertEqual(importer.sweep_interrupted_imports(), [])
+        self.assertFalse(importer._marker_path(target).exists())
+        self.assertTrue(self.cols.exists('Corpus'))
+
     def test_import_cancelled_after_the_replace_reports_the_retained_copy(self):
         self.cols.final_fault = 'cancel'          # the build of Corpus after the replace's delete
         job = self.cancelled_import('replace')
