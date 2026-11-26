@@ -2277,7 +2277,7 @@ class IngestConfigResponse(BaseModel):
     chunking_strategy: str
     chunk_size: int
     chunk_overlap: int
-    similarity_threshold: Optional[float]
+    similarity_threshold: Optional[Annotated[float, Field(allow_inf_nan=False)]]   # JSON has no NaN (#515)
     min_chunk_size: int
     is_default: bool
 
@@ -3509,7 +3509,7 @@ import re
 from pathlib import Path
 
 from config import settings
-from models.schemas import StoredIngestConfig
+from models.schemas import IngestConfigResponse, StoredIngestConfig
 from services import settings_store
 
 log = logging.getLogger(__name__)
@@ -3555,12 +3555,28 @@ def load(collection: str) -> dict | None:
 
 
 def resolve(collection: str) -> tuple[dict, bool]:
-    """Return (config, is_default). Never raises; always usable."""
+    """Return (config, is_default). Never raises; always usable.
+
+    Saved settings that cannot be served, JSON that is not an object, a field of
+    the wrong type, a non-finite similarity_threshold or the response's own
+    is_default key (#515), are logged and give the defaults, like an unreadable
+    file and as retrieval settings do (#439, #477). Values of the right type,
+    including chunk sizes from before the #53 bounds, are served as saved; the
+    next valid save replaces the file, and export still refuses it.
+    """
     saved = load(collection)
     if saved is None:
         return {"collection": collection, **DEFAULTS}, True
-    merged = {"collection": collection, **DEFAULTS, **saved}
-    merged["collection"] = collection
+    try:
+        merged = {"collection": collection, **DEFAULTS, **saved}   # TypeError: not an object
+        merged["collection"] = collection
+        if "is_default" in merged:
+            # Not a setting; the router would get the keyword twice.
+            raise ValueError("saved settings hold is_default")
+        IngestConfigResponse.model_validate({**merged, "is_default": False})
+    except (TypeError, ValueError):   # pydantic's ValidationError is a ValueError
+        log.warning("Invalid ingest config for %r; falling back to defaults", collection)
+        return {"collection": collection, **DEFAULTS}, True
     return merged, False
 
 
@@ -12085,8 +12101,28 @@ def _export_retrieval_settings(collection: str, warnings: list[str]) -> tuple[di
 
 
 def _ingest_config(collection: str) -> dict | None:
-    """The collection's saved chunking settings, or None."""
-    return ingest_config.load(collection)
+    """The collection's saved chunking settings, checked as import check 4c does, or None.
+
+    Runs before any chunk is read, like the retrieval settings, so a package never
+    holds settings its import would refuse (#510, #515). They are packaged as
+    validated; chunk sizes from before the #53 bounds are kept as they are. A file
+    that can't be read or isn't JSON counts as none, as it does on the API.
+    """
+    saved = ingest_config.load(collection)
+    if saved is None:
+        return None
+    try:
+        return ingest_config.validate(saved, collection)
+    except ValidationError as exc:
+        problems = "; ".join(
+            f"{'.'.join(map(str, error['loc']))}: {error['msg']}" if error["loc"] else error["msg"]
+            for error in exc.errors())
+        cause = exc
+    except ValueError as exc:          # validate(): the saved JSON is not an object
+        problems, cause = "the settings file is not a JSON object", exc
+    raise ValueError(f"Saved ingest settings for '{collection}' are invalid: {problems}. "
+                     "Open the Chunking Configuration page, save this collection's settings, "
+                     "then export again.") from cause
 
 
 def _goldstandard_sessions(collection: str) -> list[dict]:
@@ -12215,6 +12251,7 @@ def build(
 
         # Settings first: a bad config fails before any chunk is streamed.
         retrieval_cfg, is_default = _export_retrieval_settings(collection, warnings)
+        ingest_cfg = _ingest_config(collection)
 
         collection_cfg = wc._collection_config_sync(collection)
         stored_model = collection_cfg.get("embedding_model")
@@ -12273,8 +12310,7 @@ def build(
         # 2. collection.json
         b.add_json("collection.json", collection_cfg)
 
-        # 3. configs
-        ingest_cfg = _ingest_config(collection)
+        # 3. configs, checked before the chunks were read
         if ingest_cfg is not None:
             b.add_json("ingest_config.json", ingest_cfg)
 
@@ -15362,35 +15398,36 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
                 {"model": model, "package_model": pkg_model, "bundled": bundled})
 
         name = model_bundle.split_ref(model)[0]
+        ref = model_bundle.model_ref(model)  # name:tag in every message (#487, #498)
         state = model_bundle.installed_state(model)
         if state == "present":
-            notes.append(f"model '{name}' already present; left untouched")
+            notes.append(f"model '{ref}' already present; left untouched")
             continue
         if state == "corrupt":
             # Installing over it could break other models that share the
             # blobs, so restoring it stays an owner action (§6.3).
             if not required:
-                notes.append(f"model '{name}' is installed but its files don't match "
+                notes.append(f"model '{ref}' is installed but its files don't match "
                              "their checksums; restore or re-pull it before querying")
                 continue
             raise PackageError(
                 "MODEL_INTEGRITY_FAILED",
-                f"The embedding model '{name}' is installed, but its files don't "
+                f"The embedding model '{ref}' is installed, but its files don't "
                 f"match their checksums. Restore it, or re-pull it with "
-                f"`docker compose exec ollama ollama pull {name}`, then import again.",
+                f"`docker compose exec ollama ollama pull {ref}`, then import again.",
                 {"model": name})
         if model_bundle.model_ref(model) not in bundled:
             if not required:
-                notes.append(f"model '{name}' is absent and not bundled; "
+                notes.append(f"model '{ref}' is absent and not bundled; "
                              "queries will fail until it is pulled")
                 continue
             pkg_model = (manifest.get("embedding") or {}).get("model")
             raise PackageError(
                 "EMBEDDING_MODEL_MISSING",
-                f"This instance does not have the embedding model '{name}' and the "
+                f"This instance does not have the embedding model '{ref}' and the "
                 f"package does not bundle it. The vectors in this package were "
                 f"produced by '{pkg_model}', so nothing can embed a query against "
-                f"them. Pull it with `docker compose exec ollama ollama pull {name}`, "
+                f"them. Pull it with `docker compose exec ollama ollama pull {ref}`, "
                 f"or import a package exported with include_models=true.",
                 {"model": name, "package_model": pkg_model, "bundled": bundled})
         try:
@@ -15398,23 +15435,23 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
         except (OSError, ValueError) as exc:
             raise PackageError(
                 "EMBEDDING_MODEL_MISSING" if required else "IMPORT_FAILED",
-                f"Could not install bundled model '{name}': {exc}",
+                f"Could not install bundled model '{ref}': {exc}",
                 {"model": name}) from exc
         # Spec §6.3: confirm through Ollama itself, not the files just written (#390).
         reported = _ollama_reports(model)
         if reported is None:
             raise PackageError(
                 "IMPORT_FAILED",
-                f"Installed '{name}' from the package but couldn't reach Ollama to "
+                f"Installed '{ref}' from the package but couldn't reach Ollama to "
                 f"confirm it is there. Check that the ollama service is running, "
                 f"then import again.",
                 {"model": name})
         if not reported:
             raise PackageError(
                 "EMBEDDING_MODEL_MISSING" if required else "IMPORT_FAILED",
-                f"Installed '{name}' from the package but Ollama does not report it.",
+                f"Installed '{ref}' from the package but Ollama does not report it.",
                 {"model": name})
-        notes.append(f"model '{name}' installed from the package")
+        notes.append(f"model '{ref}' installed from the package")
     return notes
 
 
@@ -16229,8 +16266,8 @@ def export_model(model: str, dest: Path) -> list[tuple[str, Path]]:
     """Files to place under `models/<name>/<tag>/`, as (relative path, source).
 
     Each tag has its own folder, so two tags of one name never overwrite each
-    other's manifest (#487). Returns them rather than copying so the caller can digest each file into the
-    package manifest as it is written.
+    other's manifest (#487). Returns them rather than copying so the caller can
+    digest each file into the package manifest as it is written.
     """
     mp = manifest_path(model)
     if not mp.is_file():
@@ -30681,7 +30718,13 @@ regressions. Its `IngestImportTests` do the same for `ingest_config.json`
 (E35, #510): malformed ingest settings are refused `PACKAGE_CORRUPT` in every
 conflict mode before any live change, and valid ones, including chunk sizes from
 before the #53 bounds, are restored from the checked snapshot and read back
-through `GET /ingest/config`. Run it with the same API dependencies as the session import test.
+through `GET /ingest/config`. They also check (#518) that `chunk_size` 1 and
+`min_chunk_size` 0 are accepted, that a symlinked `ingest_config.json` is refused,
+and that the retrieval-settings check runs before the ingest-settings one; and
+(E52, #515) that an export refuses invalid saved ingest settings before any chunk
+is read, naming the failing field and the Chunking Configuration page, packages
+valid ones as validated, pre-#53 sizes unchanged, and leaves out a file that isn't
+JSON. Run it with the same API dependencies as the session import test.
 `05_transfer.sh` registers it and `retrieval_settings.py` (E28), which submits
 15 malformed settings imports across abort/rename/replace and verifies live
 collection counts and saved settings are unchanged. The normal rename import
@@ -31292,7 +31335,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_lan_mode.py` | API image, no network: `RAG_LAN_MODE` parsing, the startup refusal (also through `import main`), the certificate step, both nginx configurations, `lan_stack.py`'s rate-limit check against faked answers (#598), embedded copies (#26) |
 | `docker-compose.lan.verify.yml` | the harness overlay of a `--lan` run: TLS on loopback at the verify port, the verify image for `tls-init`, reserved test names (#26) |
 | `16_api_paths.sh` | ingest, query, metrics and health API paths (#399), run last by suite 01: `NO_SUPPORTED_FILES`, `JOB_NOT_FOUND`, schema rules, the proxy's `/api/` timeouts, `/metrics/latency`, a default query and its metric (LLM); opt-in restart and first-start checks |
-| `../tests/test_api_paths.py` | controlled ingest error, `/query` default, §6 prompt, query metric, retrieval-config file, `/metrics/latency` and `/health` probe regressions (#399), registered by `16_api_paths.sh` |
+| `../tests/test_api_paths.py` | controlled ingest error, `/query` default, §6 prompt, query metric, retrieval-config file, ingest-config file (#515), `/metrics/latency` and `/health` probe regressions (#399), registered by `16_api_paths.sh` |
 | `../tests/test_ollama_entrypoint.py` | `ollama/entrypoint.sh` with stub commands, on the host: skip present models, timed pull, retries (#399), registered by `16_api_paths.sh` |
 | `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure; in full runs, a large JSON Lines corpus ingested, retained, re-chunked and replaced (#312) |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
@@ -31814,7 +31857,11 @@ from the defaults, and one that isn't JSON, can't be read, holds JSON that isn't
 or nested `top_k`) gives the defaults with `is_default: true` and a warning, while coercible
 and out-of-range values are still served as saved (#439); so do a `NaN` or infinite `alpha`
 and a saved `is_default` key, which answered `"alpha": null` and 500 before #477, while a
-finite `alpha` of 1.5 is served as saved. `GET /metrics/latency` is
+finite `alpha` of 1.5 is served as saved. The saved ingest config falls back the same way
+(#515): JSON that isn't an object, a field of the wrong type, a `NaN` or infinite
+`similarity_threshold` or a saved `is_default` key gives the defaults with `is_default: true`
+and a warning, coercible, out-of-range and pre-#53 values are served as saved, and a valid
+save replaces the file. `GET /metrics/latency` is
 checked for its statistics against hand-worked percentiles, its exact-match `collection` and
 `retrieval_mode` filters, and `history_limit` (default 100, 0, 500, 501 refused with 422). A
 Weaviate client check that hangs makes `/health` give up on it after 4 s, and an unreadable
@@ -60966,6 +61013,25 @@ class RetrievalImportTests(unittest.TestCase):
         self.assertEqual(self.exported, ['embed:v1'])
         self.assertEqual(manifest['bundled_models'], ['embed:v1'])
 
+    def test_a_name_with_no_path_in_the_store_is_compared_as_written(self):
+        # `user/m` has no folder in the store (split_ref refuses it), so it is
+        # compared by its exact string: named twice it is tried once, named once
+        # it warns and the other model is still bundled whole (#494).
+        for llm in ('user/m', 'chat:v2'):
+            with self.subTest(llm=llm):
+                for leftover in self.exports.iterdir():
+                    leftover.unlink()
+                result, manifest = self.build_with_models(
+                    {'user/m'}, embed_model='user/m', llm_model=llm)
+                pkg, _ = self.extracted(result)
+                self.assertEqual(self.exported, ['user/m'] if llm == 'user/m' else ['user/m', 'chat:v2'])
+                failed = [w for w in manifest['warnings'] if 'could not be bundled' in w]
+                self.assertEqual(len(failed), 1, failed)
+                self.assertTrue(failed[0].startswith("model 'user/m' could not be bundled"))
+                expected = [] if llm == 'user/m' else ['chat:v2']
+                self.assertEqual(manifest['bundled_models'], expected)
+                self.assertEqual(model_bundle.bundled_models(pkg), expected)
+
     def test_a_model_named_with_and_without_its_tag_is_one_model(self):
         # `embed` and `embed:latest` share models/embed/latest/; a second copy
         # failing used to delete the first's files while the manifest kept
@@ -61261,14 +61327,14 @@ class ModelTagFolderTests(unittest.TestCase):
         notes = self.ensure(pkg, manifest, 'foo:a', 'bar:y')
         self.assertEqual(self.installed('foo:a'), self.manifests['foo:a'])
         self.assertIsNone(self.installed('bar:y'))  # develop: bar:x's
-        self.assertIn("model 'bar' is absent and not bundled; queries will fail until it is pulled", notes)
+        self.assertIn("model 'bar:y' is absent and not bundled; queries will fail until it is pulled", notes)
         self.assertEqual(manifest['bundled_models'], ['bar:x', 'foo:a'])
 
     def test_an_old_package_folder_installs_for_the_one_tag_its_manifest_names(self):
         pkg, manifest = self.legacy_package('foo:a', ('foo:a', 'bar:x'))
         notes = self.ensure(pkg, manifest, 'foo:a', 'bar:x')
         self.assertEqual(self.installed('foo:a'), self.manifests['foo:a'])
-        self.assertIn("model 'bar' is absent and not bundled; queries will fail until it is pulled", notes)
+        self.assertIn("model 'bar:x' is absent and not bundled; queries will fail until it is pulled", notes)
         self.assertEqual(model_bundle.bundled_models(pkg, manifest), ['foo:a'])
 
     def test_an_old_package_folder_shared_by_two_tags_counts_as_not_bundled(self):
@@ -61286,10 +61352,80 @@ class ModelTagFolderTests(unittest.TestCase):
         pkg, manifest = self.legacy_package('bar:x', ('foo:a', 'bar:x'))
         shutil.copytree(self.store / 'models', self.target / 'models', dirs_exist_ok=True)  # foo:a present
         notes = self.ensure(pkg, manifest, 'foo:a', 'bar:y')
-        self.assertIn("model 'foo' already present; left untouched", notes)
+        self.assertIn("model 'foo:a' already present; left untouched", notes)
         self.assertIsNone(self.installed('bar:y'))  # develop: bar:x's
-        self.assertIn("model 'bar' is absent and not bundled; queries will fail until it is pulled", notes)
+        self.assertIn("model 'bar:y' is absent and not bundled; queries will fail until it is pulled", notes)
         self.assertEqual(model_bundle.bundled_models(pkg, manifest), ['bar:x'])
+
+    # Reviewer additions (PR #496 testing review).
+    def test_the_embedding_model_under_another_tag_is_refused_as_missing(self):
+        pkg, manifest = self.export('foo:a', 'bar:x')
+        with self.assertRaises(packager.PackageError) as caught:
+            self.ensure(pkg, manifest, 'foo:b', 'bar:x')
+        self.assertEqual(caught.exception.code, 'EMBEDDING_MODEL_MISSING')
+        self.assertIn('does not bundle it', str(caught.exception))
+        self.assertEqual(caught.exception.detail['bundled'], ['bar:x', 'foo:a'])
+        self.assertEqual(caught.exception.detail['package_model'], 'foo:a')
+        self.assertIsNone(self.installed('foo:b'))
+        self.assertIsNone(self.installed('foo:a'))
+
+    def test_an_untagged_model_is_bundled_and_installed_as_latest(self):
+        self.manifests['baz:latest'] = self.put_model('baz:latest')
+        pkg, manifest = self.export('baz', 'foo:b')
+        self.assertEqual(manifest['bundled_models'], ['baz:latest', 'foo:b'])
+        self.assertIn('models/baz/latest/manifest.json', manifest['files'])
+        notes = self.ensure(pkg, manifest, 'baz', 'foo:b')
+        self.assertEqual(self.installed('baz:latest'), self.manifests['baz:latest'])
+        self.assertEqual(self.installed('foo:b'), self.manifests['foo:b'])
+        self.assertEqual(sum('installed from the package' in note for note in notes), 2, notes)
+
+    def test_an_old_package_folder_named_without_a_tag_installs_as_latest(self):
+        self.manifests['baz:latest'] = self.put_model('baz:latest')
+        pkg, manifest = self.legacy_package('baz:latest', ('baz', 'bar:x'))
+        self.assertEqual(model_bundle.bundled_models(pkg, manifest), ['baz:latest'])
+        notes = self.ensure(pkg, manifest, 'baz:latest', 'bar:x')
+        self.assertEqual(self.installed('baz:latest'), self.manifests['baz:latest'])
+        self.assertIn("model 'bar:x' is absent and not bundled; queries will fail until it is pulled", notes)
+
+    def test_an_old_package_folder_without_a_package_manifest_is_not_bundled(self):
+        pkg, _ = self.legacy_package('foo:a', ('foo:a', 'bar:x'))
+        self.assertEqual(model_bundle.bundled_models(pkg), [])
+        self.assertIsNone(model_bundle.bundled_source(pkg, 'foo:a'))
+        with self.assertRaises(FileNotFoundError):
+            with patch.object(settings, 'ollama_models_dir', str(self.target)):
+                model_bundle.install_model(pkg, 'foo:a')
+        self.assertIsNone(self.installed('foo:a'))
+
+    def test_every_message_names_the_model_by_name_and_tag(self):
+        # Every _ensure_models message names name:tag, so a configured foo:b
+        # suggests `ollama pull foo:b`, never foo (foo:latest); `detail` keeps
+        # the bare name (maintainer decision, 2026-11-25, #498).
+        def damage(model):
+            digest = json.loads(self.manifests[model])['layers'][0]['digest']
+            (self.target / 'models' / 'blobs' / digest.replace(':', '-')).write_bytes(b'changed')
+
+        pkg, manifest = self.export('foo:a', 'bar:x')
+        with self.assertRaises(packager.PackageError) as caught:
+            self.ensure(pkg, manifest, 'foo:b', 'bar:x')
+        self.assertEqual(caught.exception.code, 'EMBEDDING_MODEL_MISSING')
+        self.assertIn("embedding model 'foo:b'", str(caught.exception))
+        self.assertIn('ollama pull foo:b`', str(caught.exception))
+        self.assertEqual(caught.exception.detail['model'], 'foo')
+
+        shutil.copytree(self.store / 'models', self.target / 'models', dirs_exist_ok=True)
+        damage('foo:b')
+        with self.assertRaises(packager.PackageError) as caught:
+            self.ensure(pkg, manifest, 'foo:b', 'bar:x')
+        self.assertEqual(caught.exception.code, 'MODEL_INTEGRITY_FAILED')
+        self.assertIn("embedding model 'foo:b'", str(caught.exception))
+        self.assertIn('ollama pull foo:b`', str(caught.exception))
+        self.assertEqual(caught.exception.detail, {'model': 'foo'})
+
+        damage('bar:x')
+        notes = self.ensure(pkg, manifest, 'foo:a', 'bar:x')
+        self.assertIn("model 'foo:a' already present; left untouched", notes)
+        self.assertIn("model 'bar:x' is installed but its files don't match their checksums; "
+                      "restore or re-pull it before querying", notes)
 
 
 # Ingest settings in a package (#510): the save contract, except that chunk_size and
@@ -61430,6 +61566,136 @@ class IngestImportTests(unittest.TestCase):
         self.assertEqual(ingest_config.load('Renamed'), {**validated, 'collection': 'Renamed'})
         self.assertEqual(validated['collection'], 'Corpus')
         self.assertEqual(validated['chunk_size'], 800)
+
+    def test_legacy_bound_edges_and_non_overlap_strategies_are_accepted(self):
+        # Reviewer (#510): the pre-#53 edges, chunk_size 1 and min_chunk_size 0, and
+        # chunk_overlap >= chunk_size for strategies the overlap rule doesn't cover.
+        for data in [{'chunking_strategy': 'fixed', 'chunk_size': 1, 'chunk_overlap': 0,
+                      'min_chunk_size': 0},
+                     {'chunking_strategy': 'semantic', 'chunk_size': 100, 'chunk_overlap': 200,
+                      'similarity_threshold': 0, 'min_chunk_size': 0},
+                     {'chunking_strategy': 'fixed', 'chunk_size': 50, 'chunk_overlap': 50,
+                      'similarity_threshold': 1}]:
+            with self.subTest(data=data):
+                validated = ingest_config.validate(data, 'Corpus')
+                for key, value in data.items():
+                    self.assertEqual(validated[key], value)
+        for data in [{'chunk_size': 1}, {'chunk_size': '0'}, {'min_chunk_size': '-1'}]:
+            with self.subTest(data=data), self.assertRaises(ValueError):
+                ingest_config.validate(data, 'Corpus')
+
+    def test_symlinked_ingest_settings_are_refused(self):
+        # Reviewer (#510): the is_symlink branch of check 4c.
+        target = self.root / 'outside.json'
+        target.write_text('{}')
+        (self.pkg / 'ingest_config.json').symlink_to(target)
+        with self.assertRaises(packager.PackageError) as caught:
+            importer._read_ingest_config(self.pkg, 'Corpus')
+        self.assertEqual(caught.exception.code, 'PACKAGE_CORRUPT')
+        self.assertEqual(caught.exception.detail, {'file': 'ingest_config.json'})
+
+    def test_retrieval_settings_are_checked_before_ingest_settings(self):
+        # Reviewer (#510): check 4c runs after 4b, so 4b's refusal is the one reported.
+        (self.pkg / 'retrieval_config.json').write_text('{')
+        self.archive('{')
+        with patch.object(importer, '_ensure_models') as models, \
+             patch.object(importer, '_build') as build:
+            importer._jobs['test'] = {'status': 'queued'}
+            importer._run('test', 'fixture.tar.gz', 'abort')
+        result = importer._jobs['test']
+        self.assertEqual(result['status'], 'failed', result)
+        self.assertEqual(result['error_detail'], {'file': 'retrieval_config.json'}, result)
+        models.assert_not_called()
+        build.assert_not_called()
+
+    # Export (#515): saved settings are checked as import check 4c does, before any
+    # chunk is read, so a package never holds settings its import would refuse.
+    def export(self):
+        with patch.object(packager, 'read_chunks', return_value=[]) as chunks, \
+             patch.object(packager.wc, '_collection_config_sync',
+                          return_value={'embedding_model': settings.embed_model}) as collection, \
+             patch.object(packager, '_goldstandard_sessions', return_value=[]), \
+             patch.object(packager.sources, 'load_index', return_value={'documents': {}}), \
+             patch.object(packager.wc, '_meta_sync', return_value={'version': 'test'}):
+            try:
+                return packager.build('Corpus'), chunks, collection
+            except ValueError as exc:
+                exc.mocks = (chunks, collection)
+                raise
+
+    def packaged(self, filename):
+        with tarfile.open(self.exports / filename) as archive:
+            archive.extractall(self.root / 'extracted', filter='data')
+        return next((self.root / 'extracted').iterdir())
+
+    def test_export_refuses_invalid_saved_ingest_settings(self):
+        saved = ingest_config._path('Corpus')
+        for value in INVALID_INGEST:
+            if value is None:   # None is no saved settings, not invalid ones.
+                continue
+            with self.subTest(value=value):
+                saved.write_text(json.dumps(value))
+                before = saved.read_bytes()
+                with self.assertRaises(ValueError) as caught:
+                    self.export()
+                message = str(caught.exception)
+                self.assertIn("'Corpus'", message)
+                self.assertIn('Chunking Configuration page', message)
+                if not isinstance(value, dict):
+                    self.assertIn('not a JSON object', message)
+                elif {'chunk_size', 'chunk_overlap'} <= value.keys():   # the overlap rule names no field
+                    self.assertIn('chunk_overlap must be smaller', message)
+                else:
+                    self.assertIn(next(iter(value)), message)
+                for mock in caught.exception.mocks:   # refused before any chunk is read
+                    mock.assert_not_called()
+                self.assertEqual(list(self.exports.iterdir()), [])
+                self.assertEqual(saved.read_bytes(), before)
+
+    def test_export_packages_valid_saved_ingest_settings_as_validated(self):
+        cases = [
+            # Saved before the #53 bounds: exported as it is, never clamped.
+            ({'chunking_strategy': 'fixed', 'chunk_size': 20, 'chunk_overlap': 10,
+              'similarity_threshold': None, 'min_chunk_size': 8000},
+             {'chunking_strategy': 'fixed', 'chunk_size': 20, 'chunk_overlap': 10,
+              'similarity_threshold': None, 'min_chunk_size': 8000}),
+            ({}, dict(ingest_config.DEFAULTS)),
+            ({'collection': 'OldName', 'is_default': True, 'legacy_field': 'ignored',
+              'chunking_strategy': 'fixed', 'chunk_size': '150', 'chunk_overlap': '20',
+              'min_chunk_size': '40'},
+             {**ingest_config.DEFAULTS, 'chunking_strategy': 'fixed', 'chunk_size': 150,
+              'chunk_overlap': 20, 'min_chunk_size': 40}),
+        ]
+        saved = ingest_config._path('Corpus')
+        for data, expected in cases:
+            with self.subTest(data=data):
+                saved.write_text(json.dumps(data))
+                before = saved.read_bytes()
+                result, _, _ = self.export()
+                pkg = self.packaged(result['filename'])
+                packaged = json.loads((pkg / 'ingest_config.json').read_text())
+                self.assertEqual(packaged, {'collection': 'Corpus', **expected})
+                self.assertEqual(importer._read_ingest_config(pkg, 'Corpus'), packaged)
+                manifest = json.loads((pkg / 'manifest.json').read_text())
+                self.assertEqual(manifest['chunking'], {
+                    'strategy': expected['chunking_strategy'],
+                    'chunk_size': expected['chunk_size'],
+                    'chunk_overlap': expected['chunk_overlap']})
+                self.assertEqual(saved.read_bytes(), before)
+                shutil.rmtree(self.root / 'extracted')
+                for leftover in self.exports.iterdir():
+                    leftover.unlink()
+
+    def test_export_leaves_out_unreadable_saved_ingest_settings(self):
+        ingest_config._path('Corpus').write_text('{')
+        result, _, _ = self.export()
+        self.assertFalse((self.packaged(result['filename']) / 'ingest_config.json').exists())
+
+    def test_export_leaves_out_saved_ingest_settings_that_cannot_be_read(self):
+        # Reviewer (#515): a saved path that can't be read counts as no settings too.
+        ingest_config._path('Corpus').mkdir()
+        result, _, _ = self.export()
+        self.assertFalse((self.packaged(result['filename']) / 'ingest_config.json').exists())
 
 
 if __name__ == '__main__':

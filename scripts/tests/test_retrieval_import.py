@@ -385,6 +385,25 @@ class RetrievalImportTests(unittest.TestCase):
         self.assertEqual(self.exported, ['embed:v1'])
         self.assertEqual(manifest['bundled_models'], ['embed:v1'])
 
+    def test_a_name_with_no_path_in_the_store_is_compared_as_written(self):
+        # `user/m` has no folder in the store (split_ref refuses it), so it is
+        # compared by its exact string: named twice it is tried once, named once
+        # it warns and the other model is still bundled whole (#494).
+        for llm in ('user/m', 'chat:v2'):
+            with self.subTest(llm=llm):
+                for leftover in self.exports.iterdir():
+                    leftover.unlink()
+                result, manifest = self.build_with_models(
+                    {'user/m'}, embed_model='user/m', llm_model=llm)
+                pkg, _ = self.extracted(result)
+                self.assertEqual(self.exported, ['user/m'] if llm == 'user/m' else ['user/m', 'chat:v2'])
+                failed = [w for w in manifest['warnings'] if 'could not be bundled' in w]
+                self.assertEqual(len(failed), 1, failed)
+                self.assertTrue(failed[0].startswith("model 'user/m' could not be bundled"))
+                expected = [] if llm == 'user/m' else ['chat:v2']
+                self.assertEqual(manifest['bundled_models'], expected)
+                self.assertEqual(model_bundle.bundled_models(pkg), expected)
+
     def test_a_model_named_with_and_without_its_tag_is_one_model(self):
         # `embed` and `embed:latest` share models/embed/latest/; a second copy
         # failing used to delete the first's files while the manifest kept
@@ -680,14 +699,14 @@ class ModelTagFolderTests(unittest.TestCase):
         notes = self.ensure(pkg, manifest, 'foo:a', 'bar:y')
         self.assertEqual(self.installed('foo:a'), self.manifests['foo:a'])
         self.assertIsNone(self.installed('bar:y'))  # develop: bar:x's
-        self.assertIn("model 'bar' is absent and not bundled; queries will fail until it is pulled", notes)
+        self.assertIn("model 'bar:y' is absent and not bundled; queries will fail until it is pulled", notes)
         self.assertEqual(manifest['bundled_models'], ['bar:x', 'foo:a'])
 
     def test_an_old_package_folder_installs_for_the_one_tag_its_manifest_names(self):
         pkg, manifest = self.legacy_package('foo:a', ('foo:a', 'bar:x'))
         notes = self.ensure(pkg, manifest, 'foo:a', 'bar:x')
         self.assertEqual(self.installed('foo:a'), self.manifests['foo:a'])
-        self.assertIn("model 'bar' is absent and not bundled; queries will fail until it is pulled", notes)
+        self.assertIn("model 'bar:x' is absent and not bundled; queries will fail until it is pulled", notes)
         self.assertEqual(model_bundle.bundled_models(pkg, manifest), ['foo:a'])
 
     def test_an_old_package_folder_shared_by_two_tags_counts_as_not_bundled(self):
@@ -705,10 +724,80 @@ class ModelTagFolderTests(unittest.TestCase):
         pkg, manifest = self.legacy_package('bar:x', ('foo:a', 'bar:x'))
         shutil.copytree(self.store / 'models', self.target / 'models', dirs_exist_ok=True)  # foo:a present
         notes = self.ensure(pkg, manifest, 'foo:a', 'bar:y')
-        self.assertIn("model 'foo' already present; left untouched", notes)
+        self.assertIn("model 'foo:a' already present; left untouched", notes)
         self.assertIsNone(self.installed('bar:y'))  # develop: bar:x's
-        self.assertIn("model 'bar' is absent and not bundled; queries will fail until it is pulled", notes)
+        self.assertIn("model 'bar:y' is absent and not bundled; queries will fail until it is pulled", notes)
         self.assertEqual(model_bundle.bundled_models(pkg, manifest), ['bar:x'])
+
+    # Reviewer additions (PR #496 testing review).
+    def test_the_embedding_model_under_another_tag_is_refused_as_missing(self):
+        pkg, manifest = self.export('foo:a', 'bar:x')
+        with self.assertRaises(packager.PackageError) as caught:
+            self.ensure(pkg, manifest, 'foo:b', 'bar:x')
+        self.assertEqual(caught.exception.code, 'EMBEDDING_MODEL_MISSING')
+        self.assertIn('does not bundle it', str(caught.exception))
+        self.assertEqual(caught.exception.detail['bundled'], ['bar:x', 'foo:a'])
+        self.assertEqual(caught.exception.detail['package_model'], 'foo:a')
+        self.assertIsNone(self.installed('foo:b'))
+        self.assertIsNone(self.installed('foo:a'))
+
+    def test_an_untagged_model_is_bundled_and_installed_as_latest(self):
+        self.manifests['baz:latest'] = self.put_model('baz:latest')
+        pkg, manifest = self.export('baz', 'foo:b')
+        self.assertEqual(manifest['bundled_models'], ['baz:latest', 'foo:b'])
+        self.assertIn('models/baz/latest/manifest.json', manifest['files'])
+        notes = self.ensure(pkg, manifest, 'baz', 'foo:b')
+        self.assertEqual(self.installed('baz:latest'), self.manifests['baz:latest'])
+        self.assertEqual(self.installed('foo:b'), self.manifests['foo:b'])
+        self.assertEqual(sum('installed from the package' in note for note in notes), 2, notes)
+
+    def test_an_old_package_folder_named_without_a_tag_installs_as_latest(self):
+        self.manifests['baz:latest'] = self.put_model('baz:latest')
+        pkg, manifest = self.legacy_package('baz:latest', ('baz', 'bar:x'))
+        self.assertEqual(model_bundle.bundled_models(pkg, manifest), ['baz:latest'])
+        notes = self.ensure(pkg, manifest, 'baz:latest', 'bar:x')
+        self.assertEqual(self.installed('baz:latest'), self.manifests['baz:latest'])
+        self.assertIn("model 'bar:x' is absent and not bundled; queries will fail until it is pulled", notes)
+
+    def test_an_old_package_folder_without_a_package_manifest_is_not_bundled(self):
+        pkg, _ = self.legacy_package('foo:a', ('foo:a', 'bar:x'))
+        self.assertEqual(model_bundle.bundled_models(pkg), [])
+        self.assertIsNone(model_bundle.bundled_source(pkg, 'foo:a'))
+        with self.assertRaises(FileNotFoundError):
+            with patch.object(settings, 'ollama_models_dir', str(self.target)):
+                model_bundle.install_model(pkg, 'foo:a')
+        self.assertIsNone(self.installed('foo:a'))
+
+    def test_every_message_names_the_model_by_name_and_tag(self):
+        # Every _ensure_models message names name:tag, so a configured foo:b
+        # suggests `ollama pull foo:b`, never foo (foo:latest); `detail` keeps
+        # the bare name (maintainer decision, 2026-11-25, #498).
+        def damage(model):
+            digest = json.loads(self.manifests[model])['layers'][0]['digest']
+            (self.target / 'models' / 'blobs' / digest.replace(':', '-')).write_bytes(b'changed')
+
+        pkg, manifest = self.export('foo:a', 'bar:x')
+        with self.assertRaises(packager.PackageError) as caught:
+            self.ensure(pkg, manifest, 'foo:b', 'bar:x')
+        self.assertEqual(caught.exception.code, 'EMBEDDING_MODEL_MISSING')
+        self.assertIn("embedding model 'foo:b'", str(caught.exception))
+        self.assertIn('ollama pull foo:b`', str(caught.exception))
+        self.assertEqual(caught.exception.detail['model'], 'foo')
+
+        shutil.copytree(self.store / 'models', self.target / 'models', dirs_exist_ok=True)
+        damage('foo:b')
+        with self.assertRaises(packager.PackageError) as caught:
+            self.ensure(pkg, manifest, 'foo:b', 'bar:x')
+        self.assertEqual(caught.exception.code, 'MODEL_INTEGRITY_FAILED')
+        self.assertIn("embedding model 'foo:b'", str(caught.exception))
+        self.assertIn('ollama pull foo:b`', str(caught.exception))
+        self.assertEqual(caught.exception.detail, {'model': 'foo'})
+
+        damage('bar:x')
+        notes = self.ensure(pkg, manifest, 'foo:a', 'bar:x')
+        self.assertIn("model 'foo:a' already present; left untouched", notes)
+        self.assertIn("model 'bar:x' is installed but its files don't match their checksums; "
+                      "restore or re-pull it before querying", notes)
 
 
 # Ingest settings in a package (#510): the save contract, except that chunk_size and
@@ -849,6 +938,136 @@ class IngestImportTests(unittest.TestCase):
         self.assertEqual(ingest_config.load('Renamed'), {**validated, 'collection': 'Renamed'})
         self.assertEqual(validated['collection'], 'Corpus')
         self.assertEqual(validated['chunk_size'], 800)
+
+    def test_legacy_bound_edges_and_non_overlap_strategies_are_accepted(self):
+        # Reviewer (#510): the pre-#53 edges, chunk_size 1 and min_chunk_size 0, and
+        # chunk_overlap >= chunk_size for strategies the overlap rule doesn't cover.
+        for data in [{'chunking_strategy': 'fixed', 'chunk_size': 1, 'chunk_overlap': 0,
+                      'min_chunk_size': 0},
+                     {'chunking_strategy': 'semantic', 'chunk_size': 100, 'chunk_overlap': 200,
+                      'similarity_threshold': 0, 'min_chunk_size': 0},
+                     {'chunking_strategy': 'fixed', 'chunk_size': 50, 'chunk_overlap': 50,
+                      'similarity_threshold': 1}]:
+            with self.subTest(data=data):
+                validated = ingest_config.validate(data, 'Corpus')
+                for key, value in data.items():
+                    self.assertEqual(validated[key], value)
+        for data in [{'chunk_size': 1}, {'chunk_size': '0'}, {'min_chunk_size': '-1'}]:
+            with self.subTest(data=data), self.assertRaises(ValueError):
+                ingest_config.validate(data, 'Corpus')
+
+    def test_symlinked_ingest_settings_are_refused(self):
+        # Reviewer (#510): the is_symlink branch of check 4c.
+        target = self.root / 'outside.json'
+        target.write_text('{}')
+        (self.pkg / 'ingest_config.json').symlink_to(target)
+        with self.assertRaises(packager.PackageError) as caught:
+            importer._read_ingest_config(self.pkg, 'Corpus')
+        self.assertEqual(caught.exception.code, 'PACKAGE_CORRUPT')
+        self.assertEqual(caught.exception.detail, {'file': 'ingest_config.json'})
+
+    def test_retrieval_settings_are_checked_before_ingest_settings(self):
+        # Reviewer (#510): check 4c runs after 4b, so 4b's refusal is the one reported.
+        (self.pkg / 'retrieval_config.json').write_text('{')
+        self.archive('{')
+        with patch.object(importer, '_ensure_models') as models, \
+             patch.object(importer, '_build') as build:
+            importer._jobs['test'] = {'status': 'queued'}
+            importer._run('test', 'fixture.tar.gz', 'abort')
+        result = importer._jobs['test']
+        self.assertEqual(result['status'], 'failed', result)
+        self.assertEqual(result['error_detail'], {'file': 'retrieval_config.json'}, result)
+        models.assert_not_called()
+        build.assert_not_called()
+
+    # Export (#515): saved settings are checked as import check 4c does, before any
+    # chunk is read, so a package never holds settings its import would refuse.
+    def export(self):
+        with patch.object(packager, 'read_chunks', return_value=[]) as chunks, \
+             patch.object(packager.wc, '_collection_config_sync',
+                          return_value={'embedding_model': settings.embed_model}) as collection, \
+             patch.object(packager, '_goldstandard_sessions', return_value=[]), \
+             patch.object(packager.sources, 'load_index', return_value={'documents': {}}), \
+             patch.object(packager.wc, '_meta_sync', return_value={'version': 'test'}):
+            try:
+                return packager.build('Corpus'), chunks, collection
+            except ValueError as exc:
+                exc.mocks = (chunks, collection)
+                raise
+
+    def packaged(self, filename):
+        with tarfile.open(self.exports / filename) as archive:
+            archive.extractall(self.root / 'extracted', filter='data')
+        return next((self.root / 'extracted').iterdir())
+
+    def test_export_refuses_invalid_saved_ingest_settings(self):
+        saved = ingest_config._path('Corpus')
+        for value in INVALID_INGEST:
+            if value is None:   # None is no saved settings, not invalid ones.
+                continue
+            with self.subTest(value=value):
+                saved.write_text(json.dumps(value))
+                before = saved.read_bytes()
+                with self.assertRaises(ValueError) as caught:
+                    self.export()
+                message = str(caught.exception)
+                self.assertIn("'Corpus'", message)
+                self.assertIn('Chunking Configuration page', message)
+                if not isinstance(value, dict):
+                    self.assertIn('not a JSON object', message)
+                elif {'chunk_size', 'chunk_overlap'} <= value.keys():   # the overlap rule names no field
+                    self.assertIn('chunk_overlap must be smaller', message)
+                else:
+                    self.assertIn(next(iter(value)), message)
+                for mock in caught.exception.mocks:   # refused before any chunk is read
+                    mock.assert_not_called()
+                self.assertEqual(list(self.exports.iterdir()), [])
+                self.assertEqual(saved.read_bytes(), before)
+
+    def test_export_packages_valid_saved_ingest_settings_as_validated(self):
+        cases = [
+            # Saved before the #53 bounds: exported as it is, never clamped.
+            ({'chunking_strategy': 'fixed', 'chunk_size': 20, 'chunk_overlap': 10,
+              'similarity_threshold': None, 'min_chunk_size': 8000},
+             {'chunking_strategy': 'fixed', 'chunk_size': 20, 'chunk_overlap': 10,
+              'similarity_threshold': None, 'min_chunk_size': 8000}),
+            ({}, dict(ingest_config.DEFAULTS)),
+            ({'collection': 'OldName', 'is_default': True, 'legacy_field': 'ignored',
+              'chunking_strategy': 'fixed', 'chunk_size': '150', 'chunk_overlap': '20',
+              'min_chunk_size': '40'},
+             {**ingest_config.DEFAULTS, 'chunking_strategy': 'fixed', 'chunk_size': 150,
+              'chunk_overlap': 20, 'min_chunk_size': 40}),
+        ]
+        saved = ingest_config._path('Corpus')
+        for data, expected in cases:
+            with self.subTest(data=data):
+                saved.write_text(json.dumps(data))
+                before = saved.read_bytes()
+                result, _, _ = self.export()
+                pkg = self.packaged(result['filename'])
+                packaged = json.loads((pkg / 'ingest_config.json').read_text())
+                self.assertEqual(packaged, {'collection': 'Corpus', **expected})
+                self.assertEqual(importer._read_ingest_config(pkg, 'Corpus'), packaged)
+                manifest = json.loads((pkg / 'manifest.json').read_text())
+                self.assertEqual(manifest['chunking'], {
+                    'strategy': expected['chunking_strategy'],
+                    'chunk_size': expected['chunk_size'],
+                    'chunk_overlap': expected['chunk_overlap']})
+                self.assertEqual(saved.read_bytes(), before)
+                shutil.rmtree(self.root / 'extracted')
+                for leftover in self.exports.iterdir():
+                    leftover.unlink()
+
+    def test_export_leaves_out_unreadable_saved_ingest_settings(self):
+        ingest_config._path('Corpus').write_text('{')
+        result, _, _ = self.export()
+        self.assertFalse((self.packaged(result['filename']) / 'ingest_config.json').exists())
+
+    def test_export_leaves_out_saved_ingest_settings_that_cannot_be_read(self):
+        # Reviewer (#515): a saved path that can't be read counts as no settings too.
+        ingest_config._path('Corpus').mkdir()
+        result, _, _ = self.export()
+        self.assertFalse((self.packaged(result['filename']) / 'ingest_config.json').exists())
 
 
 if __name__ == '__main__':

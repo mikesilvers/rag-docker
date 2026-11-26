@@ -199,7 +199,7 @@ class IngestConfigResponse(BaseModel):
     chunking_strategy: str
     chunk_size: int
     chunk_overlap: int
-    similarity_threshold: Optional[float]
+    similarity_threshold: Optional[Annotated[float, Field(allow_inf_nan=False)]]   # JSON has no NaN (#515)
     min_chunk_size: int
     is_default: bool
 

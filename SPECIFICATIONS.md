@@ -1101,6 +1101,8 @@ Returns the saved default chunking configuration for a collection. If no configu
 
 `is_default: true` means no configuration has been explicitly saved — these are system defaults. `is_default: false` means the user has saved a configuration for this collection. The UI uses this flag to show a "using defaults" notice when appropriate.
 
+A saved file that can't be read, isn't JSON, holds JSON that isn't an object, has a field of the wrong type (for example `"chunk_size": "x"` or a fractional `chunk_size`), holds a `NaN` or infinite `similarity_threshold`, or holds the response's own `is_default` key is logged as a warning, and the response is the defaults with `is_default: true`, never an error (#515), as for retrieval settings (#439, #477). Fields of the right type are returned as saved, missing fields are filled from the defaults, and values outside the save rules, including a `chunk_size` or `min_chunk_size` from before the bounds (§8), are returned as saved. The next valid `POST /ingest/config` replaces the file. An export still refuses saved settings the save rules refuse (RAG_EXPORT_SPECIFICATIONS.md §4.2).
+
 ---
 
 ```
