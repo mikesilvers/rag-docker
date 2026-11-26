@@ -51424,6 +51424,11 @@ from config import settings
 from services import importer, model_bundle as models
 alias, name = "vfy-install-alias:latest", "vfy-install-alias"
 out = {"error": None}
+if Path(settings.ollama_models_dir) != Path("/ollama"):  # the api mount the guard above inspected (#582)
+    out["error"] = (f"OLLAMA_MODELS_DIR is {settings.ollama_models_dir!r}, not /ollama, "
+                    "the path the mount guard checked; nothing was written")
+    print(json.dumps(out))
+    raise SystemExit(0)
 target = models.manifest_path(alias)
 try:
     own = models.manifest_path(settings.embed_model)

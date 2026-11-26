@@ -199,11 +199,8 @@ class PostInstallTests(unittest.TestCase):
         self.assertEqual(caught.exception.detail, {'model': 'review-model'})
 
     def test_installed_llm_that_ollama_does_not_report_fails_the_import(self):
-        present = 'present-embedder:latest'
-        real_state = model_bundle.installed_state
-        state = lambda model: 'present' if model == present else real_state(model)
-        with patch.object(importer.model_bundle, 'installed_state', state), \
-             self.assertRaises(PackageError) as caught:
+        present, state = self.present_embedder()
+        with state, self.assertRaises(PackageError) as caught:
             self.ensure(model_list({present}), embed=present)
         self.assertEqual(caught.exception.code, 'IMPORT_FAILED')
         self.assertIn('Ollama does not report it', caught.exception.message)
@@ -221,6 +218,7 @@ class PostInstallTests(unittest.TestCase):
         with state:
             notes = self.ensure(model_list({present, self.model}), embed=present)
         self.assertIn("model 'review-model:latest' installed from the package", notes)
+        self.assertTrue(model_bundle.is_installed(self.model))
 
     def test_installed_llm_when_ollama_is_unreachable_fails_the_import(self):
         present, state = self.present_embedder()
