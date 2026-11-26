@@ -548,6 +548,29 @@ class OpenPackageTests(Fixture):
                 if not encrypted:
                     self.assertEqual(list(dest.iterdir()), [])
 
+    def test_an_absolute_name_is_refused_before_its_folders_count(self):
+        # An absolute name that leads into the work directory names its folders from '/',
+        # so counted they would take it past the cap; it is refused as an absolute path
+        # first, with none made, for a file and a directory member (#911, reviewer test).
+        for encrypted in (False, True):
+            for kind, tail in (("file", under(18)), ("dir", under(18) + "/")):
+                with self.subTest(encrypted=encrypted, kind=kind):
+                    dest = self.root / ("work-" + uuid.uuid4().hex[:6])
+                    dest.mkdir()
+                    name = f"{dest.resolve()}/{tail}"
+                    archive = self.package(None, encrypted, folder_tar([name]))
+                    with self.assertRaises(packager.PackageError) as caught:
+                        packager.open_package(archive, dest, PASSPHRASE if encrypted else None)
+                    member = name.rstrip("/")
+                    self.assertEqual(caught.exception.code, "PACKAGE_UNREADABLE",
+                                     caught.exception.message)
+                    self.assertEqual(caught.exception.message, f"Package contains an absolute "
+                                                               f"path ('{member}'), which is not allowed.")
+                    self.assertEqual(caught.exception.detail, {"member": member})
+                    self.assertFalse((dest / TOP / "d00").exists())
+                    if not encrypted:
+                        self.assertEqual(list(dest.iterdir()), [])
+
     def test_dot_and_empty_parts_are_not_folders(self):
         # 'TOP/./d00//d01//...//d16//f' makes 17 folders under the top directory: with the
         # top directory, the manifest and the file, 20 entries. (#589 testing reviewer.)

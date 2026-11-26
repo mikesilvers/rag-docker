@@ -451,10 +451,14 @@ top-level directories, and a package with no manifest, a manifest that isn't JSO
 `package_format` (`PACKAGE_FORMAT_UNSUPPORTED`). It also checks that a member with a `..`
 component that resolves inside the package, whether or not it names a folder outside the work
 directory, is refused `PACKAGE_UNREADABLE` for a `.tar.gz` and a `.tar.gz.age` package without
-any of its folders being made, and that dots within a component are allowed (#597). Through
-`importer._run`, with Weaviate and the
-model checks mocked, a digest-valid package naming a collection Weaviate can't use is
-`PACKAGE_FORMAT_UNSUPPORTED` before any lookup, and one with a `chunks.jsonl` line that isn't
+any of its folders being made, and that dots within a component are allowed (#597). A
+directory member with a `..` component (`TOP/d1/../d2`, `TOP/d1/..`) is refused the same way,
+and a member with an absolute name that leads into the work directory is refused
+`PACKAGE_UNREADABLE` and not written, while one outside it keeps the outside-path message
+(#911). Through `importer._run`, with Weaviate and the model checks mocked, the #597 case
+fails `PACKAGE_UNREADABLE` for both package kinds and leaves no `evil` folder in the upload
+directory and no work directory; a digest-valid package naming a collection Weaviate can't use
+is `PACKAGE_FORMAT_UNSUPPORTED` before any lookup, and one with a `chunks.jsonl` line that isn't
 JSON, a bad UUID, properties that aren't an object, a missing or short vector, or a chunk count
 above or below the manifest's is `PACKAGE_CORRUPT` before any collection is created, with
 `abort` and `rename`. `scripts/tests/test_package_limits.py` (API container, with caps of
@@ -467,8 +471,8 @@ message and `detail`; a negative-size entry before an over-cap file is refused
 directory (on a regular file the file after it is never extracted); folders implied by a file's
 or a directory's path count as entries (at the cap it opens, one folder over is refused
 `PACKAGE_TOO_MANY_MEMBERS`), `.` and empty path parts aren't folders, while a name with a `..`
-component, `../<work dir>/…` included, is refused `PACKAGE_UNREADABLE` before its folders are
-counted; a folder counts once, whether its own entry comes before or after a file inside it and
+component, `../<work dir>/…` included, or an absolute name that leads into the work directory
+(#911), is refused `PACKAGE_UNREADABLE` before its folders are counted; a folder counts once, whether its own entry comes before or after a file inside it and
 for a name like `d/.`, while a repeated directory entry counts each time (#599); the checks run
 in §6.2's order (count, check, folders, size); a path needing more folders at once than the
 recursion limit allows is refused `PACKAGE_UNREADABLE`, not `IMPORT_FAILED` (#599); a `.tar.gz`
@@ -756,7 +760,9 @@ times; the Engineer sees both; the Developer's export and import are listed for 
 Engineer, not the key. `browser/ui_criteria.js` (suite 06) checks the pages' Running and recent
 jobs lists: a real ingest found again after leaving the Import page, then stubbed lists for a
 running ingest, generation and export that open by themselves, survive leaving the page and show
-their result, row switching, one job per Transfer panel, and the Engineer's owner column.
+their result, row switching, one job per Transfer panel, the Import page's late poll answers
+(#316: two answers in reverse order, a stale failure after success, a change of job and leaving
+the page, each with a lookup held in flight), and the Engineer's owner column.
 
 `scripts/tests/test_jobstore.py` (#23) checks the job store that keeps ingest, export, import
 and tune job records across an API restart: an unbound store (no lifespan) is a plain dict
@@ -1381,7 +1387,7 @@ completes.
 
 `browser/transfer_page.js`, registered in `06_ui.sh` through `ui_criteria.js`, renders the
 Transfer page with every API call stubbed in the browser and the page's 2 s poll delay cut to
-20 ms (#382). Twenty-eight cases: for each half, a failed poll (a proxy 502) is shown and retried
+20 ms (#382). Twenty-nine cases: for each half, a failed poll (a proxy 502) is shown and retried
 with the button still busy and cleared by the next good poll; 30 failures in a row stop polling,
 show the last error and enable the button again, and a new start clears the message; a poll in
 flight when the page is left schedules no further poll. An export start answered after the page
@@ -1397,7 +1403,8 @@ none. Five cases cover the key export (#676): the three choices with a new key f
 "Not encrypted" sending `encryption: "none"`, no "Not encrypted" in LAN mode, Download key
 offered before the package's Download with the store-apart warning and gone once the key is
 downloaded, and a key package asking for its key file, read in the browser and sent as `key`;
-the key is never shown as text. Four cases cover downloading a package (#677):
+the key is never shown as text. One case holds the page's key file read (#860): a read that ends after
+another key package was chosen sets nothing, and Import stays disabled. Four cases cover downloading a package (#677):
 - a finished export offers a Download link to its package with "Expires" in local time, and none
   when it has no expiry;
 - the package list says when a package exported here expires, and its Download link follows the

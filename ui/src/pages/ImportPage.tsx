@@ -8,6 +8,8 @@ import JobList, { newestToOpen, useJobList } from '../components/JobList'
 
 // Statuses an ingest job never leaves; polling stops at any of them.
 const TERMINAL = ['completed', 'failed', 'partial', 'cancelled']
+// The wait before each status lookup, counted from the previous answer.
+const POLL_MS = 3000
 const ingestRunning = (j: { status: string }) => !TERMINAL.includes(j.status)
 const loadIngestJobs = () => api.listIngestJobs().then(r => r.jobs)
 
@@ -70,22 +72,34 @@ export default function ImportPage() {
     })
   }, [])
 
+  // Polls the job shown while it runs, on one chain: each lookup starts 3 s
+  // after the previous one answered, so two are never in flight together. The
+  // chain ends when its job finishes, another job is opened, an upload is
+  // accepted or the page unmounts; an answer that arrives after that changes
+  // nothing and schedules nothing, so a late answer, or one for a job no longer
+  // shown, never replaces a newer state (#316).
   useEffect(() => {
     if (!pollId) return
-    const interval = setInterval(async () => {
-      try {
-        const j = await api.getJobStatus(pollId)
+    let current = true
+    let timer: number | undefined
+    const poll = () => {
+      api.getJobStatus(pollId).then(j => {
+        if (!current) return
         setJob(j)
         setPollError('')
-        if (!ingestRunning(j)) {
-          clearInterval(interval)
-          jobs.reload()
-        }
-      } catch (e: unknown) {
+        if (ingestRunning(j)) timer = window.setTimeout(poll, POLL_MS)
+        else jobs.reload()
+      }, (e: unknown) => {
+        if (!current) return
         setPollError(`Could not check the import's progress: ${e instanceof Error ? e.message : String(e)}`)
-      }
-    }, 3000)
-    return () => clearInterval(interval)
+        timer = window.setTimeout(poll, POLL_MS)
+      })
+    }
+    timer = window.setTimeout(poll, POLL_MS)
+    return () => {
+      current = false
+      window.clearTimeout(timer)
+    }
     // jobs.reload is stable
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pollId])
