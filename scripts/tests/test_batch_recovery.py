@@ -1083,6 +1083,88 @@ class RecoveryTests(unittest.TestCase):
         self.assertIs(error.exception.__cause__, cause)
         self.assertEqual(seen, [])
 
+    # #871: a cancelled import ends failed, and cleans up or reports as a failure does.
+    CANCELLED_IMPORT = ('CancelledError: the import was cancelled before it finished. '
+                        'Start the import again.')
+
+    def cancelled_import(self, on_conflict, *changes, check=None):
+        """Runs importer._run on the fixture package until a cancellation ends it.
+        Checks the cancellation propagates and no claim or registration is left;
+        returns the job record."""
+        pkg, manifest = self.package()
+        importer._jobs['cancel'] = {'job_id': 'cancel', 'status': 'queued', 'chunks_written': 0,
+                                    'error': None, 'error_code': None, 'error_detail': None}
+        with ExitStack() as stack:
+            for change in (patch.object(importer.packager, 'open_package', return_value=(pkg, manifest)),
+                           patch.object(importer.packager, 'verify_digests'),
+                           patch.object(importer, '_check_embedding', side_effect=check),
+                           patch.object(importer, '_ensure_models', return_value=[]), *changes):
+                stack.enter_context(change)
+            with self.assertRaises(asyncio.CancelledError):
+                importer._run('cancel', 'fixture.tar.gz', on_conflict)
+        self.assertEqual(importer._targets, {})
+        self.assertEqual(collection_writes._active_jobs, {})
+        return importer._jobs['cancel']
+
+    def renamed_target(self):
+        return next(name for name in self.cols.items if name.startswith('Corpus_imported_'))
+
+    def test_import_cancelled_before_the_target_claim_fails_and_claims_nothing(self):
+        before = copy.deepcopy(self.cols.get('Corpus').rows)
+        with patch.object(importer, '_claim_target') as claim:
+            job = self.cancelled_import('rename', check=asyncio.CancelledError())
+        claim.assert_not_called()
+        self.assertEqual((job['status'], job['error_code'], job['error'], job['error_detail']),
+                         ('failed', 'IMPORT_FAILED', self.CANCELLED_IMPORT, None))
+        self.assertEqual(list(self.cols.items), ['Corpus'])
+        self.assertEqual(self.cols.get('Corpus').rows, before)
+        self.assertEqual(list(importer._markers_dir().iterdir()), [])
+        self.assertFalse(list(recovery._root().glob('*.json')))
+
+    def test_import_cancelled_while_building_a_new_target_removes_it(self):
+        before = copy.deepcopy(self.cols.get('Corpus').rows)
+        self.cols.staging_fault = 'cancel'       # any collection but Corpus: the new target
+        job = self.cancelled_import('rename')
+        self.assertEqual((job['status'], job['error_code'], job['error'], job['error_detail']),
+                         ('failed', 'IMPORT_FAILED', self.CANCELLED_IMPORT, None))
+        self.assertEqual(len([n for n in self.cols.deleted if n.startswith('Corpus_imported_')]), 1)
+        self.assertEqual(list(self.cols.items), ['Corpus'])
+        self.assertEqual(self.cols.get('Corpus').rows, before)
+        self.assertEqual(list(importer._markers_dir().iterdir()), [])
+
+    def test_import_cancelled_with_a_failed_cleanup_keeps_the_marker_for_startup(self):
+        self.cols.staging_fault = 'cancel'
+        actual_delete = self.cols.delete
+        def fail_partial_delete(name):
+            if '_imported_' in name:
+                raise OSError('partial target cleanup unavailable')
+            return actual_delete(name)
+        job = self.cancelled_import('rename', patch.object(self.cols, 'delete', side_effect=fail_partial_delete))
+        target = self.renamed_target()
+        self.assertEqual((job['status'], job['error_code'], job['error']),
+                         ('failed', 'IMPORT_FAILED', self.CANCELLED_IMPORT))
+        self.assertEqual(job['error_detail'], {'collection': target, 'cleanup_pending': True})
+        self.assertTrue(importer._marker_path(target).exists())
+        self.assertEqual(len(importer.sweep_interrupted_imports()), 1)
+        self.assertFalse(self.cols.exists(target))
+        self.assertFalse(importer._marker_path(target).exists())
+        self.assertTrue(self.cols.exists('Corpus'))
+
+    def test_import_cancelled_after_the_replace_reports_the_retained_copy(self):
+        self.cols.final_fault = 'cancel'          # the build of Corpus after the replace's delete
+        job = self.cancelled_import('replace')
+        record = self.recovery_record()
+        self.assertEqual((job['status'], job['error_code']), ('failed', 'IMPORT_FAILED'))
+        self.assertEqual(job['error'], self.CANCELLED_IMPORT +
+                         f" The imported data is available as '{record['staging']}'.")
+        self.assertEqual(job['error_detail'], {'recovered_as': record['staging'],
+                                               'sidecar_snapshots': recovery.sidecar_reference(record)})
+        self.assertFalse(self.cols.exists('Corpus'))
+        self.assertEqual(list(importer._markers_dir().iterdir()), [])
+        self.assertEqual(self.cols.get(record['staging']).rows, {r['id']: r for r in self.original})
+        self.assert_retained(record)
+        recovery.discard(record, self.client)
+
     def test_import_replace_note_counts_canonical_and_alias_sessions(self):
         seen = []
         def sessions(name):

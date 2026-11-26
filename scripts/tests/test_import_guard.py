@@ -494,6 +494,79 @@ class ImportGuardTests(unittest.TestCase):
         self.assertTrue(self.wait_finished(loop, job_id))
         self.assertEqual(self.job(job_id)["status"], "completed", self.job(job_id))
 
+    # #871: a task cancelled before its worker starts still ends its job.
+    CANCELLED = ("CancelledError: the import was cancelled before it finished. "
+                 "Start the import again.")
+
+    def start_and_cancel(self, loop, filename, before_cancel=None):
+        """Starts an import, cancels its task (after awaiting `before_cancel(job_id)`
+        when given, else before the task runs a step) and waits for the task to
+        end; returns the job id once the task's done callback has run."""
+        async def run():
+            before = asyncio.all_tasks()
+            job_id = await importer.start_import_job(filename, "abort")
+            (task,) = asyncio.all_tasks() - before - {asyncio.current_task()}
+            if before_cancel is not None:
+                await before_cancel(job_id)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            await asyncio.sleep(0)               # the done callback has run
+            return job_id
+        return loop.run_until_complete(run())
+
+    def test_an_import_cancelled_before_its_worker_runs_is_settled(self):
+        loop = self.new_loop()
+        self.packages["q.tar.gz"] = "Queued"
+        seen = []
+
+        class Record(dict):
+            # Whether the package name is still claimed when the status is written.
+            def update(self, *args, **kwargs):
+                if "status" in dict(*args, **kwargs):
+                    seen.append((dict(*args, **kwargs)["status"], importer.package_busy("q.tar.gz")))
+                dict.update(self, *args, **kwargs)
+
+        async def watch(job_id):
+            # The store here is unbound, so it holds the record object it is given.
+            importer._jobs[job_id] = Record(importer._jobs[job_id])
+
+        job_id = self.start_and_cancel(loop, "q.tar.gz", watch)
+        job = self.job(job_id)
+        self.assertEqual((job["status"], job["error_code"], job["error"]),
+                         ("failed", "IMPORT_FAILED", self.CANCELLED), job)
+        self.assertEqual(seen, [("failed", False)])   # the name was free before the status changed
+        self.assertFalse(importer.package_busy("q.tar.gz"))
+        self.assertEqual(self.arrived, [])
+        # a worker that starts late finds its job settled and runs nothing
+        with patch.object(importer, "_run", side_effect=AssertionError("a late worker ran")):
+            importer._worker(job_id, "q.tar.gz", "abort")
+        self.assertNotIn(job_id, importer._abandoned)
+        self.assertNotIn(job_id, importer._started)
+        self.assertEqual(self.job(job_id)["status"], "failed")
+
+    def test_an_import_whose_worker_started_is_not_settled_by_its_task(self):
+        loop = self.new_loop()
+        self.packages["r.tar.gz"] = "Running"
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def worker(*args, **kwargs):
+            entered.set()
+            release.wait(10)
+
+        async def worker_in(job_id):
+            self.assertTrue(await asyncio.get_running_loop().run_in_executor(None, entered.wait, 10))
+
+        with patch.object(importer, "_run", side_effect=worker):
+            job_id = self.start_and_cancel(loop, "r.tar.gz", worker_in)
+            state = (self.job(job_id)["status"], importer.package_busy("r.tar.gz"),
+                     job_id in importer._started, job_id in importer._abandoned)
+            release.set()
+        self.assertEqual(state, ("queued", True, False, False))
+        # the stub worker never ran _run's finally, so release what it would have
+        importer._release_package("r.tar.gz")
+
 
 if __name__ == "__main__":
     unittest.main()
