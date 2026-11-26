@@ -154,6 +154,13 @@ services:
       WEAVIATE_PORT: 8080
       OLLAMA_HOST: ollama
       OLLAMA_PORT: 11434
+      # Sent with rag-docker's own Ollama requests, in this stack and with an
+      # external Ollama (#673): OLLAMA_NUM_CTX with the LLM chat requests only
+      # (an embedding request keeps the model's own context), OLLAMA_KEEP_ALIVE
+      # with every request. Neither changes the Ollama server's settings. The
+      # defaults are Ollama 0.3.14's, so results are what they were.
+      OLLAMA_NUM_CTX: "2048"
+      OLLAMA_KEEP_ALIVE: "5m"
       # LLM_MODEL, BUILD_LLM_MODEL and ANSWER_LLM_MODEL, from the ollama
       # service's environment above (#671).
       <<: *llm-models
@@ -414,6 +421,60 @@ services:
   api:
     environment:
       RAG_QUERY_ONLY: "true"
+```
+
+### docker-compose.external-ollama.yml
+
+```yaml
+# External Ollama mode (#673): use an Ollama on this host, usually a native
+# install (for its GPU), instead of the stack's own ollama container. Opt-in,
+# and only together with the base file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.external-ollama.yml up -d
+#
+# With LAN mode (#26) or query-only mode (#670), list their files first and this
+# one last:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.lan.yml -f docker-compose.query-only.yml -f docker-compose.external-ollama.yml up -d
+#
+# What this changes:
+# - the ollama service is left out (profile contained-ollama, never enabled);
+# - api and weaviate reach the host's Ollama under the same name, ollama, through
+#   host-gateway: OLLAMA_HOST and every collection's stored vectorizer endpoint
+#   stay http://ollama:11434, so nothing is migrated and reindex keeps working;
+# - the api no longer waits for, or mounts the model store of, an ollama
+#   service, and runs with RAG_EXTERNAL_OLLAMA=true: it checks the models through
+#   Ollama and never pulls, installs or writes one; exports with models are
+#   refused. Ollama itself listens on port 11434, on loopback with Docker
+#   Desktop and on the docker0 address on Linux, never on 0.0.0.0.
+#
+# This file replaces the api's list of mounts. Your own override file
+# (docker-compose.override.yml is read by itself only when no -f is given) goes
+# before this one in the -f list, and any api mounts it adds are dropped: repeat
+# the ones you need, without a model store, in a further file after this one.
+#
+# Check the setup with: bash scripts/check-external-ollama.sh
+# See README "External Ollama (native)".
+services:
+  ollama:
+    profiles: [contained-ollama]
+
+  weaviate:
+    extra_hosts: ["ollama:host-gateway"]
+
+  api:
+    extra_hosts: ["ollama:host-gateway"]
+    environment:
+      RAG_EXTERNAL_OLLAMA: "true"
+    depends_on: !override
+      weaviate: { condition: service_healthy }
+    # The base file's api mounts, in its order, without ollama_models:/ollama.
+    volumes: !override
+      - ingest_uploads:/app/uploads
+      - auth_data:/app/auth_data
+      - rag_sources:/app/sources
+      - rag_preparation:/app/preparation
+      - ./exports:/app/exports
 ```
 
 ### docker-compose.lan.verify.yml
@@ -1239,6 +1300,7 @@ async def usable_collection(request, name: str, outcome: str) -> JSONResponse | 
 ### api/config.py
 
 ```python
+import re
 import sys
 
 from pydantic import ValidationError, field_validator
@@ -1253,6 +1315,18 @@ class Settings(BaseSettings):
     weaviate_port: int = 8080
     ollama_host: str = "localhost"
     ollama_port: int = 11434
+    # External Ollama mode (#673), set only by docker-compose.external-ollama.yml.
+    # When true the stack runs no Ollama of its own: the API uses one on the host
+    # (usually a native install shared with other apps), never reads or writes a
+    # model store, and refuses exports with models.
+    rag_external_ollama: bool = False
+    # Sent with rag-docker's own Ollama requests in both modes (#673), never set
+    # on the Ollama server, which may be shared: num_ctx with the LLM chat
+    # requests only (an embedding request keeps the model's own context), and
+    # keep_alive with every request. The defaults are Ollama 0.3.14's, so the
+    # contained stack's results don't change.
+    ollama_num_ctx: int = 2048
+    ollama_keep_alive: str = "5m"
     # Two LLMs (#671): the build model prepares documents and writes gold
     # standard pairs; the answer model answers questions. Each is its own
     # setting when set and not empty, else LLM_MODEL, else DEFAULT_LLM_MODEL.
@@ -1332,7 +1406,8 @@ class Settings(BaseSettings):
     # briefly (maintainer's decision, #638).
     max_preparation_bytes: int = 20 * 1024 * 1024 * 1024
 
-    @field_validator("auth_cookie_secure", "rag_lan_mode", "rag_query_only", "audit_log_questions", mode="before")
+    @field_validator("auth_cookie_secure", "rag_lan_mode", "rag_query_only", "rag_external_ollama",
+                     "audit_log_questions", mode="before")
     @classmethod
     def _exact_boolean(cls, value, info):
         # pydantic would read "1", "yes" or "on" as true. A typo in a security
@@ -1342,6 +1417,23 @@ class Settings(BaseSettings):
         if value in ("true", "false"):
             return value == "true"
         raise ValueError(f"{info.field_name.upper()} must be exactly true or false")
+
+    @field_validator("ollama_num_ctx")
+    @classmethod
+    def _num_ctx(cls, value):
+        if not 256 <= value <= 1048576:
+            raise ValueError("OLLAMA_NUM_CTX must be 256 to 1048576")
+        return value
+
+    @field_validator("ollama_keep_alive")
+    @classmethod
+    def _keep_alive(cls, value):
+        # A duration as Ollama reads it: whole seconds (`300`, `-1`), or units
+        # (`5m`, `1h30m`, `500ms`). Anything else would fail every request.
+        if not (re.fullmatch(r"-?[0-9]+", value)
+                or re.fullmatch(r"-?([0-9]+(\.[0-9]+)?(ms|s|m|h))+", value)):
+            raise ValueError("OLLAMA_KEEP_ALIVE must be a duration such as 5m, 1h30m, 300 or -1")
+        return value
 
     @field_validator("audit_log_max_bytes")
     @classmethod
@@ -1756,6 +1848,79 @@ def main(argv=None) -> int:
     _say(f"load failed: {code}: {job.get('error')}")
     _audit(package, on_conflict, encrypted, job.get("collection"), result="failed", code=code)
     return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+### api/ollama_check.py
+
+```python
+"""Checks the Ollama this instance uses, from inside the api container (#673).
+
+    docker compose exec -T api python -m ollama_check
+
+scripts/check-external-ollama.sh runs it after its own host-side check. One line
+per check on standard output, each starting "ollama-check: ok:" or
+"ollama-check: problem:", then exit status 0 when every check passed and 1
+otherwise. It only reads (GET /api/version and /api/tags): it never pulls,
+loads, unloads or changes a model, so it is safe on an Ollama other apps share.
+"""
+from __future__ import annotations
+
+import sys
+
+import httpx
+
+from config import settings
+from services.ollama_client import required_models, _tagged
+
+PREFIX = "ollama-check: "
+
+
+def run(client: httpx.Client, out=sys.stdout) -> int:
+    base = f"http://{settings.ollama_host}:{settings.ollama_port}"
+    problems = 0
+
+    def say(kind: str, text: str) -> None:
+        nonlocal problems
+        problems += kind == "problem"
+        print(f"{PREFIX}{kind}: {text}", file=out, flush=True)
+
+    if settings.rag_external_ollama:
+        say("ok", "external Ollama mode is on (RAG_EXTERNAL_OLLAMA=true)")
+    else:
+        say("problem", "external Ollama mode is off: start the stack with "
+                       "docker-compose.external-ollama.yml (README \"External Ollama (native)\")")
+    try:
+        resp = client.get(f"{base}/api/version")
+        resp.raise_for_status()
+        say("ok", f"reached Ollama {resp.json().get('version') or '(version not given)'} at {base}")
+    except Exception as exc:                          # noqa: BLE001
+        say("problem", f"can't reach Ollama at {base} from the api container: "
+                       f"{type(exc).__name__}: {exc}. On Docker Desktop (macOS, Windows), check "
+                       "that Ollama is running on the host. On Linux, check that Ollama listens "
+                       "on the docker0 address (README \"External Ollama (native)\").")
+        return 1
+    try:
+        resp = client.get(f"{base}/api/tags")
+        resp.raise_for_status()
+        reported = {_tagged(m["name"]) for m in resp.json().get("models", [])}
+    except Exception as exc:                          # noqa: BLE001
+        say("problem", f"couldn't list Ollama's models: {type(exc).__name__}: {exc}")
+        return 1
+    for model in required_models():
+        if model in reported:
+            say("ok", f"model {model} is present")
+        else:
+            say("problem", f"model {model} is missing. On the Ollama host, run: ollama pull {model}")
+    return 1 if problems else 0
+
+
+def main() -> int:
+    with httpx.Client(timeout=10.0) as client:
+        return run(client)
 
 
 if __name__ == "__main__":
@@ -5136,6 +5301,7 @@ def _sample_chunks_sync(collection_name: str, limit: int, seed: int | None = Non
 ```python
 from __future__ import annotations
 from services import telemetry
+import logging
 import time
 
 import httpx
@@ -5143,17 +5309,38 @@ import httpx
 from config import settings
 
 _BASE = f"http://{settings.ollama_host}:{settings.ollama_port}"
+_log = logging.getLogger(__name__)
+
+# Set once /api/embeddings answers 404: an Ollama that has dropped the older
+# endpoint, superseded by /api/embed (#673). Every later embedding goes to
+# /api/embed, the endpoint Weaviate's text2vec-ollama calls.
+_use_embed = False
 
 
 @telemetry.traced("ollama.embed")
 async def embed(text: str) -> list[float]:
+    # keep_alive only: the embedding model keeps its own context (num_ctx), as
+    # Weaviate's own embedding calls do (#673).
+    global _use_embed
     async with httpx.AsyncClient(timeout=60.0) as client:
+        if not _use_embed:
+            resp = await client.post(
+                f"{_BASE}/api/embeddings",
+                json={"model": settings.embed_model, "prompt": text,
+                      "keep_alive": settings.ollama_keep_alive},
+            )
+            if resp.status_code != 404:
+                resp.raise_for_status()
+                return resp.json()["embedding"]
+            _use_embed = True
+            _log.warning("Ollama answered 404 for /api/embeddings; using /api/embed from now on")
         resp = await client.post(
-            f"{_BASE}/api/embeddings",
-            json={"model": settings.embed_model, "prompt": text},
+            f"{_BASE}/api/embed",
+            json={"model": settings.embed_model, "input": text,
+                  "keep_alive": settings.ollama_keep_alive},
         )
         resp.raise_for_status()
-        return resp.json()["embedding"]
+        return resp.json()["embeddings"][0]
 
 
 async def _chat(model: str, system: str, user: str) -> str:
@@ -5167,6 +5354,9 @@ async def _chat(model: str, system: str, user: str) -> str:
                     {"role": "user", "content": user},
                 ],
                 "stream": False,
+                # In the request, never on the server, which may be shared (#673).
+                "options": {"num_ctx": settings.ollama_num_ctx},
+                "keep_alive": settings.ollama_keep_alive,
             },
         )
         resp.raise_for_status()
@@ -5195,6 +5385,15 @@ def same_model(a: str, b: str) -> bool:
     return _tagged(a) == _tagged(b)
 
 
+def required_models() -> list[str]:
+    """The embedding, answer and build models, `name:tag`, each once, in that order."""
+    seen: list[str] = []
+    for model in (settings.embed_model, settings.answer_model, settings.build_model):
+        if _tagged(model) not in seen:
+            seen.append(_tagged(model))
+    return seen
+
+
 @telemetry.traced("ollama.models")
 async def list_models() -> set[str]:
     """Full names (`name:tag`) of the models Ollama reports."""
@@ -5204,9 +5403,46 @@ async def list_models() -> set[str]:
         return {m["name"] for m in resp.json().get("models", [])}
 
 
+async def missing_models() -> list[str] | None:
+    """The required models Ollama doesn't list, tag-exact (#673), or None when it
+    can't be asked."""
+    try:
+        reported = {_tagged(name) for name in await list_models()}
+    except Exception:                                 # noqa: BLE001
+        return None
+    return [model for model in required_models() if model not in reported]
+
+
+@telemetry.traced("ollama.models")
+async def version() -> str | None:
+    """The running Ollama's version (`GET /api/version`), or None (#673)."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{_BASE}/api/version")
+            resp.raise_for_status()
+            value = resp.json().get("version")
+            return value if isinstance(value, str) and value else None
+    except Exception:                                 # noqa: BLE001
+        return None
+
+
+@telemetry.traced("ollama.models")
+async def loaded_models() -> list[dict]:
+    """What Ollama has loaded (`GET /api/ps`), for information only (#673).
+
+    The Ollama may be shared with other apps: nothing here, or anywhere in
+    rag-docker, unloads or changes another model."""
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        resp = await client.get(f"{_BASE}/api/ps")
+        resp.raise_for_status()
+        return [{key: m.get(key) for key in ("name", "size", "size_vram", "expires_at")}
+                for m in resp.json().get("models", []) if isinstance(m, dict)]
+
+
 @telemetry.traced("ollama.health")
 async def check_health() -> dict:
-    """`llm` is the answer model, `build_llm` the build model (#671)."""
+    """`llm` is the answer model, `build_llm` the build model (#671). A model is
+    present only when Ollama lists its exact `name:tag` (#673)."""
     answer, build = settings.answer_model, settings.build_model
     same = same_model(answer, build)
     start = time.monotonic()
@@ -5215,17 +5451,16 @@ async def check_health() -> dict:
             resp = await client.get(f"{_BASE}/api/tags")
             resp.raise_for_status()
             latency_ms = int((time.monotonic() - start) * 1000)
-            models = {m["name"].split(":")[0] for m in resp.json().get("models", [])}
+            models = {_tagged(m["name"]) for m in resp.json().get("models", [])}
 
             def entry(model: str) -> dict:
-                ok = model.split(":")[0] in models
+                ok = _tagged(model) in models
                 return {"status": "ok" if ok else "error", "latency_ms": latency_ms, "model": model}
 
             result = {"llm": entry(answer), "build_llm": entry(build),
                       "embed": entry(settings.embed_model), "same_model": same}
             if any(result[k]["status"] != "ok" for k in ("llm", "build_llm", "embed")):
                 telemetry.outcome("error")
-            return result
     except Exception as exc:
         telemetry.outcome("error", exc)
         latency_ms = int((time.monotonic() - start) * 1000)
@@ -5234,7 +5469,63 @@ async def check_health() -> dict:
             "build_llm": {"status": "error", "latency_ms": latency_ms, "model": build},
             "embed": {"status": "error", "latency_ms": latency_ms, "model": settings.embed_model},
             "same_model": same,
+            "version": None,
         }
+    # Information only: the version never decides the status (#673).
+    result["version"] = await version()
+    return result
+```
+
+### api/services/ollama_startup.py
+
+```python
+"""The start-up model check (#673): one log line per model Ollama doesn't have.
+
+Runs as a background task from the API's lifespan, so a slow or unreachable
+Ollama never delays the start. It only reads `/api/tags`; it never pulls.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+
+from config import settings
+from services import ollama_client
+
+_log = logging.getLogger(__name__)
+_TIMEOUT = 10.0
+
+
+def missing_line(model: str) -> str:
+    """The log line for a missing `name:tag`, with the command for this mode."""
+    if settings.rag_external_ollama:
+        return f"Ollama model missing: {model}. On the Ollama host, run: ollama pull {model}"
+    return f"Ollama model missing: {model}. Run: docker compose exec ollama ollama pull {model}"
+
+
+def unreachable_line() -> str:
+    where = f"http://{settings.ollama_host}:{settings.ollama_port}"
+    if settings.rag_external_ollama:
+        return (f"Ollama at {where} could not be reached to check the models. "
+                "Run scripts/check-external-ollama.sh on the host.")
+    return f"Ollama at {where} could not be reached to check the models."
+
+
+async def log_missing_models() -> None:
+    try:
+        missing = await asyncio.wait_for(ollama_client.missing_models(), _TIMEOUT)
+    except asyncio.CancelledError:
+        raise
+    except Exception:                                 # noqa: BLE001 (a timeout included)
+        missing = None
+    try:
+        if missing is None:
+            _log.warning(unreachable_line())
+            return
+        for model in missing:
+            _log.warning(missing_line(model))
+    except Exception:                                 # noqa: BLE001
+        _log.exception("The start-up model check failed")
 ```
 
 ### api/services/chunker.py
@@ -15412,6 +15703,8 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
     The LLM is this instance's answer model; the build model is neither checked
     nor installed (#671).
     """
+    if settings.rag_external_ollama:
+        return _ensure_models_external(pkg, manifest)
     notes: list[str] = []
     if not model_bundle.store_available():
         # Nothing can be installed or checked; say so rather than guess.
@@ -15514,6 +15807,55 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
                 {"model": name})
         notes.append(f"model '{ref}' installed from the package")
     return notes
+
+
+def _ensure_models_external(pkg: Path, manifest: dict) -> list[str]:
+    """Spec §6.3 with an external Ollama (#673): check, never install.
+
+    The models are asked of the external Ollama (`/api/tags`, tag-exact); no
+    model store is read or written, and models a package bundles are left in it.
+    The embedding model decides the import; the answer model is a note.
+    """
+    notes: list[str] = []
+    try:
+        bundled = model_bundle.bundled_models(pkg, manifest)
+    except OSError:
+        bundled = []
+    if bundled:
+        notes.append("the package bundles models; with an external Ollama they are not installed")
+    embed_ref = _tag_ref(settings.embed_model)
+    reported = _ollama_reports(settings.embed_model)
+    if reported is None:
+        raise PackageError(
+            "IMPORT_FAILED",
+            f"Couldn't reach the external Ollama to confirm the embedding model "
+            f"'{embed_ref}' is there. Run scripts/check-external-ollama.sh, then import again.",
+            {"model": embed_ref})
+    if not reported:
+        pkg_model = (manifest.get("embedding") or {}).get("model")
+        raise PackageError(
+            "EMBEDDING_MODEL_MISSING",
+            f"This instance uses an external Ollama, which does not have the embedding "
+            f"model '{embed_ref}'. On the Ollama host, run `ollama pull {embed_ref}`, "
+            f"then import again.",
+            {"model": embed_ref, "package_model": pkg_model, "bundled": bundled})
+    notes.append(f"model '{embed_ref}' reported by the external Ollama")
+    answer_ref = _tag_ref(settings.answer_model)
+    answer = _ollama_reports(settings.answer_model)
+    if answer is None:
+        notes.append(f"model '{answer_ref}' wasn't checked: the external Ollama couldn't "
+                     "be reached to confirm it is there")
+    elif answer:
+        notes.append(f"model '{answer_ref}' reported by the external Ollama")
+    else:
+        notes.append(f"model '{answer_ref}' is absent from the external Ollama; pull it "
+                     f"there with `ollama pull {answer_ref}` before querying")
+    return notes
+
+
+def _tag_ref(model: str) -> str:
+    """`name:tag`, a name without a tag being `:latest`, as Ollama lists it."""
+    return model if ":" in model.rsplit("/", 1)[-1] else f"{model}:latest"
 
 
 # ── Building ──────────────────────────────────────────────────────────────────
@@ -16287,7 +16629,13 @@ def blob_path(digest: str) -> Path:
 
 
 def store_available() -> bool:
-    """False when the model store is not mounted, e.g. an older compose file."""
+    """False when the model store is not mounted, e.g. an older compose file.
+
+    Always False with an external Ollama (#673): its models are its own, and
+    rag-docker never reads or writes a model store it doesn't run, whatever is
+    mounted."""
+    if settings.rag_external_ollama:
+        return False
     return _root().is_dir()
 
 
@@ -17507,6 +17855,16 @@ def memory_info(recommended_gb: float) -> dict:
             "Docker Desktop -> Settings -> Resources -> Memory."
         )
     return info
+
+
+def external_memory_info() -> dict:
+    """The memory report with an external Ollama (#673): the LLM isn't in Docker,
+    so there is no recommendation to compare Docker's memory with."""
+    return {
+        "status": "external",
+        "note": ("The LLM runs in the external Ollama, outside Docker, so Docker's "
+                 "memory isn't compared with RECOMMENDED_MEMORY_GB."),
+    }
 ```
 
 ### api/routers/health.py
@@ -17565,6 +17923,17 @@ async def _report() -> tuple[bool, dict]:
     # requests; failing the endpoint would mark the api container unhealthy and
     # take the whole stack down over a tuning warning.
     resources = {"memory": system_info.memory_info(settings.recommended_memory_gb)}
+    if settings.rag_external_ollama:
+        # The LLM runs in the external Ollama, outside Docker, so Docker's memory
+        # isn't compared with the recommendation; what that Ollama has loaded,
+        # other apps' models included, is reported and never acted on (#673).
+        resources = {"memory": system_info.external_memory_info()}
+        try:
+            resources["ollama_loaded"] = await ollama.loaded_models()
+        except Exception:                             # noqa: BLE001
+            resources["ollama_loaded"] = None
+            resources["ollama_loaded_note"] = (
+                "Couldn't read what the external Ollama has loaded (/api/ps).")
 
     return overall_ok, {
         "status": "ok" if overall_ok else "degraded",
@@ -18724,6 +19093,13 @@ async def start_export(body: ExportRequest, request: Request = None):
         return api_error(400, "ENCRYPTION_REQUIRED",
                          "LAN mode exports only encrypted packages: use a new key (the default) "
                          "or a passphrase.")
+    # With an external Ollama rag-docker reads no model store, so it has no
+    # model files to put in a package (#673).
+    if settings.rag_external_ollama and body.include_models:
+        return api_error(400, "MODELS_NOT_EXPORTABLE",
+                         "This instance uses an external Ollama, whose model files rag-docker "
+                         "doesn't read. Export without models, and pull the models on the "
+                         "machine that imports the package.")
     # A collection the caller may not use answers as one that doesn't exist (#606).
     if not await access.check(request, body.collection):
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{body.collection}' not found.")
@@ -24284,6 +24660,7 @@ async def lifespan(app: FastAPI):
     app.state.telemetry = runtime
     flusher = None
     sweeper = None
+    checker = None
     try:
         import logging
         from services import goldstandard, metrics
@@ -24387,11 +24764,17 @@ async def lifespan(app: FastAPI):
         # Writes the count records of repeated failed logins as their windows
         # close; the open ones are written at shutdown, below (#577).
         flusher = asyncio.create_task(audit.login_flusher())
+        # One line per model Ollama doesn't have, with the exact pull command
+        # (#673); in the background, so an unreachable Ollama doesn't delay start.
+        from services import ollama_startup
+        checker = asyncio.create_task(ollama_startup.log_missing_models())
         yield
     finally:
         try:
             if sweeper is not None:
                 sweeper.cancel()
+            if checker is not None:
+                checker.cancel()
             if flusher is not None:
                 flusher.cancel()
                 from services import audit
@@ -25527,15 +25910,22 @@ export interface HealthResult {
       build_llm: { status: string; latency_ms: number; model: string }
       embed: { status: string; latency_ms: number; model: string }
       same_model: boolean
+      // The running Ollama's version, or null when it can't be read (#673).
+      version?: string | null
     }
   }
   resources?: {
+    // With an external Ollama (#673) the status is "external" and there is no
+    // recommendation or allocated figure.
     memory: {
       status: string
-      allocated_gb: number | null
-      recommended_minimum_gb: number
+      allocated_gb?: number | null
+      recommended_minimum_gb?: number
       note?: string
     }
+    // External Ollama only (#673): what it has loaded, for information.
+    ollama_loaded?: Array<{ name: string | null; size: number | null; size_vram: number | null; expires_at: string | null }> | null
+    ollama_loaded_note?: string
   }
 }
 
@@ -30426,6 +30816,7 @@ RAG_SKIP_SLOW=1 bash scripts/verify/stack.sh run    # skip LLM work, ~8 min, sta
 bash scripts/verify/stack.sh run 02 04              # only the named suites
 bash scripts/verify/stack.sh run --lan              # LAN mode, TLS on loopback only (#26)
 bash scripts/verify/stack.sh run --query-only       # query-only mode on a second instance (#670)
+bash scripts/verify/stack.sh run --external-ollama  # a native Ollama on this host (#673)
 ```
 
 Exits non-zero if any check fails.
@@ -30584,8 +30975,8 @@ against" below).
 
 | Command | What it does |
 |---|---|
-| `stack.sh run [--checkout DIR] [--telemetry [--telemetry-pin FILE] \| --lan \| --query-only] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
-| `stack.sh up [--checkout DIR] [--pull] [--telemetry [--telemetry-pin FILE] \| --lan \| --query-only]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. `--telemetry` brings it up in the same telemetry configuration as `run --telemetry` (see "Optional Collector acceptance") and also prints `COMPOSE_PROFILES`, `RAG_VERIFY_HARNESS`, `RAG_VERIFY_CHECKOUT`, `RAG_VERIFY_OTEL_ENABLED` and `RAG_VERIFY_TELEMETRY_PIN`. `--telemetry-pin FILE` supplies a reviewed collector pin (see "Evaluating a collector pin change"). |
+| `stack.sh run [--checkout DIR] [--telemetry [--telemetry-pin FILE] \| --lan \| --query-only \| --external-ollama] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
+| `stack.sh up [--checkout DIR] [--pull] [--telemetry [--telemetry-pin FILE] \| --lan \| --query-only \| --external-ollama]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. `--telemetry` brings it up in the same telemetry configuration as `run --telemetry` (see "Optional Collector acceptance") and also prints `COMPOSE_PROFILES`, `RAG_VERIFY_HARNESS`, `RAG_VERIFY_CHECKOUT`, `RAG_VERIFY_OTEL_ENABLED` and `RAG_VERIFY_TELEMETRY_PIN`. `--telemetry-pin FILE` supplies a reviewed collector pin (see "Evaluating a collector pin change"). |
 | `stack.sh down` | Removes the project: its containers, network, volumes, images and exports folder. |
 | `stack.sh query-only-mode --package NAME [--checkout DIR]` | Only for `24_query_only.sh`, under the inherited lock of a `run --query-only` (#670): keeps package NAME aside, removes the project's containers, network and volumes (not its images or the model copy), puts the package back alone in an empty exports folder, and starts the project again from the checkout's `docker-compose.query-only.yml`, after the configuration check and without a build, as a second instance on another machine would be. |
 
@@ -30736,13 +31127,32 @@ configuration check and both refusals, with Docker replaced by a stub, so it
 needs no stack. Two of its tests read `docker-compose.yml` with PyYAML, so they
 need PyYAML on the host; without it they are skipped.
 
+`25_external_ollama.sh` checks external-Ollama mode (#673, SPECIFICATIONS.md §2.7 and §10.12). In every run
+`../tests/test_external_ollama.py` runs in the API image with no network (the settings, the request bodies in both
+modes and the `/api/embed` fallback, the tag-exact check, `/health/details`, the start-up lines, import and export,
+`python -m ollama_check`, the overlay and `install-offline.sh --external-ollama`). The rest needs
+`stack.sh run --external-ollama`, which runs this suite alone, on a host whose native Ollama is set up as the main
+README's "External Ollama (native)" says, with its models already pulled: `stack.sh` first runs
+`scripts/check-external-ollama.sh --host-only` from the harness (Ollama listening only on loopback, or on Linux the
+`docker0` address; a warning fails the run) and asks the host's Ollama for `/api/version`, before any Docker command;
+it never installs Ollama or pulls a model, and the model copy isn't used. The guard then allows `extra_hosts` exactly
+`ollama:host-gateway` on api and weaviate, and refuses a configuration that still has an ollama service. The suite
+checks that no ollama service runs, `python -m ollama_check` in the api container, `/health/details` (the version,
+memory `external`, `ollama_loaded`), an ingest (Weaviate embeds through the host's Ollama), the refused export with
+models and an export without them imported back, a reindex, and outside `RAG_SKIP_SLOW=1` `hnsw` and `semantic`
+questions with citations. Its first real run is the tests reviewer's: the fix agent ran only host tests.
+
 ## Continuous integration
 
 `.github/workflows/verify.yml` runs the suite on GitHub Actions for every pull
 request to `develop` or `main` (#24), on `ubuntu-latest`, with `RAG_SKIP_SLOW=1`.
 It uses the same verify project as a local run and never sets
 `RAG_VERIFY_LIVE`; nothing in it changes the refusals above. The badge at the
-top of the main `README.md` shows its result on `develop`.
+top of the main `README.md` shows its result on `develop`. A second job,
+`external-ollama` (#673), installs the pinned native Ollama (v0.40.18) from its
+release's install script, checked by sha256, binds it to the `docker0` address,
+pulls the models (cached by release and names) and runs
+`stack.sh up --external-ollama` and suite 25 with `RAG_SKIP_SLOW=1`.
 
 - **Up, suites, logs, down.** `stack.sh run` removes the project before its
   logs could be saved, so the workflow takes the `up` route: `stack.sh up`
@@ -31537,6 +31947,8 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `23_llm_split.sh` | the build and answer models (#671), full runs only: with `BUILD_LLM_MODEL` set to a small model, preparation and gold standard use it and query uses the answer model |
 | `llm_split.py` | helper for suite 23, run in the API container: pulls the small model, runs the three tasks through the services' code and prints the models Ollama reports answering each (#671) |
 | `24_query_only.sh` | §2.6 and §10.11 — query-only mode (#670): the overlay resolved without starting it; registers `../tests/test_query_only.py`; the start-up refusal of a non-boolean `RAG_QUERY_ONLY`; the loader's refusal on a full instance; with `stack.sh run --query-only`, build and export, `stack.sh query-only-mode`, then the load, the refusals, access and Q&A on the query-only instance, and a key package loaded with its key file on standard input and refused `KEY_FILE_REQUIRED` without it (#676) |
+| `25_external_ollama.sh` | §2.7 and §10.12 — external-Ollama mode (#673): registers `../tests/test_external_ollama.py`; with `stack.sh run --external-ollama`, no ollama service, `python -m ollama_check`, `/health/details`, ingest through the host's Ollama, the refused export with models, an import back, a reindex and, outside `RAG_SKIP_SLOW`, hnsw and semantic questions |
+| `../tests/test_check_external_ollama.py` | host-side, standard library: `scripts/check-external-ollama.sh` with stub `uname`, `lsof`, `ss`, `ip` and `docker`: loopback and docker0 pass, a wildcard or LAN address warns (exit 3), nothing listening fails (exit 1), `--host-only` skips the container check (#673) |
 | `query_only_config.py` | host-side, standard library: `docker-compose.yml` with and without `docker-compose.query-only.yml` as `docker compose config` resolves them; only the api's `RAG_QUERY_ONLY` may differ (#670) |
 | `../tests/test_query_only.py` | API image, no network (also on the host): `RAG_QUERY_ONLY` parsing, the refused and kept routes, the refusals through the app and their order, `query_only` in the user answers, `lan_mode` in the user answers (#676), the loader (usage, refusals, lock, passphrase, a key package's key file on standard input with `KEY_FILE_REQUIRED` and `KEY_FILE_INVALID` (#676), results `success`/`refused`/`failed`/`interrupted`, the Ctrl-C handler) and the access of a collection it creates (#670) |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
@@ -32235,7 +32647,12 @@ fi
 if [ "${RAG_SKIP_SLOW:-0}" != "1" ]; then
   if ! sanity=$(cd "$REPO_ROOT" && docker compose exec -T api python - < scripts/verify/llm_sanity.py 2>&1); then
     printf '\nThe answer LLM is not giving usable answers:\n  %s\n' "$sanity"
-    printf 'Restart it and run again:  docker compose restart ollama\n'
+    if [ "${RAG_VERIFY_EXTERNAL_OLLAMA:-0}" = 1 ]; then
+      # External-Ollama mode (#673): the Ollama is the host's own.
+      printf 'Restart the Ollama on this host (README "External Ollama (native)") and run again.\n'
+    else
+      printf 'Restart it and run again:  docker compose restart ollama\n'
+    fi
     printf '(with the verify environment that scripts/verify/stack.sh up prints)\n\n'
     exit 2
   fi
@@ -32246,7 +32663,7 @@ printf '\nBuilding fixtures in %s\n' "$FIX"
 rm -rf "$FIX"; python3 ./fixtures.py "$FIX" >/dev/null
 export RAG_FIXTURES="$FIX"
 
-ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings 15_telemetry 17_auth 18_lan 19_audit 20_offline_model 21_prepare 22_ui_ingest 23_llm_split 24_query_only)
+ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings 15_telemetry 17_auth 18_lan 19_audit 20_offline_model 21_prepare 22_ui_ingest 23_llm_split 24_query_only 25_external_ollama)
 if [ "$#" -gt 0 ]; then
   SUITES=()
   for want in "$@"; do
@@ -32295,8 +32712,8 @@ exit "$overall"
 # Run the verification suite on a disposable compose project, never on the
 # live stack (#152).
 #
-#   bash scripts/verify/stack.sh run [--checkout DIR] [--telemetry [--telemetry-pin FILE] | --lan | --query-only] [suite ...]
-#   bash scripts/verify/stack.sh up [--checkout DIR] [--pull] [--telemetry [--telemetry-pin FILE] | --lan | --query-only]
+#   bash scripts/verify/stack.sh run [--checkout DIR] [--telemetry [--telemetry-pin FILE] | --lan | --query-only | --external-ollama] [suite ...]
+#   bash scripts/verify/stack.sh up [--checkout DIR] [--pull] [--telemetry [--telemetry-pin FILE] | --lan | --query-only | --external-ollama]
 #   bash scripts/verify/stack.sh down
 #
 # `run` brings the verify project up, runs that checkout's all.sh against it
@@ -32351,6 +32768,19 @@ exit "$overall"
 # again in query-only mode (the checkout's docker-compose.query-only.yml): a
 # second instance with its own empty volumes, as on another machine, never two
 # at once. Without suite names, a --query-only run runs 24_query_only.
+#
+# --external-ollama (#673) runs the verify project in external-Ollama mode (the
+# checkout's docker-compose.external-ollama.yml): no ollama service, and api and
+# weaviate reach an Ollama installed natively on this host as `ollama`, through
+# host-gateway. Before anything else it checks that host the way the README's
+# guide does: scripts/check-external-ollama.sh --host-only must pass with no
+# warning (Ollama listening only on loopback, or on Linux the docker0 address),
+# and that Ollama must answer on port 11434. Nothing here installs Ollama or
+# pulls a model into it: its models must already be there, or the start fails
+# with the `ollama pull` lines. The model copy is not used. The guard then
+# allows exactly `ollama:host-gateway` as extra_hosts on api and weaviate, and
+# nothing else, and refuses a configuration that still has an ollama service.
+# Without suite names, an --external-ollama run runs 25_external_ollama.
 #
 # --telemetry checks the collector image against this checkout's own
 # telemetry/image.json, so a PR that changes the pin is refused. To evaluate
@@ -32420,6 +32850,7 @@ PULL=""
 TELEMETRY=0
 LAN=0
 QUERY_ONLY=0
+EXTERNAL=0
 QO_PACKAGE=""
 OTEL_ENABLED=true
 PIN=""
@@ -32442,6 +32873,9 @@ while [ "$#" -gt 0 ]; do
     --query-only)
       { [ "$CMD" = up ] || [ "$CMD" = run ]; } || usage
       QUERY_ONLY=1; shift ;;
+    --external-ollama)
+      { [ "$CMD" = up ] || [ "$CMD" = run ]; } || usage
+      EXTERNAL=1; shift ;;
     --package)
       [ "$CMD" = query-only-mode ] && [ "$#" -ge 2 ] || usage
       QO_PACKAGE="$2"; shift 2 ;;
@@ -32461,6 +32895,8 @@ done
 [ "$TELEMETRY" = 0 ] || [ "$LAN" = 0 ] || fail "--lan and --telemetry can't be combined."
 [ "$QUERY_ONLY" = 0 ] || { [ "$TELEMETRY" = 0 ] && [ "$LAN" = 0 ]; } \
   || fail "--query-only can't be combined with --lan or --telemetry."
+[ "$EXTERNAL" = 0 ] || { [ "$TELEMETRY" = 0 ] && [ "$LAN" = 0 ] && [ "$QUERY_ONLY" = 0 ]; } \
+  || fail "--external-ollama can't be combined with --lan, --telemetry or --query-only."
 if [ "$CMD" = query-only-mode ]; then
   # A package name as the loader takes it (#670): no path, no other file.
   printf '%s' "$QO_PACKAGE" | grep -Eqx 'ragpkg-[A-Za-z0-9._-]+\.tar\.gz(\.age)?' \
@@ -32481,6 +32917,24 @@ if [ "$CMD" != down ]; then
   { [ -d "$CHECKOUT" ] && [ -f "$CHECKOUT/docker-compose.yml" ]; } \
     || fail "--checkout must be a checkout of this project (a folder with docker-compose.yml): $CHECKOUT"
   CHECKOUT="$(cd "$CHECKOUT" && pwd -P)"
+fi
+
+# External-Ollama mode (#673): the host is checked as the README's guide sets
+# it up, before any Docker command. The listener check comes from the harness,
+# not the checkout under test.
+if [ "$EXTERNAL" = 1 ]; then
+  [ -f "$CHECKOUT/docker-compose.external-ollama.yml" ] \
+    || fail "--external-ollama needs a checkout with docker-compose.external-ollama.yml: $CHECKOUT"
+  bash "$HARNESS/scripts/check-external-ollama.sh" --host-only \
+    || fail "the host's Ollama isn't set up as README \"External Ollama (native)\" says (above): it must listen on loopback, or on Linux the docker0 address, and nowhere else."
+  OLLAMA_ADDR=127.0.0.1
+  if [ "$(uname -s)" = Linux ]; then
+    OLLAMA_ADDR=$(ip -4 -o addr show docker0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+    [ -n "$OLLAMA_ADDR" ] || fail "--external-ollama on Linux needs the docker0 bridge, where Ollama listens."
+  fi
+  code=$(command curl -s -o /dev/null -m 5 -w '%{http_code}' "http://$OLLAMA_ADDR:11434/api/version" 2>/dev/null)
+  [ "$code" = 200 ] \
+    || fail "no Ollama answers at http://$OLLAMA_ADDR:11434 (HTTP $code). Install and start it as README \"External Ollama (native)\" says, with its models pulled."
 fi
 
 # The reviewed collector pin (#532): the evaluator's file, never the checkout's.
@@ -32593,6 +33047,12 @@ fi
 # LAN mode's configuration, switched to once the default one is up and set up.
 LAN_COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$CHECKOUT/docker-compose.lan.yml:$HARNESS/docker-compose.verify.yml:$HARNESS/docker-compose.lan.verify.yml"
 export RAG_VERIFY_LAN="$LAN"
+# External-Ollama mode (#673): its configuration from the start.
+export RAG_VERIFY_EXTERNAL_OLLAMA="$EXTERNAL"
+if [ "$EXTERNAL" = 1 ]; then
+  export COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$CHECKOUT/docker-compose.external-ollama.yml:$HARNESS/docker-compose.verify.yml"
+  GUARD_MODE=external-ollama
+fi
 # Query-only mode's configuration (#670), switched to by query-only-mode.
 QUERY_ONLY_COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$CHECKOUT/docker-compose.query-only.yml:$HARNESS/docker-compose.verify.yml"
 [ "$CMD" != query-only-mode ] || QUERY_ONLY="${RAG_VERIFY_QUERY_ONLY:-0}"
@@ -32708,6 +33168,9 @@ do_seed() {
   if ! docker volume inspect "$MODELS" >/dev/null 2>&1; then
     docker volume create --label rag-verify.models=1 "$MODELS" >/dev/null || fail "could not create the volume $MODELS."
   fi
+  # External-Ollama mode (#673): the models are the host Ollama's own; nothing
+  # in the project uses the copy, so it isn't checked or filled.
+  [ "$EXTERNAL" = 0 ] || return 0
   if ! docker volume inspect "$LIVE_MODELS" >/dev/null 2>&1; then
     printf 'note: there is no %s volume to copy the models from, so the verify\n' "$LIVE_MODELS"
     printf 'project'"'"'s ollama will pull them into %s (this needs the internet).\n' "$MODELS"
@@ -32783,8 +33246,26 @@ for svc, service in services.items():
     allowed = SERVICE_KEYS
     if svc in ('otel-collector', 'otel-capture'):
         allowed = allowed | {'profiles', 'mem_limit', 'cpus', 'stop_grace_period', 'read_only', 'logging'}
+    if mode == 'external-ollama' and svc in ('api', 'weaviate'):
+        allowed = allowed | {'extra_hosts'}
     if extra(service, allowed):
         problems.append(f"(h) service {svc!r} uses keys not allowed: {extra(service, allowed)}")
+
+# (k) external-Ollama mode (#673): api and weaviate may name the host only as
+# `ollama`, at host-gateway, and nothing else; the ollama service is left out.
+if mode == 'external-ollama':
+    for svc in ('api', 'weaviate'):
+        hosts = (services.get(svc) or {}).get('extra_hosts')
+        if hosts is None:
+            continue
+        if isinstance(hosts, dict):
+            hosts = [f"{name}={value}" for name, value in hosts.items()]
+        if not (isinstance(hosts, list) and len(hosts) == 1
+                and hosts[0] in ('ollama=host-gateway', 'ollama:host-gateway')):
+            problems.append(f"(k) service {svc!r} sets extra_hosts {hosts!r}; only "
+                            f"['ollama:host-gateway'] is allowed")
+    if 'ollama' in services:
+        problems.append("(k) the ollama service must be left out in external-Ollama mode")
 if {'otel-collector', 'otel-capture'} & services.keys():
     import runpy
     harness = sys.argv[5] if len(sys.argv) > 5 else checkout
@@ -33032,6 +33513,10 @@ do_up() {
                  docker compose -p "$PROJECT" logs --tail 50 "$service" ;;
             esac
           done
+      if [ "$EXTERNAL" = 1 ]; then
+        printf '\n── the api container'"'"'s Ollama check (#673) ──\n'
+        docker compose -p "$PROJECT" exec -T api python -m ollama_check </dev/null || true
+      fi
       [ "$CMD" != run ] || fail "the verify project did not come up; run removes it now."
       fail "the verify project did not come up; it is left running for inspection (stack.sh down removes it)."
     fi
@@ -33044,7 +33529,7 @@ do_up() {
   [ "$code" = 200 ] || fail "$RAG_API/health did not return 200 within 60 seconds (last: $code)."
   [ "$LAN" = 0 ] || lan_switch
   printf '\nThe verify project is up at %s. To point commands at it:\n\n' "${RAG_API%/api}"
-  for var in COMPOSE_PROJECT_NAME COMPOSE_FILE RAG_API RAG_EXPECTED_PROXY_PORT RAG_EXPORTS_DIR RAG_VERIFY_PORT RAG_VERIFY_TELEMETRY RAG_VERIFY_LAN RAG_VERIFY_QUERY_ONLY; do
+  for var in COMPOSE_PROJECT_NAME COMPOSE_FILE RAG_API RAG_EXPECTED_PROXY_PORT RAG_EXPORTS_DIR RAG_VERIFY_PORT RAG_VERIFY_TELEMETRY RAG_VERIFY_LAN RAG_VERIFY_QUERY_ONLY RAG_VERIFY_EXTERNAL_OLLAMA; do
     printf 'export %s=%q\n' "$var" "${!var}"
   done
   if [ "$LAN" = 1 ]; then
@@ -33081,6 +33566,8 @@ case "$CMD" in
     [ "$LAN" = 0 ] || [ "${#ARGS[@]}" -gt 0 ] || ARGS=(18_lan)
     # A query-only run checks query-only mode (#670).
     [ "$QUERY_ONLY" = 0 ] || [ "${#ARGS[@]}" -gt 0 ] || ARGS=(24_query_only)
+    # An external-Ollama run checks external-Ollama mode (#673).
+    [ "$EXTERNAL" = 0 ] || [ "${#ARGS[@]}" -gt 0 ] || ARGS=(25_external_ollama)
     # In the background with job control on, all.sh leads a process group of
     # its own (pgid $!), which stop_suite ends; and `wait`, unlike a foreground
     # command, returns as soon as INT or TERM arrives, so the traps act at once.
@@ -39463,6 +39950,1034 @@ class ImplementationNotes(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+```
+
+### scripts/verify/25_external_ollama.sh
+
+```bash
+#!/usr/bin/env bash
+# External-Ollama mode (#673): SPECIFICATIONS.md §2.7 and §10.12.
+#
+# Every run runs test_external_ollama.py in the API image with no network. The
+# external-mode checks need `stack.sh run --external-ollama`, on a host with a
+# native Ollama set up as README "External Ollama (native)" says (its models
+# pulled): no ollama service runs, the api container's check passes,
+# /api/health/details reports the version and what the shared Ollama has
+# loaded, ingest proves Weaviate reaches the host's Ollama through
+# host-gateway, export with models is refused and one without them imports
+# back, and a reindex is accepted. Outside RAG_SKIP_SLOW, hnsw and semantic
+# questions return the fixture. Anywhere else they are skipped. Nothing here
+# pulls, loads or unloads a model in the host's Ollama.
+cd "$(dirname "$0")" && . ./lib.sh
+REPO_ROOT="$(cd ../.. && pwd)"
+FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
+[ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
+require_stack
+C="${PREFIX}ExtOllama"
+OUT="$(mktemp)"
+trap 'rm -f "$OUT" /tmp/vfy_eo.json' EXIT
+
+section "External-Ollama units: settings, requests, health, import, export, helper"
+API_IMAGE="$(cd "$REPO_ROOT" && docker compose images -q api)"
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$API_IMAGE" python scripts/tests/test_external_ollama.py)
+check "test_external_ollama.py registered regression checks" $?
+
+if [ "${RAG_VERIFY_EXTERNAL_OLLAMA:-0}" != 1 ]; then
+  skip "external-Ollama mode on a native Ollama: helper, health, ingest, export, import, reindex" \
+    "run stack.sh run --external-ollama"
+  summary
+  exit $?
+fi
+
+section "The stack runs no Ollama of its own"
+services=$(cd "$REPO_ROOT" && docker compose ps --services 2>/dev/null | tr '\n' ' ')
+case " $services " in
+  *" ollama "*) false ;;
+  *) true ;;
+esac
+check "no ollama service runs in the project" $? "services: $services"
+_rag_require_lock_owner
+(cd "$REPO_ROOT" && docker compose exec -T api python -m ollama_check </dev/null) > "$OUT" 2>&1
+check "the api container's check passes (python -m ollama_check)" $? "$(cat "$OUT")"
+grep -q "^ollama-check: ok: reached Ollama " "$OUT"
+check "... and it reached the host's Ollama through ollama:host-gateway" $? "$(head -3 "$OUT")"
+
+section "Health in external mode"
+check_eq "GET /api/health is 200" "$(api_code "$API/health")" "200"
+api_get "/health/details" > /tmp/vfy_eo.json
+python3 - /tmp/vfy_eo.json <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+version = d["services"]["ollama"].get("version")
+r = d.get("resources") or {}
+ok = (isinstance(version, str) and version
+      and r.get("memory", {}).get("status") == "external"
+      and "recommended_minimum_gb" not in r.get("memory", {})
+      and isinstance(r.get("ollama_loaded"), list))
+print(version)
+sys.exit(0 if ok else 1)
+PY
+check "/health/details reports the Ollama version, memory 'external' with no advice, and what Ollama has loaded" $? \
+  "$(head -c 400 /tmp/vfy_eo.json)"
+
+section "Ingest: Weaviate embeds through the host's Ollama"
+drop_collection "$C"; drop_collection "${C}Back"; make_collection "$C"
+curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
+  -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$FIX/policies.txt" > /tmp/vfy_eo.json
+job=$(jfield "['job_id']" < /tmp/vfy_eo.json)
+check_eq "the fixture is ingested (Weaviate's text2vec-ollama embedded it)" "$(wait_for_job "/ingest/job/$job" 900)" "completed"
+count=$(api_get "/collections" | python3 -c "
+import json, sys
+print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name'] == sys.argv[1]][0])" "$C" 2>/dev/null)
+[ -n "$count" ] && [ "$count" -gt 0 ]
+check "the collection holds the fixture's chunks" $? "count '$count'"
+
+section "Export and import"
+code=$(curl -s -m 120 -o /tmp/vfy_eo.json -w '%{http_code}' -X POST "$API/export" \
+  -H 'Content-Type: application/json' -d "{\"encryption\":\"none\",\"collection\":\"$C\",\"include_models\":true}")
+check_eq "an export with models is refused (400 MODELS_NOT_EXPORTABLE)" \
+  "$code $(jfield "['error']['code']" < /tmp/vfy_eo.json)" "400 MODELS_NOT_EXPORTABLE"
+api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_eo.json
+ejob=$(jfield "['job_id']" < /tmp/vfy_eo.json)
+check_eq "an export without models completes" "$(wait_for_job "/export/job/$ejob" 1800)" "completed"
+pkg=$(api_get "/export/job/$ejob" | jfield "['filename']")
+api_post "/import" "{\"filename\":\"$pkg\",\"on_conflict\":\"rename\"}" > /tmp/vfy_eo.json
+ijob=$(jfield "['job_id']" < /tmp/vfy_eo.json)
+check_eq "the package imports back under a new name" "$(wait_for_job "/import/job/$ijob" 1800)" "completed"
+api_get "/import/job/$ijob" > /tmp/vfy_eo.json
+python3 -c "
+import json, sys
+notes = json.load(open('/tmp/vfy_eo.json')).get('notes') or []
+sys.exit(0 if any('reported by the external Ollama' in n for n in notes) else 1)"
+check "the import checked the embedding model through the external Ollama" $? "$(head -c 400 /tmp/vfy_eo.json)"
+imported=$(jfield "['collection']" < /tmp/vfy_eo.json)
+
+section "Reindex keeps the stored endpoint (http://ollama:11434)"
+api_post "/tune/reindex" "{\"collection\":\"$C\"}" > /tmp/vfy_eo.json
+rjob=$(jfield "['job_id']" < /tmp/vfy_eo.json)
+check_eq "a reindex of the collection completes" "$([ -n "$rjob" ] && wait_for_job "/tune/job/$rjob" 1800 || echo "refused: $(head -c 200 /tmp/vfy_eo.json)")" "completed"
+
+if [ "$SKIP_SLOW" = "1" ]; then
+  skip "hnsw and semantic questions through the host's Ollama" "set RAG_SKIP_SLOW=0 to include model calls"
+else
+  section "Questions through the host's Ollama"
+  for mode in hnsw semantic; do
+    api_post "/query" "{\"question\":\"who approves overtime?\",\"collection\":\"$C\",\"retrieval_mode\":\"$mode\",\"top_k\":3,\"alpha\":0.5,\"include_citations\":true,\"response_format\":\"end_user\"}" > /tmp/vfy_eo.json
+    python3 -c "
+import json, sys
+d = json.load(open('/tmp/vfy_eo.json'))
+sys.exit(0 if d.get('answer', '').strip() and any(c.get('source_file') == 'policies.txt' for c in d.get('citations') or []) else 1)"
+    check "a $mode question is answered and cites the fixture" $? "$(head -c 300 /tmp/vfy_eo.json)"
+  done
+fi
+
+drop_collection "$C"
+[ -z "${imported:-}" ] || drop_collection "$imported"
+[ -z "${pkg:-}" ] || rm -f "${RAG_EXPORTS_DIR:?}/$pkg"
+summary
+exit $?
+```
+
+### scripts/check-external-ollama.sh
+
+```bash
+#!/usr/bin/env bash
+#
+# Check an external Ollama for rag-docker (#673): README "External Ollama (native)".
+#
+#   bash scripts/check-external-ollama.sh              # on the host, from anywhere
+#   bash scripts/check-external-ollama.sh --host-only  # only the listener check
+#
+# 1. On this host (macOS or Linux): what listens on TCP port 11434. Ollama has
+#    no authentication, so it should listen only where Docker reaches it:
+#    loopback (127.0.0.1, ::1) with Docker Desktop, and on Linux the docker0
+#    bridge address too. Any other address, or a wildcard (0.0.0.0, ::, *), is
+#    a warning: other machines on your network may reach it.
+# 2. From inside the api container: `python -m ollama_check`, which reaches
+#    Ollama as the stack does and checks its version and the models. It uses
+#    COMPOSE_FILE when set, else docker-compose.yml with
+#    docker-compose.external-ollama.yml.
+#
+# Exit status: 0 every check passed; 3 passed, with warnings; 1 a problem;
+# 2 a usage error. It only reads: it never pulls, changes or unloads a model,
+# and never changes Ollama's settings. Windows: see the README's PowerShell
+# lines (not yet verified).
+set -uo pipefail
+
+usage() {
+  sed -n '5,6p' "${BASH_SOURCE[0]}" | sed 's/^#  //' >&2
+  exit 2
+}
+
+HOST_ONLY=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --host-only) HOST_ONLY=1; shift ;;
+    -h|--help) usage ;;
+    *) usage ;;
+  esac
+done
+
+PORT=11434
+WARNINGS=0
+PROBLEMS=0
+say() { printf 'check-external-ollama: %s: %s\n' "$1" "$2"; }
+warn() { WARNINGS=$((WARNINGS + 1)); say warning "$1"; }
+problem() { PROBLEMS=$((PROBLEMS + 1)); say problem "$1"; }
+
+OS="$(uname -s)"
+
+# The docker0 bridge address on Linux (where Ollama listens for the containers),
+# or nothing.
+docker0_address() {
+  [ "$OS" = Linux ] || return 0
+  command -v ip >/dev/null 2>&1 || return 0
+  ip -4 -o addr show docker0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1
+}
+
+# Each address something listens on at $PORT, one per line, brackets removed.
+listeners() {
+  case "$OS" in
+    Darwin)
+      lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null \
+        | awk -v p=":$PORT" 'NR > 1 { for (i = 1; i <= NF; i++) if (index($i, p) && substr($i, length($i) - length(p) + 1) == p) print $i }'
+      ;;
+    *)
+      ss -ltnH "sport = :$PORT" 2>/dev/null | awk '{print $4}'
+      ;;
+  esac | sed -e "s/:$PORT\$//" -e 's/^\[//' -e 's/\]$//' -e 's/%.*$//' | sort -u
+}
+
+host_check() {
+  local tool addresses address docker0 allowed
+  case "$OS" in
+    Darwin) tool=lsof ;;
+    Linux) tool=ss ;;
+    *) warn "the listener check runs on macOS and Linux only; on Windows use the README's PowerShell lines."
+       return 0 ;;
+  esac
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    warn "couldn't check what listens on port $PORT: '$tool' isn't installed."
+    return 0
+  fi
+  docker0="$(docker0_address)"
+  allowed="127.0.0.1 or ::1"
+  [ -z "$docker0" ] || allowed="$docker0 (docker0), 127.0.0.1 or ::1"
+  addresses="$(listeners)"
+  if [ -z "$addresses" ]; then
+    problem "nothing listens on port $PORT on this host: start Ollama (README \"External Ollama (native)\")."
+    return 0
+  fi
+  while IFS= read -r address; do
+    case "$address" in
+      127.0.0.1|::1)
+        say ok "Ollama listens on $address:$PORT (loopback)" ;;
+      0.0.0.0|::|'*')
+        warn "Ollama listens on every address ($address:$PORT), so other machines on your network may reach it. Ollama has no authentication; bind it to $allowed (README \"External Ollama (native)\")." ;;
+      *)
+        if [ -n "$docker0" ] && [ "$address" = "$docker0" ]; then
+          say ok "Ollama listens on $address:$PORT (docker0)"
+        else
+          warn "Ollama listens on $address:$PORT, which other machines on your network may reach. Ollama has no authentication; bind it to $allowed (README \"External Ollama (native)\")."
+        fi ;;
+    esac
+  done <<< "$addresses"
+}
+
+host_check
+
+if [ "$HOST_ONLY" = 0 ]; then
+  cd "$(dirname "${BASH_SOURCE[0]}")/.." || { problem "couldn't open the repository folder."; exit 1; }
+  export COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.yml:docker-compose.external-ollama.yml}"
+  if ! docker compose exec -T api python -m ollama_check </dev/null; then
+    problem "the api container's check failed (above), or the api container isn't running."
+  fi
+fi
+
+if [ "$PROBLEMS" -gt 0 ]; then
+  exit 1
+elif [ "$WARNINGS" -gt 0 ]; then
+  exit 3
+fi
+exit 0
+```
+
+### scripts/tests/test_external_ollama.py
+
+```python
+"""External-Ollama mode (#673): SPECIFICATIONS.md §2.7, RAG_EXPORT_SPECIFICATIONS.md §6.3.
+
+The settings (RAG_EXTERNAL_OLLAMA, OLLAMA_NUM_CTX, OLLAMA_KEEP_ALIVE), the bodies
+of rag-docker's own Ollama requests in both modes (num_ctx on chat only,
+keep_alive everywhere) and the /api/embed fallback, the tag-exact model check,
+the version and, in external mode, the memory report and what Ollama has loaded
+in /health/details, the start-up lines for missing models, import's check-only
+path and the refused export with models, `python -m ollama_check`, the overlay
+file and the base file's two settings, and install-offline.sh's options.
+
+Runs with the API's dependencies, on the host (`~/.venvs/rag-api/bin/python`) or
+in the built API image with no network (`25_external_ollama.sh`):
+
+    docker run --rm --network none -v "$PWD:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api \\
+      "$(docker compose images -q api)" python scripts/tests/test_external_ollama.py
+
+Ollama is answered by an httpx mock transport; nothing reaches a backend.
+"""
+import asyncio
+import contextlib
+import io
+import json
+import logging
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, os.environ.get("RAG_TEST_API_DIR") or str(ROOT / "api"))
+
+import httpx
+import yaml
+from fastapi.testclient import TestClient
+from pydantic import ValidationError
+
+import ollama_check
+from config import Settings, settings
+from main import app
+from auth import testing as auth_testing
+from services import importer, model_bundle, ollama_client, ollama_startup, system_info
+from services import weaviate_client as wc
+from services.packager import PackageError
+
+REAL_ASYNC_CLIENT = httpx.AsyncClient
+REAL_CLIENT = httpx.Client
+
+
+def tagged(model):
+    return model if ":" in model.rsplit("/", 1)[-1] else model + ":latest"
+
+
+class FakeOllama:
+    """An Ollama answering /api/tags, /api/version, /api/ps, /api/chat and the two
+    embedding endpoints, recording every request's path and JSON body."""
+
+    def __init__(self, models=None, down=False, version="0.40.18", embeddings_gone=False,
+                 loaded=None, ps_fails=False):
+        self.models = models
+        self.down = down
+        self.version = version
+        self.embeddings_gone = embeddings_gone
+        self.loaded = loaded if loaded is not None else []
+        self.ps_fails = ps_fails
+        self.requests = []
+
+    def __call__(self, request):
+        body = json.loads(request.content) if request.content else None
+        self.requests.append((request.method, request.url.path, body))
+        if self.down:
+            raise httpx.ConnectError("connection refused", request=request)
+        path = request.url.path
+        if path == "/api/tags":
+            models = self.models
+            if models is None:
+                models = [settings.answer_model, settings.build_model, settings.embed_model]
+            return httpx.Response(200, json={"models": [{"name": tagged(m)} for m in models]})
+        if path == "/api/version":
+            return httpx.Response(200, json={"version": self.version})
+        if path == "/api/ps":
+            if self.ps_fails:
+                return httpx.Response(500)
+            return httpx.Response(200, json={"models": self.loaded})
+        if path == "/api/chat":
+            return httpx.Response(200, json={"message": {"content": "an answer"}})
+        if path == "/api/embeddings":
+            if self.embeddings_gone:
+                return httpx.Response(404, text="404 page not found")
+            return httpx.Response(200, json={"embedding": [0.1, 0.2, 0.3]})
+        if path == "/api/embed":
+            return httpx.Response(200, json={"embeddings": [[0.4, 0.5, 0.6]]})
+        return httpx.Response(404)
+
+    @contextlib.contextmanager
+    def serving(self):
+        def async_factory(*args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(self)
+            return REAL_ASYNC_CLIENT(*args, **kwargs)
+
+        def sync_factory(*args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(self)
+            return REAL_CLIENT(*args, **kwargs)
+
+        with patch.object(httpx, "AsyncClient", async_factory), \
+                patch.object(httpx, "Client", sync_factory):
+            yield self
+
+    def bodies(self, path):
+        return [body for _, p, body in self.requests if p == path]
+
+
+def external(on=True):
+    return patch.object(settings, "rag_external_ollama", on)
+
+
+class SettingsTests(unittest.TestCase):
+    def setUp(self):
+        self.env = patch.dict(os.environ, {}, clear=False)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        for key in ("RAG_EXTERNAL_OLLAMA", "OLLAMA_NUM_CTX", "OLLAMA_KEEP_ALIVE"):
+            os.environ.pop(key, None)
+
+    def test_defaults(self):
+        s = Settings(_env_file=None)
+        self.assertIs(s.rag_external_ollama, False)
+        self.assertEqual(s.ollama_num_ctx, 2048)
+        self.assertEqual(s.ollama_keep_alive, "5m")
+
+    def test_external_is_exactly_true_or_false(self):
+        for value, want in (("true", True), ("false", False)):
+            os.environ["RAG_EXTERNAL_OLLAMA"] = value
+            self.assertIs(Settings(_env_file=None).rag_external_ollama, want)
+        for value in ("yes", "1", "True", ""):
+            with self.subTest(value=value):
+                os.environ["RAG_EXTERNAL_OLLAMA"] = value
+                with self.assertRaises(ValidationError) as caught:
+                    Settings(_env_file=None)
+                self.assertIn("RAG_EXTERNAL_OLLAMA must be exactly true or false", str(caught.exception))
+
+    def test_num_ctx_bounds(self):
+        for value in ("256", "2048", "1048576"):
+            os.environ["OLLAMA_NUM_CTX"] = value
+            self.assertEqual(Settings(_env_file=None).ollama_num_ctx, int(value))
+        for value in ("255", "1048577", "0", "-1"):
+            with self.subTest(value=value):
+                os.environ["OLLAMA_NUM_CTX"] = value
+                with self.assertRaises(ValidationError) as caught:
+                    Settings(_env_file=None)
+                self.assertIn("OLLAMA_NUM_CTX must be 256 to 1048576", str(caught.exception))
+
+    def test_keep_alive_is_a_duration(self):
+        for value in ("5m", "1h30m", "300", "-1", "0", "500ms", "1.5h", "30s"):
+            with self.subTest(value=value):
+                os.environ["OLLAMA_KEEP_ALIVE"] = value
+                self.assertEqual(Settings(_env_file=None).ollama_keep_alive, value)
+        for value in ("", "5x", "m", "5 m", "forever", "5m;"):
+            with self.subTest(value=value):
+                os.environ["OLLAMA_KEEP_ALIVE"] = value
+                with self.assertRaises(ValidationError) as caught:
+                    Settings(_env_file=None)
+                self.assertIn("OLLAMA_KEEP_ALIVE must be a duration", str(caught.exception))
+
+
+class RequestBodyTests(unittest.TestCase):
+    """S3: the same bodies in both modes; num_ctx on chat only."""
+
+    def setUp(self):
+        ollama_client._use_embed = False
+        self.addCleanup(setattr, ollama_client, "_use_embed", False)
+
+    def test_chat_carries_num_ctx_and_keep_alive_in_both_modes(self):
+        for on in (False, True):
+            with self.subTest(external=on), external(on), \
+                    patch.object(settings, "ollama_num_ctx", 4096), \
+                    patch.object(settings, "ollama_keep_alive", "10m"), FakeOllama().serving() as fake:
+                asyncio.run(ollama_client.chat("system", "user"))
+                asyncio.run(ollama_client.build_chat("system", "user"))
+                bodies = fake.bodies("/api/chat")
+                self.assertEqual([b["model"] for b in bodies], [settings.answer_model, settings.build_model])
+                for body in bodies:
+                    self.assertEqual(body["options"], {"num_ctx": 4096})
+                    self.assertEqual(body["keep_alive"], "10m")
+                    self.assertIs(body["stream"], False)
+
+    def test_embedding_carries_keep_alive_and_no_num_ctx(self):
+        for on in (False, True):
+            with self.subTest(external=on), external(on), FakeOllama().serving() as fake:
+                vector = asyncio.run(ollama_client.embed("a question"))
+                self.assertEqual(vector, [0.1, 0.2, 0.3])
+                [body] = fake.bodies("/api/embeddings")
+                self.assertEqual(body, {"model": settings.embed_model, "prompt": "a question",
+                                        "keep_alive": settings.ollama_keep_alive})
+                self.assertNotIn("options", body)
+                self.assertEqual(fake.bodies("/api/embed"), [])
+
+    def test_a_404_from_embeddings_falls_back_to_embed_for_good(self):
+        with FakeOllama(embeddings_gone=True).serving() as fake, self.assertLogs(
+                "services.ollama_client", "WARNING") as logs:
+            self.assertEqual(asyncio.run(ollama_client.embed("one")), [0.4, 0.5, 0.6])
+            self.assertEqual(asyncio.run(ollama_client.embed("two")), [0.4, 0.5, 0.6])
+        self.assertEqual(len(fake.bodies("/api/embeddings")), 1, "the older endpoint is asked once")
+        self.assertEqual(fake.bodies("/api/embed"), [
+            {"model": settings.embed_model, "input": "one", "keep_alive": settings.ollama_keep_alive},
+            {"model": settings.embed_model, "input": "two", "keep_alive": settings.ollama_keep_alive}])
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("using /api/embed", logs.output[0])
+
+    def test_another_error_is_not_a_fallback(self):
+        def failing(request):
+            return httpx.Response(500)
+        fake = FakeOllama()
+        fake.__call__ = failing
+        with patch.object(httpx, "AsyncClient",
+                          lambda *a, **k: REAL_ASYNC_CLIENT(*a, **{**k, "transport": httpx.MockTransport(failing)})):
+            with self.assertRaises(httpx.HTTPStatusError):
+                asyncio.run(ollama_client.embed("x"))
+        self.assertIs(ollama_client._use_embed, False)
+
+    def test_only_reads_besides_chat_and_embeddings(self):
+        with external(), FakeOllama().serving() as fake:
+            asyncio.run(ollama_client.check_health())
+            asyncio.run(ollama_client.loaded_models())
+            asyncio.run(ollama_client.missing_models())
+            asyncio.run(ollama_client.version())
+        self.assertEqual({(m, p) for m, p, _ in fake.requests},
+                         {("GET", "/api/tags"), ("GET", "/api/version"), ("GET", "/api/ps")})
+
+
+class ModelCheckTests(unittest.TestCase):
+    def test_the_check_is_tag_exact(self):
+        with patch.object(settings, "llm_model", "llama3.1:8b"), \
+                patch.object(settings, "build_llm_model", ""), patch.object(settings, "answer_llm_model", ""), \
+                FakeOllama(models=["llama3.1:70b", "nomic-embed-text"]).serving():
+            result = asyncio.run(ollama_client.check_health())
+            self.assertEqual(result["llm"]["status"], "error")
+            self.assertEqual(result["build_llm"]["status"], "error")
+            self.assertEqual(result["embed"]["status"], "ok")
+            self.assertEqual(asyncio.run(ollama_client.missing_models()), ["llama3.1:8b"])
+
+    def test_a_name_without_a_tag_is_latest(self):
+        with patch.object(settings, "embed_model", "nomic-embed-text"), \
+                FakeOllama(models=["nomic-embed-text:v1.5", settings.answer_model, settings.build_model]).serving():
+            result = asyncio.run(ollama_client.check_health())
+        self.assertEqual(result["embed"]["status"], "error")
+
+    def test_required_models_are_distinct_and_tagged(self):
+        with patch.object(settings, "embed_model", "nomic-embed-text"), \
+                patch.object(settings, "llm_model", "llama3.1:8b"), \
+                patch.object(settings, "build_llm_model", ""), patch.object(settings, "answer_llm_model", "llama3.1:8b"):
+            self.assertEqual(ollama_client.required_models(), ["nomic-embed-text:latest", "llama3.1:8b"])
+
+    def test_missing_models_is_none_when_unreachable(self):
+        with FakeOllama(down=True).serving():
+            self.assertIsNone(asyncio.run(ollama_client.missing_models()))
+            self.assertIsNone(asyncio.run(ollama_client.version()))
+
+
+class HealthTests(unittest.TestCase):
+    def setUp(self):
+        self.client = TestClient(app, headers=auth_testing.headers(), raise_server_exceptions=False)
+        self.addCleanup(self.client.close)
+
+    def details(self, fake):
+        with fake.serving(), patch.object(wc, "check_health", AsyncMock(return_value=True)), \
+                patch.object(system_info, "_read_mem_total_gb", return_value=11.0):
+            return self.client.get("/health/details")
+
+    def test_the_version_is_reported_in_both_modes(self):
+        for on in (False, True):
+            with self.subTest(external=on), external(on):
+                response = self.details(FakeOllama(version="0.40.18"))
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.json()["services"]["ollama"]["version"], "0.40.18")
+
+    def test_an_unreadable_version_is_null_and_decides_nothing(self):
+        fake = FakeOllama(version=None)
+        response = self.details(fake)
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.json()["services"]["ollama"]["version"])
+
+    def test_container_mode_keeps_the_memory_advice(self):
+        with external(False):
+            body = self.details(FakeOllama()).json()
+        self.assertIn("recommended_minimum_gb", body["resources"]["memory"])
+        self.assertNotIn("ollama_loaded", body["resources"])
+
+    def test_external_mode_reports_what_ollama_has_loaded_without_the_advice(self):
+        loaded = [{"name": "someone-elses:7b", "model": "someone-elses:7b", "size": 5, "size_vram": 5,
+                   "expires_at": "2026-11-26T22:00:00Z", "digest": "abc"}]
+        with external():
+            response = self.details(FakeOllama(loaded=loaded))
+        self.assertEqual(response.status_code, 200, response.text)
+        resources = response.json()["resources"]
+        self.assertEqual(resources["memory"]["status"], "external")
+        self.assertNotIn("recommended_minimum_gb", resources["memory"])
+        self.assertNotIn("allocated_gb", resources["memory"])
+        self.assertEqual(resources["ollama_loaded"], [
+            {"name": "someone-elses:7b", "size": 5, "size_vram": 5, "expires_at": "2026-11-26T22:00:00Z"}])
+
+    def test_an_unreadable_ps_is_a_note_not_a_failure(self):
+        with external():
+            response = self.details(FakeOllama(ps_fails=True))
+        self.assertEqual(response.status_code, 200)
+        resources = response.json()["resources"]
+        self.assertIsNone(resources["ollama_loaded"])
+        self.assertIn("/api/ps", resources["ollama_loaded_note"])
+
+    def test_a_missing_model_is_still_503_in_external_mode(self):
+        with external():
+            response = self.details(FakeOllama(models=[settings.embed_model]))
+            public = None
+            with FakeOllama(models=[settings.embed_model]).serving(), \
+                    patch.object(wc, "check_health", AsyncMock(return_value=True)):
+                public = self.client.get("/health")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(public.status_code, 503)
+        self.assertEqual(public.json(), {"status": "degraded"})
+
+
+class StartupLogTests(unittest.TestCase):
+    def run_check(self, fake):
+        with fake.serving(), self.assertLogs("services.ollama_startup", "WARNING") as logs:
+            asyncio.run(ollama_startup.log_missing_models())
+        return [record.getMessage() for record in logs.records]
+
+    def test_external_mode_names_the_pull_on_the_ollama_host(self):
+        with external(), patch.object(settings, "llm_model", "llama3.1:8b"), \
+                patch.object(settings, "build_llm_model", "qwen2.5:7b"), patch.object(settings, "answer_llm_model", ""):
+            lines = self.run_check(FakeOllama(models=[settings.embed_model]))
+        self.assertEqual(lines, [
+            "Ollama model missing: llama3.1:8b. On the Ollama host, run: ollama pull llama3.1:8b",
+            "Ollama model missing: qwen2.5:7b. On the Ollama host, run: ollama pull qwen2.5:7b"])
+
+    def test_container_mode_names_the_container(self):
+        with external(False):
+            lines = self.run_check(FakeOllama(models=[settings.answer_model, settings.build_model]))
+        ref = tagged(settings.embed_model)
+        self.assertEqual(lines, [f"Ollama model missing: {ref}. Run: docker compose exec ollama ollama pull {ref}"])
+
+    def test_unreachable_is_one_line(self):
+        with external():
+            lines = self.run_check(FakeOllama(down=True))
+        self.assertEqual(len(lines), 1)
+        self.assertIn("could not be reached", lines[0])
+        self.assertIn("scripts/check-external-ollama.sh", lines[0])
+
+    def test_nothing_missing_logs_nothing(self):
+        with FakeOllama().serving(), patch.object(ollama_startup._log, "warning") as warning:
+            asyncio.run(ollama_startup.log_missing_models())
+        warning.assert_not_called()
+
+
+class ImportTests(unittest.TestCase):
+    """S5.1: check, never install, never touch a store."""
+
+    def setUp(self):
+        self.pkg = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.pkg, ignore_errors=True))
+        self.manifest = {"embedding": {"model": settings.embed_model}}
+        # Any store access fails the test.
+        self.guards = [patch.object(model_bundle, name, side_effect=AssertionError(name + " was called"))
+                       for name in ("installed_state", "install_model", "is_installed", "export_model")]
+        for guard in self.guards:
+            guard.start()
+            self.addCleanup(guard.stop)
+
+    def ensure(self, fake):
+        with external(), fake.serving():
+            return importer._ensure_models(self.pkg, self.manifest)
+
+    def test_present_models_are_notes(self):
+        notes = self.ensure(FakeOllama())
+        self.assertIn(f"model '{tagged(settings.embed_model)}' reported by the external Ollama", notes)
+        self.assertIn(f"model '{tagged(settings.answer_model)}' reported by the external Ollama", notes)
+
+    def test_a_missing_embedding_model_is_refused_with_the_pull(self):
+        ref = tagged(settings.embed_model)
+        with self.assertRaises(PackageError) as caught:
+            self.ensure(FakeOllama(models=[settings.answer_model]))
+        self.assertEqual(caught.exception.code, "EMBEDDING_MODEL_MISSING")
+        self.assertIn(f"On the Ollama host, run `ollama pull {ref}`", str(caught.exception))
+
+    def test_a_bundled_package_installs_nothing(self):
+        folder = self.pkg / "models" / "nomic-embed-text" / "latest"
+        folder.mkdir(parents=True)
+        (folder / "manifest.json").write_text("{}")
+        ref = tagged(settings.embed_model)
+        with patch.object(model_bundle, "bundled_models", return_value=[ref]):
+            with self.assertRaises(PackageError) as caught:
+                self.ensure(FakeOllama(models=[settings.answer_model]))
+            self.assertEqual(caught.exception.code, "EMBEDDING_MODEL_MISSING")
+            notes = self.ensure(FakeOllama())
+        self.assertIn("the package bundles models; with an external Ollama they are not installed", notes)
+
+    def test_a_missing_answer_model_is_a_note(self):
+        notes = self.ensure(FakeOllama(models=[settings.embed_model]))
+        ref = tagged(settings.answer_model)
+        self.assertIn(f"model '{ref}' is absent from the external Ollama; pull it there with "
+                      f"`ollama pull {ref}` before querying", notes)
+
+    def test_unreachable_is_import_failed(self):
+        with self.assertRaises(PackageError) as caught:
+            self.ensure(FakeOllama(down=True))
+        self.assertEqual(caught.exception.code, "IMPORT_FAILED")
+        self.assertIn("scripts/check-external-ollama.sh", str(caught.exception))
+
+    def test_the_store_is_never_available_in_external_mode(self):
+        with tempfile.TemporaryDirectory() as store:
+            (Path(store) / "models").mkdir()
+            with patch.object(settings, "ollama_models_dir", store):
+                with external(False):
+                    self.assertTrue(model_bundle.store_available())
+                with external():
+                    self.assertFalse(model_bundle.store_available())
+
+
+class ExportTests(unittest.TestCase):
+    def setUp(self):
+        audit = tempfile.TemporaryDirectory()
+        self.addCleanup(audit.cleanup)
+        directory = patch.object(settings, "audit_dir", audit.name)
+        directory.start()
+        self.addCleanup(directory.stop)
+        self.client = TestClient(app, headers=auth_testing.headers(), raise_server_exceptions=False)
+        self.addCleanup(self.client.close)
+
+    def test_export_with_models_is_refused_in_external_mode(self):
+        with external(), patch.object(wc, "collection_exists", AsyncMock(side_effect=AssertionError("asked"))):
+            response = self.client.post("/export", json={"collection": "Anything", "include_models": True,
+                                                         "encryption": "none"})
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(response.json()["error"]["code"], "MODELS_NOT_EXPORTABLE")
+        self.assertIn("Export without models", response.json()["error"]["message"])
+
+    def test_without_models_it_goes_on_as_before(self):
+        with external(), patch.object(wc, "collection_exists", AsyncMock(return_value=False)):
+            response = self.client.post("/export", json={"collection": "Missing", "include_models": False,
+                                                         "encryption": "none"})
+        self.assertNotEqual(response.json().get("error", {}).get("code"), "MODELS_NOT_EXPORTABLE")
+
+    def test_container_mode_doesnt_refuse(self):
+        with external(False), patch.object(wc, "collection_exists", AsyncMock(return_value=False)):
+            response = self.client.post("/export", json={"collection": "Missing", "include_models": True,
+                                                         "encryption": "none"})
+        self.assertNotEqual(response.json().get("error", {}).get("code"), "MODELS_NOT_EXPORTABLE")
+
+
+class OllamaCheckTests(unittest.TestCase):
+    def run_check(self, fake, on=True):
+        out = io.StringIO()
+        with external(on), fake.serving():
+            with httpx.Client(timeout=5) as client:
+                status = ollama_check.run(client, out)
+        return status, out.getvalue().splitlines()
+
+    def test_all_good_is_0(self):
+        status, lines = self.run_check(FakeOllama(version="0.40.18"))
+        self.assertEqual(status, 0, lines)
+        self.assertTrue(all(line.startswith("ollama-check: ok: ") for line in lines), lines)
+        self.assertIn("ollama-check: ok: reached Ollama 0.40.18 at http://ollama:11434"
+                      if settings.ollama_host == "ollama" else "reached Ollama 0.40.18", "\n".join(lines))
+
+    def test_a_missing_model_names_its_pull(self):
+        status, lines = self.run_check(FakeOllama(models=[settings.embed_model]))
+        self.assertEqual(status, 1)
+        ref = tagged(settings.answer_model)
+        self.assertIn(f"ollama-check: problem: model {ref} is missing. On the Ollama host, run: ollama pull {ref}",
+                      lines)
+
+    def test_unreachable_is_1_with_the_platform_hint(self):
+        status, lines = self.run_check(FakeOllama(down=True))
+        self.assertEqual(status, 1)
+        self.assertTrue(any("can't reach Ollama" in line and "docker0" in line for line in lines), lines)
+
+    def test_mode_off_is_a_problem(self):
+        status, lines = self.run_check(FakeOllama(), on=False)
+        self.assertEqual(status, 1)
+        self.assertIn("external Ollama mode is off", lines[0])
+
+    def test_it_only_reads(self):
+        fake = FakeOllama()
+        self.run_check(fake)
+        self.assertEqual({(m, p) for m, p, _ in fake.requests}, {("GET", "/api/version"), ("GET", "/api/tags")})
+
+
+def compose_yaml(path):
+    """A compose file, with the `!override` and `!reset` tags read as plain values."""
+    class Loader(yaml.SafeLoader):
+        pass
+
+    def tagged_value(loader, tag_suffix, node):
+        if isinstance(node, yaml.MappingNode):
+            return loader.construct_mapping(node, deep=True)
+        if isinstance(node, yaml.SequenceNode):
+            return loader.construct_sequence(node, deep=True)
+        return loader.construct_scalar(node)
+
+    Loader.add_multi_constructor("!", tagged_value)
+    return yaml.load((ROOT / path).read_text(), Loader=Loader)
+
+
+class ComposeFileTests(unittest.TestCase):
+    def test_the_overlay(self):
+        overlay = compose_yaml("docker-compose.external-ollama.yml")
+        text = (ROOT / "docker-compose.external-ollama.yml").read_text()
+        services = overlay["services"]
+        self.assertEqual(set(overlay), {"services"})
+        self.assertEqual(set(services), {"ollama", "weaviate", "api"})
+        self.assertEqual(services["ollama"], {"profiles": ["contained-ollama"]})
+        self.assertEqual(services["weaviate"], {"extra_hosts": ["ollama:host-gateway"]})
+        api = services["api"]
+        self.assertEqual(api["extra_hosts"], ["ollama:host-gateway"])
+        self.assertEqual(api["environment"], {"RAG_EXTERNAL_OLLAMA": "true"})
+        self.assertEqual(api["depends_on"], {"weaviate": {"condition": "service_healthy"}})
+        self.assertIn("depends_on: !override", text)
+        self.assertIn("volumes: !override", text)
+        base = compose_yaml("docker-compose.yml")
+        self.assertEqual(api["volumes"], [m for m in base["services"]["api"]["volumes"] if m != "ollama_models:/ollama"])
+        self.assertIn("ollama_models:/ollama", base["services"]["api"]["volumes"])
+        code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+        self.assertNotIn("0.0.0.0", code)
+
+    def test_the_base_file_keeps_the_contained_default_and_sets_the_two_options(self):
+        base = compose_yaml("docker-compose.yml")
+        api = base["services"]["api"]["environment"]
+        self.assertEqual((api["OLLAMA_HOST"], api["OLLAMA_PORT"]), ("ollama", 11434))
+        self.assertEqual((api["OLLAMA_NUM_CTX"], api["OLLAMA_KEEP_ALIVE"]), ("2048", "5m"))
+        self.assertNotIn("RAG_EXTERNAL_OLLAMA", api)
+        self.assertNotIn("extra_hosts", base["services"]["api"])
+        self.assertIn("ollama", base["services"])
+        self.assertEqual(base["services"]["weaviate"]["environment"]["TEXT2VEC_OLLAMA_APIENDPOINT"],
+                         "http://ollama:11434")
+        # Nothing rag-docker ships sets an Ollama server's own settings (#673).
+        for name in ("OLLAMA_NUM_PARALLEL", "OLLAMA_CONTEXT_LENGTH"):
+            self.assertNotIn(name, (ROOT / "docker-compose.yml").read_text())
+            self.assertNotIn(name, (ROOT / "docker-compose.external-ollama.yml").read_text())
+        self.assertEqual(Settings(_env_file=None).ollama_num_ctx, int(api["OLLAMA_NUM_CTX"]))
+        self.assertEqual(Settings(_env_file=None).ollama_keep_alive, api["OLLAMA_KEEP_ALIVE"])
+
+    def test_listed_after_lan_and_query_only_it_keeps_their_settings(self):
+        merged = {}
+        for path in ("docker-compose.yml", "docker-compose.lan.yml", "docker-compose.query-only.yml",
+                     "docker-compose.external-ollama.yml"):
+            env = (compose_yaml(path)["services"].get("api") or {}).get("environment") or {}
+            merged.update(env)
+        self.assertEqual((merged["RAG_EXTERNAL_OLLAMA"], merged["RAG_QUERY_ONLY"], merged["RAG_LAN_MODE"]),
+                         ("true", "true", "true"))
+
+
+INSTALL_STUBS = {
+    "docker": """#!/bin/bash
+printf 'docker %s\\n' "$*" >> "$STUB_LOG"
+if [ "$1 $2" = "compose config" ]; then
+  echo '{"services": {"ollama": {"environment": {"LLM_MODEL": "llama3.1:8b", "BUILD_LLM_MODEL": "", "ANSWER_LLM_MODEL": ""}}}}'
+fi
+if [ "$1 $2" = "compose ps" ]; then printf 'a\\nb\\nc\\nd\\ne\\n' | head -n "${STUB_RUNNING:-5}"; fi
+exit 0
+""",
+    "sleep": "#!/bin/bash\nexit 0\n",
+}
+
+
+class InstallOfflineTests(unittest.TestCase):
+    def run_install(self, *args, models_tarball=True, running=5):
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(folder, ignore_errors=True))
+        bundle = folder / "bundle"
+        (bundle / "offline").mkdir(parents=True)
+        (bundle / "ollama").mkdir()
+        for name in ("install-offline.sh", "ollama/compose-models.sh", "ollama/models.sh"):
+            (bundle / name).write_text((ROOT / name).read_text())
+        (bundle / "offline/images.tar.gz").write_text("x")
+        if models_tarball:
+            (bundle / "offline/ollama_models.tar.gz").write_text("x")
+        stubs = folder / "bin"
+        stubs.mkdir()
+        for name, body in INSTALL_STUBS.items():
+            (stubs / name).write_text(body)
+            (stubs / name).chmod(0o755)
+        log = folder / "log"
+        env = dict(os.environ, PATH=f"{stubs}{os.pathsep}{os.environ['PATH']}", STUB_LOG=str(log),
+                   STUB_RUNNING=str(running))
+        env.pop("COMPOSE_FILE", None)
+        out = subprocess.run(["bash", str(bundle / "install-offline.sh"), *args], capture_output=True,
+                             text=True, timeout=120, env=env)
+        calls = log.read_text() if log.exists() else ""
+        return out, calls
+
+    def test_external_skips_the_weights_and_prints_the_pulls(self):
+        out, calls = self.run_install("--external-ollama", models_tarball=False, running=4)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertNotIn("tar xzf", calls)
+        self.assertIn("docker compose up -d --no-build", calls)
+        self.assertIn("ollama pull llama3.1:8b", out.stdout)
+        self.assertIn("ollama pull nomic-embed-text", out.stdout)
+        self.assertIn("bash scripts/check-external-ollama.sh", out.stdout)
+
+    def test_without_it_the_weights_are_still_required_and_restored(self):
+        out, _ = self.run_install(models_tarball=False)
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("offline/ollama_models.tar.gz missing", out.stderr)
+        out, calls = self.run_install()
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("tar xzf /backup/ollama_models.tar.gz", calls)
+        self.assertNotIn("ollama pull", out.stdout)
+
+    def test_an_unknown_option_is_a_usage_error(self):
+        out, _ = self.run_install("--nope")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("Usage: bash install-offline.sh [--telemetry] [--external-ollama]", out.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+```
+
+### scripts/tests/test_check_external_ollama.py
+
+```python
+"""Host-only check of scripts/check-external-ollama.sh (#673).
+
+`uname`, `lsof`, `ss`, `ip` and `docker` are stubs on PATH that answer as macOS
+or Linux would, so the listener check's decisions and the exit status are
+checked without Ollama or Docker: loopback is fine, a wildcard or a LAN address
+is a warning (Ollama has no authentication), the docker0 address is fine on
+Linux, nothing listening is a problem, and the api container's check runs
+unless --host-only. Standard library only.
+
+Run: python3 scripts/tests/test_check_external_ollama.py
+"""
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import textwrap
+import unittest
+
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = ROOT / 'scripts/check-external-ollama.sh'
+
+LSOF_HEADER = 'COMMAND   PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME'
+
+
+def lsof_line(address):
+    return 'ollama  4242 mike    3u  IPv4 0x1234567890abcdef      0t0  TCP {}:11434 (LISTEN)'.format(address)
+
+
+def ss_line(address):
+    return 'LISTEN 0      4096      {}:11434      0.0.0.0:*'.format(address)
+
+
+class HelperTests(unittest.TestCase):
+    def run_helper(self, os_name, listening, *args, docker0='172.17.0.1', tools=('lsof', 'ss', 'ip'),
+                   docker_status=0, compose_file=None):
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__('shutil').rmtree(folder, ignore_errors=True))
+        log = folder / 'log'
+        stubs = {
+            'uname': 'echo {}'.format(os_name),
+            'docker': 'echo "docker $*" >> "{}"; echo "COMPOSE_FILE=$COMPOSE_FILE" >> "{}"; '
+                      'echo "ollama-check: ok: stub"; exit {}'.format(log, log, docker_status),
+        }
+        if 'lsof' in tools:
+            body = '\n'.join([LSOF_HEADER] + [lsof_line(a) for a in listening]) if listening else ''
+            stubs['lsof'] = 'cat <<\'EOF\'\n{}\nEOF'.format(body) if body else 'exit 1'
+        if 'ss' in tools:
+            body = '\n'.join(ss_line(a) for a in listening)
+            stubs['ss'] = 'cat <<\'EOF\'\n{}\nEOF'.format(body) if body else 'exit 0'
+        if 'ip' in tools:
+            stubs['ip'] = ('echo "4: docker0    inet {}/16 brd 172.17.255.255 scope global docker0"'.format(docker0)
+                           if docker0 else 'exit 1')
+        bin_dir = folder / 'bin'
+        bin_dir.mkdir()
+        for name, body in stubs.items():
+            path = bin_dir / name
+            path.write_text('#!/bin/bash\n' + body + '\n')
+            path.chmod(0o755)
+        # Only the stubs and the basic tools the script uses (no real lsof/ss/ip).
+        base = folder / 'base'
+        base.mkdir()
+        for tool in ('bash', 'sed', 'awk', 'sort', 'cut', 'head', 'cat', 'dirname', 'printf', 'grep', 'tr'):
+            for directory in ('/bin', '/usr/bin'):
+                if os.path.exists(os.path.join(directory, tool)):
+                    os.symlink(os.path.join(directory, tool), base / tool)
+                    break
+        env = {'PATH': '{}:{}'.format(bin_dir, base), 'HOME': str(folder)}
+        if compose_file:
+            env['COMPOSE_FILE'] = compose_file
+        out = subprocess.run(['bash', str(SCRIPT), *args], capture_output=True, text=True, timeout=60, env=env)
+        calls = log.read_text() if log.exists() else ''
+        return out, calls
+
+    def test_loopback_on_macos_passes_and_runs_the_container_check(self):
+        out, calls = self.run_helper('Darwin', ['127.0.0.1', '[::1]'])
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn('ok: Ollama listens on 127.0.0.1:11434 (loopback)', out.stdout)
+        self.assertIn('ok: Ollama listens on ::1:11434 (loopback)', out.stdout)
+        self.assertIn('docker compose exec -T api python -m ollama_check', calls)
+        self.assertIn('COMPOSE_FILE=docker-compose.yml:docker-compose.external-ollama.yml', calls)
+
+    def test_a_wildcard_is_a_warning(self):
+        for os_name, address in (('Darwin', '*'), ('Linux', '0.0.0.0'), ('Linux', '[::]'), ('Linux', '*')):
+            with self.subTest(os=os_name, address=address):
+                out, _ = self.run_helper(os_name, [address], '--host-only')
+                self.assertEqual(out.returncode, 3, out.stdout + out.stderr)
+                self.assertIn('warning: Ollama listens on every address', out.stdout)
+                self.assertIn('Ollama has no authentication', out.stdout)
+
+    def test_a_lan_address_is_a_warning(self):
+        out, _ = self.run_helper('Darwin', ['192.168.1.20'], '--host-only')
+        self.assertEqual(out.returncode, 3)
+        self.assertIn('warning: Ollama listens on 192.168.1.20:11434, which other machines', out.stdout)
+        self.assertIn('bind it to 127.0.0.1 or ::1', out.stdout)
+
+    def test_docker0_is_allowed_on_linux_only(self):
+        out, _ = self.run_helper('Linux', ['172.17.0.1'], '--host-only')
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertIn('ok: Ollama listens on 172.17.0.1:11434 (docker0)', out.stdout)
+        out, _ = self.run_helper('Darwin', ['172.17.0.1'], '--host-only')
+        self.assertEqual(out.returncode, 3, out.stdout)
+
+    def test_the_warning_names_docker0_on_linux(self):
+        out, _ = self.run_helper('Linux', ['0.0.0.0'], '--host-only')
+        self.assertIn('bind it to 172.17.0.1 (docker0), 127.0.0.1 or ::1', out.stdout)
+
+    def test_nothing_listening_is_a_problem(self):
+        for os_name in ('Darwin', 'Linux'):
+            with self.subTest(os=os_name):
+                out, _ = self.run_helper(os_name, [], '--host-only')
+                self.assertEqual(out.returncode, 1)
+                self.assertIn('problem: nothing listens on port 11434', out.stdout)
+
+    def test_a_missing_tool_is_a_warning(self):
+        out, _ = self.run_helper('Darwin', ['127.0.0.1'], '--host-only', tools=('ss', 'ip'))
+        self.assertEqual(out.returncode, 3)
+        self.assertIn("'lsof' isn't installed", out.stdout)
+
+    def test_host_only_skips_docker(self):
+        out, calls = self.run_helper('Darwin', ['127.0.0.1'], '--host-only')
+        self.assertEqual(out.returncode, 0)
+        self.assertEqual(calls, '')
+
+    def test_a_failed_container_check_is_a_problem(self):
+        out, _ = self.run_helper('Darwin', ['127.0.0.1'], docker_status=1)
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("problem: the api container's check failed", out.stdout)
+
+    def test_the_users_compose_file_is_kept(self):
+        mine = 'docker-compose.yml:docker-compose.lan.yml:docker-compose.external-ollama.yml'
+        out, calls = self.run_helper('Darwin', ['127.0.0.1'], compose_file=mine)
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertIn('COMPOSE_FILE=' + mine + '\n', calls)
+
+    def test_usage(self):
+        out, _ = self.run_helper('Darwin', ['127.0.0.1'], '--nope')
+        self.assertEqual(out.returncode, 2)
+        self.assertIn('check-external-ollama.sh', out.stderr)
+
+    def test_it_never_writes(self):
+        text = SCRIPT.read_text()
+        code = '\n'.join(line for line in text.splitlines() if not line.lstrip().startswith('#'))
+        for refused in ('ollama pull', 'ollama rm', 'ollama stop', '/api/pull', '/api/delete', 'OLLAMA_HOST=',
+                        'launchctl', 'systemctl'):
+            with self.subTest(refused=refused):
+                self.assertNotIn(refused, code)
+
+
+if __name__ == '__main__':
+    unittest.main()
 ```
 
 ### scripts/tests/test_auth.py
@@ -56312,6 +57827,157 @@ jobs:
         with:
           path: ${{ runner.temp }}/ollama-models
           key: ${{ steps.models.outputs.key }}
+
+  # External-Ollama mode (#673) on Linux, as README "External Ollama (native)"
+  # sets it up there: the pinned native Ollama (the release the README says it
+  # was tested with), installed with its release's own install script, checked
+  # by sha256, then bound to the docker0 address with a systemd drop-in, never
+  # 0.0.0.0, and its models pulled, as a user would; rag-docker itself never
+  # pulls into it. Then `stack.sh up --external-ollama` and suite 25, with
+  # RAG_SKIP_SLOW=1 as the job above. The native model store is cached by
+  # release and model names.
+  external-ollama:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      RAG_SKIP_SLOW: '1'
+      OLLAMA_VERSION: 0.40.18
+      OLLAMA_INSTALL_SHA256: 17659c2456c9e65a3b11056b76da51774911cb822f47bf44f7f3ecc0c40528a8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The suites run this PR's code; leave no token in its git config.
+          persist-credentials: false
+
+      # The names the contained stack would pull, read from the base file
+      # before any overlay is in play.
+      - name: Read the model names
+        id: models
+        run: |
+          names=$(bash ollama/compose-models.sh) \
+            || { echo "could not read the model names (ollama/compose-models.sh)" >&2; exit 1; }
+          names=$(echo $names)
+          [ -n "$names" ] || { echo "no model names from ollama/compose-models.sh" >&2; exit 1; }
+          echo "models: $names"
+          {
+            echo "names=$names"
+            echo "key=native-ollama-$OLLAMA_VERSION-${names// /-}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install native Ollama
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q zstd
+          curl -fsSL -o "$RUNNER_TEMP/install.sh" \
+            "https://github.com/ollama/ollama/releases/download/v$OLLAMA_VERSION/install.sh"
+          echo "$OLLAMA_INSTALL_SHA256  $RUNNER_TEMP/install.sh" | sha256sum -c -
+          OLLAMA_VERSION="$OLLAMA_VERSION" sh "$RUNNER_TEMP/install.sh"
+          ollama --version
+
+      # README "External Ollama (native)", Linux: the docker0 address only.
+      - name: Bind Ollama to the docker0 address
+        id: bind
+        run: |
+          addr=$(ip -4 -o addr show docker0 | awk '{print $4}' | cut -d/ -f1 | head -1)
+          [ -n "$addr" ] || { echo "no docker0 address" >&2; exit 1; }
+          sudo mkdir -p /etc/systemd/system/ollama.service.d
+          printf '[Service]\nEnvironment="OLLAMA_HOST=%s:11434"\n' "$addr" \
+            | sudo tee /etc/systemd/system/ollama.service.d/rag-docker.conf
+          sudo systemctl daemon-reload
+          sudo systemctl restart ollama
+          for i in $(seq 1 60); do
+            curl -fs "http://$addr:11434/api/version" && break
+            sleep 1
+          done
+          curl -fs "http://$addr:11434/api/version"
+          echo "addr=$addr" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the native models
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/native-models
+          key: ${{ steps.models.outputs.key }}
+
+      - name: Pull the models into the native Ollama
+        env:
+          NAMES: ${{ steps.models.outputs.names }}
+          ADDR: ${{ steps.bind.outputs.addr }}
+          HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: |
+          store=/usr/share/ollama/.ollama/models
+          if [ "$HIT" = true ]; then
+            sudo mkdir -p "$store"
+            sudo cp -a "$RUNNER_TEMP/native-models/." "$store/"
+            sudo chown -R ollama:ollama /usr/share/ollama/.ollama
+            rm -rf "$RUNNER_TEMP/native-models"
+            sudo systemctl restart ollama
+            sleep 3
+          fi
+          for model in $NAMES; do
+            OLLAMA_HOST="$ADDR:11434" ollama pull "$model"
+          done
+          OLLAMA_HOST="$ADDR:11434" ollama list
+
+      - name: Start the verify project in external-Ollama mode
+        run: |
+          bash scripts/verify/stack.sh up --external-ollama | tee "$RUNNER_TEMP/stack-up.log"
+          grep '^export ' "$RUNNER_TEMP/stack-up.log" > "$RUNNER_TEMP/verify-env.sh"
+          . "$RUNNER_TEMP/verify-env.sh"
+          sed -n 's/^export \([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$RUNNER_TEMP/verify-env.sh" \
+            | while read -r var; do printf '%s=%s\n' "$var" "${!var}"; done >> "$GITHUB_ENV"
+
+      - name: Run the external-Ollama suite
+        run: bash scripts/verify/all.sh 25_external_ollama
+
+      - name: Collect the compose logs
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/verify-logs"
+          sudo journalctl -u ollama --no-pager > "$RUNNER_TEMP/verify-logs/ollama.log" 2>&1 || true
+          cd /
+          env -u COMPOSE_FILE docker compose -p rag-verify ps -a > "$RUNNER_TEMP/verify-logs/ps.txt" 2>&1 || true
+          env -u COMPOSE_FILE docker compose -p rag-verify logs --no-color --timestamps > "$RUNNER_TEMP/verify-logs/compose.log" 2>&1 || true
+
+      - name: Upload the compose logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: compose-logs-external-ollama
+          path: ${{ runner.temp }}/verify-logs
+
+      - name: Remove the verify project
+        if: always()
+        run: bash scripts/verify/stack.sh down
+
+      # On a cache miss: the native store's models/ tree, once every model is
+      # listed. A failure here fails only this step.
+      - name: Copy the native models out for the cache
+        id: export
+        if: always() && steps.models.outcome == 'success' && steps.cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        env:
+          NAMES: ${{ steps.models.outputs.names }}
+          ADDR: ${{ steps.bind.outputs.addr }}
+        run: |
+          listed=$(OLLAMA_HOST="$ADDR:11434" ollama list | awk 'NR > 1 {print $1}')
+          for model in $NAMES; do
+            case "$model" in *:*) want=$model ;; *) want=$model:latest ;; esac
+            printf '%s\n' "$listed" | grep -qx "$want" || { echo "$model isn't listed; not caching" >&2; exit 1; }
+          done
+          rm -rf "$RUNNER_TEMP/native-models"
+          sudo cp -a /usr/share/ollama/.ollama/models "$RUNNER_TEMP/native-models"
+          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/native-models"
+
+      - name: Save the native models
+        if: always() && steps.export.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/native-models
+          key: ${{ steps.models.outputs.key }}
 ```
 
 ### scripts/tests/test_ci_workflow.py
@@ -56324,7 +57990,10 @@ copies, run by `01_infrastructure.sh`.
 
 Reads .github/workflows/verify.yml as text: its trigger, permissions and
 action pins, the stack.sh up / all.sh / stack.sh down sequence on the
-disposable verify project, the compose logs artifact and the model cache. Also
+disposable verify project, the compose logs artifact and the model cache, in
+the `verify` job; and the `external-ollama` job (#673), which installs the
+pinned native Ollama from its release's install script checked by sha256, binds
+it to the docker0 address and runs suite 25 in `stack.sh up --external-ollama`. Also
 checks the README badge and the copies embedded in IMPLEMENTATION.md. The
 workflow's real run is the pull request's own; this keeps its rules from
 drifting. Standard library only; no Docker or stack needed.
@@ -56352,6 +58021,28 @@ echo '{"name": "rag-docker", "services": {"ollama": {"environment": {"LLM_MODEL"
 
 def workflow():
     return (ROOT / WORKFLOW).read_text()
+
+
+def job(text, name):
+    """One job's lines, from its `  <name>:` line to the next job or the end."""
+    lines = text.splitlines()
+    start = lines.index('  {}:'.format(name))
+    block = [lines[start]]
+    for line in lines[start + 1:]:
+        if re.match(r'^  [A-Za-z0-9_-]+:\s*$', line) or (line and not line.startswith((' ', '#'))):
+            break
+        block.append(line)
+    while block and (not block[-1].strip() or block[-1].lstrip().startswith('#')):
+        block.pop()
+    return '\n'.join(block) + '\n'
+
+
+def verify_job():
+    return job(workflow(), 'verify')
+
+
+def external_job():
+    return job(workflow(), 'external-ollama')
 
 
 def code(text):
@@ -56400,10 +58091,14 @@ class TriggerAndPermissionTests(unittest.TestCase):
                          ['on:', '  pull_request:', '    branches: [develop, main]'])
         self.assertNotIn('pull_request_target', text)
 
-    def test_one_job_on_ubuntu_latest_with_a_timeout(self):
+    def test_two_jobs_on_ubuntu_latest_with_a_timeout(self):
         text = workflow()
-        self.assertEqual(re.findall(r'^    runs-on: (.*)$', text, re.M), ['ubuntu-latest'])
-        self.assertRegex(text, r'(?m)^    timeout-minutes: \d+$')
+        self.assertEqual(re.findall(r'^  ([A-Za-z0-9_-]+):\s*$', text.split('\njobs:\n', 1)[1], re.M),
+                         ['verify', 'external-ollama'])
+        self.assertEqual(re.findall(r'^    runs-on: (.*)$', text, re.M), ['ubuntu-latest', 'ubuntu-latest'])
+        for name in ('verify', 'external-ollama'):
+            with self.subTest(job=name):
+                self.assertRegex(job(text, name), r'(?m)^    timeout-minutes: \d+$')
 
     def test_least_privilege_and_no_secrets(self):
         text = workflow()
@@ -56421,13 +58116,14 @@ class TriggerAndPermissionTests(unittest.TestCase):
                 self.assertRegex(value, r'^actions/[a-z-]+(/[a-z-]+)?@[0-9a-f]{40} # v\d+\.\d+\.\d+$')
 
     def test_checkout_leaves_no_credentials(self):
-        _, step = step_with(workflow(), 'actions/checkout@')
-        self.assertIn('persist-credentials: false', step)
+        for text in (verify_job(), external_job()):
+            _, step = step_with(text, 'actions/checkout@')
+            self.assertIn('persist-credentials: false', step)
 
 
 class SuiteTests(unittest.TestCase):
     def test_skip_slow_on_the_verify_project_never_the_live_stack(self):
-        text = code(workflow())
+        text = code(verify_job())
         self.assertRegex(text, r"(?m)^      RAG_SKIP_SLOW: '1'$")
         for refused in ('RAG_VERIFY_LIVE', 'stack.sh run'):
             with self.subTest(refused=refused):
@@ -56435,7 +58131,7 @@ class SuiteTests(unittest.TestCase):
         self.assertIsNone(re.search(r'docker compose[^\n]* up\b', text), 'docker compose up is used')
 
     def test_up_suite_logs_upload_down_in_order(self):
-        text = workflow()
+        text = verify_job()
         order = [step_with(text, needle)[0] for needle in (
             'bash scripts/verify/stack.sh up', 'bash scripts/verify/all.sh',
             'docker compose -p rag-verify logs', 'actions/upload-artifact@',
@@ -56443,7 +58139,7 @@ class SuiteTests(unittest.TestCase):
         self.assertEqual(order, sorted(order))
 
     def test_logs_upload_and_down_always_run(self):
-        text = workflow()
+        text = verify_job()
         for needle in ('docker compose -p rag-verify logs', 'actions/upload-artifact@',
                        'bash scripts/verify/stack.sh down'):
             with self.subTest(step=needle):
@@ -56454,7 +58150,7 @@ class ModelCacheTests(unittest.TestCase):
     def test_key_is_the_models_the_entrypoint_pulls(self):
         # The names ollama/compose-models.sh resolves from the ollama service's LLM
         # settings, which the entrypoint pulls (#671).
-        text = workflow()
+        text = verify_job()
         _, step = step_with(text, 'id: models')
         self.assertIn('names=$(bash ollama/compose-models.sh) \\\n', step)
         self.assertIn('|| { echo "could not read the model names (ollama/compose-models.sh)" >&2; exit 1; }', step)
@@ -56473,7 +58169,7 @@ class ModelCacheTests(unittest.TestCase):
                          'ollama-models-llama3.1:8b-nomic-embed-text')
 
     def test_restored_before_start_and_saved_only_after_a_miss(self):
-        text = workflow()
+        text = verify_job()
         restore, restore_step = step_with(text, 'actions/cache/restore@')
         start, _ = step_with(text, 'bash scripts/verify/stack.sh up')
         export, export_step = step_with(text, 'id: export')
@@ -56486,6 +58182,65 @@ class ModelCacheTests(unittest.TestCase):
             self.assertIn('key: ${{ steps.models.outputs.key }}', step)
         self.assertIn("steps.cache.outputs.cache-hit != 'true'", export_step)
         self.assertIn('/copy/models', export_step)
+        self.assertIn("steps.export.outcome == 'success'", save_step)
+
+
+class ExternalOllamaJobTests(unittest.TestCase):
+    """The external-Ollama job (#673): README "External Ollama (native)" on Linux."""
+
+    def test_pins_the_tested_release_and_its_install_script(self):
+        text = external_job()
+        self.assertRegex(text, r"(?m)^      OLLAMA_VERSION: 0\.40\.18$")
+        self.assertRegex(text, r"(?m)^      OLLAMA_INSTALL_SHA256: [0-9a-f]{64}$")
+        _, step = step_with(text, 'name: Install native Ollama')
+        self.assertIn('https://github.com/ollama/ollama/releases/download/v$OLLAMA_VERSION/install.sh', step)
+        self.assertIn('echo "$OLLAMA_INSTALL_SHA256  $RUNNER_TEMP/install.sh" | sha256sum -c -', step)
+        # The check comes before the script runs, and nothing is piped into a shell.
+        self.assertLess(step.index('sha256sum -c -'), step.index('sh "$RUNNER_TEMP/install.sh"'))
+        self.assertNotRegex(code(text), r'\|\s*(sudo\s+)?(ba)?sh\b')
+        self.assertIn('0.40.18', (ROOT / 'README.md').read_text())
+
+    def test_binds_ollama_to_docker0_never_every_address(self):
+        text = code(external_job())
+        _, step = step_with(text, 'name: Bind Ollama to the docker0 address')
+        self.assertIn('ip -4 -o addr show docker0', step)
+        self.assertIn('Environment="OLLAMA_HOST=%s:11434"', step)
+        self.assertNotIn('0.0.0.0', text)
+
+    def test_up_external_suite_logs_upload_down_in_order(self):
+        text = external_job()
+        order = [step_with(text, needle)[0] for needle in (
+            'name: Install native Ollama', 'name: Bind Ollama', 'name: Pull the models',
+            'bash scripts/verify/stack.sh up --external-ollama',
+            'bash scripts/verify/all.sh 25_external_ollama',
+            'docker compose -p rag-verify logs', 'actions/upload-artifact@',
+            'bash scripts/verify/stack.sh down')]
+        self.assertEqual(order, sorted(order))
+        for needle in ('docker compose -p rag-verify logs', 'actions/upload-artifact@',
+                       'bash scripts/verify/stack.sh down'):
+            with self.subTest(step=needle):
+                self.assertIn('if: always()', step_with(text, needle)[1])
+        self.assertRegex(code(text), r"(?m)^      RAG_SKIP_SLOW: '1'$")
+        for refused in ('RAG_VERIFY_LIVE', 'stack.sh run'):
+            with self.subTest(refused=refused):
+                self.assertNotIn(refused, code(text))
+
+    def test_native_model_cache_by_release_and_names(self):
+        text = external_job()
+        _, names = step_with(text, 'id: models')
+        self.assertIn('names=$(bash ollama/compose-models.sh)', names)
+        self.assertIn('echo "key=native-ollama-$OLLAMA_VERSION-${names// /-}"', names)
+        restore, restore_step = step_with(text, 'actions/cache/restore@')
+        pull, _ = step_with(text, 'name: Pull the models')
+        export, export_step = step_with(text, 'id: export')
+        save, save_step = step_with(text, 'actions/cache/save@')
+        down, _ = step_with(text, 'bash scripts/verify/stack.sh down')
+        self.assertLess(restore, pull)
+        self.assertLess(down, export)
+        self.assertLess(export, save)
+        for step in (restore_step, save_step):
+            self.assertIn('key: ${{ steps.models.outputs.key }}', step)
+        self.assertIn("steps.cache.outputs.cache-hit != 'true'", export_step)
         self.assertIn("steps.export.outcome == 'success'", save_step)
 
 
@@ -56852,11 +58607,17 @@ volume, and starts the stack without building or pulling.
 #
 # Install this project on a machine with NO internet access.
 #
-#   bash install-offline.sh
+#   bash install-offline.sh [--telemetry] [--external-ollama]
 #
 # Run it from inside the extracted bundle directory. It loads the pre-built
 # Docker images, restores the Ollama model weights into the project's volume,
 # and starts the stack without building or pulling anything.
+#
+# --external-ollama (#673) installs for an Ollama on this host instead of the
+# stack's own (README "External Ollama (native)"): the model weights aren't
+# restored (rag-docker never writes to an Ollama it doesn't run), the stack
+# starts with docker-compose.external-ollama.yml, and the `ollama pull` lines
+# for the models are printed, to run on the Ollama host.
 #
 # Requires only Docker Desktop (running) on the target Mac.
 
@@ -56864,11 +58625,18 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 [ -f offline/images.tar.gz ] || { echo "ERROR: offline/images.tar.gz missing. This is the source-only package, not the offline bundle (see package-offline.sh)." >&2; exit 1; }
-[ -f offline/ollama_models.tar.gz ] || { echo "ERROR: offline/ollama_models.tar.gz missing." >&2; exit 1; }
 
 TELEMETRY=0
-if [ "${1:-}" = --telemetry ]; then TELEMETRY=1; shift; fi
-[ "$#" = 0 ] || { echo "Usage: bash install-offline.sh [--telemetry]" >&2; exit 2; }
+EXTERNAL=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --telemetry) TELEMETRY=1; shift ;;
+    --external-ollama) EXTERNAL=1; shift ;;
+    *) echo "Usage: bash install-offline.sh [--telemetry] [--external-ollama]" >&2; exit 2 ;;
+  esac
+done
+[ "$EXTERNAL" = 1 ] || [ -f offline/ollama_models.tar.gz ] \
+  || { echo "ERROR: offline/ollama_models.tar.gz missing." >&2; exit 1; }
 if [ "$TELEMETRY" = 1 ]; then
   # Validate bytes against tracked platform identities before docker load sees them.
   COLLECTOR_STAGE="$(mktemp -d)"
@@ -56878,12 +58646,19 @@ if [ "$TELEMETRY" = 1 ]; then
   export COMPOSE_FILE="$PWD/docker-compose.yml:$PWD/docker-compose.telemetry.yml:$COLLECTOR_STAGE/offline.yml"
   export COMPOSE_PROFILES=telemetry
 fi
+if [ "$EXTERNAL" = 1 ]; then
+  # Last, after telemetry's files when both are given.
+  export COMPOSE_FILE="${COMPOSE_FILE:-$PWD/docker-compose.yml}:$PWD/docker-compose.external-ollama.yml"
+fi
 
 docker info >/dev/null 2>&1 || { echo "ERROR: Docker is not running. Start Docker Desktop and retry." >&2; exit 1; }
 
 echo "==> Loading Docker images (no network used)"
 docker load -i offline/images.tar.gz
 
+if [ "$EXTERNAL" = 1 ]; then
+  echo "==> External Ollama: the model weights are not restored (#673)"
+else
 echo "==> Restoring Ollama model weights"
 # `compose run` resolves the project's ollama_models volume for us, so this does
 # not depend on the directory name. The ollama image ships tar and was just
@@ -56893,6 +58668,7 @@ RESTORE_PULL=""
 docker compose run --rm --no-deps ${RESTORE_PULL:+$RESTORE_PULL} --entrypoint sh \
   -v "$PWD/offline:/backup:ro" \
   ollama -c 'tar xzf /backup/ollama_models.tar.gz -C /root/.ollama && ls /root/.ollama'
+fi
 
 echo "==> Starting the stack (--no-build: nothing is compiled or pulled)"
 if [ "$TELEMETRY" = 1 ]; then
@@ -56905,13 +58681,25 @@ echo
 echo "Waiting for services to report healthy..."
 for i in $(seq 1 60); do
   running=$(docker compose ps --services --filter status=running | wc -l | tr -d ' ')
-  [ "$running" = "$((5 + TELEMETRY))" ] && break
+  # Five services, six with telemetry; one fewer with an external Ollama.
+  [ "$running" = "$((5 + TELEMETRY - EXTERNAL))" ] && break
   sleep 5
 done
 docker compose ps
 
 echo
 echo "If the requested services are up, open http://localhost:8080"
+if [ "$EXTERNAL" = 1 ]; then
+  echo "On the Ollama host, pull the models rag-docker uses (it never pulls them itself):"
+  # Read from the base file alone: the overlay leaves the ollama service out,
+  # and its settings are where the model names are.
+  for model in $(COMPOSE_FILE="$PWD/docker-compose.yml" COMPOSE_PROFILES= bash ollama/compose-models.sh); do
+    echo "  ollama pull $model"
+  done
+  echo "Then check the setup:"
+  echo "  bash scripts/check-external-ollama.sh"
+  exit 0
+fi
 echo "Verify the models were restored (no download should occur):"
 echo "  docker compose exec ollama ollama list"
 ```
