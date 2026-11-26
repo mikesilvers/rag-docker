@@ -1,9 +1,12 @@
 # The age tool for scripts/backup.sh and scripts/restore.sh (#848).
 #
 # The scripts build this image on first use, tagged rag-docker-age:<the age
-# package version below>-<the first 12 hex digits of the SHA-256 of this file's
-# instruction lines, comments and blank lines left out>, so a change of any
-# instruction builds a new image; the build needs the network once.
+# package version below>-<the first 12 hex digits of a SHA-256 of this file's
+# parser directives and instruction lines (other comments and blank lines left
+# out) and of every other file in this folder (rb_age_text in
+# scripts/backup-common.sh)>, so a change of any of them builds a new image;
+# the build needs the network once. Any parser directive goes above this
+# comment: Docker reads directives only at the very top.
 # package-offline.sh builds it too and carries it in the offline bundle. Every
 # backup and restore runs age and tar in a container of it, so nothing
 # unencrypted leaves the container.
