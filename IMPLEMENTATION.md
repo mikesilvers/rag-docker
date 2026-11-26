@@ -6322,9 +6322,10 @@ and the job status says so ("no estimate yet"). A failed save is logged once.
 the job hasn't reached, the file it is still parsing (before its first chunks,
 `file_chunking`), and a split file's later parts (#621), aren't guessed:
 `files_not_chunked` counts the first two, and `seconds_left_is_minimum` says the
-job's time left is then a minimum. Inside a long part the time left counts down by the time the
-part has been storing (`storing_since`), never below 0. Only a running job has
-a time left; a queued, finished or interrupted one shows its counts alone.
+job's time left is then a minimum. Inside a long part the time left counts down
+by the time the part has been storing (`storing_since`), never below 0. Only a
+running job has a time left; a queued, finished or interrupted one shows its
+counts alone.
 """
 from __future__ import annotations
 
@@ -7645,10 +7646,12 @@ class _CountedMember:
     the member's compressed size after every block, as a backstop to the
     declared ratio check (#28). With CPython's zipfile it does not trigger:
     zipfile stops reading a member at its declared uncompressed size, so a
-    header that understates the size fails the member's CRC check and is
-    refused as damaged (ARCHIVE_UNREADABLE), not for its ratio. These are the
-    ZIP layer's bytes only: a gzipped member's output counts toward the total,
-    not toward its ratio.
+    header that understates the size usually fails the member's CRC check and
+    is refused as damaged (ARCHIVE_UNREADABLE), not for its ratio. A header
+    whose CRC matches the truncated data reads as a shorter member and isn't
+    refused, which is still safe: nothing beyond the declared size is
+    decompressed. These are the ZIP layer's bytes only: a gzipped member's
+    output counts toward the total, not toward its ratio.
     """
 
     def __init__(self, data: Any, budget: _ExpansionBudget,
@@ -31043,22 +31046,22 @@ in a temporary upload folder, the ingest time estimate: the rate (characters ove
 the last 20 stored parts, weighted by size) saved and read back after a restart, a malformed
 file read as no rate and replaced, ignored and unsaved measurements, the file named outside
 the startup sweep's prefixes with the older `ingest-rate.json` read until it exists, and a
-failed save logged once (#896); the time left a job status
-computes (none before a measurement, a countdown inside the part being stored never below 0,
-a failed file's 0, the "at least" flag for files not reached, a file still being parsed (#896)
-and split files with more parts, nothing for a job that isn't running, old records); and the
-per-file progress the job loop
+failed save logged once (#896); the time left a job status computes (none before a measurement,
+a countdown inside the part being stored never below 0, a failed file's 0, the "at least" flag
+for files not reached, a file still being parsed (#896) and split files with more parts,
+nothing for a job that isn't running, old records); and the per-file progress the job loop
 records for a whole file, a split file (chunked only after its last part, one measurement a
 part), a failed store (not a measurement), a file failing before any chunks (also as the last
 file), a one-file job read before its first part (#896), and the cap on entries. `02_ingest.sh`
-runs it in the API image with no network.
-On the stack, `02_ingest.sh` then checks that the six-type job's finished status lists each
-file's chunk and character counts, all stored, with no rate or time left, and that the real
-store left valid measurements in the API's `UPLOAD_DIR/embedding-rate.json`.
+runs it in the API image with no network. On the stack, `02_ingest.sh` then checks that the
+six-type job's finished status lists each file's chunk and character counts, all stored, with
+no rate or time left, and that the real store left valid measurements in the API's
+`UPLOAD_DIR/embedding-rate.json`.
 `browser/ui_criteria.js` (suite 06) stubs job responses to check the Import page's progress
 panel: "No estimate yet" before a measurement, the rate and "About ... left" ("Under a minute
-left" without "about", #896), "At least ... left" for files not chunked yet and for a split file with more parts, and a finished job's
-per-file counts (failed, done, earlier files not shown) with no estimate.
+left" without "about", #896), "At least ... left" for files not chunked yet and for a split
+file with more parts, and a finished job's per-file counts (failed, done, earlier files not
+shown) with no estimate.
 `browser/ui_criteria.js` (suite 06) checks that the Import page's file picker accepts
 `.jsonl` and `.jsonl.gz` and that its hint names JSONL.
 
