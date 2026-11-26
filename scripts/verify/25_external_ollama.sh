@@ -21,8 +21,8 @@ OUT="$(mktemp)"
 trap 'rm -f "$OUT" /tmp/vfy_eo.json' EXIT
 
 section "External-Ollama units: settings, requests, health, import, export, helper"
-(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api \
-  "$(docker compose images -q api)" python scripts/tests/test_external_ollama.py)
+API_IMAGE="$(cd "$REPO_ROOT" && docker compose images -q api)"
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$API_IMAGE" python scripts/tests/test_external_ollama.py)
 check "test_external_ollama.py registered regression checks" $?
 
 if [ "${RAG_VERIFY_EXTERNAL_OLLAMA:-0}" != 1 ]; then
