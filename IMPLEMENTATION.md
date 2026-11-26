@@ -30718,8 +30718,8 @@ message and `detail`; a negative-size entry before an over-cap file is refused
 directory (on a regular file the file after it is never extracted); folders implied by a file's
 or a directory's path count as entries (at the cap it opens, one folder over is refused
 `PACKAGE_TOO_MANY_MEMBERS`), `.` and empty path parts aren't folders, while a name with a `..`
-component, `../<work dir>/…` included, is refused `PACKAGE_UNREADABLE` before its folders are
-counted; a folder counts once, whether its own entry comes before or after a file inside it and
+component, `../<work dir>/…` included, or an absolute name that leads into the work directory
+(#911), is refused `PACKAGE_UNREADABLE` before its folders are counted; a folder counts once, whether its own entry comes before or after a file inside it and
 for a name like `d/.`, while a repeated directory entry counts each time (#599); the checks run
 in §6.2's order (count, check, folders, size); a path needing more folders at once than the
 recursion limit allows is refused `PACKAGE_UNREADABLE`, not `IMPORT_FAILED` (#599); a `.tar.gz`
