@@ -19,9 +19,10 @@ and the job status says so ("no estimate yet"). A failed save is logged once.
 the job hasn't reached, the file it is still parsing (before its first chunks,
 `file_chunking`), and a split file's later parts (#621), aren't guessed:
 `files_not_chunked` counts the first two, and `seconds_left_is_minimum` says the
-job's time left is then a minimum. Inside a long part the time left counts down by the time the
-part has been storing (`storing_since`), never below 0. Only a running job has
-a time left; a queued, finished or interrupted one shows its counts alone.
+job's time left is then a minimum. Inside a long part the time left counts down
+by the time the part has been storing (`storing_since`), never below 0. Only a
+running job has a time left; a queued, finished or interrupted one shows its
+counts alone.
 """
 from __future__ import annotations
 

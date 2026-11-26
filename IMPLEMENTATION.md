@@ -6322,9 +6322,10 @@ and the job status says so ("no estimate yet"). A failed save is logged once.
 the job hasn't reached, the file it is still parsing (before its first chunks,
 `file_chunking`), and a split file's later parts (#621), aren't guessed:
 `files_not_chunked` counts the first two, and `seconds_left_is_minimum` says the
-job's time left is then a minimum. Inside a long part the time left counts down by the time the
-part has been storing (`storing_since`), never below 0. Only a running job has
-a time left; a queued, finished or interrupted one shows its counts alone.
+job's time left is then a minimum. Inside a long part the time left counts down
+by the time the part has been storing (`storing_since`), never below 0. Only a
+running job has a time left; a queued, finished or interrupted one shows its
+counts alone.
 """
 from __future__ import annotations
 
@@ -7645,10 +7646,12 @@ class _CountedMember:
     the member's compressed size after every block, as a backstop to the
     declared ratio check (#28). With CPython's zipfile it does not trigger:
     zipfile stops reading a member at its declared uncompressed size, so a
-    header that understates the size fails the member's CRC check and is
-    refused as damaged (ARCHIVE_UNREADABLE), not for its ratio. These are the
-    ZIP layer's bytes only: a gzipped member's output counts toward the total,
-    not toward its ratio.
+    header that understates the size usually fails the member's CRC check and
+    is refused as damaged (ARCHIVE_UNREADABLE), not for its ratio. A header
+    whose CRC matches the truncated data reads as a shorter member and isn't
+    refused, which is still safe: nothing beyond the declared size is
+    decompressed. These are the ZIP layer's bytes only: a gzipped member's
+    output counts toward the total, not toward its ratio.
     """
 
     def __init__(self, data: Any, budget: _ExpansionBudget,
@@ -15008,6 +15011,14 @@ _active: set[str] = set()
 # imports never build, mark or clean up one collection at once (#391).
 _targets: dict[str, str] = {}
 _lock = threading.Lock()
+# A cancelled import's error (#871); its code is IMPORT_FAILED, as for an
+# unexpected failure.
+_CANCELLED = ("CancelledError: the import was cancelled before it finished. "
+              "Start the import again.")
+# Import workers that have started, and jobs settled before their worker
+# could start (#871): whichever comes first wins, under _lock.
+_started: set[str] = set()
+_abandoned: set[str] = set()
 
 # Weaviate capitalises the first character of a collection name and rejects
 # anything outside [A-Za-z0-9_]. Both were confirmed against the live server.
@@ -15780,11 +15791,16 @@ def _build(target: str, pkg: Path, manifest: dict, progress, instance: str | Non
     _create_from_package(target, pkg, instance)
     try:
         return _insert_chunks(target, pkg, manifest, progress)
-    except Exception as original:
-        # Spec §6.5: a failure part-way leaves no partial collection.
+    except (Exception, asyncio.CancelledError) as original:
+        # Spec §6.5: a failure part-way leaves no partial collection, and so does
+        # a cancellation (#871).
         try:
             telemetry.call("weaviate.delete", wc.get_client().collections.delete, target)
         except Exception as cleanup:
+            if isinstance(original, asyncio.CancelledError):
+                # Re-raised as it is: _run finds the target still there and
+                # keeps its marker for the startup sweep.
+                raise original
             raise PackageError("IMPORT_FAILED", f"{type(original).__name__}: {original}; "
                                f"partial target cleanup failed ({cleanup})",
                                {"collection": target, "cleanup_pending": True}) from original
@@ -16010,6 +16026,23 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
                             f"'{temp_collection}'.")
             job["error_detail"] = {"recovered_as": temp_collection,
                                    "sidecar_snapshots": collection_recovery.sidecar_reference(ownership)}
+    except asyncio.CancelledError:
+        # A cancellation still ends the job (#871), with the code of an
+        # unexpected failure. _build removed a partial target; one it could not
+        # remove (or that Weaviate can't confirm gone) keeps its marker for the
+        # startup sweep. A retained replace copy is reported as on the failure
+        # paths. Re-raised so it propagates; `traced` records the outcome.
+        detail: dict = {}
+        if marked and not built and exists_fail_closed(marked):
+            detail.update(collection=marked, cleanup_pending=True)
+        error = _CANCELLED
+        if staged and temp_collection:
+            error += f" The imported data is available as '{temp_collection}'."
+            detail.update(recovered_as=temp_collection,
+                          sidecar_snapshots=collection_recovery.sidecar_reference(ownership))
+        finish(status="failed", error_code="IMPORT_FAILED", error=error,
+               error_detail=detail or None)
+        raise
     finally:
         # A handled failure already removed the partial collection, so the
         # marker has nothing left to describe. Only a hard kill leaves one
@@ -16046,6 +16079,38 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
         with _lock:
             _active.discard(_package_key(filename))
         _release_targets(job_id)
+
+
+def _worker(job_id: str, filename: str, on_conflict: str, passphrase: str | None = None,
+            identity: "age_stream.Identity | None" = None) -> None:
+    """The import task's worker: runs `_run` unless the task has already settled
+    the job, because it ended before this worker could start (#871)."""
+    with _lock:
+        if job_id in _abandoned:
+            _abandoned.discard(job_id)
+            return
+        _started.add(job_id)
+    if identity is not None:
+        _run(job_id, filename, on_conflict, None, identity)
+    else:
+        _run(job_id, filename, on_conflict, passphrase)
+
+
+def _settle_unstarted(job_id: str, name: str) -> None:
+    """A done callback: settles a job whose task ended before its worker could
+    start (#871), freeing the package claim before the status turns terminal,
+    so a client that sees it fail can import or download the package again. A
+    worker that started settles its own job."""
+    with _lock:
+        if job_id in _started:
+            _started.discard(job_id)
+            return
+        _abandoned.add(job_id)
+        _active.discard(name)
+    job = _jobs.get(job_id)
+    # A small write on the event loop, as ingest's done callback makes (#309).
+    if job is not None and job.get("status") not in jobstore.TERMINAL:
+        job.update(status="failed", error_code="IMPORT_FAILED", error=_CANCELLED)
 
 
 def package_kind(name: str) -> str | None:
@@ -16141,11 +16206,13 @@ async def start_import_job(filename: str, on_conflict: str, passphrase: str | No
         _release_package(name)
         raise
     if identity is not None:
-        asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, filename, on_conflict,
-                                              None, identity))
+        task = asyncio.create_task(asyncio.to_thread(telemetry.admitted(_worker), job_id, filename,
+                                                     on_conflict, None, identity))
     else:
-        asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, filename, on_conflict,
-                                              passphrase))
+        task = asyncio.create_task(asyncio.to_thread(telemetry.admitted(_worker), job_id, filename,
+                                                     on_conflict, passphrase))
+    # A task cancelled before its worker starts still ends its job (#871).
+    task.add_done_callback(lambda _task: _settle_unstarted(job_id, name))
     return job_id
 ```
 
@@ -30789,7 +30856,13 @@ also checks all saved retrieval fields round-trip. `legacy_retrieval.py` (E28,
 #184) writes a legacy `ef` and other invalid saved settings into the API
 container, then checks through the real API that a legacy `ef` exports and
 imports as `null` with a warning or note, and that other invalid saved settings
-fail the export early with an actionable error and publish nothing. Crafted
+fail the export early with an actionable error and publish nothing.
+`ingest_settings_export.py` (E52, #919) does the same for saved ingest settings: it
+writes a saved file that isn't a JSON object, one with a wrong-typed `chunk_size` and
+one with an invalid `chunk_size` into the API container, and checks through the real
+export job that each export fails with an error naming the collection, the field and
+the Chunking Configuration page, and publishes nothing; it restores the saved file
+afterwards. Crafted
 packages are written under a `.part` name and renamed into place, because on
 Docker Desktop the API can read a freshly written bind-mounted file as empty. Controlled tests complement,
 and do not replace, this live acceptance.
@@ -30905,8 +30978,11 @@ collection; a target is free again after its import fails; a refused import leav
 the claim with its holder, so a third import of the target is refused too; the claim
 comes before the `COLLECTION_DELETING` check; a refused import never reaches model
 installation, the target stays claimed while its holder installs models, and a
-target is free again after a failed model installation (#492); and a start whose
-first job record can't be stored releases the package name. `05_transfer.sh` runs it
+target is free again after a failed model installation (#492); a start whose
+first job record can't be stored releases the package name; and an import whose task
+is cancelled before its worker runs frees the package name, then reads `failed`
+`IMPORT_FAILED` with the cancelled message, a worker that starts late runs nothing,
+and one that started is left to settle its own job (#871). `05_transfer.sh` runs it
 in the verify project's API container.
 
 `scripts/tests/test_ingest_errors.py` (#290) checks that damaged or unreadable ZIPs are
@@ -31048,22 +31124,22 @@ in a temporary upload folder, the ingest time estimate: the rate (characters ove
 the last 20 stored parts, weighted by size) saved and read back after a restart, a malformed
 file read as no rate and replaced, ignored and unsaved measurements, the file named outside
 the startup sweep's prefixes with the older `ingest-rate.json` read until it exists, and a
-failed save logged once (#896); the time left a job status
-computes (none before a measurement, a countdown inside the part being stored never below 0,
-a failed file's 0, the "at least" flag for files not reached, a file still being parsed (#896)
-and split files with more parts, nothing for a job that isn't running, old records); and the
-per-file progress the job loop
+failed save logged once (#896); the time left a job status computes (none before a measurement,
+a countdown inside the part being stored never below 0, a failed file's 0, the "at least" flag
+for files not reached, a file still being parsed (#896) and split files with more parts,
+nothing for a job that isn't running, old records); and the per-file progress the job loop
 records for a whole file, a split file (chunked only after its last part, one measurement a
 part), a failed store (not a measurement), a file failing before any chunks (also as the last
 file), a one-file job read before its first part (#896), and the cap on entries. `02_ingest.sh`
-runs it in the API image with no network.
-On the stack, `02_ingest.sh` then checks that the six-type job's finished status lists each
-file's chunk and character counts, all stored, with no rate or time left, and that the real
-store left valid measurements in the API's `UPLOAD_DIR/embedding-rate.json`.
+runs it in the API image with no network. On the stack, `02_ingest.sh` then checks that the
+six-type job's finished status lists each file's chunk and character counts, all stored, with
+no rate or time left, and that the real store left valid measurements in the API's
+`UPLOAD_DIR/embedding-rate.json`.
 `browser/ui_criteria.js` (suite 06) stubs job responses to check the Import page's progress
 panel: "No estimate yet" before a measurement, the rate and "About ... left" ("Under a minute
-left" without "about", #896), "At least ... left" for files not chunked yet and for a split file with more parts, and a finished job's
-per-file counts (failed, done, earlier files not shown) with no estimate.
+left" without "about", #896), "At least ... left" for files not chunked yet and for a split
+file with more parts, and a finished job's per-file counts (failed, done, earlier files not
+shown) with no estimate.
 `browser/ui_criteria.js` (suite 06) checks that the Import page's file picker accepts
 `.jsonl` and `.jsonl.gz` and that its hint names JSONL.
 
@@ -50844,6 +50920,10 @@ check "invalid retrieval imports preserve live collections and settings" $?
 # with a warning or note; other invalid saved settings fail the export early.
 python3 ./legacy_retrieval.py "$API" "$C" "$EXPORTS" "$REPO_ROOT"
 check "E28: legacy ef is cleared on export and import; invalid saved settings fail early" $?
+# Saved ingest settings the API would refuse to save fail the export before any
+# chunk is read, publishing nothing, through the real export job (E52, #919).
+python3 ./ingest_settings_export.py "$API" "$C" "$EXPORTS" "$REPO_ROOT"
+check "E52: invalid saved ingest settings fail the export early, publishing nothing" $?
 
 # ── evaluation metadata is validated before mutation (E23) ──────────────────
 # Add one evaluation sidecar to a copy of the package and re-sign the manifest,
@@ -65941,6 +66021,112 @@ def run(api, collection, exports, repo_root):
                 timeout=120).read()
         request('/retrieval/config', saved)
     print(f'{len(failures)} legacy/invalid retrieval settings check(s) failed')
+    return 1 if failures else 0
+
+
+if __name__ == '__main__':
+    sys.exit(run(*sys.argv[1:]))
+```
+
+### scripts/verify/ingest_settings_export.py
+
+```python
+"""Live E52 acceptance: invalid saved ingest settings fail the export (#515, #919).
+
+Writes the collection's saved ingest settings file directly in the API
+container, as an older API or a hand edit could leave it (the API's own save
+refuses these values), then checks through the real export job that each
+invalid file fails the export with an error naming the collection, the failing
+field and the Chunking Configuration page, and that no package is published.
+The collection's saved settings file is restored on exit.
+"""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+import urllib.request
+
+# The suite's session (#25); found beside this file however the file is loaded.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import auth_headers  # noqa: E402
+
+# Each invalid saved file and what its error must name: JSON that isn't an
+# object, a field of the wrong type and an invalid value, as E52 lists them.
+CASES = [([], 'not a JSON object'),
+         ({'chunk_size': 'invalid'}, 'chunk_size'),
+         ({'chunk_size': 0}, 'chunk_size')]
+
+READ = ('import json, sys\n'
+        'from services import ingest_config\n'
+        'p = ingest_config._path(sys.argv[1])\n'
+        'print(json.dumps(p.read_text() if p.exists() else None))\n')
+WRITE = ('import sys\n'
+         'from services import ingest_config\n'
+         'ingest_config._path(sys.argv[1]).write_text(sys.argv[2])\n')
+REMOVE = ('import sys\n'
+          'from services import ingest_config\n'
+          'ingest_config._path(sys.argv[1]).unlink(missing_ok=True)\n')
+
+
+def run(api, collection, exports, repo_root):
+    exports = Path(exports)
+    failures = []
+
+    def request(path, body=None):
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(api.rstrip('/') + path, data=data,
+                                     headers={'Content-Type': 'application/json', **auth_headers.headers()})
+        with urllib.request.urlopen(req, timeout=60) as response:
+            return json.load(response)
+
+    def wait(path, timeout=900):
+        deadline = time.monotonic() + timeout
+        while True:
+            job = request(path)
+            if job['status'] in ('failed', 'completed'):
+                return job
+            if time.monotonic() >= deadline:
+                raise AssertionError(f'{path} timed out: {job}')
+            time.sleep(0.5)
+
+    def in_api(code, *args):
+        """Runs `code` in the API container, where the saved settings live."""
+        return subprocess.run(['docker', 'compose', 'exec', '-T', 'api', 'python', '-c', code,
+                               collection, *args], cwd=repo_root, check=True,
+                              capture_output=True, text=True).stdout
+
+    def expect(name, ok, detail=''):
+        print(('PASS ' if ok else 'FAIL ') + name + ('' if ok else f'  -- {detail}'))
+        if not ok:
+            failures.append(name)
+
+    def listing():
+        return sorted(p.name for p in exports.iterdir())
+
+    saved = json.loads(in_api(READ).strip().splitlines()[-1])
+    try:
+        for value, needle in CASES:
+            # Bypasses the save contract, which refuses these values.
+            in_api(WRITE, json.dumps(value))
+            before = listing()
+            job = wait('/export/job/' + request('/export', {'collection': collection, 'encryption': 'none',
+                                                            'include_models': False})['job_id'])
+            error = job.get('error') or ''
+            expect(f'invalid saved ingest settings {value!r}: export fails', job['status'] == 'failed', job)
+            expect(f'invalid saved ingest settings {value!r}: the error names the collection, '
+                   f'{needle!r} and the Chunking Configuration page',
+                   f"'{collection}'" in error and needle in error
+                   and 'Chunking Configuration page' in error, error)
+            expect(f'invalid saved ingest settings {value!r}: no package or staging is left',
+                   listing() == before, sorted(set(listing()) ^ set(before)))
+    finally:
+        if saved is None:
+            in_api(REMOVE)
+        else:
+            in_api(WRITE, saved)
+    print(f'{len(failures)} invalid saved ingest settings check(s) failed')
     return 1 if failures else 0
 
 

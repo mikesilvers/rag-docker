@@ -820,6 +820,8 @@ count is checked as soon as the ZIP is opened, before anything else; a count equ
 accepted. Over it: 400 `ARCHIVE_TOO_MANY_MEMBERS`, `'<zip>' holds 5,001 entries, more than 5,000,
 the most one zip may hold, so nothing from it was imported. Split it into smaller zips and upload
 them in separate imports.`, `detail` `{"file": "<zip>", "members": [], "members_omitted": 0}`.
+The count is read only after zipfile has loaded the whole central directory into memory, when
+the ZIP is opened, so that memory is bounded only by the 512 MB upload limit.
 
 A member of 1 MiB (1,048,576 bytes) or more, uncompressed, may expand to at most
 `max_zip_member_ratio` (env `MAX_ZIP_MEMBER_RATIO`, default 200) times its compressed size;
@@ -827,9 +829,11 @@ smaller members are exempt, and exactly the ratio is accepted. It is checked on 
 ZIP declares, after the declared total and before any member is read, and again, as a backstop, on
 the bytes the ZIP layer decompresses for each member, after every block read. With CPython's
 zipfile that second check doesn't trigger: zipfile stops reading a member at its declared
-uncompressed size, so a member whose header understates its size fails its CRC check and is
-refused as unreadable (`ARCHIVE_UNREADABLE`, `damaged: Bad CRC-32 ...`), not as
-`ARCHIVE_RATIO_TOO_HIGH`. Only the ZIP layer counts:
+uncompressed size, so a member whose header understates its size usually fails its CRC check
+and is refused as unreadable (`ARCHIVE_UNREADABLE`, `damaged: Bad CRC-32 ...`), not as
+`ARCHIVE_RATIO_TOO_HIGH`. If the header's CRC was also computed over the truncated data, the
+member reads cleanly as a shorter member and isn't refused; that is still safe, since zipfile
+never decompresses beyond the declared size. Only the ZIP layer counts:
 a `.json.gz` or `.jsonl.gz` member's gzip output counts toward the expansion cap, not its ratio.
 Over it, whatever else was found: 400 `ARCHIVE_RATIO_TOO_HIGH`, `'<zip>' can't be imported: its
 member '<member>' expands to more than 200 times its compressed size, which is refused as a
@@ -1004,11 +1008,10 @@ is parsing before its first chunks (#896), and `seconds_left_is_minimum` is `tru
 file, or any unfinished split file's later parts, remain, so the job's time left is then a
 minimum. Before the instance's first measurement the rate and every `seconds_left` are `null`
 (the Import page says "No estimate yet"); there is no default rate. A job that isn't `running`
-has `null` rate and times and
-`seconds_left_is_minimum` `false`; its `file_progress` counts stay. Job records written before
-these fields existed read back with `file_progress: []`, `file_progress_omitted: 0` and the
-other estimate fields `null`/`false`. `GET /ingest/jobs` entries carry `file_progress` as
-recorded, without the computed times.
+has `null` rate and times and `seconds_left_is_minimum` `false`; its `file_progress` counts
+stay. Job records written before these fields existed read back with `file_progress: []`,
+`file_progress_omitted: 0` and the other estimate fields `null`/`false`. `GET /ingest/jobs`
+entries carry `file_progress` as recorded, without the computed times.
 
 `status` values: `"queued"`, `"running"`, `"completed"`, `"partial"` (some files failed),
 `"failed"`.
@@ -2646,6 +2649,15 @@ GET /import/job/{job_id}
 `original_collection` when `rename` resolved a collision. On failure,
 `error_code` is one of the codes in `RAG_EXPORT_SPECIFICATIONS.md` §11 and
 `error_detail` names the offending file, model or collection.
+
+An import whose run is cancelled reads `failed` with `error_code` `IMPORT_FAILED` and the
+`error` "CancelledError: the import was cancelled before it finished. Start the import again."
+Its partial collection is removed as on a failure. Once a `replace` has retained its staging
+copy, the error adds "The imported data is available as '<staging>'." and `error_detail` holds
+`recovered_as` and `sidecar_snapshots`. A partial target whose removal fails gives
+`error_detail` `collection` and `cleanup_pending: true`, and the startup sweep removes it. An
+import whose task is cancelled before its worker starts frees its package claim, then reads
+`failed` the same way (#871).
 
 Validation order, the conflict policies and the atomicity guarantees are
 specified in `RAG_EXPORT_SPECIFICATIONS.md` §6.
@@ -4511,6 +4523,8 @@ now lives once, in `api/services/ingest_config.py`.
       *`test_batch_recovery.py`: `test_startup_check_flags_an_interrupted_cutover_only_once`, `test_complete_cutover_is_not_rechecked_after_later_mutation`, `test_other_instance_decision_is_retired_without_touching_sessions`, `test_unreadable_cutover_stays_pending_until_check_can_finish`, `test_failed_outcome_write_keeps_cutover_pending_for_retry`, `test_handled_failure_after_cutover_records_the_decision` and `test_failed_post_cutover_marking_leaves_the_check_for_startup`.*
 - [x] A tuning job whose run is cancelled ends `failed` `TUNE_FAILED`, never `running`; one cancelled after cutover marks sessions stale, records the cutover decision and reports `recovered_as` and `sidecar_snapshots` as a failure does (#870).
       *`test_batch_recovery.py`: `test_cancellation_before_cutover_fails_the_job_and_leaves_the_original`, `test_cancellation_after_cutover_reports_the_retained_copy`, `test_cancellation_after_reindex_cutover_marks_stale_and_reports_the_copy`, `test_cancellation_while_marking_stale_leaves_the_original_and_says_so`, `test_cancellation_at_the_cutover_record_leaves_the_original_and_says_so` and `test_cancellation_before_the_rebuild_fails_the_job`.*
+- [x] An import job whose run is cancelled ends `failed` `IMPORT_FAILED`, never `running`: a partial target is removed, or keeps its marker for the startup sweep when its removal fails, and one cancelled after a `replace` retained its copy reports `recovered_as` and `sidecar_snapshots` as a failure does; an import whose task is cancelled before its worker starts frees its package claim, then ends `failed` the same way, and a worker that starts late does nothing (#871).
+      *`test_batch_recovery.py`: `test_import_cancelled_before_the_target_claim_fails_and_claims_nothing`, `test_import_cancelled_while_building_a_new_target_removes_it`, `test_import_cancelled_with_a_failed_cleanup_keeps_the_marker_for_startup` and `test_import_cancelled_after_the_replace_reports_the_retained_copy`; `test_import_guard.py`: `test_an_import_cancelled_before_its_worker_runs_is_settled` and `test_an_import_whose_worker_started_is_not_settled_by_its_task`.*
 - [x] A tuning rebuild's recovery copy keeps links inside the sources folder as links and never stores an outside file's bytes; a linked retained-sources folder, config or gold-standard session, dangling or not, is refused before cutover, naming its path relative to its volume, and the original is kept (#881, #886).
       *`test_batch_recovery.py`: `test_failed_cutover_copies_source_links_as_links_never_their_bytes`, `test_linked_sources_folder_is_refused_before_cutover`, `test_success_discards_copied_source_links_without_touching_targets`, `test_linked_config_sidecar_is_refused_before_cutover`, `test_dangling_source_link_is_copied_as_a_link` and `test_dangling_session_link_is_refused_naming_its_path`.*
 - [x] Export includes only approved/edited pairs; excluded count matches rejected + pending.

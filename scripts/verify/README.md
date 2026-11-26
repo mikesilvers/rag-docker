@@ -437,7 +437,13 @@ also checks all saved retrieval fields round-trip. `legacy_retrieval.py` (E28,
 #184) writes a legacy `ef` and other invalid saved settings into the API
 container, then checks through the real API that a legacy `ef` exports and
 imports as `null` with a warning or note, and that other invalid saved settings
-fail the export early with an actionable error and publish nothing. Crafted
+fail the export early with an actionable error and publish nothing.
+`ingest_settings_export.py` (E52, #919) does the same for saved ingest settings: it
+writes a saved file that isn't a JSON object, one with a wrong-typed `chunk_size` and
+one with an invalid `chunk_size` into the API container, and checks through the real
+export job that each export fails with an error naming the collection, the field and
+the Chunking Configuration page, and publishes nothing; it restores the saved file
+afterwards. Crafted
 packages are written under a `.part` name and renamed into place, because on
 Docker Desktop the API can read a freshly written bind-mounted file as empty. Controlled tests complement,
 and do not replace, this live acceptance.
@@ -553,8 +559,11 @@ collection; a target is free again after its import fails; a refused import leav
 the claim with its holder, so a third import of the target is refused too; the claim
 comes before the `COLLECTION_DELETING` check; a refused import never reaches model
 installation, the target stays claimed while its holder installs models, and a
-target is free again after a failed model installation (#492); and a start whose
-first job record can't be stored releases the package name. `05_transfer.sh` runs it
+target is free again after a failed model installation (#492); a start whose
+first job record can't be stored releases the package name; and an import whose task
+is cancelled before its worker runs frees the package name, then reads `failed`
+`IMPORT_FAILED` with the cancelled message, a worker that starts late runs nothing,
+and one that started is left to settle its own job (#871). `05_transfer.sh` runs it
 in the verify project's API container.
 
 `scripts/tests/test_ingest_errors.py` (#290) checks that damaged or unreadable ZIPs are
@@ -696,22 +705,22 @@ in a temporary upload folder, the ingest time estimate: the rate (characters ove
 the last 20 stored parts, weighted by size) saved and read back after a restart, a malformed
 file read as no rate and replaced, ignored and unsaved measurements, the file named outside
 the startup sweep's prefixes with the older `ingest-rate.json` read until it exists, and a
-failed save logged once (#896); the time left a job status
-computes (none before a measurement, a countdown inside the part being stored never below 0,
-a failed file's 0, the "at least" flag for files not reached, a file still being parsed (#896)
-and split files with more parts, nothing for a job that isn't running, old records); and the
-per-file progress the job loop
+failed save logged once (#896); the time left a job status computes (none before a measurement,
+a countdown inside the part being stored never below 0, a failed file's 0, the "at least" flag
+for files not reached, a file still being parsed (#896) and split files with more parts,
+nothing for a job that isn't running, old records); and the per-file progress the job loop
 records for a whole file, a split file (chunked only after its last part, one measurement a
 part), a failed store (not a measurement), a file failing before any chunks (also as the last
 file), a one-file job read before its first part (#896), and the cap on entries. `02_ingest.sh`
-runs it in the API image with no network.
-On the stack, `02_ingest.sh` then checks that the six-type job's finished status lists each
-file's chunk and character counts, all stored, with no rate or time left, and that the real
-store left valid measurements in the API's `UPLOAD_DIR/embedding-rate.json`.
+runs it in the API image with no network. On the stack, `02_ingest.sh` then checks that the
+six-type job's finished status lists each file's chunk and character counts, all stored, with
+no rate or time left, and that the real store left valid measurements in the API's
+`UPLOAD_DIR/embedding-rate.json`.
 `browser/ui_criteria.js` (suite 06) stubs job responses to check the Import page's progress
 panel: "No estimate yet" before a measurement, the rate and "About ... left" ("Under a minute
-left" without "about", #896), "At least ... left" for files not chunked yet and for a split file with more parts, and a finished job's
-per-file counts (failed, done, earlier files not shown) with no estimate.
+left" without "about", #896), "At least ... left" for files not chunked yet and for a split
+file with more parts, and a finished job's per-file counts (failed, done, earlier files not
+shown) with no estimate.
 `browser/ui_criteria.js` (suite 06) checks that the Import page's file picker accepts
 `.jsonl` and `.jsonl.gz` and that its hint names JSONL.
 
