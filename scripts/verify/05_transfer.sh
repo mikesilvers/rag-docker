@@ -300,6 +300,10 @@ check "invalid retrieval imports preserve live collections and settings" $?
 # with a warning or note; other invalid saved settings fail the export early.
 python3 ./legacy_retrieval.py "$API" "$C" "$EXPORTS" "$REPO_ROOT"
 check "E28: legacy ef is cleared on export and import; invalid saved settings fail early" $?
+# Saved ingest settings the API would refuse to save fail the export before any
+# chunk is read, publishing nothing, through the real export job (E52, #919).
+python3 ./ingest_settings_export.py "$API" "$C" "$EXPORTS" "$REPO_ROOT"
+check "E52: invalid saved ingest settings fail the export early, publishing nothing" $?
 
 # ── evaluation metadata is validated before mutation (E23) ──────────────────
 # Add one evaluation sidecar to a copy of the package and re-sign the manifest,

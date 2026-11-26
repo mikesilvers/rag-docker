@@ -19,7 +19,8 @@ class SessionImplementationTests(unittest.TestCase):
                                       ('api/templates/retrieve.py.tmpl', '```', 'python'),
                                       ('scripts/tests/test_retrieval_import.py', '```', 'python'),
                                       ('scripts/verify/retrieval_settings.py', '```', 'python'),
-                                      ('scripts/verify/legacy_retrieval.py', '```', 'python')]:
+                                      ('scripts/verify/legacy_retrieval.py', '```', 'python'),
+                                      ('scripts/verify/ingest_settings_export.py', '```', 'python')]:
             with self.subTest(path=name):
                 header = '### ' + name + '\n\n' + fence + language + '\n'
                 start = implementation.index(header) + len(header)
