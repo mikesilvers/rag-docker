@@ -8150,8 +8150,17 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
                 if job and job["status"] not in ("completed", "partial", "failed"):
                     # The error first: the status change is the write that saves
                     # the record (#23), and an in-place append is not seen alone.
-                    job["errors"].append(str(exc))
-                    job["status"] = "failed"
+                    if isinstance(exc, Exception):
+                        job["errors"].append(str(exc))
+                        job["status"] = "failed"
+                    else:
+                        # A cancellation (or another non-Exception) has no message of
+                        # its own; the files it stored count, as after a restart (#529).
+                        job["errors"].append(f"{type(exc).__name__}: the ingest was cancelled "
+                                             "before it finished. Re-upload the files to try again.")
+                        completed = job.get("files_completed")
+                        job["status"] = ("partial" if isinstance(completed, int) and completed > 0
+                                         else "failed")
 
     future = asyncio.get_running_loop().run_in_executor(
         None,
@@ -14266,6 +14275,10 @@ _starting: dict[str, asyncio.Future] = {}
 # write then gets EXPORT_STARTING instead of holding every later request (#338).
 START_WAIT = 30.0
 _lock = threading.Lock()
+# Export workers that have started, and jobs settled before their worker
+# could start (#529): whichever comes first wins, under _lock.
+_started: set[str] = set()
+_abandoned: set[str] = set()
 
 
 class ExportStartingError(Exception):
@@ -14385,6 +14398,18 @@ def _run(job_id: str, collection: str, include_models: bool,
                 del _active[collection]
 
 
+def _worker(job_id: str, collection: str, include_models: bool,
+            passphrase: str | None = None, encryption: str | None = None) -> None:
+    """The export task's worker: runs `_run` unless the task has already settled
+    the job, because it ended before this worker could start (#529)."""
+    with _lock:
+        if job_id in _abandoned:
+            _abandoned.discard(job_id)
+            return
+        _started.add(job_id)
+    _run(job_id, collection, include_models, passphrase, encryption)
+
+
 async def start_export_job(collection: str, include_models: bool = False,
                            passphrase: str | None = None, owner: dict | None = None,
                            encryption: str | None = None) -> str:
@@ -14475,10 +14500,34 @@ async def start_export_job(collection: str, include_models: bool = False,
     # to_thread keeps the blocking Weaviate iteration off the event loop, so an
     # export does not stall the API: queries and other collections carry on, and
     # only guarded writes to this collection wait for it (spec §6.1, #509).
-    task = asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, collection, include_models,
-                                         passphrase, encryption))
-    # _run ends it first; this also covers a task that never ran its worker.
-    task.add_done_callback(lambda _task: collection_writes.end_job("export", job_id))
+    task = asyncio.create_task(asyncio.to_thread(telemetry.admitted(_worker), job_id, collection,
+                                                 include_models, passphrase, encryption))
+
+    def _done(task: asyncio.Task) -> None:
+        # _run ends the registration first; this also covers a task that never
+        # ran its worker. Such a task (cancelled before its thread started, #529)
+        # settles the job here: registration, then slot, then status (#40), so a
+        # client that sees it fail can delete the collection or export again.
+        collection_writes.end_job("export", job_id)
+        with _lock:
+            if job_id in _started:
+                # The worker ran, or is running: it settles its own job.
+                _started.discard(job_id)
+                return
+            _abandoned.add(job_id)
+            if _active.get(collection) == job_id:
+                del _active[collection]
+        _log.warning("Export of %r cancelled before it started", collection)
+        job = _jobs.get(job_id)
+        # This write stays on the event loop, as ingest's done callback's does
+        # (#309): a done callback is synchronous and saves one small record.
+        # error_code stays null, as for a build that is cancelled (#529).
+        if job is not None and job.get("status") not in jobstore.TERMINAL:
+            name = "CancelledError" if task.cancelled() else type(task.exception()).__name__
+            job.update(status="failed", error=f"{name}: the export was cancelled before it "
+                       "finished. Start the export again.")
+
+    task.add_done_callback(_done)
     return job_id
 ```
 
@@ -15432,7 +15481,7 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
                 f"match their checksums. Restore it, or re-pull it with "
                 f"`docker compose exec ollama ollama pull {ref}`, then import again.",
                 {"model": name})
-        if model_bundle.model_ref(model) not in bundled:
+        if ref not in bundled:
             if not required:
                 notes.append(f"model '{ref}' is absent and not bundled; "
                              "queries will fail until it is pulled")
@@ -30755,7 +30804,7 @@ Suite 05 also runs `scripts/tests/test_batch_implementation.py` on the host (Pyt
 
 `05_transfer.sh` registers the ten controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_export_snapshot.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_import_guard.py`, `test_batch_recovery.py`, `test_package_listing.py`, `test_export_encryption.py` and `test_package_download.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links. It also checks (#509) that export writes a `null` `source_sha256` for a chunk whose retained blob is missing on disk, and that import check 3a refuses a chunk whose non-null `source_sha256` isn't a digest of the package's source index (with or without `sources/`) as `PACKAGE_CORRUPT`, `detail` `{"file": "chunks.jsonl", "line": n}`, before the embedding check and any backend work. Since #520 it checks that a name the index lists under two digests, one of them missing on disk, exports `null` for its chunks and its parts while a unique name still links; that check 3a refuses a `chunks.jsonl` line that isn't valid JSON, naming its line, and leaves blank lines and non-object records to the insert-time checks; and that bad ingest settings (check 4c) are still refused when the chunks resolve, while a package failing both names `chunks.jsonl`, before models or any backend call.
 
-`scripts/tests/test_export_snapshot.py` (#509, API container) drives `exporter._run` with the real `packager.build` and retained-source store and a mocked Weaviate backend whose iterator reads the stored chunks one at a time. A re-ingest that tries to commit new chunks and a new `doc.txt` source after the first chunk is streamed waits for the export: the package holds the old chunk text and the old source bytes and index, every chunk's `source_sha256` names a blob in `sources/`, and the re-ingest lands after the build. During an export, gold-standard generation preparation answers `COLLECTION_BUSY` (409) and a guarded chunk insert waits; an export started while another writer holds the guard reads `queued` until it is released; and the guard is free again after an export that succeeds, is refused (`PackageError`), fails or is cancelled. An export whose build is cancelled, or ended by another non-`Exception`, reads `failed` with an `error` naming the exception and saying it was cancelled, and the exception still propagates (#521). Orderings use events and the guard's waiter count. On the code before #509 the re-ingest, generation, insert, queued and guard-held checks fail; on the code before #521 the cancelled-status checks fail. Since #520 it also checks that an export blocks only its own collection, so its first-character alias is refused busy and another collection's writer goes ahead; that a replace-import started mid-export waits on the guard and reaches its conflict (existence) check only after the build; and that a query (`rag_pipeline.run_query`, Ollama mocked) completes during the export.
+`scripts/tests/test_export_snapshot.py` (#509, API container) drives `exporter._run` with the real `packager.build` and retained-source store and a mocked Weaviate backend whose iterator reads the stored chunks one at a time. A re-ingest that tries to commit new chunks and a new `doc.txt` source after the first chunk is streamed waits for the export: the package holds the old chunk text and the old source bytes and index, every chunk's `source_sha256` names a blob in `sources/`, and the re-ingest lands after the build. During an export, gold-standard generation preparation answers `COLLECTION_BUSY` (409) and a guarded chunk insert waits; an export started while another writer holds the guard reads `queued` until it is released; and the guard is free again after an export that succeeds, is refused (`PackageError`), fails or is cancelled. An export whose build is cancelled, or ended by another non-`Exception`, reads `failed` with an `error` naming the exception and saying it was cancelled, and the exception still propagates (#521). Such an export also frees its one-export slot and its delete registration, and the registration has ended when the status turns terminal (#529). Orderings use events and the guard's waiter count. On the code before #509 the re-ingest, generation, insert, queued and guard-held checks fail; on the code before #521 the cancelled-status checks fail. Since #520 it also checks that an export blocks only its own collection, so its first-character alias is refused busy and another collection's writer goes ahead; that a replace-import started mid-export waits on the guard and reaches its conflict (existence) check only after the build; and that a query (`rag_pipeline.run_query`, Ollama mocked) completes during the export.
 
 `scripts/tests/test_session_import.py` exercises the real package reader and
 evaluation persistence with disposable fixtures. Model and database mutation
@@ -31160,6 +31209,13 @@ exports of other collections never wait. The wait is bounded (#338): past it, th
 start gives up holding nothing and the route answers `409 EXPORT_STARTING` with no job id.
 The bound counts once, from the second start's first wait: when the first start's write fails
 and another start takes the slot, waiting again on that one doesn't restart it (#347).
+An export task cancelled before its worker starts frees the collection's export slot and its
+delete registration, then reads `failed` with the cancelled message and `error_code` `null`,
+as does one whose task fails before its worker starts (the message names the error's type),
+and a worker that starts late does nothing; one whose worker has started is left to the worker,
+and one that ends normally leaves no bookkeeping behind (#529). An error that escapes the ingest worker is saved with the `failed` status, and a
+cancellation that escapes it is named in `errors` and reads `partial` when files completed,
+otherwise `failed` (#529).
 `02_ingest.sh` runs it in the API container. With
 `RAG_ALLOW_RESTART=1`, `02_ingest.sh` also restarts the API
 (`docker compose restart --timeout 0 api`) while two uploads are part-way and checks that a
@@ -31441,7 +31497,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_json_ingest.py` | controlled ordinary-JSON conversion regressions, registered by ingest |
 | `../tests/test_jsonl_ingest.py` | controlled JSON Lines reading, conversion, limit and gzip regressions, registered by ingest |
 | `../tests/test_delete_busy.py` | controlled delete-while-busy registry, request-ordering and job-report regressions, registered by ingest |
-| `../tests/test_jobstore.py` | controlled job-record persistence, throttling, startup marking and retention regressions, registered by ingest |
+| `../tests/test_jobstore.py` | controlled job-record persistence, throttling, startup marking and retention regressions, and cancelled export and ingest jobs (#529), registered by ingest |
 | `../tests/test_reingest.py` | controlled re-ingest replacement, exact-name selection (#622), same-name upload, macOS ZIP metadata, retention and rechunk-coverage regressions, registered by ingest |
 | `../tests/test_split_parts.py` | controlled regressions for files over the per-file limits stored as parts (#621): the reviewer's 13,000 records, files over 10,000,000 characters, family replacement, all or nothing, cuts, CSV, Markdown, encoding, `overlap` sizing, re-chunk and export links, registered by ingest |
 | `../tests/test_large_corpus.py` | controlled large-corpus regressions (#312): retention by path in blocks, a large retained original through export and import, the re-chunk reader staging one part at a time and its refusals, `chunks_total` following staging; registered by ingest in the API image with the repository mounted |
@@ -31451,7 +31507,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_collection_spelling.py` | controlled regressions for per-collection state keyed by the stored collection name (#372), registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal, unresolvable chunk-source refusal and export read-boundary regressions, and an index that isn't JSON answering `SOURCE_INDEX_INVALID` at the tuning options, refusing export and left unchanged by an ingest (#52), registered by transfer |
-| `../tests/test_export_snapshot.py` | controlled export writer-guard regressions: a mid-export re-ingest can't change the package, busy and waiting writers, guard release (#509), a cancelled export's status (#521), only its own collection blocked, a waiting replace-import and a query during an export (#520), registered by transfer |
+| `../tests/test_export_snapshot.py` | controlled export writer-guard regressions: a mid-export re-ingest can't change the package, busy and waiting writers, guard release (#509), a cancelled export's status (#521) and its slot and registration (#529), only its own collection blocked, a waiting replace-import and a query during an export (#520), registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
 | `../tests/test_batch_recovery_fixture.py` | controlled check that the import package `batch_recovery.py`'s `write_import_package` writes passes the importer's real digest and source checks; run in the API image with no network and the repository mounted read-only, registered by transfer |
 | `../tests/test_package_listing.py` | controlled package-listing regressions (#383): the listing reads each archive only up to its manifest, new archives put the manifest first, an oversized manifest and other unreadable files are listed `readable: false`, and so is a manifest with a wrongly typed listed value (#451); run in the API image with no network, registered by transfer |
@@ -50595,7 +50651,7 @@ check "bundled-model install safety, E21 install and E22 EMBEDDING_MODEL_MISSING
 check "real embedding model exported, installed and refused when mismatched" $?
 # The package listing reads each manifest without decompressing the package (#383).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_package_listing.py)
-check "the package listing reads only up to each manifest (#383)" $?
+check "the package listing reads only up to each manifest (#383, #451)" $?
 # Passphrase encryption (#27): the age module against the CCTV vectors, export,
 # import, listing and refusals, with no backend.
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_export_encryption.py)
@@ -51530,6 +51586,11 @@ from config import settings
 from services import importer, model_bundle as models
 alias, name = "vfy-install-alias:latest", "vfy-install-alias"
 out = {"error": None}
+if Path(settings.ollama_models_dir) != Path("/ollama"):  # the api mount the guard above inspected (#582)
+    out["error"] = (f"OLLAMA_MODELS_DIR is {settings.ollama_models_dir!r}, not /ollama, "
+                    "the path the mount guard checked; nothing was written")
+    print(json.dumps(out))
+    raise SystemExit(0)
 target = models.manifest_path(alias)
 try:
     own = models.manifest_path(settings.embed_model)
@@ -72472,6 +72533,141 @@ class StartTests(StoreTestCase):
         self.assertEqual(exporter._starting, {})
         self.release_export(name, started[0])
 
+    def test_an_export_cancelled_before_its_worker_runs_is_settled(self):
+        # #529: a task ended before its worker thread started frees the slot and
+        # the registration, then reads failed with the #521 message, error_code null.
+        module, store, calls = self.harness("export")
+        name = "Vfy529Queued"
+        seen = []
+        changed = store._changed
+
+        def spy(record, status_changed):
+            if status_changed:
+                seen.append((("export", record["job_id"]) in collection_writes.active_jobs(name),
+                             exporter._active.get(name)))
+            changed(record, status_changed)
+
+        async def run():
+            before = asyncio.all_tasks()
+            job_id = await exporter.start_export_job(name)
+            (task,) = asyncio.all_tasks() - before - {asyncio.current_task()}
+            task.cancel()                    # it hasn't run a step: no worker is submitted
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            for _ in range(500):
+                if store[job_id]["status"] in jobstore.TERMINAL:
+                    break
+                await asyncio.sleep(0.01)
+            return job_id
+
+        with patch.object(store, "_changed", side_effect=spy):
+            job_id = asyncio.run(run())
+        record = self.on_disk("export", job_id)
+        self.assertEqual(record["status"], "failed")
+        self.assertEqual(record["error"], "CancelledError: the export was cancelled before it "
+                                          "finished. Start the export again.")
+        self.assertIsNone(record.get("error_code"))
+        self.assertEqual(seen, [(False, None)])
+        self.assertIsNone(exporter.active_job_for(name))
+        self.assertEqual(collection_writes.active_jobs(name), [])
+        self.assertEqual(calls, [])
+        # a worker that starts late finds its job settled and does nothing
+        exporter._worker(job_id, name, False)
+        self.assertEqual(calls, [])
+        self.assertNotIn(job_id, exporter._abandoned)
+        self.assertNotIn(job_id, exporter._started)
+
+    def test_an_export_whose_worker_started_is_not_settled_by_its_task(self):
+        # #529: once the worker runs, it settles its own job, even if its task
+        # is cancelled meanwhile (the thread carries on).
+        module, store, calls = self.harness("export")
+        name = "Vfy529Running"
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def worker(*args, **kwargs):
+            entered.set()
+            release.wait(10)
+
+        async def run():
+            loop = asyncio.get_running_loop()
+            before = asyncio.all_tasks()
+            job_id = await exporter.start_export_job(name)
+            (task,) = asyncio.all_tasks() - before - {asyncio.current_task()}
+            self.assertTrue(await loop.run_in_executor(None, entered.wait, 10))
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            await asyncio.sleep(0)               # the done callback has run
+            state = (store[job_id]["status"], exporter._active.get(name),
+                     job_id in exporter._started, job_id in exporter._abandoned)
+            release.set()
+            return job_id, state
+
+        with patch.object(exporter, "_run", side_effect=worker):
+            job_id, state = asyncio.run(run())
+        self.assertEqual(state, ("queued", job_id, False, False))
+        self.release_export(name, job_id)
+
+    def test_an_export_whose_task_fails_before_its_worker_runs_is_settled(self):
+        # #529: a task that ends with an error before its worker runs (to_thread
+        # itself raised, as when the executor is shut down) is settled like a
+        # cancelled one: slot and registration freed, then failed, error_code null,
+        # and the error names the exception's type.
+        module, store, calls = self.harness("export")
+        name = "Vfy529Refused"
+        real = asyncio.to_thread
+
+        async def refusing(fn, *args, **kwargs):
+            if getattr(fn, "__name__", "") == "_worker":
+                raise RuntimeError("cannot schedule new futures after shutdown")
+            return await real(fn, *args, **kwargs)
+
+        async def run():
+            before = asyncio.all_tasks()
+            job_id = await exporter.start_export_job(name)
+            (task,) = asyncio.all_tasks() - before - {asyncio.current_task()}
+            with self.assertRaises(RuntimeError):
+                await task
+            for _ in range(500):
+                if store[job_id]["status"] in jobstore.TERMINAL:
+                    break
+                await asyncio.sleep(0.01)
+            return job_id
+
+        with patch.object(asyncio, "to_thread", side_effect=refusing):
+            job_id = asyncio.run(run())
+        self.addCleanup(exporter._abandoned.discard, job_id)
+        record = self.on_disk("export", job_id)
+        self.assertEqual(record["status"], "failed")
+        self.assertEqual(record["error"], "RuntimeError: the export was cancelled before it "
+                                          "finished. Start the export again.")
+        self.assertIsNone(record.get("error_code"))
+        self.assertIsNone(exporter.active_job_for(name))
+        self.assertEqual(collection_writes.active_jobs(name), [])
+        self.assertEqual(calls, [])
+
+    def test_an_export_that_runs_to_the_end_leaves_no_bookkeeping(self):
+        # #529: a worker that ran and a task that ended normally leave neither
+        # set holding the job, and the done callback doesn't touch its status.
+        module, store, calls = self.harness("export")
+        name = "Vfy529Done"
+
+        async def run():
+            before = asyncio.all_tasks()
+            job_id = await exporter.start_export_job(name)
+            (task,) = asyncio.all_tasks() - before - {asyncio.current_task()}
+            await task
+            await asyncio.sleep(0)               # the done callback has run
+            return job_id
+
+        job_id = asyncio.run(run())
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn(job_id, exporter._started)
+        self.assertNotIn(job_id, exporter._abandoned)
+        self.assertEqual(store[job_id]["status"], "queued")   # the stub worker wrote nothing
+        self.release_export(name, job_id)
+
     def test_the_route_answers_export_starting_with_no_job_id(self):
         from unittest.mock import AsyncMock
         from models.schemas import ExportRequest
@@ -72489,27 +72685,47 @@ class StartTests(StoreTestCase):
 
 
 class IngestFallbackTests(StoreTestCase):
-    def test_an_error_that_escapes_the_worker_is_saved_with_the_status(self):
+    def on_done(self, record, exc):
+        """Runs `_on_done` on a stored ingest record and a future that failed with
+        `exc`, and returns the record as saved."""
         store = self.bound("ingest")
+        job_id = record["job_id"]
         with patch.object(ingest_pipeline, "_jobs", store):
-            store["ffff0001"] = {"job_id": "ffff0001", "status": "running", "files_total": 1,
-                                 "files_completed": 0, "files_failed": 0, "chunks_stored": 0,
-                                 "errors": [], "skipped": []}
+            store[job_id] = record
             source = Path(ingest_pipeline.__file__).read_text()
             start = source.index("    def _on_done(future")
             end = source.index("    future = asyncio.get_running_loop()", start)
             namespace = {"collection_writes": ingest_pipeline.collection_writes,
-                         "_log": ingest_pipeline._log, "_jobs": store, "job_id": "ffff0001",
+                         "_log": ingest_pipeline._log, "_jobs": store, "job_id": job_id,
                          "asyncio": asyncio, "telemetry": ingest_pipeline.telemetry}
             exec("\n".join(line[4:] for line in source[start:end].splitlines()), namespace)
             loop = asyncio.new_event_loop()
             future = loop.create_future()
-            future.set_exception(RuntimeError("worker crashed"))
+            future.set_exception(exc)
             namespace["_on_done"](future)
             loop.close()
-        record = self.on_disk("ingest", "ffff0001")
+        return self.on_disk("ingest", job_id)
+
+    def test_an_error_that_escapes_the_worker_is_saved_with_the_status(self):
+        record = self.on_done({"job_id": "ffff0001", "status": "running", "files_total": 1,
+                               "files_completed": 0, "files_failed": 0, "chunks_stored": 0,
+                               "errors": [], "skipped": []}, RuntimeError("worker crashed"))
         self.assertEqual((record["status"], record["errors"]), ("failed", ["worker crashed"]))
 
+    def test_a_cancellation_that_escapes_the_worker_is_named_and_counts_stored_files(self):
+        # #529: a cancellation has no message of its own, and the files stored
+        # before it count, as after a restart: partial if any completed.
+        message = ("CancelledError: the ingest was cancelled before it finished. "
+                   "Re-upload the files to try again.")
+        for completed, status in ((0, "failed"), (2, "partial")):
+            with self.subTest(files_completed=completed):
+                job_id = f"ffff052{completed}"
+                record = self.on_done({"job_id": job_id, "status": "running", "files_total": 3,
+                                       "files_completed": completed, "files_failed": 0,
+                                       "chunks_stored": 0, "errors": [], "skipped": []},
+                                      asyncio.CancelledError())
+                self.assertEqual((record["status"], record["errors"], record["files_completed"]),
+                                 (status, [message], completed))
 
 if __name__ == "__main__":
     if not os.environ.get("RAG_TEST_LOG_LEVEL"):

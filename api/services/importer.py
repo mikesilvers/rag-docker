@@ -538,7 +538,7 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
                 f"match their checksums. Restore it, or re-pull it with "
                 f"`docker compose exec ollama ollama pull {ref}`, then import again.",
                 {"model": name})
-        if model_bundle.model_ref(model) not in bundled:
+        if ref not in bundled:
             if not required:
                 notes.append(f"model '{ref}' is absent and not bundled; "
                              "queries will fail until it is pulled")
