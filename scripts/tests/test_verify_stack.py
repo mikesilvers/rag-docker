@@ -597,6 +597,49 @@ class ApiPathsFirstStartTests(unittest.TestCase):
         self.assertEqual(removed[0][removed[0].index('-p') + 1], 'rag-verify')
 
 
+class WeaviateUpgradeGateTests(unittest.TestCase):
+    """#805: suite 25 is skipped under RAG_SKIP_SLOW=1 and refused off the verify project,
+    in both cases before any Docker call, run with Docker and curl stubbed."""
+
+    BOTH = '/c/docker-compose.yml:/h/docker-compose.verify.yml'
+
+    def run_suite(self, **env):
+        box = Sandbox(self)
+        setup = box.root / 'auth_setup.py'
+        (box.root / 'auth').mkdir()
+        setup.write_text('import json, os, sys\n'
+                         'open(os.environ["STUB_LOG"], "a").write(json.dumps(["auth_setup"] + sys.argv[1:]) + "\\n")\n'
+                         'if sys.argv[1] == "login": open(sys.argv[3], "w").close()\n')
+        result = box.run(['bash', str(VERIFY / '25_weaviate_upgrade.sh')], STUB_CURL_CODE='200',
+                         RAG_API='http://localhost:9/api', RAG_AUTH_SETUP=str(setup),
+                         RAG_AUTH_DIR=str(box.root / 'auth'), **env)
+        docker = [call for call in box.calls() if call[:1] == ['docker']]
+        return result, docker
+
+    def test_skipped_in_a_skip_slow_run(self):
+        result, docker = self.run_suite(RAG_SKIP_SLOW='1', COMPOSE_PROJECT_NAME='rag-verify',
+                                        COMPOSE_FILE=self.BOTH)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertRegex(result.stdout, r'SKIP\s+the Weaviate upgrade path[^\n]*full runs only')
+        self.assertEqual(docker, [])
+
+    def test_another_project_is_refused(self):
+        result, docker = self.run_suite(RAG_SKIP_SLOW='0', COMPOSE_PROJECT_NAME='my-rag',
+                                        COMPOSE_FILE=self.BOTH)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertRegex(result.stdout, r'FAIL\s+the Weaviate upgrade path runs only on the verify project'
+                                        r'[^\n]*rag-verify')
+        self.assertEqual(docker, [])
+
+    def test_verify_project_without_the_overlay_is_refused(self):
+        result, docker = self.run_suite(RAG_SKIP_SLOW='0', COMPOSE_PROJECT_NAME='rag-verify',
+                                        COMPOSE_FILE='/c/docker-compose.yml')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertRegex(result.stdout, r'FAIL\s+the Weaviate upgrade path runs only on the verify project'
+                                        r'[^\n]*docker-compose\.verify\.yml')
+        self.assertEqual(docker, [])
+
+
 # Weaviate's measured cold start on a copy of real data, rounded up to 30s (#130).
 WEAVIATE_START_PERIOD_S = 180
 # The restart check's default limit: the start period plus 60s (#130).
