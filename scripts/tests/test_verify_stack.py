@@ -738,6 +738,92 @@ class RestartTimingTests(unittest.TestCase):
                 self.assertIn(text, result.stdout)
 
 
+class RegenerationRetryTests(unittest.TestCase):
+    """RD-260: suite 04's regeneration retry, run on the host with curl scripted.
+
+    Only 502 PAIR_GENERATION_FAILED is tried again, 3 attempts at most (#483),
+    and a pass after a retry says so in the log.
+    """
+
+    FAILED = (502, '{"error":{"code":"PAIR_GENERATION_FAILED"}}')
+    OK = (200, '{"pair_id":"p_1","question":"q"}')
+
+    def run_helper(self, answers):
+        box = Sandbox(self)
+        script = box.root / 'answers'
+        script.write_text(''.join(f'{code}\t{body}\n' for code, body in answers))
+        calls = box.root / 'calls'
+        answer = box.root / 'answer.json'
+        stubs = textwrap.dedent(r"""
+            _rag_require_lock_owner() { echo lock >> "$CALLS"; }
+            curl() {
+              local out="" prev="" a line
+              for a in "$@"; do [ "$prev" = -o ] && out="$a"; prev="$a"; done
+              printf 'curl' >> "$CALLS"; printf '\x1f%s' "$@" >> "$CALLS"; echo >> "$CALLS"
+              line=$(sed -n "$(grep -c '^curl' "$CALLS")p" "$ANSWERS")
+              printf '%s' "${line#*$'\t'}" > "$out"
+              printf '%s' "${line%%$'\t'*}"
+            }
+        """)
+        result = box.run(['bash', '-c', f'. "{VERIFY}/lib.sh"\n{stubs}\n'
+                          'regeneration_retry_check regen gs_1 p_1 "$ANSWER"; echo "PASS=$PASS FAIL=$FAIL"'],
+                         RAG_API='http://localhost:9/api', CALLS=str(calls), ANSWERS=str(script),
+                         ANSWER=str(answer))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = calls.read_text().splitlines() if calls.exists() else []
+        requests = [line.split('\x1f')[1:] for line in lines if line.startswith('curl')]
+        return result.stdout, lines, requests, answer.read_text() if answer.exists() else None
+
+    def test_first_attempt_pass(self):
+        out, _, requests, _ = self.run_helper([self.OK])
+        self.assertEqual(len(requests), 1)
+        self.assertIn('PASS  regen\n', out)
+        self.assertIn('PASS=1 FAIL=0', out)
+        self.assertNotIn('passed on attempt', out)
+
+    def test_pass_after_retry_is_logged(self):
+        out, _, requests, _ = self.run_helper([self.FAILED, self.OK])
+        self.assertEqual(len(requests), 2)
+        self.assertIn('PASS  regen\n      passed on attempt 2 of 3; retried: attempt 1 HTTP 502 '
+                      'PAIR_GENERATION_FAILED\n', out)
+        self.assertIn('PASS=1 FAIL=0', out)
+        out, _, requests, _ = self.run_helper([self.FAILED, self.FAILED, self.OK])
+        self.assertEqual(len(requests), 3)
+        self.assertIn('      passed on attempt 3 of 3; retried: attempt 1 HTTP 502 PAIR_GENERATION_FAILED, '
+                      'attempt 2 HTTP 502 PAIR_GENERATION_FAILED\n', out)
+
+    def test_other_answers_stop_at_once(self):
+        for code, error in ((409, 'GENERATION_IN_PROGRESS'), (504, 'PAIR_GENERATION_TIMEOUT'),
+                            (502, 'OTHER_FAILURE')):
+            with self.subTest(code=code, error=error):
+                body = json.dumps({'error': {'code': error}})
+                out, _, requests, _ = self.run_helper([(code, body), self.OK])
+                self.assertEqual(len(requests), 1)
+                self.assertIn(f'FAIL  regen  — HTTP {code} {error} after 1 attempt(s)', out)
+                self.assertIn('PASS=0 FAIL=1', out)
+                self.assertNotIn('passed on attempt', out)
+
+    def test_three_attempts_at_most(self):
+        out, _, requests, _ = self.run_helper([self.FAILED] * 4 + [self.OK])
+        self.assertEqual(len(requests), 3)
+        self.assertIn('FAIL  regen  — HTTP 502 PAIR_GENERATION_FAILED after 3 attempt(s)', out)
+        self.assertNotIn('passed on attempt', out)
+
+    def test_lock_checked_and_request_kept(self):
+        _, lines, requests, _ = self.run_helper([self.FAILED, self.OK])
+        self.assertEqual([line.split('\x1f')[0] for line in lines], ['lock', 'curl', 'lock', 'curl'])
+        for args in requests:
+            with self.subTest(args=args):
+                self.assertEqual(args[args.index('-m') + 1], '1920')
+                self.assertTrue(args[args.index('-o') + 1].endswith('/answer.json'))
+                self.assertIn('http://localhost:9/api/goldstandard/regenerate', args)
+                self.assertEqual(args[args.index('-X') + 1], 'POST')
+                self.assertEqual(json.loads(args[args.index('-d') + 1]), {'session_id': 'gs_1', 'pair_id': 'p_1'})
+
+    def test_answer_file_holds_last_answer(self):
+        _, _, _, answer = self.run_helper([self.FAILED, self.OK])
+        self.assertEqual(answer, self.OK[1])
+
 class StackArgumentTests(unittest.TestCase):
     """S7 and S8: bad arguments are refused before any Docker command."""
 
