@@ -8,7 +8,10 @@
 # for that process only, leaving the answer model as compose sets it: the API
 # itself and the compose settings are not changed. Its collection is
 # VfyLlmSplit, removed at the end; it creates no preparation document and no
-# gold standard session.
+# gold standard session. Its model pull is retried on a 5xx; a pull that fails
+# anyway is one failed check, with the model checks skipped (#922).
+# ../tests/test_llm_split.py checks both on the host, in every run but an
+# external-Ollama one.
 #
 # External-Ollama mode (#673) skips it: the Ollama there is the host's own,
 # shared with other apps, and rag-docker never pulls or deletes a model in it.
@@ -30,6 +33,9 @@ trap 'rm -f "$OUT" /tmp/vfy_llm_split_ingest.json' EXIT
 
 section "Build and answer models (#671)"
 
+python3 "$REPO_ROOT/scripts/tests/test_llm_split.py"
+check "llm_split.py retries its model pull on a 5xx and reports a failed pull as one setup error (#922)" $?
+
 if [ "$SKIP_SLOW" = "1" ]; then
   skip "preparation and gold standard on the build model, query on the answer model" \
     "set RAG_SKIP_SLOW=0 to include it"
@@ -44,9 +50,18 @@ check_eq "the collection for the query is ingested" "$(wait_for_job "/ingest/job
 
 (cd "$REPO_ROOT" && docker compose exec -T -e BUILD_LLM_MODEL="$SMALL" -e RAG_LLM_SPLIT_COLLECTION="$C" \
   api python - < scripts/verify/llm_split.py) > "$OUT"
-check "llm_split.py ran to the end" $? "$(tail -c 400 "$OUT")"
+ran=$?
 
 f() { python3 -c "import json,sys;print(json.loads(open(sys.argv[1]).read().strip().splitlines()[-1]).get(sys.argv[2]))" "$OUT" "$1" 2>/dev/null; }
+# A pull that failed is one setup error, not a failure of every check below (#922).
+setup_error="$(f setup_error)"
+if [ -n "$setup_error" ] && [ "$setup_error" != "None" ]; then
+  check "the build model is pulled into the verify project's Ollama" 1 "$setup_error"
+  skip "the build and answer model checks" "they need the build model pulled"
+  drop_collection "$C"
+  summary; exit $?
+fi
+check "llm_split.py ran to the end" "$ran" "$(tail -c 400 "$OUT")"
 check_eq "with BUILD_LLM_MODEL set, the API resolves it as the build model" "$(f build_model)" "$SMALL"
 answer="$(f answer_model)"
 [ -n "$answer" ] && [ "$answer" != "None" ] && [ "$answer" != "$SMALL" ]

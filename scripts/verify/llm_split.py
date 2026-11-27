@@ -9,9 +9,12 @@ standard pair and one query through the services' own code, recording the model
 Ollama reports in each /api/chat reply (the calls themselves are unchanged).
 Preparation writes its parts to a temporary folder and the pair isn't stored,
 so nothing is left behind; the build model is deleted from Ollama at the end.
+The pull is tried again when Ollama answers with a 5xx (3 attempts, waiting 5 s
+and then 10 s); a pull that still fails, or fails another way, runs no task and
+is reported as `setup_error` (#922).
 Prints one JSON line: the resolved models (as set, and as `name:tag`) and, per
 task, the sorted set of models that answered (Ollama's names, `name:tag`) and,
-when the task raised, `<task>_error`.
+when the task raised, `<task>_error`; or, when the pull failed, `setup_error`.
 
 In external-Ollama mode (RAG_EXTERNAL_OLLAMA=true) it refuses before any request
 and exits 2: that Ollama is shared, and rag-docker never pulls or deletes a model
@@ -22,6 +25,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import httpx
@@ -54,9 +58,30 @@ out = {"build_model": settings.build_model, "answer_model": settings.answer_mode
        "answer_tagged": tagged(settings.answer_model)}
 build = settings.build_model
 
-# The build model, pulled into the verify project's Ollama (removed below).
-httpx.post(f"{BASE}/api/pull", json={"name": build, "stream": False},
-           timeout=1800).raise_for_status()
+# The build model, pulled into the verify project's Ollama (removed below). A
+# 5xx, which a busy Ollama gives now and then, is tried again (#922).
+PULL_WAITS = (5, 10)                  # seconds before the 2nd and the 3rd attempt
+PULL_ATTEMPTS = len(PULL_WAITS) + 1
+
+
+def pull(name):
+    """Pulls name into Ollama: None once it is pulled, else why it wasn't."""
+    for attempt in range(1, PULL_ATTEMPTS + 1):
+        try:
+            response = httpx.post(f"{BASE}/api/pull", json={"name": name, "stream": False},
+                                  timeout=1800)
+        except httpx.HTTPError as exc:
+            return f"{type(exc).__name__}: {exc}"
+        if response.is_success:
+            return None
+        if response.status_code < 500 or attempt == PULL_ATTEMPTS:
+            tries = f"{attempt} attempt" + ("s" if attempt > 1 else "")
+            return f"HTTP {response.status_code} after {tries}: {response.text[:200]}"
+        wait = PULL_WAITS[attempt - 1]
+        print(f"pull of {name}: attempt {attempt} of {PULL_ATTEMPTS} answered HTTP "
+              f"{response.status_code}; trying again in {wait} s", file=sys.stderr)
+        time.sleep(wait)
+
 
 seen = []
 real_post = httpx.AsyncClient.post
@@ -110,9 +135,13 @@ async def query():
 
 
 try:
-    task("prepare", prepare())
-    task("goldstandard", gold_pair())
-    task("query", query())
+    failed = pull(build)
+    if failed:
+        out["setup_error"] = f"could not pull {build} into the verify project's Ollama: {failed}"
+    else:
+        task("prepare", prepare())
+        task("goldstandard", gold_pair())
+        task("query", query())
 finally:
     httpx.AsyncClient.post = real_post
     try:
