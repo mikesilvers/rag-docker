@@ -19,8 +19,12 @@ router = APIRouter()
 # AI Engineers the full report, with the same 200/503 rule.
 
 
-async def _report() -> tuple[bool, dict]:
-    """Whether every dependency is ok, and the full report."""
+async def _report(details: bool = True) -> tuple[bool, dict]:
+    """Whether every dependency is ok, and the full report.
+
+    `details` False is the public route's: it leaves out the reads that only
+    inform (the Ollama version and, with an external Ollama, what it has
+    loaded), so the container healthcheck waits on nothing it doesn't use (#673)."""
     results = {}
     overall_ok = True
 
@@ -40,7 +44,7 @@ async def _report() -> tuple[bool, dict]:
     if not ok:
         overall_ok = False
 
-    ollama_result = await ollama.check_health()
+    ollama_result = await ollama.check_health(with_version=details)
     results["ollama"] = ollama_result
     # `same_model` is a flag, not a service: it never decides the status (#671).
     if any(v["status"] != "ok" for v in ollama_result.values() if isinstance(v, dict)):
@@ -51,6 +55,17 @@ async def _report() -> tuple[bool, dict]:
     # requests; failing the endpoint would mark the api container unhealthy and
     # take the whole stack down over a tuning warning.
     resources = {"memory": system_info.memory_info(settings.recommended_memory_gb)}
+    if settings.rag_external_ollama and details:
+        # The LLM runs in the external Ollama, outside Docker, so Docker's memory
+        # isn't compared with the recommendation; what that Ollama has loaded,
+        # other apps' models included, is reported and never acted on (#673).
+        resources = {"memory": system_info.external_memory_info()}
+        try:
+            resources["ollama_loaded"] = await ollama.loaded_models()
+        except Exception:                             # noqa: BLE001
+            resources["ollama_loaded"] = None
+            resources["ollama_loaded_note"] = (
+                "Couldn't read what the external Ollama has loaded (/api/ps).")
 
     return overall_ok, {
         "status": "ok" if overall_ok else "degraded",
@@ -61,7 +76,7 @@ async def _report() -> tuple[bool, dict]:
 
 @router.get("/health")
 async def health_check():
-    overall_ok, _ = await _report()
+    overall_ok, _ = await _report(details=False)
     return JSONResponse(status_code=200 if overall_ok else 503,
                         content={"status": "ok" if overall_ok else "degraded"})
 

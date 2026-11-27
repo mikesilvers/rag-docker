@@ -111,6 +111,13 @@ services:
       WEAVIATE_PORT: 8080
       OLLAMA_HOST: ollama
       OLLAMA_PORT: 11434
+      # Sent with rag-docker's own Ollama requests, in this stack and with an
+      # external Ollama (#673): OLLAMA_NUM_CTX with the LLM chat requests only
+      # (an embedding request keeps the model's own context), OLLAMA_KEEP_ALIVE
+      # with every request. Neither changes the Ollama server's settings. The
+      # defaults are Ollama 0.3.14's, so results are what they were.
+      OLLAMA_NUM_CTX: "2048"
+      OLLAMA_KEEP_ALIVE: "5m"
       # LLM_MODEL, BUILD_LLM_MODEL and ANSWER_LLM_MODEL, from the ollama
       # service's environment above (#671).
       <<: *llm-models
