@@ -377,6 +377,9 @@ async function runTransferPageTests(browser, base, reporter) {
     assert.ok(!(await text(page)).includes('AGE-SECRET-KEY'), 'the key is shown as text');
   }, { hold: ['GET /api/packages'] }]);
   cases.push(['import encryption: a key file read that ends after another package was chosen is dropped (#860)', async page => {
+    // The #860 fix was already in develop when this case was added, so it
+    // passes without new code: it guards that fix, through the held-read
+    // harness below (#864), rather than testing a new one.
     // A second package encrypted with its own key, so the key file input stays
     // shown when the selection moves to it.
     const OTHER = 'ragpkg-vfytransfera-20261021-0000-dddd2222.tar.gz.age';

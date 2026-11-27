@@ -1430,7 +1430,9 @@ none. Five cases cover the key export (#676): the three choices with a new key f
 offered before the package's Download with the store-apart warning and gone once the key is
 downloaded, and a key package asking for its key file, read in the browser and sent as `key`;
 the key is never shown as text. One case holds the page's key file read (#860): a read that ends after
-another key package was chosen sets nothing, and Import stays disabled. Four cases cover downloading a package (#677):
+another key package was chosen sets nothing, and Import stays disabled; the #860 fix came first, so the
+case passes without new code and guards that fix through the held-read harness (#864), not a new one.
+Four cases cover downloading a package (#677):
 - a finished export offers a Download link to its package with "Expires" in local time, and none
   when it has no expiry;
 - the package list says when a package exported here expires, and its Download link follows the

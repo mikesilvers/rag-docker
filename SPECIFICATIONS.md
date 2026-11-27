@@ -4715,8 +4715,9 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 
 - [x] The Import page polls the job it shows on one chain (#316, §7.4): one lookup at a time, each
       3 s after the previous answer; an answer, success or failure, that arrives after its chain
-      ended (another job opened, an upload accepted, the job opened again, the page left) changes
-      nothing and schedules nothing, so an older answer never replaces a newer one.
+      ended (another job opened, an upload accepted, the page left) changes nothing and schedules
+      nothing, so an older answer never replaces a newer one. Opening the running job already shown
+      keeps its chain, since its job ID doesn't change.
       *`scripts/verify/browser/ui_criteria.js` (suite 06), section "running and recent jobs (#617)",
       the checks marked (#316): two answers in reverse order, a stale failure after success, a
       change of job and leaving the page, each with a lookup held in flight.*

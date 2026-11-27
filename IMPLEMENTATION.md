@@ -31846,7 +31846,9 @@ none. Five cases cover the key export (#676): the three choices with a new key f
 offered before the package's Download with the store-apart warning and gone once the key is
 downloaded, and a key package asking for its key file, read in the browser and sent as `key`;
 the key is never shown as text. One case holds the page's key file read (#860): a read that ends after
-another key package was chosen sets nothing, and Import stays disabled. Four cases cover downloading a package (#677):
+another key package was chosen sets nothing, and Import stays disabled; the #860 fix came first, so the
+case passes without new code and guards that fix through the held-read harness (#864), not a new one.
+Four cases cover downloading a package (#677):
 - a finished export offers a Download link to its package with "Expires" in local time, and none
   when it has no expiry;
 - the package list says when a package exported here expires, and its Download link follows the
@@ -63029,6 +63031,9 @@ async function runTransferPageTests(browser, base, reporter) {
     assert.ok(!(await text(page)).includes('AGE-SECRET-KEY'), 'the key is shown as text');
   }, { hold: ['GET /api/packages'] }]);
   cases.push(['import encryption: a key file read that ends after another package was chosen is dropped (#860)', async page => {
+    // The #860 fix was already in develop when this case was added, so it
+    // passes without new code: it guards that fix, through the held-read
+    // harness below (#864), rather than testing a new one.
     // A second package encrypted with its own key, so the key file input stays
     // shown when the selection moves to it.
     const OTHER = 'ragpkg-vfytransfera-20261021-0000-dddd2222.tar.gz.age';
