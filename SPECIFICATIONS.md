@@ -815,13 +815,22 @@ API keeps answering other requests meanwhile.
 
 **Member-count and ratio caps (#28).** Each ZIP may hold at most `max_zip_members` entries (env
 `MAX_ZIP_MEMBERS`, default 5,000), counted per ZIP over every entry in its central directory:
-files, folders, unsupported files, macOS metadata and members whose path leaves the archive. The
-count is checked as soon as the ZIP is opened, before anything else; a count equal to the cap is
-accepted. Over it: 400 `ARCHIVE_TOO_MANY_MEMBERS`, `'<zip>' holds 5,001 entries, more than 5,000,
-the most one zip may hold, so nothing from it was imported. Split it into smaller zips and upload
-them in separate imports.`, `detail` `{"file": "<zip>", "members": [], "members_omitted": 0}`.
-The count is read only after zipfile has loaded the whole central directory into memory, when
-the ZIP is opened, so that memory is bounded only by the 512 MB upload limit.
+files, folders, unsupported files, macOS metadata and members whose path leaves the archive. A
+count equal to the cap is accepted. Over it: 400 `ARCHIVE_TOO_MANY_MEMBERS`, `'<zip>' holds 5,001
+entries, more than 5,000, the most one zip may hold, so nothing from it was imported. Split it into
+smaller zips and upload them in separate imports.`, `detail` `{"file": "<zip>", "members": [],
+"members_omitted": 0}`. The count is checked twice, both times before any member is read and
+before the declared total and the ratio (#928). First, before zipfile opens the ZIP, on the total
+the ZIP declares in its end-of-central-directory record (the ZIP64 record's total, for a ZIP64
+archive), found as zipfile finds it, also when the ZIP ends with an archive comment: a ZIP that
+declares more than the cap is refused without its central directory being loaded. A record that
+is missing or can't be read refuses nothing there, and zipfile decides as before: a ZIP it can't
+open is refused as `ARCHIVE_UNREADABLE`, and one it opens is counted next. Then, once zipfile has
+opened the ZIP, on the entries it loaded, since zipfile reads every entry the central directory
+holds whatever the record declares. So a ZIP whose record declares the cap or fewer but whose
+directory holds more is refused only after that directory is in memory: about 500 bytes per entry
+(measured on Python 3.12), about 10 times the directory's size on disk, so a 512 MB upload of tiny
+entries can take several GB in the API before it is refused.
 
 A member of 1 MiB (1,048,576 bytes) or more, uncompressed, may expand to at most
 `max_zip_member_ratio` (env `MAX_ZIP_MEMBER_RATIO`, default 200) times its compressed size;
