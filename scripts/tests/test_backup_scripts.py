@@ -237,6 +237,38 @@ class StaticTests(unittest.TestCase):
             (age / 'sub').rmdir()
             self.assertEqual(tag(), original)
 
+    def test_an_unreadable_entry_in_the_age_folder_stops_before_any_docker_call(self):
+        # A find that fails partway (here on a folder it can't read) fails rb_age_text,
+        # so the tag is never hashed from part of scripts/age and no image is inspected
+        # or built (#937).
+        if os.geteuid() == 0:
+            self.skipTest('runs as root, where a folder of mode 000 can still be read')
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder).resolve()
+            age = folder / 'scripts' / 'age'
+            age.mkdir(parents=True)
+            shutil.copy2(str(ROOT / 'scripts/backup-common.sh'), str(folder / 'scripts'))
+            (age / 'Dockerfile').write_text(dockerfile())
+            (age / 'sub').mkdir()
+            (age / 'sub' / 'a.txt').write_text('one\n')
+            stub = folder / 'bin' / 'docker'
+            stub.parent.mkdir()
+            stub.write_text(STUB_DOCKER)
+            stub.chmod(0o755)
+            log = folder / 'docker.log'
+            env = dict(os.environ, PATH=str(stub.parent) + os.pathsep + os.environ['PATH'], STUB_LOG=str(log))
+            (age / 'sub').chmod(0o000)
+            try:
+                run = subprocess.run(['bash', '-c', '. scripts/backup-common.sh; rb_image; echo "tag=$RB_IMAGE"'],
+                                     cwd=str(folder), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     universal_newlines=True)
+            finally:
+                (age / 'sub').chmod(0o755)
+            self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+            self.assertNotIn('tag=', run.stdout)
+            self.assertFalse(log.exists() and log.read_text(), 'docker was called: ' + (
+                log.read_text() if log.exists() else ''))
+
     def test_the_tag_without_sha256sum_uses_shasum_and_without_either_stops(self):
         # rb_sha256 falls back to shasum where there is no sha256sum, with the same
         # tag, and with neither it stops before building anything (#856).
