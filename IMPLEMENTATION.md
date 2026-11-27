@@ -32014,8 +32014,8 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `llm_split.py` | helper for suite 23, run in the API container: pulls the small model, runs the three tasks through the services' code and prints the models Ollama reports answering each (#671); refuses in external-Ollama mode (#673) |
 | `../tests/test_llm_split.py` | host-only, standard library: `llm_split.py` with stand-ins for `httpx`, `config`, `services` and `time.sleep`: the model pull tried again on a 5xx (3 attempts, waits of 5 s and 10 s) and not on a 4xx or a request error, a failed pull reported as `setup_error` with no task run; and suite 23 turning that into one failed check and no other (#922), registered by suite 23 |
 | `24_query_only.sh` | §2.6 and §10.11 — query-only mode (#670): the overlay resolved without starting it; registers `../tests/test_query_only.py`; the start-up refusal of a non-boolean `RAG_QUERY_ONLY`; the loader's refusal on a full instance; with `stack.sh run --query-only`, build and export, `stack.sh query-only-mode`, then the load, the refusals, access and Q&A on the query-only instance, and a key package loaded with its key file on standard input and refused `KEY_FILE_REQUIRED` without it (#676) |
-| `26_external_ollama.sh` | §2.7 and §10.12 — external-Ollama mode (#673): registers `../tests/test_external_ollama.py`; with `stack.sh run --external-ollama`, no ollama service, `python -m ollama_check`, `/health/details`, ingest through the host's Ollama, the refused export with models, an import back, a reindex and, outside `RAG_SKIP_SLOW`, hnsw and semantic questions |
-| `../tests/test_check_external_ollama.py` | host-side, standard library: `scripts/check-external-ollama.sh` with stub `uname`, `lsof`, `ss`, `ip` and `docker`: loopback and docker0 pass, a wildcard or LAN address warns (exit 3), nothing listening fails (exit 1), `--host-only` skips the container check (#673) |
+| `26_external_ollama.sh` | §2.7 and §10.12 — external-Ollama mode (#673): registers `../tests/test_external_ollama.py` and `../tests/test_check_external_ollama.py`; with `stack.sh run --external-ollama`, no ollama service, `python -m ollama_check`, `/health/details`, ingest through the host's Ollama, the refused export with models, an import back, a reindex and, outside `RAG_SKIP_SLOW`, hnsw and semantic questions |
+| `../tests/test_check_external_ollama.py` | host-side, standard library, run by suite 26 in every run: `scripts/check-external-ollama.sh` with stub `uname`, `lsof`, `ss`, `ip` and `docker`: loopback and docker0 pass, a wildcard or LAN address warns (exit 3), nothing listening fails (exit 1), `--host-only` skips the container check (#673) |
 | `query_only_config.py` | host-side, standard library: `docker-compose.yml` with and without `docker-compose.query-only.yml` as `docker compose config` resolves them; only the api's `RAG_QUERY_ONLY` may differ (#670) |
 | `../tests/test_query_only.py` | API image, no network (also on the host): `RAG_QUERY_ONLY` parsing, the refused and kept routes, the refusals through the app and their order, `query_only` in the user answers, `lan_mode` in the user answers (#676), the loader (usage, refusals, lock, passphrase, a key package's key file on standard input with `KEY_FILE_REQUIRED` and `KEY_FILE_INVALID` (#676), results `success`/`refused`/`failed`/`interrupted`, the Ctrl-C handler) and the access of a collection it creates (#670) |
 | `25_weaviate_upgrade.sh` | the Weaviate upgrade path (#805), full runs only: the previous Weaviate (`RAG_WEAVIATE_FROM`, else `origin/main`'s pin) writes data on a throwaway volume, the checkout's reads it back, and again after a Raft snapshot and a restart; only on the verify project |
@@ -40702,7 +40702,8 @@ if __name__ == "__main__":
 #!/usr/bin/env bash
 # External-Ollama mode (#673): SPECIFICATIONS.md §2.7 and §10.12.
 #
-# Every run runs test_external_ollama.py in the API image with no network. The
+# Every run runs test_external_ollama.py in the API image with no network, and
+# test_check_external_ollama.py on the host (the helper, with stub tools). The
 # external-mode checks need `stack.sh run --external-ollama`, on a host with a
 # native Ollama set up as README "External Ollama (native)" says (its models
 # pulled): no ollama service runs, the api container's check passes,
@@ -40725,6 +40726,9 @@ section "External-Ollama units: settings, requests, health, import, export, help
 API_IMAGE="$(cd "$REPO_ROOT" && docker compose images -q api)"
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$API_IMAGE" python scripts/tests/test_external_ollama.py)
 check "test_external_ollama.py registered regression checks" $?
+
+python3 "$REPO_ROOT/scripts/tests/test_check_external_ollama.py"
+check "check-external-ollama.sh: the listener check and its exit status, with stub tools (test_check_external_ollama.py)" $?
 
 if [ "${RAG_VERIFY_EXTERNAL_OLLAMA:-0}" != 1 ]; then
   skip "external-Ollama mode on a native Ollama: helper, health, ingest, export, import, reindex" \

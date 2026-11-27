@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # External-Ollama mode (#673): SPECIFICATIONS.md §2.7 and §10.12.
 #
-# Every run runs test_external_ollama.py in the API image with no network. The
+# Every run runs test_external_ollama.py in the API image with no network, and
+# test_check_external_ollama.py on the host (the helper, with stub tools). The
 # external-mode checks need `stack.sh run --external-ollama`, on a host with a
 # native Ollama set up as README "External Ollama (native)" says (its models
 # pulled): no ollama service runs, the api container's check passes,
@@ -24,6 +25,9 @@ section "External-Ollama units: settings, requests, health, import, export, help
 API_IMAGE="$(cd "$REPO_ROOT" && docker compose images -q api)"
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$API_IMAGE" python scripts/tests/test_external_ollama.py)
 check "test_external_ollama.py registered regression checks" $?
+
+python3 "$REPO_ROOT/scripts/tests/test_check_external_ollama.py"
+check "check-external-ollama.sh: the listener check and its exit status, with stub tools (test_check_external_ollama.py)" $?
 
 if [ "${RAG_VERIFY_EXTERNAL_OLLAMA:-0}" != 1 ]; then
   skip "external-Ollama mode on a native Ollama: helper, health, ingest, export, import, reindex" \
