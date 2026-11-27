@@ -43,7 +43,7 @@ import ollama_check
 from config import Settings, settings
 from main import app
 from auth import testing as auth_testing
-from services import importer, model_bundle, ollama_client, ollama_startup, system_info
+from services import importer, model_bundle, ollama_client, ollama_startup, system_info, telemetry
 from services import weaviate_client as wc
 from services.packager import PackageError
 
@@ -193,6 +193,31 @@ class RequestBodyTests(unittest.TestCase):
                     self.assertEqual(body["keep_alive"], "10m")
                     self.assertIs(body["stream"], False)
 
+    def test_keep_alive_in_seconds_is_sent_as_a_number(self):
+        # Ollama reads a keep_alive string as a Go duration, which needs a unit:
+        # "300" or "-1" as a string is refused (400) on every request (#940).
+        for value, sent in (("300", 300), ("-1", -1), ("0", 0), ("5m", "5m"), ("1h30m", "1h30m"),
+                            ("-1s", "-1s"), ("500ms", "500ms")):
+            with self.subTest(value=value), patch.object(settings, "ollama_keep_alive", value), \
+                    FakeOllama().serving() as fake:
+                asyncio.run(ollama_client.chat("system", "user"))
+                asyncio.run(ollama_client.build_chat("system", "user"))
+                asyncio.run(ollama_client.embed("a question"))
+                bodies = fake.bodies("/api/chat") + fake.bodies("/api/embeddings")
+                self.assertEqual(len(bodies), 3)
+                for body in bodies:
+                    self.assertEqual(body["keep_alive"], sent)
+                    self.assertIs(type(body["keep_alive"]), type(sent))
+
+    def test_keep_alive_in_seconds_is_a_number_on_api_embed_too(self):
+        with patch.object(settings, "ollama_keep_alive", "300"), \
+                FakeOllama(embeddings_gone=True).serving() as fake, \
+                self.assertLogs("services.ollama_client", "WARNING"):
+            asyncio.run(ollama_client.embed("one"))
+        [body] = fake.bodies("/api/embed")
+        self.assertEqual(body["keep_alive"], 300)
+        self.assertIs(type(body["keep_alive"]), int)
+
     def test_embedding_carries_keep_alive_and_no_num_ctx(self):
         for on in (False, True):
             with self.subTest(external=on), external(on), FakeOllama().serving() as fake:
@@ -200,7 +225,7 @@ class RequestBodyTests(unittest.TestCase):
                 self.assertEqual(vector, [0.1, 0.2, 0.3])
                 [body] = fake.bodies("/api/embeddings")
                 self.assertEqual(body, {"model": settings.embed_model, "prompt": "a question",
-                                        "keep_alive": settings.ollama_keep_alive})
+                                        "keep_alive": ollama_client.keep_alive()})
                 self.assertNotIn("options", body)
                 self.assertEqual(fake.bodies("/api/embed"), [])
 
@@ -211,8 +236,8 @@ class RequestBodyTests(unittest.TestCase):
             self.assertEqual(asyncio.run(ollama_client.embed("two")), [0.4, 0.5, 0.6])
         self.assertEqual(len(fake.bodies("/api/embeddings")), 1, "the older endpoint is asked once")
         self.assertEqual(fake.bodies("/api/embed"), [
-            {"model": settings.embed_model, "input": "one", "keep_alive": settings.ollama_keep_alive},
-            {"model": settings.embed_model, "input": "two", "keep_alive": settings.ollama_keep_alive}])
+            {"model": settings.embed_model, "input": "one", "keep_alive": ollama_client.keep_alive()},
+            {"model": settings.embed_model, "input": "two", "keep_alive": ollama_client.keep_alive()}])
         self.assertEqual(len(logs.records), 1)
         self.assertIn("using /api/embed", logs.output[0])
 
@@ -246,6 +271,23 @@ class RequestBodyTests(unittest.TestCase):
             with self.assertRaises(httpx.HTTPStatusError):
                 asyncio.run(ollama_client.embed("x"))
         self.assertIs(ollama_client._use_embed, False)
+
+    def test_version_and_ps_have_their_own_span_names(self):
+        names = []
+
+        @contextlib.contextmanager
+        def span(name, *args, **kwargs):
+            names.append(name)
+            yield
+
+        with patch.object(telemetry, "span", span), FakeOllama().serving():
+            asyncio.run(ollama_client.list_models())
+            asyncio.run(ollama_client.version())
+            asyncio.run(ollama_client.loaded_models())
+        self.assertEqual(names, ["ollama.models", "ollama.version", "ollama.ps"])
+        for name in names:
+            self.assertIn(name, telemetry.SPAN_NAMES)
+            self.assertIn(name, telemetry.DEPENDENCIES)
 
     def test_only_reads_besides_chat_and_embeddings(self):
         with external(), FakeOllama().serving() as fake:

@@ -126,8 +126,9 @@ class Settings(BaseSettings):
     @field_validator("ollama_keep_alive")
     @classmethod
     def _keep_alive(cls, value):
-        # A duration as Ollama reads it: whole seconds (`300`, `-1`), or units
-        # (`5m`, `1h30m`, `500ms`). Anything else would fail every request.
+        # A duration as Ollama reads it: whole seconds (`300`, `-1`), which
+        # ollama_client.keep_alive() sends as a JSON number, or units (`5m`,
+        # `1h30m`, `500ms`), sent as a string. Anything else would fail every request.
         if not (re.fullmatch(r"-?[0-9]+", value)
                 or re.fullmatch(r"-?([0-9]+(\.[0-9]+)?(ms|s|m|h))+", value)):
             raise ValueError("OLLAMA_KEEP_ALIVE must be a duration such as 5m, 1h30m, 300 or -1")

@@ -1317,7 +1317,7 @@ All API settings are environment variables in `docker-compose.yml`:
 | `WEAVIATE_HOST` | `weaviate` | Weaviate hostname (internal) |
 | `OLLAMA_HOST` | `ollama` | Ollama hostname (internal). Stays `ollama` with an external Ollama too: the overlay points that name at the host (#673) |
 | `OLLAMA_NUM_CTX` | `2048` | The context length sent as `num_ctx` with rag-docker's LLM chat requests, in both modes; embedding requests keep the model's own. 256 to 1048576; anything else stops the API. Never set on the Ollama server (#673) |
-| `OLLAMA_KEEP_ALIVE` | `5m` | How long Ollama keeps rag-docker's model loaded after a request, sent as `keep_alive` with every request, in both modes: a duration such as `5m`, `1h30m`, `300` or `-1`; anything else stops the API. Never set on the Ollama server (#673) |
+| `OLLAMA_KEEP_ALIVE` | `5m` | How long Ollama keeps rag-docker's model loaded after a request, sent as `keep_alive` with every request, in both modes: a duration such as `5m`, `1h30m`, `300` or `-1` (whole seconds, sent to Ollama as a number; `-1` keeps it loaded); anything else stops the API. Never set on the Ollama server (#673) |
 | `RAG_EXTERNAL_OLLAMA` | `false` | External Ollama mode (#673), set `true` only by `docker-compose.external-ollama.yml`. Exactly `true` or `false`; anything else stops the API. See [External Ollama (native)](#external-ollama-native) |
 | `UPLOAD_DIR` | `/app/uploads` | Container path for uploads and session data |
 | `RECOMMENDED_MEMORY_GB` | `12` | Memory recommendation reported by `/health/details`. Raise it if you allocate more to Docker; no rebuild needed |

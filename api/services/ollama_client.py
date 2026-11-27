@@ -1,6 +1,7 @@
 from __future__ import annotations
 from services import telemetry
 import logging
+import re
 import time
 
 import httpx
@@ -14,6 +15,14 @@ _log = logging.getLogger(__name__)
 # dropped the older endpoint, superseded by /api/embed (#673). Every later
 # embedding goes to /api/embed, the endpoint Weaviate's text2vec-ollama calls.
 _use_embed = False
+
+
+def keep_alive() -> int | str:
+    """OLLAMA_KEEP_ALIVE as Ollama's `keep_alive` takes it (#673): whole seconds
+    (`300`, `-1`) as a JSON number, since Ollama reads a string as a Go duration,
+    which needs a unit; a duration with units (`5m`, `1h30m`) as a string."""
+    value = settings.ollama_keep_alive
+    return int(value) if re.fullmatch(r"-?[0-9]+", value) else value
 
 
 def _route_missing(resp: httpx.Response) -> bool:
@@ -39,7 +48,7 @@ async def embed(text: str) -> list[float]:
             resp = await client.post(
                 f"{_BASE}/api/embeddings",
                 json={"model": settings.embed_model, "prompt": text,
-                      "keep_alive": settings.ollama_keep_alive},
+                      "keep_alive": keep_alive()},
             )
             if not _route_missing(resp):
                 resp.raise_for_status()
@@ -49,7 +58,7 @@ async def embed(text: str) -> list[float]:
         resp = await client.post(
             f"{_BASE}/api/embed",
             json={"model": settings.embed_model, "input": text,
-                  "keep_alive": settings.ollama_keep_alive},
+                  "keep_alive": keep_alive()},
         )
         resp.raise_for_status()
         return resp.json()["embeddings"][0]
@@ -68,7 +77,7 @@ async def _chat(model: str, system: str, user: str) -> str:
                 "stream": False,
                 # In the request, never on the server, which may be shared (#673).
                 "options": {"num_ctx": settings.ollama_num_ctx},
-                "keep_alive": settings.ollama_keep_alive,
+                "keep_alive": keep_alive(),
             },
         )
         resp.raise_for_status()
@@ -126,7 +135,7 @@ async def missing_models() -> list[str] | None:
     return [model for model in required_models() if model not in reported]
 
 
-@telemetry.traced("ollama.models")
+@telemetry.traced("ollama.version")
 async def version() -> str | None:
     """The running Ollama's version (`GET /api/version`), or None (#673)."""
     try:
@@ -139,7 +148,7 @@ async def version() -> str | None:
         return None
 
 
-@telemetry.traced("ollama.models")
+@telemetry.traced("ollama.ps")
 async def loaded_models() -> list[dict]:
     """What Ollama has loaded (`GET /api/ps`), for information only (#673).
 

@@ -3988,7 +3988,7 @@ External Ollama mode (#673, §2.7) adds three API container settings:
 |---|---|---|
 | `RAG_EXTERNAL_OLLAMA` | `false` | Exactly `true` or `false`; anything else fails API startup. `true` only through `docker-compose.external-ollama.yml` |
 | `OLLAMA_NUM_CTX` | `2048` | 256 to 1048576. Sent as `num_ctx` with the LLM chat requests, in both modes; never set on the server |
-| `OLLAMA_KEEP_ALIVE` | `5m` | A duration: whole seconds (`300`, `-1`) or `<number><unit>` parts with `ms`, `s`, `m` or `h` (`5m`, `1h30m`). Sent as `keep_alive` with every request, in both modes; never set on the server |
+| `OLLAMA_KEEP_ALIVE` | `5m` | A duration: whole seconds (`300`, `-1`), sent as a JSON number (Ollama reads a string as a duration that needs a unit), or `<number><unit>` parts with `ms`, `s`, `m` or `h` (`5m`, `1h30m`), sent as a string. Sent as `keep_alive` with every request, in both modes; never set on the server |
 
 An invalid API container setting (any setting of `api/config.py`, such as `AUTH_COOKIE_SECURE`, `RAG_LAN_MODE`,
 `AUDIT_LOG_QUESTIONS` or `MAX_ZIP_MEMBERS`) stops API startup: the API writes one line per invalid setting to standard

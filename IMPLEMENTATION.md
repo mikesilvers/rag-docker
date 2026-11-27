@@ -1428,8 +1428,9 @@ class Settings(BaseSettings):
     @field_validator("ollama_keep_alive")
     @classmethod
     def _keep_alive(cls, value):
-        # A duration as Ollama reads it: whole seconds (`300`, `-1`), or units
-        # (`5m`, `1h30m`, `500ms`). Anything else would fail every request.
+        # A duration as Ollama reads it: whole seconds (`300`, `-1`), which
+        # ollama_client.keep_alive() sends as a JSON number, or units (`5m`,
+        # `1h30m`, `500ms`), sent as a string. Anything else would fail every request.
         if not (re.fullmatch(r"-?[0-9]+", value)
                 or re.fullmatch(r"-?([0-9]+(\.[0-9]+)?(ms|s|m|h))+", value)):
             raise ValueError("OLLAMA_KEEP_ALIVE must be a duration such as 5m, 1h30m, 300 or -1")
@@ -5302,6 +5303,7 @@ def _sample_chunks_sync(collection_name: str, limit: int, seed: int | None = Non
 from __future__ import annotations
 from services import telemetry
 import logging
+import re
 import time
 
 import httpx
@@ -5315,6 +5317,14 @@ _log = logging.getLogger(__name__)
 # dropped the older endpoint, superseded by /api/embed (#673). Every later
 # embedding goes to /api/embed, the endpoint Weaviate's text2vec-ollama calls.
 _use_embed = False
+
+
+def keep_alive() -> int | str:
+    """OLLAMA_KEEP_ALIVE as Ollama's `keep_alive` takes it (#673): whole seconds
+    (`300`, `-1`) as a JSON number, since Ollama reads a string as a Go duration,
+    which needs a unit; a duration with units (`5m`, `1h30m`) as a string."""
+    value = settings.ollama_keep_alive
+    return int(value) if re.fullmatch(r"-?[0-9]+", value) else value
 
 
 def _route_missing(resp: httpx.Response) -> bool:
@@ -5340,7 +5350,7 @@ async def embed(text: str) -> list[float]:
             resp = await client.post(
                 f"{_BASE}/api/embeddings",
                 json={"model": settings.embed_model, "prompt": text,
-                      "keep_alive": settings.ollama_keep_alive},
+                      "keep_alive": keep_alive()},
             )
             if not _route_missing(resp):
                 resp.raise_for_status()
@@ -5350,7 +5360,7 @@ async def embed(text: str) -> list[float]:
         resp = await client.post(
             f"{_BASE}/api/embed",
             json={"model": settings.embed_model, "input": text,
-                  "keep_alive": settings.ollama_keep_alive},
+                  "keep_alive": keep_alive()},
         )
         resp.raise_for_status()
         return resp.json()["embeddings"][0]
@@ -5369,7 +5379,7 @@ async def _chat(model: str, system: str, user: str) -> str:
                 "stream": False,
                 # In the request, never on the server, which may be shared (#673).
                 "options": {"num_ctx": settings.ollama_num_ctx},
-                "keep_alive": settings.ollama_keep_alive,
+                "keep_alive": keep_alive(),
             },
         )
         resp.raise_for_status()
@@ -5427,7 +5437,7 @@ async def missing_models() -> list[str] | None:
     return [model for model in required_models() if model not in reported]
 
 
-@telemetry.traced("ollama.models")
+@telemetry.traced("ollama.version")
 async def version() -> str | None:
     """The running Ollama's version (`GET /api/version`), or None (#673)."""
     try:
@@ -5440,7 +5450,7 @@ async def version() -> str | None:
         return None
 
 
-@telemetry.traced("ollama.models")
+@telemetry.traced("ollama.ps")
 async def loaded_models() -> list[dict]:
     """What Ollama has loaded (`GET /api/ps`), for information only (#673).
 
@@ -41005,7 +41015,7 @@ import ollama_check
 from config import Settings, settings
 from main import app
 from auth import testing as auth_testing
-from services import importer, model_bundle, ollama_client, ollama_startup, system_info
+from services import importer, model_bundle, ollama_client, ollama_startup, system_info, telemetry
 from services import weaviate_client as wc
 from services.packager import PackageError
 
@@ -41155,6 +41165,31 @@ class RequestBodyTests(unittest.TestCase):
                     self.assertEqual(body["keep_alive"], "10m")
                     self.assertIs(body["stream"], False)
 
+    def test_keep_alive_in_seconds_is_sent_as_a_number(self):
+        # Ollama reads a keep_alive string as a Go duration, which needs a unit:
+        # "300" or "-1" as a string is refused (400) on every request (#940).
+        for value, sent in (("300", 300), ("-1", -1), ("0", 0), ("5m", "5m"), ("1h30m", "1h30m"),
+                            ("-1s", "-1s"), ("500ms", "500ms")):
+            with self.subTest(value=value), patch.object(settings, "ollama_keep_alive", value), \
+                    FakeOllama().serving() as fake:
+                asyncio.run(ollama_client.chat("system", "user"))
+                asyncio.run(ollama_client.build_chat("system", "user"))
+                asyncio.run(ollama_client.embed("a question"))
+                bodies = fake.bodies("/api/chat") + fake.bodies("/api/embeddings")
+                self.assertEqual(len(bodies), 3)
+                for body in bodies:
+                    self.assertEqual(body["keep_alive"], sent)
+                    self.assertIs(type(body["keep_alive"]), type(sent))
+
+    def test_keep_alive_in_seconds_is_a_number_on_api_embed_too(self):
+        with patch.object(settings, "ollama_keep_alive", "300"), \
+                FakeOllama(embeddings_gone=True).serving() as fake, \
+                self.assertLogs("services.ollama_client", "WARNING"):
+            asyncio.run(ollama_client.embed("one"))
+        [body] = fake.bodies("/api/embed")
+        self.assertEqual(body["keep_alive"], 300)
+        self.assertIs(type(body["keep_alive"]), int)
+
     def test_embedding_carries_keep_alive_and_no_num_ctx(self):
         for on in (False, True):
             with self.subTest(external=on), external(on), FakeOllama().serving() as fake:
@@ -41162,7 +41197,7 @@ class RequestBodyTests(unittest.TestCase):
                 self.assertEqual(vector, [0.1, 0.2, 0.3])
                 [body] = fake.bodies("/api/embeddings")
                 self.assertEqual(body, {"model": settings.embed_model, "prompt": "a question",
-                                        "keep_alive": settings.ollama_keep_alive})
+                                        "keep_alive": ollama_client.keep_alive()})
                 self.assertNotIn("options", body)
                 self.assertEqual(fake.bodies("/api/embed"), [])
 
@@ -41173,8 +41208,8 @@ class RequestBodyTests(unittest.TestCase):
             self.assertEqual(asyncio.run(ollama_client.embed("two")), [0.4, 0.5, 0.6])
         self.assertEqual(len(fake.bodies("/api/embeddings")), 1, "the older endpoint is asked once")
         self.assertEqual(fake.bodies("/api/embed"), [
-            {"model": settings.embed_model, "input": "one", "keep_alive": settings.ollama_keep_alive},
-            {"model": settings.embed_model, "input": "two", "keep_alive": settings.ollama_keep_alive}])
+            {"model": settings.embed_model, "input": "one", "keep_alive": ollama_client.keep_alive()},
+            {"model": settings.embed_model, "input": "two", "keep_alive": ollama_client.keep_alive()}])
         self.assertEqual(len(logs.records), 1)
         self.assertIn("using /api/embed", logs.output[0])
 
@@ -41208,6 +41243,23 @@ class RequestBodyTests(unittest.TestCase):
             with self.assertRaises(httpx.HTTPStatusError):
                 asyncio.run(ollama_client.embed("x"))
         self.assertIs(ollama_client._use_embed, False)
+
+    def test_version_and_ps_have_their_own_span_names(self):
+        names = []
+
+        @contextlib.contextmanager
+        def span(name, *args, **kwargs):
+            names.append(name)
+            yield
+
+        with patch.object(telemetry, "span", span), FakeOllama().serving():
+            asyncio.run(ollama_client.list_models())
+            asyncio.run(ollama_client.version())
+            asyncio.run(ollama_client.loaded_models())
+        self.assertEqual(names, ["ollama.models", "ollama.version", "ollama.ps"])
+        for name in names:
+            self.assertIn(name, telemetry.SPAN_NAMES)
+            self.assertIn(name, telemetry.DEPENDENCIES)
 
     def test_only_reads_besides_chat_and_embeddings(self):
         with external(), FakeOllama().serving() as fake:
@@ -69269,6 +69321,7 @@ SPAN_NAMES |= ROUTES | frozenset(("rag.request", "rag.reformulate", "rag.retriev
     "rag.parse", "rag.chunk", "rag.store", "rag.retain", "rag.package", "rag.validate",
     "rag.rebuild", "rag.pair", "rag.regenerate", "rag.failure_report",
     "ollama.chat", "ollama.embed", "ollama.models", "ollama.health",
+    "ollama.version", "ollama.ps",
     "weaviate.connect", "weaviate.health", "weaviate.create", "weaviate.delete",
     "weaviate.exists", "weaviate.list", "weaviate.meta", "weaviate.config",
     "weaviate.aggregate", "weaviate.query", "weaviate.iterate", "weaviate.batch"))
