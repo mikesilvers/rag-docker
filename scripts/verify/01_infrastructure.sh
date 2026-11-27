@@ -42,6 +42,8 @@ python3 "$REPO_ROOT/scripts/tests/test_tailwind_output.py"
 check "the built UI CSS keeps the Tailwind 4 rules the migration relies on (#773)" $?
 python3 "$REPO_ROOT/scripts/tests/test_weaviate_pin.py"
 check "the Weaviate pin is the same everywhere and Dependabot leaves it alone (#530)" $?
+python3 "$REPO_ROOT/scripts/tests/test_weaviate_upgrade.py"
+check "the Weaviate upgrade-path helper's host tests pass, with a fake docker (#805)" $?
 python3 "$REPO_ROOT/scripts/tests/test_upgrade_backup.py"
 check "the README's 1.1.0 backup and rollback commands check before they write, and pin alpine (#679)" $?
 python3 "$REPO_ROOT/scripts/tests/test_backup_scripts.py"
