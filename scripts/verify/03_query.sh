@@ -21,6 +21,10 @@ check "a failed metrics write keeps the answer; metrics.jsonl is bounded and rel
 check "citation scores convert each metric's distance, best first; missing reads as null (#376)" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/citation_score.py)
 check "real Weaviate: cosine, dot and l2-squared scores, and a recreated collection's new metric (#376)" $?
+# hnsw and flat query vectors are the ones Weaviate makes (/api/embed, #936): the
+# embedding model is real, the reformulation and answer controlled.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/query_embedding.py)
+check "hnsw and flat query vectors match Weaviate's (/api/embed): dot and l2-squared collections return their own fixture, scores as semantic's (#936)" $?
 
 drop_collection "$C"; make_collection "$C"
 curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \

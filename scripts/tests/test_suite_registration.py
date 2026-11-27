@@ -3,13 +3,15 @@
 Each file below used to exist with no suite running it, or (test_corpus_rules.py
 and test_corpus_rules_estimates.py, #615; test_offline_ingest.py, #695;
 ui_ingest_weaviate.py, #641; test_large_corpus.py, #312;
-test_ingest_estimate.py, #614; test_external_ollama.py, #673) is run the same way. This reads the suite scripts and checks that a command line runs
+test_ingest_estimate.py, #614; test_external_ollama.py, #673; query_embedding.py, #936)
+is run the same way. This reads the suite scripts and checks that a command line runs
 the file and that its exit status goes straight to `check`. Standard library
 only; no Docker or stack needed.
 
 Run: python3 scripts/tests/test_suite_registration.py
 """
 from pathlib import Path
+import re
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -36,6 +38,7 @@ REGISTERED = (
     ('scripts/tests/test_large_corpus.py', '02_ingest.sh', True),
     ('scripts/tests/test_ingest_estimate.py', '02_ingest.sh', True),
     ('scripts/tests/test_external_ollama.py', '26_external_ollama.sh', True),
+    ('scripts/verify/query_embedding.py', '03_query.sh', False),
 )
 
 
@@ -69,7 +72,9 @@ class SuiteRegistrationTests(unittest.TestCase):
                     self.assertIn('RAG_TEST_API_DIR=/repo/api', line)
                     self.assertIn('python ' + name, line)
                 else:
-                    self.assertIn('docker compose exec -T api python - < ' + name, line)
+                    # Environment options (`-e NAME=value`) may come before the service.
+                    self.assertRegex(line, r'docker compose exec -T (-e \S+ )*api python - < '
+                                     + re.escape(name))
 
 
 if __name__ == '__main__':

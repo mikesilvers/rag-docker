@@ -455,8 +455,8 @@ never `0.0.0.0` (it has no authentication). On Linux the `docker0` bind needs a 
 accepts packets for that address on any interface: TCP 11434 is accepted on `lo`, `docker0` and `br-+` and dropped on
 every other interface (the README gives the `iptables` lines). It is shared with other apps and models, so rag-docker never pulls,
 creates, copies, deletes or unloads a model in it and never changes its server-wide settings (`OLLAMA_KEEP_ALIVE`,
-`OLLAMA_NUM_PARALLEL`, `OLLAMA_CONTEXT_LENGTH`). Its only calls are `/api/chat`, `/api/embeddings` (or `/api/embed`,
-below) and the reads `/api/tags`, `/api/version` and `/api/ps`.
+`OLLAMA_NUM_PARALLEL`, `OLLAMA_CONTEXT_LENGTH`). Its only calls are `/api/chat`, `/api/embed` (below) and the reads
+`/api/tags`, `/api/version` and `/api/ps`.
 
 **Per-request options, in both modes.** Every `/api/chat` request carries `"options": {"num_ctx": OLLAMA_NUM_CTX}`
 (default 2048) and `"keep_alive": OLLAMA_KEEP_ALIVE` (default `5m`), Ollama 0.3.14's defaults, so the contained
@@ -465,11 +465,15 @@ keeps its own context (`nomic-embed-text` sets 8192), as Weaviate's own calls do
 embedding calls (ingest of records without a vector, `semantic` and `hybrid` questions) can't carry options; they use
 the Ollama server's settings in either mode.
 
-**Embedding endpoint.** `embed()` calls `POST /api/embeddings` (`prompt`; still documented by Ollama v0.40.18, as
-superseded by `/api/embed`). When it answers 404 for a missing route (a body that isn't a JSON object with an
-`error`, such as Ollama's plain `404 page not found`), the API logs one line and uses `POST /api/embed` (`input`; the
-first of `embeddings`) for the rest of the process. A 404 with a JSON `error` (a missing model, `model "…" not
-found`) is an error like any other and changes no endpoint. Weaviate 1.40.2's client calls `/api/embed`.
+**Embedding endpoint (#936).** `embed()` calls `POST /api/embed` with `{"model", "input", "keep_alive"}` and returns the
+first of `embeddings` (`[]` when there is none, for an empty text): the endpoint and body Weaviate 1.40.2's
+text2vec-ollama uses for documents and for `semantic` and `hybrid` questions, so the API's `hnsw` and `flat` query
+vectors are the vectors Weaviate makes for the same text. Any error status (a missing model's 404 included) is an
+error. The older `/api/embeddings` isn't called. It returns another vector: for `nomic-embed-text` on Ollama 0.3.14 and
+v0.40.18, `/api/embeddings` returns the model's raw vector and `/api/embed` the same vector at unit length (Ollama's
+`server/routes.go` normalises in `EmbedHandler` only; suite 03 reports both norms on 0.3.14). Stored vectors are unit
+length, so a query vector from `/api/embeddings` kept the order of results but put `dot` and `l2-squared` citation
+scores on another scale (cosine is unaffected). Stored vectors are Weaviate's either way: nothing needs re-embedding.
 
 **Health (§3.1).** The model check is tag-exact in both modes (a name without a tag is `:latest`). `/health/details`
 reports `services.ollama.version` in both modes. In external mode `resources.memory` is
@@ -1332,7 +1336,7 @@ not returned. Any other failure in the pipeline answers `500 INTERNAL_ERROR` (§
 
 **RAG pipeline (internal steps):**
 1. Reformat user question for retrieval using the answer LLM (`ANSWER_LLM_MODEL`, else `LLM_MODEL`; `llama3.1:8b` by default) (Section 6.1 prompt).
-2. Embed reformulated question — **only for `hnsw` and `flat` modes**: call Ollama `/api/embeddings` directly; for `hybrid` and `semantic` modes, Weaviate handles query embedding internally via `text2vec-ollama`.
+2. Embed reformulated question — **only for `hnsw` and `flat` modes**: call Ollama `/api/embed` directly (as Weaviate does, #936); for `hybrid` and `semantic` modes, Weaviate handles query embedding internally via `text2vec-ollama`.
 3. Retrieve top_k chunks from Weaviate using the specified retrieval mode and its parameters.
 4. Pass original question + retrieved chunks to the answer LLM for synthesis (Section 6.2 or 6.3 prompt).
 5. Format response according to `response_format`.
@@ -3238,8 +3242,8 @@ file, asking whether its name already has chunks (#22, §3.1.3), fails.
 
 | Retrieval mode | Weaviate query type | Who embeds the query |
 |---|---|---|
-| `hnsw` | `near_vector` | API calls Ollama `/api/embeddings` directly |
-| `flat` | `near_vector` | API calls Ollama `/api/embeddings` directly |
+| `hnsw` | `near_vector` | API calls Ollama `/api/embed` directly (the call Weaviate makes, #936) |
+| `flat` | `near_vector` | API calls Ollama `/api/embed` directly (the call Weaviate makes, #936) |
 | `hybrid` | `hybrid` (BM25 + vector) | Weaviate embeds the vector component via `text2vec-ollama` |
 | `semantic` | `near_text` | Weaviate embeds via `text2vec-ollama` |
 
@@ -4525,6 +4529,12 @@ now lives once, in `api/services/ingest_config.py`.
       collection recreated with another metric is converted by the new one. Controlled tests
       cover a missing distance or hybrid score (`null`), an unknown metric, and a failed metric
       read answering 503; the Q&A page shows `n/a` for a `null` score.*
+- [ ] `hnsw` and `flat` query vectors are the ones Weaviate makes (`/api/embed`, unit length, #936): a `dot` and an
+      `l2-squared` collection each return their own fixture first, with the `semantic` mode's scores.
+      *Evidence: `query_embedding.py` in suite 03, every run: Ollama's `/api/embeddings` and `/api/embed` norms for
+      one text (reported), `/api/embed` unit length, the API's vector equal to the one Weaviate stored for the same
+      text, and in each collection the expected first citation and the `semantic` scores in the `hnsw` and `flat`
+      modes.*
 - [x] `response_format: "end_user"` produces shorter, plainer answers than `"engineer"` for the same question.
       *Four paired trials: end_user shorter in 4/4, mean 652 vs 907 chars. Brevity
       was originally not instructed, so the margin was only a tendency, and
@@ -5234,11 +5244,11 @@ v0.40.18) pass, and the CI job `external-ollama` passes on the PR.
       default.
       *Evidence: `test_external_ollama.py` `ComposeFileTests` (suite 26, every run); `docker compose config` in
       `stack.sh --external-ollama`'s guard.*
-- [ ] The three settings are validated; `/api/chat` carries `num_ctx` and `keep_alive`, embedding requests
-      `keep_alive` only, in both modes; a 404 for a missing `/api/embeddings` route moves embeddings to `/api/embed`
-      for good, and a missing model's 404 doesn't; the API calls no endpoint that writes to Ollama.
+- [ ] The three settings are validated; `/api/chat` carries `num_ctx` and `keep_alive`, embedding requests go to
+      `/api/embed` only and carry `keep_alive` only, in both modes (#936); the API calls no endpoint that writes to
+      Ollama.
       *Evidence: `test_external_ollama.py` `SettingsTests` and `RequestBodyTests`; in a `stack.sh run
-      --external-ollama`, which endpoint the native Ollama answered (the api log).*
+      --external-ollama`, the `hnsw` question embedded through the native Ollama's `/api/embed` (suite 26).*
 - [ ] The model check is tag-exact; `/health/details` reports the version, and in external mode the memory status
       `external` with no advice and `ollama_loaded`; a missing model is 503 and one start-up line with its
       `ollama pull`.
