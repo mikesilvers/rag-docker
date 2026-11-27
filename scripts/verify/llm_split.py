@@ -12,6 +12,10 @@ so nothing is left behind; the build model is deleted from Ollama at the end.
 Prints one JSON line: the resolved models (as set, and as `name:tag`) and, per
 task, the sorted set of models that answered (Ollama's names, `name:tag`) and,
 when the task raised, `<task>_error`.
+
+In external-Ollama mode (RAG_EXTERNAL_OLLAMA=true) it refuses before any request
+and exits 2: that Ollama is shared, and rag-docker never pulls or deletes a model
+in it (#673). Suite 23 skips in that mode before it gets here.
 """
 import asyncio
 import json
@@ -23,6 +27,13 @@ from pathlib import Path
 import httpx
 
 from config import settings
+
+if settings.rag_external_ollama:
+    print(f"llm_split.py: refused in external-Ollama mode (RAG_EXTERNAL_OLLAMA=true): it pulls and "
+          f"deletes {settings.build_model}, and an external Ollama is shared, so rag-docker never "
+          "writes models to it (#673)", file=sys.stderr)
+    sys.exit(2)
+
 from services import goldstandard, preparation, preparation_jobs, rag_pipeline
 
 COLLECTION = os.environ["RAG_LLM_SPLIT_COLLECTION"]

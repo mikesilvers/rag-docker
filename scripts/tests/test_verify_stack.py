@@ -1675,5 +1675,64 @@ class ModelSyncTests(unittest.TestCase):
         self.assertIn('does not match its name', self.sync().stderr)
 
 
+class ExternalOllamaNoModelWritesTests(unittest.TestCase):
+    """An external Ollama is shared (#673): no verify suite may pull or delete a
+    model in it. `stack.sh run --external-ollama <suites>` runs any suite named,
+    so each suite that pulls or deletes a model, itself or through a helper,
+    must skip when RAG_VERIFY_EXTERNAL_OLLAMA is 1."""
+
+    WRITES = re.compile(r'/api/(pull|delete|create|copy|push)\b|ollama\s+(pull|rm|cp|create|push)\b')
+    GATE = re.compile(r'RAG_VERIFY_EXTERNAL_OLLAMA')
+
+    @staticmethod
+    def code(text):
+        return '\n'.join(line for line in text.splitlines() if not line.lstrip().startswith('#'))
+
+    def suites_that_write(self):
+        writers = {}
+        files = sorted(VERIFY.glob('*.sh')) + sorted(VERIFY.glob('*.py'))
+        for path in files:
+            if path.name in ('stack.sh', 'all.sh', 'lib.sh'):
+                continue
+            if self.WRITES.search(self.code(path.read_text())):
+                writers[path.name] = path
+        suites = {}
+        for suite in sorted(VERIFY.glob('[0-9][0-9]_*.sh')):
+            text = suite.read_text()
+            hit = [name for name in writers if name == suite.name or name in text]
+            if hit:
+                suites[suite.name] = (text, hit)
+        return suites
+
+    def test_a_suite_that_writes_models_skips_in_external_mode(self):
+        suites = self.suites_that_write()
+        self.assertIn('23_llm_split.sh', suites, 'expected llm_split.py to be found as a writer')
+        for name, (text, hit) in suites.items():
+            with self.subTest(suite=name):
+                self.assertRegex(self.code(text), self.GATE,
+                              f'{name} pulls or deletes a model (through {hit}) but never '
+                              'checks RAG_VERIFY_EXTERNAL_OLLAMA, so stack.sh run '
+                              '--external-ollama would write to the shared Ollama')
+
+
+class LlmSplitExternalSkipTests(unittest.TestCase):
+    """Suite 23 pulls and deletes a model (#671), so in external-Ollama mode it
+    skips before it reaches Docker, the API or Ollama (#673)."""
+
+    def test_it_skips_with_the_reason_and_calls_nothing(self):
+        sandbox = Sandbox(self)
+        fixtures = sandbox.root / 'fixtures'
+        fixtures.mkdir()
+        out = sandbox.run(['bash', str(VERIFY / '23_llm_split.sh')],
+                          RAG_VERIFY_EXTERNAL_OLLAMA='1', RAG_FIXTURES=str(fixtures),
+                          RAG_API='http://localhost:8081/api', COMPOSE_PROJECT_NAME='rag-verify')
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn('SKIP', out.stdout)
+        self.assertIn('external-Ollama mode: this suite pulls and deletes qwen2.5:0.5b', out.stdout)
+        self.assertIn('rag-docker never writes models to it (#673)', out.stdout)
+        self.assertIn('0 passed, 0 failed, 1 skipped', out.stdout)
+        self.assertEqual(sandbox.calls(), [], 'no docker or curl call in external-Ollama mode')
+
+
 if __name__ == '__main__':
     unittest.main()

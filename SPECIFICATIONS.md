@@ -464,8 +464,10 @@ embedding calls (ingest of records without a vector, `semantic` and `hybrid` que
 the Ollama server's settings in either mode.
 
 **Embedding endpoint.** `embed()` calls `POST /api/embeddings` (`prompt`; still documented by Ollama v0.40.18, as
-superseded by `/api/embed`). When it answers 404, the API logs one line and uses `POST /api/embed` (`input`; the
-first of `embeddings`) for the rest of the process. Weaviate 1.40.2's client calls `/api/embed`.
+superseded by `/api/embed`). When it answers 404 for a missing route (a body that isn't a JSON object with an
+`error`, such as Ollama's plain `404 page not found`), the API logs one line and uses `POST /api/embed` (`input`; the
+first of `embeddings`) for the rest of the process. A 404 with a JSON `error` (a missing model, `model "…" not
+found`) is an error like any other and changes no endpoint. Weaviate 1.40.2's client calls `/api/embed`.
 
 **Health (§3.1).** The model check is tag-exact in both modes (a name without a tag is `:latest`). `/health/details`
 reports `services.ollama.version` in both modes. In external mode `resources.memory` is
@@ -490,7 +492,8 @@ model tag-exact with its `ollama pull` line). Exit 0 all passed, 3 with warnings
 `--host-only` runs only the listener check. Both only read.
 
 **Verify.** `scripts/verify/stack.sh run --external-ollama` on a host whose native Ollama follows the guide, and the
-CI job `external-ollama` on Linux (§10.12).
+CI job `external-ollama` on Linux (§10.12). In that mode a suite that would pull or delete a model skips
+(`23_llm_split`, whose helper `llm_split.py` also refuses), so the harness never writes to the host's Ollama either.
 
 ---
 
@@ -5228,8 +5231,8 @@ v0.40.18) pass, and the CI job `external-ollama` passes on the PR.
       *Evidence: `test_external_ollama.py` `ComposeFileTests` (suite 26, every run); `docker compose config` in
       `stack.sh --external-ollama`'s guard.*
 - [ ] The three settings are validated; `/api/chat` carries `num_ctx` and `keep_alive`, embedding requests
-      `keep_alive` only, in both modes; a 404 from `/api/embeddings` moves embeddings to `/api/embed` for good; the
-      API calls no endpoint that writes to Ollama.
+      `keep_alive` only, in both modes; a 404 for a missing `/api/embeddings` route moves embeddings to `/api/embed`
+      for good, and a missing model's 404 doesn't; the API calls no endpoint that writes to Ollama.
       *Evidence: `test_external_ollama.py` `SettingsTests` and `RequestBodyTests`; in a `stack.sh run
       --external-ollama`, which endpoint the native Ollama answered (the api log).*
 - [ ] The model check is tag-exact; `/health/details` reports the version, and in external mode the memory status
@@ -5246,6 +5249,10 @@ v0.40.18) pass, and the CI job `external-ollama` passes on the PR.
 - [ ] `stack.sh --external-ollama` refuses a host that doesn't follow the guide before any Docker command, uses no
       model copy, and its guard allows exactly `ollama:host-gateway` on api and weaviate and no ollama service.
       *Evidence: `test_verify_stack.py` `ExternalOllamaGuardTests` and `ExternalOllamaPreflightTests`.*
+- [ ] In external-Ollama mode no verify suite pulls, deletes, creates, copies or pushes a model: `23_llm_split`
+      skips before it touches the stack, and `llm_split.py` refuses before any request.
+      *Evidence: `test_verify_stack.py` `ExternalOllamaNoModelWritesTests` and `LlmSplitExternalSkipTests`;
+      `test_external_ollama.py` `LlmSplitRefusalTests`.*
 - [ ] End to end on a native Ollama: no ollama service runs, ingest completes (Weaviate reaches the host's Ollama),
       a reindex completes, and outside `RAG_SKIP_SLOW` `hnsw` and `semantic` questions answer with citations.
       *Evidence: suite 26 in a `stack.sh run --external-ollama` (macOS) and the CI job `external-ollama` (Linux,

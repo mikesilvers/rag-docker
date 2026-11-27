@@ -10,10 +10,23 @@ from config import settings
 _BASE = f"http://{settings.ollama_host}:{settings.ollama_port}"
 _log = logging.getLogger(__name__)
 
-# Set once /api/embeddings answers 404: an Ollama that has dropped the older
-# endpoint, superseded by /api/embed (#673). Every later embedding goes to
-# /api/embed, the endpoint Weaviate's text2vec-ollama calls.
+# Set once /api/embeddings answers 404 for a missing route: an Ollama that has
+# dropped the older endpoint, superseded by /api/embed (#673). Every later
+# embedding goes to /api/embed, the endpoint Weaviate's text2vec-ollama calls.
 _use_embed = False
+
+
+def _route_missing(resp: httpx.Response) -> bool:
+    """A 404 for the route itself, not for the model: Ollama answers a missing
+    model with a JSON `error` ("model ... not found"), and a missing route with
+    plain text ("404 page not found")."""
+    if resp.status_code != 404:
+        return False
+    try:
+        body = resp.json()
+    except ValueError:
+        return True
+    return not (isinstance(body, dict) and "error" in body)
 
 
 @telemetry.traced("ollama.embed")
@@ -28,7 +41,7 @@ async def embed(text: str) -> list[float]:
                 json={"model": settings.embed_model, "prompt": text,
                       "keep_alive": settings.ollama_keep_alive},
             )
-            if resp.status_code != 404:
+            if not _route_missing(resp):
                 resp.raise_for_status()
                 return resp.json()["embedding"]
             _use_embed = True

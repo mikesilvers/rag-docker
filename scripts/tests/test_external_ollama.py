@@ -2,11 +2,13 @@
 
 The settings (RAG_EXTERNAL_OLLAMA, OLLAMA_NUM_CTX, OLLAMA_KEEP_ALIVE), the bodies
 of rag-docker's own Ollama requests in both modes (num_ctx on chat only,
-keep_alive everywhere) and the /api/embed fallback, the tag-exact model check,
-the version and, in external mode, the memory report and what Ollama has loaded
-in /health/details, the start-up lines for missing models, import's check-only
-path and the refused export with models, `python -m ollama_check`, the overlay
-file and the base file's two settings, and install-offline.sh's options.
+keep_alive everywhere) and the /api/embed fallback (for a missing route only,
+never a missing model), the tag-exact model check, the version and, in external
+mode, the memory report and what Ollama has loaded in /health/details, the
+start-up lines for missing models, import's check-only path and the refused
+export with models, `python -m ollama_check`, the overlay file and the base
+file's two settings, install-offline.sh's options, and suite 23's llm_split.py
+refusing in external mode.
 
 Runs with the API's dependencies, on the host (`~/.venvs/rag-api/bin/python`) or
 in the built API image with no network (`26_external_ollama.sh`):
@@ -58,11 +60,12 @@ class FakeOllama:
     embedding endpoints, recording every request's path and JSON body."""
 
     def __init__(self, models=None, down=False, version="0.40.18", embeddings_gone=False,
-                 loaded=None, ps_fails=False):
+                 loaded=None, ps_fails=False, embed_model_missing=False):
         self.models = models
         self.down = down
         self.version = version
         self.embeddings_gone = embeddings_gone
+        self.embed_model_missing = embed_model_missing
         self.loaded = loaded if loaded is not None else []
         self.ps_fails = ps_fails
         self.requests = []
@@ -89,6 +92,10 @@ class FakeOllama:
         if path == "/api/embeddings":
             if self.embeddings_gone:
                 return httpx.Response(404, text="404 page not found")
+            if self.embed_model_missing:
+                # The route is there; the model isn't (Ollama's own JSON error).
+                return httpx.Response(404, json={"error": f'model "{body["model"]}" not found, '
+                                                          "try pulling it first"})
             return httpx.Response(200, json={"embedding": [0.1, 0.2, 0.3]})
         if path == "/api/embed":
             return httpx.Response(200, json={"embeddings": [[0.4, 0.5, 0.6]]})
@@ -208,6 +215,26 @@ class RequestBodyTests(unittest.TestCase):
             {"model": settings.embed_model, "input": "two", "keep_alive": settings.ollama_keep_alive}])
         self.assertEqual(len(logs.records), 1)
         self.assertIn("using /api/embed", logs.output[0])
+
+    def test_a_missing_model_404_is_an_error_not_a_fallback(self):
+        with FakeOllama(embed_model_missing=True).serving() as fake, \
+                self.assertNoLogs("services.ollama_client", "WARNING"):
+            with self.assertRaises(httpx.HTTPStatusError) as caught:
+                asyncio.run(ollama_client.embed("x"))
+        self.assertEqual(caught.exception.response.status_code, 404)
+        self.assertIs(ollama_client._use_embed, False, "the endpoint stays /api/embeddings")
+        self.assertEqual(fake.bodies("/api/embed"), [])
+        self.assertEqual(len(fake.bodies("/api/embeddings")), 1)
+
+    def test_only_a_404_without_a_json_error_is_a_missing_route(self):
+        for response, missing in ((httpx.Response(404, text="404 page not found"), True),
+                                  (httpx.Response(404), True),
+                                  (httpx.Response(404, json=["not", "an", "object"]), True),
+                                  (httpx.Response(404, json={"error": "model not found"}), False),
+                                  (httpx.Response(200, json={"embedding": [1.0]}), False),
+                                  (httpx.Response(500, text="oops"), False)):
+            with self.subTest(status=response.status_code, body=response.text):
+                self.assertIs(ollama_client._route_missing(response), missing)
 
     def test_another_error_is_not_a_fallback(self):
         def failing(request):
@@ -623,6 +650,26 @@ class InstallOfflineTests(unittest.TestCase):
         out, _ = self.run_install("--nope")
         self.assertEqual(out.returncode, 2)
         self.assertIn("Usage: bash install-offline.sh [--telemetry] [--external-ollama]", out.stderr)
+
+
+class LlmSplitRefusalTests(unittest.TestCase):
+    """Suite 23's helper pulls and deletes a model (#671), so in external-Ollama
+    mode it refuses before any request (#673). OLLAMA_PORT=1: a request that
+    slipped through would reach no Ollama and end in a ConnectError traceback."""
+
+    def test_it_refuses_in_external_mode_before_any_request(self):
+        api_dir = os.environ.get("RAG_TEST_API_DIR") or str(ROOT / "api")
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("RAG_", "OLLAMA_"))}
+        env.update({"PYTHONPATH": api_dir, "RAG_EXTERNAL_OLLAMA": "true",
+                    "RAG_LLM_SPLIT_COLLECTION": "VfyLlmSplit",
+                    "OLLAMA_HOST": "127.0.0.1", "OLLAMA_PORT": "1"})
+        out = subprocess.run([sys.executable, str(ROOT / "scripts/verify/llm_split.py")],
+                             capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertIn("llm_split.py: refused in external-Ollama mode (RAG_EXTERNAL_OLLAMA=true)", out.stderr)
+        self.assertIn("rag-docker never writes models to it (#673)", out.stderr)
+        self.assertNotIn("Traceback", out.stderr)
+        self.assertEqual(out.stdout, "")
 
 
 if __name__ == "__main__":
