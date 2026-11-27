@@ -431,6 +431,73 @@ controls, and keeps the Collections page's list and Access without "+ New Collec
 
 **Verify.** `scripts/verify/stack.sh run --query-only` (§10.11).
 
+### 2.7 External Ollama Mode (#673)
+
+The stack uses an Ollama it doesn't run, usually one installed natively on the same machine for its GPU, instead of
+its own `ollama` container. It is opt-in: only `docker compose -f docker-compose.yml -f docker-compose.external-ollama.yml
+...` turns it on, alone or listed last after LAN mode's and query-only mode's files; the contained stack stays the
+default. It applies to full and query-only instances. README "External Ollama (native)" is the setup guide for
+macOS, Linux and Windows (Windows not yet verified); tested with Ollama v0.40.18, and older than 0.3.14 isn't
+supported.
+
+**File:** `docker-compose.external-ollama.yml`. Over the base file:
+- `ollama`: `profiles: [contained-ollama]`, never enabled, so it is neither created nor started;
+- `api` and `weaviate`: `extra_hosts: ["ollama:host-gateway"]`. The name `ollama` reaches the host (Docker Desktop:
+  the host's loopback; Linux: the `docker0` address), so `OLLAMA_HOST` stays `ollama`, Weaviate's
+  `TEXT2VEC_OLLAMA_APIENDPOINT` and every collection's stored endpoint stay `http://ollama:11434`, nothing is
+  migrated, and reindex's endpoint check (§3.1, tuning) keeps passing;
+- `api`: `RAG_EXTERNAL_OLLAMA: "true"`, `depends_on: !override` with only `weaviate` healthy, and `volumes: !override`
+  with the base file's api mounts except `ollama_models:/ollama`. A user's own override file comes before it in the
+  `-f` list; api mounts it adds are dropped unless repeated in a later file.
+
+**The host's Ollama.** Listens on port 11434: on loopback with Docker Desktop, on the `docker0` address on Linux,
+never `0.0.0.0` (it has no authentication). On Linux the `docker0` bind needs a firewall rule as well, since Linux
+accepts packets for that address on any interface: TCP 11434 is accepted on `lo`, `docker0` and `br-+` and dropped on
+every other interface (the README gives the `iptables` lines). It is shared with other apps and models, so rag-docker never pulls,
+creates, copies, deletes or unloads a model in it and never changes its server-wide settings (`OLLAMA_KEEP_ALIVE`,
+`OLLAMA_NUM_PARALLEL`, `OLLAMA_CONTEXT_LENGTH`). Its only calls are `/api/chat`, `/api/embeddings` (or `/api/embed`,
+below) and the reads `/api/tags`, `/api/version` and `/api/ps`.
+
+**Per-request options, in both modes.** Every `/api/chat` request carries `"options": {"num_ctx": OLLAMA_NUM_CTX}`
+(default 2048) and `"keep_alive": OLLAMA_KEEP_ALIVE` (default `5m`), Ollama 0.3.14's defaults, so the contained
+stack's results don't change. Every embedding request carries `keep_alive` and no `num_ctx`: the embedding model
+keeps its own context (`nomic-embed-text` sets 8192), as Weaviate's own calls do. Weaviate's text2vec-ollama
+embedding calls (ingest of records without a vector, `semantic` and `hybrid` questions) can't carry options; they use
+the Ollama server's settings in either mode.
+
+**Embedding endpoint.** `embed()` calls `POST /api/embeddings` (`prompt`; still documented by Ollama v0.40.18, as
+superseded by `/api/embed`). When it answers 404 for a missing route (a body that isn't a JSON object with an
+`error`, such as Ollama's plain `404 page not found`), the API logs one line and uses `POST /api/embed` (`input`; the
+first of `embeddings`) for the rest of the process. A 404 with a JSON `error` (a missing model, `model "…" not
+found`) is an error like any other and changes no endpoint. Weaviate 1.40.2's client calls `/api/embed`.
+
+**Health (§3.1).** The model check is tag-exact in both modes (a name without a tag is `:latest`). `/health/details`
+reports `services.ollama.version` in both modes. In external mode `resources.memory` is
+`{"status": "external", "note": ...}` with no Docker-memory recommendation, and `resources.ollama_loaded` lists what
+Ollama has loaded (`/api/ps`: `name`, `size`, `size_vram`, `expires_at`), or is `null` with
+`resources.ollama_loaded_note`; information only. A missing model keeps `/health` at 503, as in the contained stack.
+
+**Start-up.** In the background, the API reads `/api/tags` once (10 s at most) and logs one line per missing model:
+`Ollama model missing: <name:tag>. On the Ollama host, run: ollama pull <name:tag>` (external) or `... Run: docker
+compose exec ollama ollama pull <name:tag>` (contained); an unreachable Ollama is one line.
+
+**Packages.** In external mode `model_bundle.store_available()` is false whatever is mounted. Import and the loader
+check the embedding model and the answer model through `/api/tags` and never install a bundled model
+(RAG_EXPORT_SPECIFICATIONS §6.3); `POST /export` with `include_models: true` answers **400 `MODELS_NOT_EXPORTABLE`**.
+`install-offline.sh --external-ollama` restores no model weights, starts with the overlay and prints the
+`ollama pull` lines.
+
+**Checking a setup.** `bash scripts/check-external-ollama.sh` checks on the host what listens on port 11434 (`lsof`
+on macOS, `ss` on Linux; loopback, and on Linux the `docker0` address, are fine, the `docker0` line saying it holds
+only with the firewall rule, which the helper can't see; a wildcard or any other address is a warning; nothing
+listening is a problem, on macOS with a note that `lsof` without root sees only this user's sockets), then runs `python -m ollama_check` in the api container (the mode, reaching Ollama and its version, each
+model tag-exact with its `ollama pull` line). Exit 0 all passed, 3 with warnings, 1 a problem, 2 usage;
+`--host-only` runs only the listener check. Both only read.
+
+**Verify.** `scripts/verify/stack.sh run --external-ollama` on a host whose native Ollama follows the guide, and the
+CI job `external-ollama` on Linux (§10.12). In that mode a suite that would pull or delete a model skips
+(`23_llm_split`, whose helper `llm_split.py` also refuses), so the harness never writes to the host's Ollama either.
+
 ---
 
 ## 3. API Service Specification
@@ -482,7 +549,8 @@ The full report, for Developers and AI Engineers, with a session or a service ke
       "llm": { "status": "ok", "latency_ms": 5, "model": "llama3.1:8b" },
       "build_llm": { "status": "ok", "latency_ms": 5, "model": "llama3.1:8b" },
       "embed": { "status": "ok", "latency_ms": 5, "model": "nomic-embed-text" },
-      "same_model": true
+      "same_model": true,
+      "version": "0.3.14"
     }
   },
   "resources": {
@@ -499,7 +567,11 @@ The full report, for Developers and AI Engineers, with a session or a service ke
 
 `llm` is the answer model (`ANSWER_LLM_MODEL`), `build_llm` the build model (`BUILD_LLM_MODEL`), each
 falling back to `LLM_MODEL` (#671); a missing one of either makes the response 503. `same_model` is true when
-they are one model (`x` and `x:latest` are); it never affects the status.
+they are one model (`x` and `x:latest` are); it never affects the status. A model is present only when Ollama lists
+its exact `name:tag`, a name without a tag being `:latest` (#673). `version` is the running Ollama's
+(`GET /api/version`), or `null`; it never affects the status (#673). With an external Ollama (§2.7) `resources` is
+`{"memory": {"status": "external", "note": ...}, "ollama_loaded": [...]}`: no Docker-memory recommendation, and
+what Ollama has loaded, information only.
 
 **Weaviate is probed through the client, not over plain HTTP.** A bare `GET
 /v1/.well-known/ready` cannot detect a client/server version mismatch: the server
@@ -2315,6 +2387,7 @@ Standard error codes:
 | `PACKAGE_NOT_FOUND` | 404 | `GET /packages/{filename}`: no such package in `./exports`, a name outside the rule, or one the caller may not see (#677) |
 | `PACKAGE_BUSY` | 409 | `GET /packages/{filename}`: an import of the package runs or another download of it is in progress (#677) |
 | `ENCRYPTION_REQUIRED` | 400 | `POST /export` with `encryption: "none"` in LAN mode (#676) |
+| `MODELS_NOT_EXPORTABLE` | 400 | `POST /export` with `include_models: true` with an external Ollama (§2.7, #673) |
 | `KEY_FILE_REQUIRED` | 400 | `POST /import` of a package encrypted with a key, sent without `key` (#676) |
 | `KEY_FILE_INVALID` | 400 | `POST /import` with a `key` that isn't the text of an age X25519 key file (#676) |
 | `KEY_FILE_NOT_EXPECTED` | 400 | `POST /import` with a `key` for an unencrypted package (#676) |
@@ -3913,6 +3986,14 @@ Query-only mode (#670, §2.6) adds one API container setting:
 |---|---|---|
 | `RAG_QUERY_ONLY` | `false` | Exactly `true` or `false`; anything else fails API startup. `true` through `docker-compose.query-only.yml`; then the routes of §2.6 answer `403 QUERY_ONLY` and `python -m loader` loads packages |
 
+External Ollama mode (#673, §2.7) adds three API container settings:
+
+| Setting | Default | Accepted values |
+|---|---|---|
+| `RAG_EXTERNAL_OLLAMA` | `false` | Exactly `true` or `false`; anything else fails API startup. `true` only through `docker-compose.external-ollama.yml` |
+| `OLLAMA_NUM_CTX` | `2048` | 256 to 1048576. Sent as `num_ctx` with the LLM chat requests, in both modes; never set on the server |
+| `OLLAMA_KEEP_ALIVE` | `5m` | A duration: whole seconds (`300`, `-1`), sent as a JSON number (Ollama reads a string as a duration that needs a unit), or `<number><unit>` parts with `ms`, `s`, `m` or `h` (`5m`, `1h30m`), sent as a string. Sent as `keep_alive` with every request, in both modes; never set on the server |
+
 An invalid API container setting (any setting of `api/config.py`, such as `AUTH_COOKIE_SECURE`, `RAG_LAN_MODE`,
 `AUDIT_LOG_QUESTIONS` or `MAX_ZIP_MEMBERS`) stops API startup: the API writes one line per invalid setting to standard
 error, `Settings refused: <reason>`, without the value given and with no traceback, and exits 1 (#555). Telemetry
@@ -3948,8 +4029,10 @@ rag-docker/
 │   ├── backup.sh               # Encrypted volume backup, a new age key per volume (#848)
 │   ├── restore.sh              # Restores it; checks every archive with its key first (#848)
 │   ├── backup-common.sh        # Shared by the two: volumes, prefix, the age image
+│   ├── check-external-ollama.sh # Checks an external Ollama's setup (#673, §2.7)
 │   └── age/Dockerfile          # The age image: pinned alpine plus a pinned age package
 ├── docker-compose.lan.yml      # LAN mode, opt-in (#26)
+├── docker-compose.external-ollama.yml # External (native) Ollama, opt-in (#673, §2.7)
 ├── proxy/
 │   ├── nginx.conf              # Default server: HTTP, container port 80
 │   ├── nginx.lan.conf          # LAN mode: TLS, container port 443
@@ -3963,6 +4046,7 @@ rag-docker/
 │   ├── requirements.in         # Direct dependencies — edit this one
 │   ├── requirements.txt        # Generated lock (pinned); installed by the build
 │   ├── main.py                  # FastAPI app entry point
+│   ├── ollama_check.py          # python -m ollama_check: the Ollama it uses, from inside the api (#673)
 │   ├── utils.py                 # Shared helpers (api_error response factory)
 │   ├── auth/                    # Accounts, sessions, service keys, the role matrix (#25)
 │   │   ├── __main__.py          # The operator command, python -m auth
@@ -3989,6 +4073,7 @@ rag-docker/
 │   ├── services/
 │   │   ├── weaviate_client.py   # Weaviate connection, schema, and query operations
 │   │   ├── ollama_client.py     # Ollama LLM and embed calls
+│   │   ├── ollama_startup.py    # The start-up model check's log lines (#673)
 │   │   ├── ingest_pipeline.py   # Parse → chunk → embed → store
 │   │   ├── preparation_store.py # The preparation area on disk (#638)
 │   │   ├── preparation.py       # Preparing one document: extract, split, clean, title, check
@@ -5140,6 +5225,46 @@ the tests reviewer's full `stack.sh run` and `stack.sh run --query-only` on the 
 - [ ] The UI hides Import, Prepare, Chunking, Retrieval and Gold Standard and the Transfer page's import controls
       and the Collections page's create and delete in query-only mode, and is unchanged otherwise.
       *Evidence: the UI build (`tsc && vite build`) and review; `GET /auth/me`'s `query_only` in suite 24.*
+
+### 10.12 External Ollama (#673)
+
+The stack uses a native Ollama on the host instead of its own container (§2.7). These are ticked once the tests
+reviewer's full `stack.sh run` and `stack.sh run --external-ollama` (on the maintainer's Mac, with native Ollama
+v0.40.18) pass, and the CI job `external-ollama` passes on the PR.
+
+- [ ] `docker-compose.external-ollama.yml` leaves out the `ollama` service, gives api and weaviate exactly
+      `ollama:host-gateway`, makes the api wait only for weaviate, drops only its model-store mount and sets
+      `RAG_EXTERNAL_OLLAMA=true`, alone and after the LAN and query-only files; the base file keeps the contained
+      default.
+      *Evidence: `test_external_ollama.py` `ComposeFileTests` (suite 26, every run); `docker compose config` in
+      `stack.sh --external-ollama`'s guard.*
+- [ ] The three settings are validated; `/api/chat` carries `num_ctx` and `keep_alive`, embedding requests
+      `keep_alive` only, in both modes; a 404 for a missing `/api/embeddings` route moves embeddings to `/api/embed`
+      for good, and a missing model's 404 doesn't; the API calls no endpoint that writes to Ollama.
+      *Evidence: `test_external_ollama.py` `SettingsTests` and `RequestBodyTests`; in a `stack.sh run
+      --external-ollama`, which endpoint the native Ollama answered (the api log).*
+- [ ] The model check is tag-exact; `/health/details` reports the version, and in external mode the memory status
+      `external` with no advice and `ollama_loaded`; a missing model is 503 and one start-up line with its
+      `ollama pull`.
+      *Evidence: `test_external_ollama.py` `ModelCheckTests`, `HealthTests` and `StartupLogTests`; suite 26.*
+- [ ] In external mode, import and the loader check models through Ollama and install none; export with models is
+      refused `400 MODELS_NOT_EXPORTABLE`; an export without models imports back.
+      *Evidence: `test_external_ollama.py` `ImportTests` and `ExportTests`; suite 26.*
+- [ ] `scripts/check-external-ollama.sh` passes on loopback (and `docker0` on Linux), warns on a wildcard or a LAN
+      address, fails when nothing listens; `python -m ollama_check` reaches Ollama and names each missing model's
+      pull.
+      *Evidence: `test_check_external_ollama.py`, `test_external_ollama.py` `OllamaCheckTests`; suite 26.*
+- [ ] `stack.sh --external-ollama` refuses a host that doesn't follow the guide before any Docker command, uses no
+      model copy, and its guard allows exactly `ollama:host-gateway` on api and weaviate and no ollama service.
+      *Evidence: `test_verify_stack.py` `ExternalOllamaGuardTests` and `ExternalOllamaPreflightTests`.*
+- [ ] In external-Ollama mode no verify suite pulls, deletes, creates, copies or pushes a model: `23_llm_split`
+      skips before it touches the stack, and `llm_split.py` refuses before any request.
+      *Evidence: `test_verify_stack.py` `ExternalOllamaNoModelWritesTests` and `LlmSplitExternalSkipTests`;
+      `test_external_ollama.py` `LlmSplitRefusalTests`.*
+- [ ] End to end on a native Ollama: no ollama service runs, ingest completes (Weaviate reaches the host's Ollama),
+      a reindex completes, and outside `RAG_SKIP_SLOW` `hnsw` and `semantic` questions answer with citations.
+      *Evidence: suite 26 in a `stack.sh run --external-ollama` (macOS) and the CI job `external-ollama` (Linux,
+      `RAG_SKIP_SLOW=1`).*
 
 ## 11. Host Requirements and Distribution
 
