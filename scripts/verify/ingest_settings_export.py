@@ -4,8 +4,9 @@ Writes the collection's saved ingest settings file directly in the API
 container, as an older API or a hand edit could leave it (the API's own save
 refuses these values), then checks through the real export job that each
 invalid file fails the export with an error naming the collection, the failing
-field and the Chunking Configuration page, and that no package is published.
-The collection's saved settings file is restored on exit.
+field and the Chunking Configuration page, that no package is published, and
+that the refused export leaves the saved file as it was written (#932). The
+collection's saved settings file is restored on exit.
 """
 import json
 import os
@@ -72,11 +73,16 @@ def run(api, collection, exports, repo_root):
     def listing():
         return sorted(p.name for p in exports.iterdir())
 
-    saved = json.loads(in_api(READ).strip().splitlines()[-1])
+    def saved_file():
+        """The saved settings file's text, or None when there is none."""
+        return json.loads(in_api(READ).strip().splitlines()[-1])
+
+    saved = saved_file()
     try:
         for value, needle in CASES:
             # Bypasses the save contract, which refuses these values.
             in_api(WRITE, json.dumps(value))
+            written = saved_file()
             before = listing()
             job = wait('/export/job/' + request('/export', {'collection': collection, 'encryption': 'none',
                                                             'include_models': False})['job_id'])
@@ -88,6 +94,9 @@ def run(api, collection, exports, repo_root):
                    and 'Chunking Configuration page' in error, error)
             expect(f'invalid saved ingest settings {value!r}: no package or staging is left',
                    listing() == before, sorted(set(listing()) ^ set(before)))
+            after = saved_file()
+            expect(f'invalid saved ingest settings {value!r}: the saved settings file is unchanged',
+                   after == written, {'written': written, 'after': after})
     finally:
         if saved is None:
             in_api(REMOVE)

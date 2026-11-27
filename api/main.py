@@ -23,6 +23,7 @@ async def lifespan(app: FastAPI):
     app.state.telemetry = runtime
     flusher = None
     sweeper = None
+    checker = None
     try:
         import logging
         from services import goldstandard, metrics
@@ -126,11 +127,17 @@ async def lifespan(app: FastAPI):
         # Writes the count records of repeated failed logins as their windows
         # close; the open ones are written at shutdown, below (#577).
         flusher = asyncio.create_task(audit.login_flusher())
+        # One line per model Ollama doesn't have, with the exact pull command
+        # (#673); in the background, so an unreachable Ollama doesn't delay start.
+        from services import ollama_startup
+        checker = asyncio.create_task(ollama_startup.log_missing_models())
         yield
     finally:
         try:
             if sweeper is not None:
                 sweeper.cancel()
+            if checker is not None:
+                checker.cancel()
             if flusher is not None:
                 flusher.cancel()
                 from services import audit

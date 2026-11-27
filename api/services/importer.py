@@ -454,7 +454,7 @@ def _ollama_reports(model: str) -> bool | None:
     missing would send the user to pull one they may already have.
     """
     from services import ollama_client
-    want = model if ":" in model.rsplit("/", 1)[-1] else f"{model}:latest"
+    want = ollama_client.tagged(model)
     try:
         return want in asyncio.run(ollama_client.list_models())
     except Exception as exc:                      # noqa: BLE001
@@ -473,6 +473,8 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
     The LLM is this instance's answer model; the build model is neither checked
     nor installed (#671).
     """
+    if settings.rag_external_ollama:
+        return _ensure_models_external(pkg, manifest)
     notes: list[str] = []
     if not model_bundle.store_available():
         # Nothing can be installed or checked; say so rather than guess.
@@ -574,6 +576,51 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
                 f"Installed '{ref}' from the package but Ollama does not report it.",
                 {"model": name})
         notes.append(f"model '{ref}' installed from the package")
+    return notes
+
+
+def _ensure_models_external(pkg: Path, manifest: dict) -> list[str]:
+    """Spec §6.3 with an external Ollama (#673): check, never install.
+
+    The models are asked of the external Ollama (`/api/tags`, tag-exact); no
+    model store is read or written, and models a package bundles are left in it.
+    The embedding model decides the import; the answer model is a note.
+    """
+    from services import ollama_client
+    notes: list[str] = []
+    try:
+        bundled = model_bundle.bundled_models(pkg, manifest)
+    except OSError:
+        bundled = []
+    if bundled:
+        notes.append("the package bundles models; with an external Ollama they are not installed")
+    embed_ref = ollama_client.tagged(settings.embed_model)
+    reported = _ollama_reports(settings.embed_model)
+    if reported is None:
+        raise PackageError(
+            "IMPORT_FAILED",
+            f"Couldn't reach the external Ollama to confirm the embedding model "
+            f"'{embed_ref}' is there. Run scripts/check-external-ollama.sh, then import again.",
+            {"model": embed_ref})
+    if not reported:
+        pkg_model = (manifest.get("embedding") or {}).get("model")
+        raise PackageError(
+            "EMBEDDING_MODEL_MISSING",
+            f"This instance uses an external Ollama, which does not have the embedding "
+            f"model '{embed_ref}'. On the Ollama host, run `ollama pull {embed_ref}`, "
+            f"then import again.",
+            {"model": embed_ref, "package_model": pkg_model, "bundled": bundled})
+    notes.append(f"model '{embed_ref}' reported by the external Ollama")
+    answer_ref = ollama_client.tagged(settings.answer_model)
+    answer = _ollama_reports(settings.answer_model)
+    if answer is None:
+        notes.append(f"model '{answer_ref}' wasn't checked: the external Ollama couldn't "
+                     "be reached to confirm it is there")
+    elif answer:
+        notes.append(f"model '{answer_ref}' reported by the external Ollama")
+    else:
+        notes.append(f"model '{answer_ref}' is absent from the external Ollama; pull it "
+                     f"there with `ollama pull {answer_ref}` before querying")
     return notes
 
 
@@ -1150,21 +1197,30 @@ def _worker(job_id: str, filename: str, on_conflict: str, passphrase: str | None
         _run(job_id, filename, on_conflict, passphrase)
 
 
-def _settle_unstarted(job_id: str, name: str) -> None:
+def _settle_unstarted(job_id: str, name: str, task: asyncio.Task) -> None:
     """A done callback: settles a job whose task ended before its worker could
     start (#871), freeing the package claim before the status turns terminal,
     so a client that sees it fail can import or download the package again. A
-    worker that started settles its own job."""
+    cancelled task reads the cancelled message; one that ended with another
+    error reads that error's type and message, and the warning carries its
+    traceback (#932). A worker that started settles its own job."""
     with _lock:
         if job_id in _started:
             _started.discard(job_id)
             return
         _abandoned.add(job_id)
         _active.discard(name)
+    # Retrieving the exception keeps asyncio from reporting it again (#932).
+    exc = None if task.cancelled() else task.exception()
+    if exc is None:
+        _log.warning("Import of %r cancelled before it started", name)
+    else:
+        _log.warning("Import of %r failed before it started", name, exc_info=exc)
     job = _jobs.get(job_id)
     # A small write on the event loop, as ingest's done callback makes (#309).
     if job is not None and job.get("status") not in jobstore.TERMINAL:
-        job.update(status="failed", error_code="IMPORT_FAILED", error=_CANCELLED)
+        job.update(status="failed", error_code="IMPORT_FAILED",
+                   error=_CANCELLED if exc is None else f"{type(exc).__name__}: {exc}")
 
 
 def package_kind(name: str) -> str | None:
@@ -1266,5 +1322,5 @@ async def start_import_job(filename: str, on_conflict: str, passphrase: str | No
         task = asyncio.create_task(asyncio.to_thread(telemetry.admitted(_worker), job_id, filename,
                                                      on_conflict, passphrase))
     # A task cancelled before its worker starts still ends its job (#871).
-    task.add_done_callback(lambda _task: _settle_unstarted(job_id, name))
+    task.add_done_callback(lambda done: _settle_unstarted(job_id, name, done))
     return job_id

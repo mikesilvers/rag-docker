@@ -255,8 +255,23 @@ async def start_export_job(collection: str, include_models: bool = False,
     # to_thread keeps the blocking Weaviate iteration off the event loop, so an
     # export does not stall the API: queries and other collections carry on, and
     # only guarded writes to this collection wait for it (spec §6.1, #509).
-    task = asyncio.create_task(asyncio.to_thread(telemetry.admitted(_worker), job_id, collection,
-                                                 include_models, passphrase, encryption))
+    # The task marks itself when its coroutine first runs, before it hands the
+    # worker to the executor (#926). A task that ends unmarked was cancelled
+    # before its first step: its worker can never run, so its job needs no
+    # _abandoned entry. A marked task whose worker hasn't started keeps one, so
+    # a worker whose thread starts late finds its job settled (#529). An entry
+    # can still stay when a marked task's queued executor item is cancelled
+    # before a thread runs it, or when to_thread itself raises (as at executor
+    # shutdown): the worker never comes to clear it. Set and read on the loop.
+    submitted = False
+
+    async def _submit() -> None:
+        nonlocal submitted
+        submitted = True
+        await asyncio.to_thread(telemetry.admitted(_worker), job_id, collection,
+                                include_models, passphrase, encryption)
+
+    task = asyncio.create_task(_submit())
 
     def _done(task: asyncio.Task) -> None:
         # _run ends the registration first; this also covers a task that never
@@ -269,18 +284,27 @@ async def start_export_job(collection: str, include_models: bool = False,
                 # The worker ran, or is running: it settles its own job.
                 _started.discard(job_id)
                 return
-            _abandoned.add(job_id)
+            if submitted:
+                _abandoned.add(job_id)
             if _active.get(collection) == job_id:
                 del _active[collection]
-        _log.warning("Export of %r cancelled before it started", collection)
+        # Retrieving the exception keeps asyncio from reporting it again; the
+        # warning carries its traceback instead (#926).
+        exc = None if task.cancelled() else task.exception()
+        if exc is None:
+            _log.warning("Export of %r cancelled before it started", collection)
+        else:
+            _log.warning("Export of %r failed before it started", collection, exc_info=exc)
         job = _jobs.get(job_id)
         # This write stays on the event loop, as ingest's done callback's does
         # (#309): a done callback is synchronous and saves one small record.
-        # error_code stays null, as for a build that is cancelled (#529).
+        # error_code stays null, as for a build that is cancelled (#529); an
+        # error other than a cancellation records its own type and message, as
+        # _run records an unexpected failure (#926).
         if job is not None and job.get("status") not in jobstore.TERMINAL:
-            name = "CancelledError" if task.cancelled() else type(task.exception()).__name__
-            job.update(status="failed", error=f"{name}: the export was cancelled before it "
-                       "finished. Start the export again.")
+            error = ("CancelledError: the export was cancelled before it finished. "
+                     "Start the export again." if exc is None else f"{type(exc).__name__}: {exc}")
+            job.update(status="failed", error=error)
 
     task.add_done_callback(_done)
     return job_id

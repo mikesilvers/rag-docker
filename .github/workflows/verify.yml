@@ -138,3 +138,167 @@ jobs:
         with:
           path: ${{ runner.temp }}/ollama-models
           key: ${{ steps.models.outputs.key }}
+
+  # External-Ollama mode (#673) on Linux, as README "External Ollama (native)"
+  # sets it up there: the pinned native Ollama (the release the README says it
+  # was tested with), its release asset checked by sha256 against the digest the
+  # release publishes before anything is extracted, and installed as the
+  # release's install script would (binary, user, systemd unit; the script
+  # itself fetches the binary unchecked, so it isn't run). It is bound to the
+  # docker0 address with a systemd drop-in, never 0.0.0.0, and its models
+  # pulled, as a user would; rag-docker itself never pulls into it. Then
+  # `stack.sh up --external-ollama` and suite 26, with
+  # RAG_SKIP_SLOW=1 as the job above. The native model store is cached by
+  # release and model names.
+  external-ollama:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      RAG_SKIP_SLOW: '1'
+      OLLAMA_VERSION: 0.40.18
+      # The published sha256 of ollama-linux-amd64.tar.zst in the v0.40.18 release.
+      OLLAMA_SHA256: b82649006cb5b54ed1237fa2d1a26a7f939a4fd03150033759acbff7ff315adf
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The suites run this PR's code; leave no token in its git config.
+          persist-credentials: false
+
+      # The names the contained stack would pull, read from the base file
+      # before any overlay is in play.
+      - name: Read the model names
+        id: models
+        run: |
+          names=$(bash ollama/compose-models.sh) \
+            || { echo "could not read the model names (ollama/compose-models.sh)" >&2; exit 1; }
+          names=$(echo $names)
+          [ -n "$names" ] || { echo "no model names from ollama/compose-models.sh" >&2; exit 1; }
+          echo "models: $names"
+          {
+            echo "names=$names"
+            echo "key=native-ollama-$OLLAMA_VERSION-${names// /-}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install native Ollama
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q zstd
+          tarball="$RUNNER_TEMP/ollama-linux-amd64.tar.zst"
+          curl -fsSL -o "$tarball" \
+            "https://github.com/ollama/ollama/releases/download/v$OLLAMA_VERSION/ollama-linux-amd64.tar.zst"
+          echo "$OLLAMA_SHA256  $tarball" | sha256sum -c -
+          zstd -dc "$tarball" | sudo tar -xf - -C /usr/local
+          rm -f "$tarball"
+          id ollama >/dev/null 2>&1 || sudo useradd -r -s /bin/false -U -m -d /usr/share/ollama ollama
+          printf '%s\n' '[Unit]' 'Description=Ollama Service' 'After=network-online.target' '' \
+            '[Service]' 'ExecStart=/usr/local/bin/ollama serve' 'User=ollama' 'Group=ollama' \
+            'Restart=always' 'RestartSec=3' '' '[Install]' 'WantedBy=default.target' \
+            | sudo tee /etc/systemd/system/ollama.service
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now ollama
+          ollama --version
+
+      # README "External Ollama (native)", Linux: the docker0 address only.
+      - name: Bind Ollama to the docker0 address
+        id: bind
+        run: |
+          addr=$(ip -4 -o addr show docker0 | awk '{print $4}' | cut -d/ -f1 | head -1)
+          [ -n "$addr" ] || { echo "no docker0 address" >&2; exit 1; }
+          sudo mkdir -p /etc/systemd/system/ollama.service.d
+          printf '[Service]\nEnvironment="OLLAMA_HOST=%s:11434"\n' "$addr" \
+            | sudo tee /etc/systemd/system/ollama.service.d/rag-docker.conf
+          sudo systemctl daemon-reload
+          sudo systemctl restart ollama
+          for i in $(seq 1 60); do
+            curl -fs "http://$addr:11434/api/version" && break
+            sleep 1
+          done
+          curl -fs "http://$addr:11434/api/version"
+          echo "addr=$addr" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the native models
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/native-models
+          key: ${{ steps.models.outputs.key }}
+
+      - name: Pull the models into the native Ollama
+        env:
+          NAMES: ${{ steps.models.outputs.names }}
+          ADDR: ${{ steps.bind.outputs.addr }}
+          HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: |
+          store=/usr/share/ollama/.ollama/models
+          if [ "$HIT" = true ]; then
+            sudo mkdir -p "$store"
+            sudo cp -a "$RUNNER_TEMP/native-models/." "$store/"
+            sudo chown -R ollama:ollama /usr/share/ollama/.ollama
+            rm -rf "$RUNNER_TEMP/native-models"
+            sudo systemctl restart ollama
+            sleep 3
+          fi
+          for model in $NAMES; do
+            OLLAMA_HOST="$ADDR:11434" ollama pull "$model"
+          done
+          OLLAMA_HOST="$ADDR:11434" ollama list
+
+      - name: Start the verify project in external-Ollama mode
+        run: |
+          bash scripts/verify/stack.sh up --external-ollama | tee "$RUNNER_TEMP/stack-up.log"
+          grep '^export ' "$RUNNER_TEMP/stack-up.log" > "$RUNNER_TEMP/verify-env.sh"
+          . "$RUNNER_TEMP/verify-env.sh"
+          sed -n 's/^export \([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$RUNNER_TEMP/verify-env.sh" \
+            | while read -r var; do printf '%s=%s\n' "$var" "${!var}"; done >> "$GITHUB_ENV"
+
+      - name: Run the external-Ollama suite
+        run: bash scripts/verify/all.sh 26_external_ollama
+
+      - name: Collect the compose logs
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/verify-logs"
+          sudo journalctl -u ollama --no-pager > "$RUNNER_TEMP/verify-logs/ollama.log" 2>&1 || true
+          cd /
+          env -u COMPOSE_FILE docker compose -p rag-verify ps -a > "$RUNNER_TEMP/verify-logs/ps.txt" 2>&1 || true
+          env -u COMPOSE_FILE docker compose -p rag-verify logs --no-color --timestamps > "$RUNNER_TEMP/verify-logs/compose.log" 2>&1 || true
+
+      - name: Upload the compose logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: compose-logs-external-ollama
+          path: ${{ runner.temp }}/verify-logs
+
+      - name: Remove the verify project
+        if: always()
+        run: bash scripts/verify/stack.sh down
+
+      # On a cache miss: the native store's models/ tree, once every model is
+      # listed. A failure here fails only this step.
+      - name: Copy the native models out for the cache
+        id: export
+        if: always() && steps.models.outcome == 'success' && steps.cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        env:
+          NAMES: ${{ steps.models.outputs.names }}
+          ADDR: ${{ steps.bind.outputs.addr }}
+        run: |
+          listed=$(OLLAMA_HOST="$ADDR:11434" ollama list | awk 'NR > 1 {print $1}')
+          for model in $NAMES; do
+            case "$model" in *:*) want=$model ;; *) want=$model:latest ;; esac
+            printf '%s\n' "$listed" | grep -qx "$want" || { echo "$model isn't listed; not caching" >&2; exit 1; }
+          done
+          rm -rf "$RUNNER_TEMP/native-models"
+          sudo cp -a /usr/share/ollama/.ollama/models "$RUNNER_TEMP/native-models"
+          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/native-models"
+
+      - name: Save the native models
+        if: always() && steps.export.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/native-models
+          key: ${{ steps.models.outputs.key }}

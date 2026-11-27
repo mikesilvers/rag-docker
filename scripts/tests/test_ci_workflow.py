@@ -2,7 +2,10 @@
 
 Reads .github/workflows/verify.yml as text: its trigger, permissions and
 action pins, the stack.sh up / all.sh / stack.sh down sequence on the
-disposable verify project, the compose logs artifact and the model cache. Also
+disposable verify project, the compose logs artifact and the model cache, in
+the `verify` job; and the `external-ollama` job (#673), which installs the
+pinned native Ollama from its release asset checked by sha256, binds
+it to the docker0 address and runs suite 26 in `stack.sh up --external-ollama`. Also
 checks the README badge and the copies embedded in IMPLEMENTATION.md. The
 workflow's real run is the pull request's own; this keeps its rules from
 drifting. Standard library only; no Docker or stack needed.
@@ -30,6 +33,28 @@ echo '{"name": "rag-docker", "services": {"ollama": {"environment": {"LLM_MODEL"
 
 def workflow():
     return (ROOT / WORKFLOW).read_text()
+
+
+def job(text, name):
+    """One job's lines, from its `  <name>:` line to the next job or the end."""
+    lines = text.splitlines()
+    start = lines.index('  {}:'.format(name))
+    block = [lines[start]]
+    for line in lines[start + 1:]:
+        if re.match(r'^  [A-Za-z0-9_-]+:\s*$', line) or (line and not line.startswith((' ', '#'))):
+            break
+        block.append(line)
+    while block and (not block[-1].strip() or block[-1].lstrip().startswith('#')):
+        block.pop()
+    return '\n'.join(block) + '\n'
+
+
+def verify_job():
+    return job(workflow(), 'verify')
+
+
+def external_job():
+    return job(workflow(), 'external-ollama')
 
 
 def code(text):
@@ -78,10 +103,14 @@ class TriggerAndPermissionTests(unittest.TestCase):
                          ['on:', '  pull_request:', '    branches: [develop, main]'])
         self.assertNotIn('pull_request_target', text)
 
-    def test_one_job_on_ubuntu_latest_with_a_timeout(self):
+    def test_two_jobs_on_ubuntu_latest_with_a_timeout(self):
         text = workflow()
-        self.assertEqual(re.findall(r'^    runs-on: (.*)$', text, re.M), ['ubuntu-latest'])
-        self.assertRegex(text, r'(?m)^    timeout-minutes: \d+$')
+        self.assertEqual(re.findall(r'^  ([A-Za-z0-9_-]+):\s*$', text.split('\njobs:\n', 1)[1], re.M),
+                         ['verify', 'external-ollama'])
+        self.assertEqual(re.findall(r'^    runs-on: (.*)$', text, re.M), ['ubuntu-latest', 'ubuntu-latest'])
+        for name in ('verify', 'external-ollama'):
+            with self.subTest(job=name):
+                self.assertRegex(job(text, name), r'(?m)^    timeout-minutes: \d+$')
 
     def test_least_privilege_and_no_secrets(self):
         text = workflow()
@@ -99,13 +128,14 @@ class TriggerAndPermissionTests(unittest.TestCase):
                 self.assertRegex(value, r'^actions/[a-z-]+(/[a-z-]+)?@[0-9a-f]{40} # v\d+\.\d+\.\d+$')
 
     def test_checkout_leaves_no_credentials(self):
-        _, step = step_with(workflow(), 'actions/checkout@')
-        self.assertIn('persist-credentials: false', step)
+        for text in (verify_job(), external_job()):
+            _, step = step_with(text, 'actions/checkout@')
+            self.assertIn('persist-credentials: false', step)
 
 
 class SuiteTests(unittest.TestCase):
     def test_skip_slow_on_the_verify_project_never_the_live_stack(self):
-        text = code(workflow())
+        text = code(verify_job())
         self.assertRegex(text, r"(?m)^      RAG_SKIP_SLOW: '1'$")
         for refused in ('RAG_VERIFY_LIVE', 'stack.sh run'):
             with self.subTest(refused=refused):
@@ -113,7 +143,7 @@ class SuiteTests(unittest.TestCase):
         self.assertIsNone(re.search(r'docker compose[^\n]* up\b', text), 'docker compose up is used')
 
     def test_up_suite_logs_upload_down_in_order(self):
-        text = workflow()
+        text = verify_job()
         order = [step_with(text, needle)[0] for needle in (
             'bash scripts/verify/stack.sh up', 'bash scripts/verify/all.sh',
             'docker compose -p rag-verify logs', 'actions/upload-artifact@',
@@ -121,7 +151,7 @@ class SuiteTests(unittest.TestCase):
         self.assertEqual(order, sorted(order))
 
     def test_logs_upload_and_down_always_run(self):
-        text = workflow()
+        text = verify_job()
         for needle in ('docker compose -p rag-verify logs', 'actions/upload-artifact@',
                        'bash scripts/verify/stack.sh down'):
             with self.subTest(step=needle):
@@ -132,7 +162,7 @@ class ModelCacheTests(unittest.TestCase):
     def test_key_is_the_models_the_entrypoint_pulls(self):
         # The names ollama/compose-models.sh resolves from the ollama service's LLM
         # settings, which the entrypoint pulls (#671).
-        text = workflow()
+        text = verify_job()
         _, step = step_with(text, 'id: models')
         self.assertIn('names=$(bash ollama/compose-models.sh) \\\n', step)
         self.assertIn('|| { echo "could not read the model names (ollama/compose-models.sh)" >&2; exit 1; }', step)
@@ -151,7 +181,7 @@ class ModelCacheTests(unittest.TestCase):
                          'ollama-models-llama3.1:8b-nomic-embed-text')
 
     def test_restored_before_start_and_saved_only_after_a_miss(self):
-        text = workflow()
+        text = verify_job()
         restore, restore_step = step_with(text, 'actions/cache/restore@')
         start, _ = step_with(text, 'bash scripts/verify/stack.sh up')
         export, export_step = step_with(text, 'id: export')
@@ -164,6 +194,76 @@ class ModelCacheTests(unittest.TestCase):
             self.assertIn('key: ${{ steps.models.outputs.key }}', step)
         self.assertIn("steps.cache.outputs.cache-hit != 'true'", export_step)
         self.assertIn('/copy/models', export_step)
+        self.assertIn("steps.export.outcome == 'success'", save_step)
+
+
+class ExternalOllamaJobTests(unittest.TestCase):
+    """The external-Ollama job (#673): README "External Ollama (native)" on Linux."""
+
+    def test_pins_the_tested_release_and_checks_its_binary(self):
+        text = external_job()
+        self.assertRegex(text, r"(?m)^      OLLAMA_VERSION: 0\.40\.18$")
+        # The release asset's published digest; the install script isn't used, since it
+        # fetches the binary without a checksum (#940's evaluation).
+        self.assertRegex(text, r"(?m)^      OLLAMA_SHA256: [0-9a-f]{64}$")
+        self.assertNotIn('install.sh', code(text))
+        self.assertNotIn('OLLAMA_INSTALL_SHA256', text)
+        _, step = step_with(text, 'name: Install native Ollama')
+        self.assertIn('https://github.com/ollama/ollama/releases/download/v$OLLAMA_VERSION/'
+                      'ollama-linux-amd64.tar.zst', step)
+        self.assertIn('echo "$OLLAMA_SHA256  $tarball" | sha256sum -c -', step)
+        self.assertNotIn('ollama.com/download', step)
+        # The check comes before anything is extracted, and nothing is piped into a shell.
+        self.assertLess(step.index('sha256sum -c -'), step.index('tar -xf'))
+        self.assertLess(step.index('sha256sum -c -'), step.index('systemctl enable --now ollama'))
+        self.assertNotRegex(code(text), r'\|[ \t]*(sudo[ \t]+)?(ba)?sh\b')
+        self.assertIn('0.40.18', (ROOT / 'README.md').read_text())
+
+    def test_the_pinned_digest_is_the_one_the_readme_gives(self):
+        digest = re.search(r"(?m)^      OLLAMA_SHA256: ([0-9a-f]{64})$", external_job()).group(1)
+        self.assertIn(digest, (ROOT / 'README.md').read_text())
+
+    def test_binds_ollama_to_docker0_never_every_address(self):
+        text = code(external_job())
+        _, step = step_with(text, 'name: Bind Ollama to the docker0 address')
+        self.assertIn('ip -4 -o addr show docker0', step)
+        self.assertIn('Environment="OLLAMA_HOST=%s:11434"', step)
+        self.assertNotIn('0.0.0.0', text)
+
+    def test_up_external_suite_logs_upload_down_in_order(self):
+        text = external_job()
+        order = [step_with(text, needle)[0] for needle in (
+            'name: Install native Ollama', 'name: Bind Ollama', 'name: Pull the models',
+            'bash scripts/verify/stack.sh up --external-ollama',
+            'bash scripts/verify/all.sh 26_external_ollama',
+            'docker compose -p rag-verify logs', 'actions/upload-artifact@',
+            'bash scripts/verify/stack.sh down')]
+        self.assertEqual(order, sorted(order))
+        for needle in ('docker compose -p rag-verify logs', 'actions/upload-artifact@',
+                       'bash scripts/verify/stack.sh down'):
+            with self.subTest(step=needle):
+                self.assertIn('if: always()', step_with(text, needle)[1])
+        self.assertRegex(code(text), r"(?m)^      RAG_SKIP_SLOW: '1'$")
+        for refused in ('RAG_VERIFY_LIVE', 'stack.sh run'):
+            with self.subTest(refused=refused):
+                self.assertNotIn(refused, code(text))
+
+    def test_native_model_cache_by_release_and_names(self):
+        text = external_job()
+        _, names = step_with(text, 'id: models')
+        self.assertIn('names=$(bash ollama/compose-models.sh)', names)
+        self.assertIn('echo "key=native-ollama-$OLLAMA_VERSION-${names// /-}"', names)
+        restore, restore_step = step_with(text, 'actions/cache/restore@')
+        pull, _ = step_with(text, 'name: Pull the models')
+        export, export_step = step_with(text, 'id: export')
+        save, save_step = step_with(text, 'actions/cache/save@')
+        down, _ = step_with(text, 'bash scripts/verify/stack.sh down')
+        self.assertLess(restore, pull)
+        self.assertLess(down, export)
+        self.assertLess(export, save)
+        for step in (restore_step, save_step):
+            self.assertIn('key: ${{ steps.models.outputs.key }}', step)
+        self.assertIn("steps.cache.outputs.cache-hit != 'true'", export_step)
         self.assertIn("steps.export.outcome == 'success'", save_step)
 
 

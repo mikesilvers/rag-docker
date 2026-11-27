@@ -757,6 +757,8 @@ class TelemetryTests(unittest.TestCase):
                                                                      recover=lambda:(order.append('recover') or [])),
                                     # The export package sweep (#677), a task cancelled at shutdown.
                                     package_retention=SimpleNamespace(sweeper=lambda:asyncio.sleep(3600)),
+                                    # The start-up model check (#673), a task cancelled at shutdown.
+                                    ollama_startup=SimpleNamespace(log_missing_models=lambda:asyncio.sleep(3600)),
                                     audit=SimpleNamespace(record=lambda *args,**kwargs:order.append('audit'),
                                                           login_flusher=lambda:asyncio.sleep(3600),
                                                           flush_logins=lambda:order.append('flush')))

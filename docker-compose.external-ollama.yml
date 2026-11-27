@@ -1,0 +1,49 @@
+# External Ollama mode (#673): use an Ollama on this host, usually a native
+# install (for its GPU), instead of the stack's own ollama container. Opt-in,
+# and only together with the base file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.external-ollama.yml up -d
+#
+# With LAN mode (#26) or query-only mode (#670), list their files first and this
+# one last:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.lan.yml -f docker-compose.query-only.yml -f docker-compose.external-ollama.yml up -d
+#
+# What this changes:
+# - the ollama service is left out (profile contained-ollama, never enabled);
+# - api and weaviate reach the host's Ollama under the same name, ollama, through
+#   host-gateway: OLLAMA_HOST and every collection's stored vectorizer endpoint
+#   stay http://ollama:11434, so nothing is migrated and reindex keeps working;
+# - the api no longer waits for, or mounts the model store of, an ollama
+#   service, and runs with RAG_EXTERNAL_OLLAMA=true: it checks the models through
+#   Ollama and never pulls, installs or writes one; exports with models are
+#   refused. Ollama itself listens on port 11434, on loopback with Docker
+#   Desktop and on the docker0 address on Linux, never on 0.0.0.0.
+#
+# This file replaces the api's list of mounts. Your own override file
+# (docker-compose.override.yml is read by itself only when no -f is given) goes
+# before this one in the -f list, and any api mounts it adds are dropped: repeat
+# the ones you need, without a model store, in a further file after this one.
+#
+# Check the setup with: bash scripts/check-external-ollama.sh
+# See README "External Ollama (native)".
+services:
+  ollama:
+    profiles: [contained-ollama]
+
+  weaviate:
+    extra_hosts: ["ollama:host-gateway"]
+
+  api:
+    extra_hosts: ["ollama:host-gateway"]
+    environment:
+      RAG_EXTERNAL_OLLAMA: "true"
+    depends_on: !override
+      weaviate: { condition: service_healthy }
+    # The base file's api mounts, in its order, without ollama_models:/ollama.
+    volumes: !override
+      - ingest_uploads:/app/uploads
+      - auth_data:/app/auth_data
+      - rag_sources:/app/sources
+      - rag_preparation:/app/preparation
+      - ./exports:/app/exports

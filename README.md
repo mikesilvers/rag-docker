@@ -659,6 +659,207 @@ separate `BUILD_LLM_MODEL`, set the LLM settings on the query-only machine so
 the build model is the answer model (for example `BUILD_LLM_MODEL` equal to
 `ANSWER_LLM_MODEL`), so Ollama doesn't download a model nothing there uses.
 
+## External Ollama (native)
+
+By default the stack runs Ollama in its own container. On a Mac that container
+uses only the CPU, and elsewhere it needs extra setup to reach a GPU. External
+Ollama mode (#673) leaves that container out and uses an Ollama installed
+natively on the same machine, which uses the Apple GPU (Metal) on a Mac and
+NVIDIA or AMD GPUs on Linux and Windows. Preparation, ingest embeddings, gold
+standard generation and answering all get faster. The contained stack stays
+the default; this is opt-in, for full and query-only instances alike.
+
+The native Ollama is yours, and other apps and models may share it. rag-docker
+never pulls, installs, deletes or unloads a model in it, and never changes its
+server settings: it checks that the models it needs are there and tells you
+what to pull.
+
+Tested with Ollama v0.40.18 (the release the CI job pins; macOS and Linux).
+Older than 0.3.14, the version the contained stack runs, isn't supported. The
+Windows steps below are **not yet verified**.
+
+### 1. Install Ollama
+
+- **macOS:** the app from <https://ollama.com/download>, or `brew install ollama`.
+- **Windows:** the installer from <https://ollama.com/download> (`OllamaSetup.exe`).
+- **Linux:** the tested release from its GitHub release page, checked before
+  it is installed (as the CI job does), or your distribution's package. Take
+  the sha256 from the release page's asset list
+  (<https://github.com/ollama/ollama/releases/tag/v0.40.18>); for v0.40.18 on
+  x86-64 it is the one below. The official `curl ... | sh` install script
+  downloads the binary without any check, so these steps do its work instead:
+
+  ```bash
+  sudo apt-get install -y zstd   # or your distribution's zstd package
+  curl -fsSLO https://github.com/ollama/ollama/releases/download/v0.40.18/ollama-linux-amd64.tar.zst
+  echo "b82649006cb5b54ed1237fa2d1a26a7f939a4fd03150033759acbff7ff315adf  ollama-linux-amd64.tar.zst" | sha256sum -c -
+  zstd -dc ollama-linux-amd64.tar.zst | sudo tar -xf - -C /usr/local
+  id ollama >/dev/null 2>&1 || sudo useradd -r -s /bin/false -U -m -d /usr/share/ollama ollama
+  printf '%s\n' '[Unit]' 'Description=Ollama Service' 'After=network-online.target' '' \
+    '[Service]' 'ExecStart=/usr/local/bin/ollama serve' 'User=ollama' 'Group=ollama' \
+    'Restart=always' 'RestartSec=3' '' '[Install]' 'WantedBy=default.target' \
+    | sudo tee /etc/systemd/system/ollama.service
+  sudo systemctl daemon-reload
+  ```
+
+  On ARM64, use `ollama-linux-arm64.tar.zst` and its digest from the same page.
+
+Check it with `ollama --version`.
+
+### 2. Run it as a service that starts at boot
+
+- **macOS:** the app starts at login (keep it in the menu bar); with Homebrew,
+  `brew services start ollama`.
+- **Windows:** the installed app starts at sign-in and runs in the tray.
+- **Linux:** the unit from step 1 (or your package's): `sudo systemctl enable --now ollama`.
+
+### 3. Reachable from Docker, not from your network
+
+Ollama has no authentication: anyone who reaches its port can use, pull or
+delete its models. Keep it where only this machine's Docker reaches it, never
+on `0.0.0.0`.
+
+- **Docker Desktop (macOS, Windows):** keep Ollama's default, `127.0.0.1:11434`.
+  The containers reach it through Docker Desktop's `host-gateway`, which leads
+  to the host's loopback.
+- **Linux:** a container can't reach the host's `127.0.0.1`. Bind Ollama to the
+  `docker0` bridge address, which is what `host-gateway` resolves to (find it
+  with `ip -4 addr show docker0`; by default `172.17.0.1`):
+
+  ```bash
+  sudo systemctl edit ollama
+  # add, then save:
+  # [Service]
+  # Environment="OLLAMA_HOST=172.17.0.1:11434"
+  sudo systemctl restart ollama
+  ```
+
+  Not the compose network's own gateway: `host-gateway` doesn't lead there.
+  The `ollama` command then needs the same address: `OLLAMA_HOST=172.17.0.1:11434 ollama list`.
+
+  **Then add a firewall rule.** Binding to the `docker0` address doesn't keep
+  Ollama off your network by itself: Linux accepts packets for that address on
+  any interface, so a machine on your network that routes `172.17.0.0/16`
+  through this host reaches it. Drop TCP 11434 on every interface except
+  loopback (the `ollama` command), `docker0` and the compose networks' bridges
+  (`br-...`):
+
+  ```bash
+  sudo iptables -I INPUT -p tcp --dport 11434 -j DROP
+  sudo iptables -I INPUT -p tcp --dport 11434 -i br-+ -j ACCEPT
+  sudo iptables -I INPUT -p tcp --dport 11434 -i docker0 -j ACCEPT
+  sudo iptables -I INPUT -p tcp --dport 11434 -i lo -j ACCEPT
+  ```
+
+  Each `-I` goes to the top, so the three accepts end up above the drop. These
+  rules last until the next reboot: save them with your distribution's tool
+  (for example `sudo netfilter-persistent save` on Debian and Ubuntu), or write
+  the same rules in `ufw` or `firewalld` if you use one of those.
+  `scripts/check-external-ollama.sh` can't see firewall rules: its `ok` for a
+  `docker0` listener holds only with this rule in place.
+
+### 4. Pull the models
+
+rag-docker needs the embedding model and the LLMs its settings name
+(`EMBED_MODEL`, and `ANSWER_LLM_MODEL` and `BUILD_LLM_MODEL`, which fall back to
+`LLM_MODEL`; see [Configuration](#configuration)). With the defaults:
+
+```bash
+ollama pull nomic-embed-text
+ollama pull llama3.1:8b
+```
+
+`bash ollama/compose-models.sh` prints the names your settings resolve to.
+The embedding model must be the one your collections were built with (#390):
+vectors from another model are meaningless, and import refuses such a package.
+
+### 5. A shared Ollama: no server changes
+
+The Ollama server's own settings (`OLLAMA_KEEP_ALIVE`, `OLLAMA_NUM_PARALLEL`,
+`OLLAMA_CONTEXT_LENGTH`) are left as you have them, for your other apps.
+rag-docker sends what it needs with its own requests instead, in both modes:
+`num_ctx` (`OLLAMA_NUM_CTX`, 2048) with its LLM chat requests, and `keep_alive`
+(`OLLAMA_KEEP_ALIVE`, `5m`) with every request; an embedding request keeps the
+embedding model's own context. These are the values the contained stack has
+always used, so results match it. Weaviate's own embedding calls (ingest, and
+semantic and hybrid questions) can't carry options, so they use your server's
+settings.
+
+### 6. Check that the GPU is used
+
+Run a question, then `ollama ps`: the `PROCESSOR` column should say `GPU`.
+Watch Activity Monitor's GPU History (macOS), `nvidia-smi` (NVIDIA), or Task
+Manager's GPU tab (Windows).
+
+- **No GPU detected:** update the GPU driver (NVIDIA, AMD) and restart Ollama;
+  on Linux check `journalctl -u ollama` for the GPU it found.
+- **Out of memory, or a model loads on the CPU:** other loaded models count,
+  yours and other apps'. `ollama ps` and `/api/health/details`
+  (`resources.ollama_loaded`) list them; rag-docker only reports them.
+- **Port 11434 in use:** another Ollama is running, for example the app and a
+  Homebrew service, or rag-docker's own `ollama` container: stop one.
+
+### 7. Turn it on and check
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.external-ollama.yml up -d
+# with LAN mode or query-only mode, their files first and this one last:
+docker compose -f docker-compose.yml -f docker-compose.lan.yml -f docker-compose.query-only.yml -f docker-compose.external-ollama.yml up -d
+bash scripts/check-external-ollama.sh
+```
+
+The helper checks, on this host, that Ollama listens only on loopback (or
+`docker0` on Linux), and warns otherwise; then, from inside the api container,
+that it reaches Ollama, its version and each model, with the exact
+`ollama pull` line for a missing one. It exits 0 when all is well, 3 with
+warnings and 1 with a problem. It only reads. Set `COMPOSE_FILE` if you started
+the stack with other files. `/api/health/details` reports the Ollama version,
+and the API logs one `Ollama model missing: <name:tag>. On the Ollama host,
+run: ollama pull <name:tag>` line per missing model at start; while any is
+missing, `/api/health` answers 503 and the UI waits, as in the contained stack.
+
+On Windows (not yet verified), in PowerShell:
+
+```powershell
+Get-NetTCPConnection -LocalPort 11434 -State Listen | Select-Object LocalAddress
+# only 127.0.0.1 or ::1; anything else is reachable from your network
+docker compose exec -T api python -m ollama_check
+```
+
+In external mode:
+
+- the `ollama` service and its model volume aren't used;
+- import and the loader check the models through Ollama and never install
+  them, so a package's bundled models aren't installed: pull them on the
+  Ollama host instead;
+- export with models (`include_models`) is refused with
+  `400 MODELS_NOT_EXPORTABLE`: rag-docker doesn't read the native model store;
+- the 12 GB Docker-memory advice in `/health/details` doesn't apply and isn't
+  given;
+- `bash install-offline.sh --external-ollama` installs the offline bundle
+  without restoring its model weights and prints the `ollama pull` lines.
+
+**Your own override file.** `docker compose` reads `docker-compose.override.yml`
+by itself only when you give no `-f`. With `-f`, list it yourself, before
+`docker-compose.external-ollama.yml`. The overlay replaces the api's list of
+mounts, so api mounts your override adds (a model store bind, for example) are
+dropped: repeat the ones you need, without a model store, in another file after
+the overlay.
+
+### 8. Upgrading Ollama, and going back to the contained default
+
+- **Upgrade:** the macOS app updates itself (or `brew upgrade ollama`); run the
+  Windows installer again; on Linux remove the old libraries
+  (`sudo rm -rf /usr/local/lib/ollama`), repeat step 1's download, check and
+  extraction with the new release and its digest, then
+  `sudo systemctl restart ollama` (your `systemctl edit` drop-in stays). Then
+  `bash scripts/check-external-ollama.sh`.
+- **Back to the contained default:** `docker compose -f docker-compose.yml -f
+  docker-compose.external-ollama.yml down`, then `docker compose up -d`
+  without the overlay. The `ollama` container pulls its models into the
+  `ollama_models` volume on its first start (about 5.2 GB). Your collections
+  keep working: both modes reach Ollama as `http://ollama:11434`.
+
 ## Workflow
 
 ### 1. Create a collection
@@ -1087,7 +1288,9 @@ it ([Encrypting a package](#encrypting-a-package)).
 
 ## GPU acceleration (optional)
 
-To use a CUDA GPU for Ollama, uncomment the `deploy` block in `docker-compose.yml`:
+To use the GPU without containers, run Ollama natively: see
+[External Ollama (native)](#external-ollama-native). To use a CUDA GPU for the
+contained Ollama instead, uncomment the `deploy` block in `docker-compose.yml`:
 
 ```yaml
 ollama:
@@ -1112,7 +1315,10 @@ All API settings are environment variables in `docker-compose.yml`:
 | `ANSWER_LLM_MODEL` | empty | The LLM that answers questions. Empty means `LLM_MODEL`. Export with `include_models` bundles this one, never the build model |
 | `EMBED_MODEL` | `nomic-embed-text` | Ollama model name for embeddings |
 | `WEAVIATE_HOST` | `weaviate` | Weaviate hostname (internal) |
-| `OLLAMA_HOST` | `ollama` | Ollama hostname (internal) |
+| `OLLAMA_HOST` | `ollama` | Ollama hostname (internal). Stays `ollama` with an external Ollama too: the overlay points that name at the host (#673) |
+| `OLLAMA_NUM_CTX` | `2048` | The context length sent as `num_ctx` with rag-docker's LLM chat requests, in both modes; embedding requests keep the model's own. 256 to 1048576; anything else stops the API. Never set on the Ollama server (#673) |
+| `OLLAMA_KEEP_ALIVE` | `5m` | How long Ollama keeps rag-docker's model loaded after a request, sent as `keep_alive` with every request, in both modes: a duration such as `5m`, `1h30m`, `300` or `-1` (whole seconds, sent to Ollama as a number; `-1` keeps it loaded); anything else stops the API. Never set on the Ollama server (#673) |
+| `RAG_EXTERNAL_OLLAMA` | `false` | External Ollama mode (#673), set `true` only by `docker-compose.external-ollama.yml`. Exactly `true` or `false`; anything else stops the API. See [External Ollama (native)](#external-ollama-native) |
 | `UPLOAD_DIR` | `/app/uploads` | Container path for uploads and session data |
 | `RECOMMENDED_MEMORY_GB` | `12` | Memory recommendation reported by `/health/details`. Raise it if you allocate more to Docker; no rebuild needed |
 | `MAX_ZIP_EXPANDED_BYTES` | `2147483648` (2 GiB) | The most one upload's ZIPs may expand to in all, gzipped members' output included. Over it the upload is refused with `ARCHIVE_TOO_LARGE` |
@@ -1233,6 +1439,7 @@ rag-docker/
 │   ├── backup.sh         # Encrypted volume backup, a new age key per volume (#848)
 │   ├── restore.sh        # Restores it; checks every archive with its key first (#848)
 │   ├── backup-common.sh  # Shared by the two: volumes, prefix, the age image
+│   ├── check-external-ollama.sh # Checks an external Ollama's setup (#673)
 │   └── age/Dockerfile    # The age image: pinned alpine plus a pinned age package
 ├── api/                  # FastAPI backend
 │   ├── Dockerfile
@@ -1266,7 +1473,8 @@ rag-docker/
 ├── exports/              # Export packages land here (bind mount)
 ├── docker-compose.yml
 ├── docker-compose.lan.yml # LAN mode, opt-in (#26)
-└── docker-compose.query-only.yml # Query-only mode, opt-in (#670)
+├── docker-compose.query-only.yml # Query-only mode, opt-in (#670)
+└── docker-compose.external-ollama.yml # External (native) Ollama, opt-in (#673)
 ```
 
 ## Exporting and importing a RAG
@@ -1527,7 +1735,10 @@ embedding model and the answer LLM as Ollama's own manifest and blob files (neve
 the build LLM). On import,
 a model already present is left alone, provided its files match their checksums;
 a missing one is installed from the package and verified before the collection
-is built. If the embedding model is present but damaged, the import fails
+is built. With an external Ollama ([External Ollama (native)](#external-ollama-native))
+nothing is installed: export with models is refused with `MODELS_NOT_EXPORTABLE`,
+and an import checks the models through Ollama and names the `ollama pull` for a
+missing one. If the embedding model is present but damaged, the import fails
 `MODEL_INTEGRITY_FAILED`: restore or re-pull it, then import again. The models are
 content-addressed, so what lands on the target is byte-identical to what produced
 the vectors.
@@ -1809,7 +2020,7 @@ If this fails after Docker restarts, Docker's internal networking is broken — 
 
 **Ollama health check is stuck after images are pulled** — The model download phase (`ollama pull llama3.1:8b` etc.) is in progress. Run `docker compose logs -f ollama` to watch. The health check gives the first download up to 30 minutes before it marks ollama unhealthy; if `docker compose up` stopped on that, run it again once the log reads `ollama: llama3.1:8b ready.` If the internet drops mid-download, the entrypoint script detects the stall via a 2-hour per-attempt timeout, kills the hung pull, and retries automatically up to 5 times. Ollama resumes partial downloads so retries pick up where they left off.
 
-**LLM answers are garbage or time out** — Answers come back in mixed scripts or as fragments of unrelated instructions, run to thousands of characters, or time out, while `/api/health/details` still reports the LLM as ok. Ollama's model runner has degraded; it does not recover on its own. Restart it with `docker compose restart ollama`. `scripts/verify/all.sh` checks for this before its LLM suites and stops with the same advice.
+**LLM answers are garbage or time out** — Answers come back in mixed scripts or as fragments of unrelated instructions, run to thousands of characters, or time out, while `/api/health/details` still reports the LLM as ok. Ollama's model runner has degraded; it does not recover on its own. Restart it with `docker compose restart ollama`; with an [external Ollama](#external-ollama-native), restart it on the host (the app, `brew services restart ollama` or `sudo systemctl restart ollama`). `scripts/verify/all.sh` checks for this before its LLM suites and stops with the same advice.
 
 **Port 8080 already in use** — The proxy publishes on host loopback port 8080 (`docker-compose.yml`, the `proxy` service: `"127.0.0.1:8080:80"`). Change the middle number to any free port, for example `"127.0.0.1:9090:80"`, then access the UI at `http://localhost:9090`. Keep the `127.0.0.1` host address and container port 80. In LAN mode the port is 443 on every interface instead; set `RAG_LAN_PORT` to use another (see [Sharing with your office](#sharing-with-your-office)).
 
@@ -1861,6 +2072,8 @@ Check what Docker actually has, and what is loaded:
 curl -s -b ~/.rag-session http://localhost:8080/api/health/details   # resources.memory (Developer or AI Engineer login)
 docker compose exec ollama ollama ps          # "Stopping..." means thrashing
 ```
+
+With an [external Ollama](#external-ollama-native) the LLM isn't in Docker: run `ollama ps` on the host, and see `resources.ollama_loaded` for what else is loaded.
 
 Raise it in **Docker Desktop → Settings → Resources → Memory**, then restart Docker. If the daemon does not come back, quit Docker fully (check no `com.docker.backend` process survives) before relaunching — a stale backend can leave the VM unreachable.
 

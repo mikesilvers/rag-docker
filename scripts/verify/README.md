@@ -10,6 +10,7 @@ RAG_SKIP_SLOW=1 bash scripts/verify/stack.sh run    # skip LLM work, ~8 min, sta
 bash scripts/verify/stack.sh run 02 04              # only the named suites
 bash scripts/verify/stack.sh run --lan              # LAN mode, TLS on loopback only (#26)
 bash scripts/verify/stack.sh run --query-only       # query-only mode on a second instance (#670)
+bash scripts/verify/stack.sh run --external-ollama  # a native Ollama on this host (#673)
 ```
 
 Exits non-zero if any check fails.
@@ -142,7 +143,12 @@ small model is deleted from Ollama and the collection dropped at the end. The pu
 when Ollama answers with a 5xx, up to 3 attempts with waits of 5 s and 10 s; a pull that still
 fails, or fails another way, is one failed check, "the build model is pulled into the verify
 project's Ollama", with the model checks skipped, rather than a failure of each (#922).
-`../tests/test_llm_split.py` checks both on the host, in every run.
+`../tests/test_llm_split.py` checks both on the host, in every run but an external-Ollama one.
+In external-Ollama mode (`RAG_VERIFY_EXTERNAL_OLLAMA=1`, #673) the suite skips before it touches
+the stack: that Ollama is the host's own, shared with other apps, and rag-docker never pulls or
+deletes a model in it. `llm_split.py` refuses there too (exit 2, before any request), in case it
+is run by hand. `test_verify_stack.py`'s `ExternalOllamaNoModelWritesTests` fails any suite that
+pulls, deletes, creates, copies or pushes a model, itself or through a helper, without that check.
 
 `24_query_only.sh` checks query-only mode (#670, SPECIFICATIONS.md §2.6 and §10.11). In every run:
 `query_only_config.py` resolves `docker-compose.yml` with and without `docker-compose.query-only.yml` through
@@ -198,8 +204,8 @@ against" below).
 
 | Command | What it does |
 |---|---|
-| `stack.sh run [--checkout DIR] [--telemetry [--telemetry-pin FILE] \| --lan \| --query-only] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
-| `stack.sh up [--checkout DIR] [--pull] [--telemetry [--telemetry-pin FILE] \| --lan \| --query-only]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. `--telemetry` brings it up in the same telemetry configuration as `run --telemetry` (see "Optional Collector acceptance") and also prints `COMPOSE_PROFILES`, `RAG_VERIFY_HARNESS`, `RAG_VERIFY_CHECKOUT`, `RAG_VERIFY_OTEL_ENABLED` and `RAG_VERIFY_TELEMETRY_PIN`. `--telemetry-pin FILE` supplies a reviewed collector pin (see "Evaluating a collector pin change"). |
+| `stack.sh run [--checkout DIR] [--telemetry [--telemetry-pin FILE] \| --lan \| --query-only \| --external-ollama] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
+| `stack.sh up [--checkout DIR] [--pull] [--telemetry [--telemetry-pin FILE] \| --lan \| --query-only \| --external-ollama]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. `--telemetry` brings it up in the same telemetry configuration as `run --telemetry` (see "Optional Collector acceptance") and also prints `COMPOSE_PROFILES`, `RAG_VERIFY_HARNESS`, `RAG_VERIFY_CHECKOUT`, `RAG_VERIFY_OTEL_ENABLED` and `RAG_VERIFY_TELEMETRY_PIN`. `--telemetry-pin FILE` supplies a reviewed collector pin (see "Evaluating a collector pin change"). |
 | `stack.sh down` | Removes the project: its containers, network, volumes, images and exports folder. |
 | `stack.sh query-only-mode --package NAME [--checkout DIR]` | Only for `24_query_only.sh`, under the inherited lock of a `run --query-only` (#670): keeps package NAME aside, removes the project's containers, network and volumes (not its images or the model copy), puts the package back alone in an empty exports folder, and starts the project again from the checkout's `docker-compose.query-only.yml`, after the configuration check and without a build, as a second instance on another machine would be. |
 
@@ -350,13 +356,32 @@ configuration check and both refusals, with Docker replaced by a stub, so it
 needs no stack. Two of its tests read `docker-compose.yml` with PyYAML, so they
 need PyYAML on the host; without it they are skipped.
 
+`26_external_ollama.sh` checks external-Ollama mode (#673, SPECIFICATIONS.md §2.7 and §10.12). In every run
+`../tests/test_external_ollama.py` runs in the API image with no network (the settings, the request bodies in both
+modes and the `/api/embed` fallback, the tag-exact check, `/health/details`, the start-up lines, import and export,
+`python -m ollama_check`, the overlay and `install-offline.sh --external-ollama`). The rest needs
+`stack.sh run --external-ollama`, which runs this suite alone, on a host whose native Ollama is set up as the main
+README's "External Ollama (native)" says, with its models already pulled: `stack.sh` first runs
+`scripts/check-external-ollama.sh --host-only` from the harness (Ollama listening only on loopback, or on Linux the
+`docker0` address; a warning fails the run) and asks the host's Ollama for `/api/version`, before any Docker command;
+it never installs Ollama or pulls a model, and the model copy isn't used. The guard then allows `extra_hosts` exactly
+`ollama:host-gateway` on api and weaviate, and refuses a configuration that still has an ollama service. The suite
+checks that no ollama service runs, `python -m ollama_check` in the api container, `/health/details` (the version,
+memory `external`, `ollama_loaded`), an ingest (Weaviate embeds through the host's Ollama), the refused export with
+models and an export without them imported back, a reindex, and outside `RAG_SKIP_SLOW=1` `hnsw` and `semantic`
+questions with citations. Its first real run is the tests reviewer's: the fix agent ran only host tests.
+
 ## Continuous integration
 
 `.github/workflows/verify.yml` runs the suite on GitHub Actions for every pull
 request to `develop` or `main` (#24), on `ubuntu-latest`, with `RAG_SKIP_SLOW=1`.
 It uses the same verify project as a local run and never sets
 `RAG_VERIFY_LIVE`; nothing in it changes the refusals above. The badge at the
-top of the main `README.md` shows its result on `develop`.
+top of the main `README.md` shows its result on `develop`. A second job,
+`external-ollama` (#673), installs the pinned native Ollama (v0.40.18) from its
+release's install script, checked by sha256, binds it to the `docker0` address,
+pulls the models (cached by release and names) and runs
+`stack.sh up --external-ollama` and suite 26 with `RAG_SKIP_SLOW=1`.
 
 - **Up, suites, logs, down.** `stack.sh run` removes the project before its
   logs could be saved, so the workflow takes the `up` route: `stack.sh up`
@@ -478,8 +503,8 @@ fail the export early with an actionable error and publish nothing.
 writes a saved file that isn't a JSON object, one with a wrong-typed `chunk_size` and
 one with an invalid `chunk_size` into the API container, and checks through the real
 export job that each export fails with an error naming the collection, the field and
-the Chunking Configuration page, and publishes nothing; it restores the saved file
-afterwards. Crafted
+the Chunking Configuration page, publishes nothing and leaves the saved file as it
+was written (#932); it restores the saved file afterwards. Crafted
 packages are written under a `.part` name and renamed into place, because on
 Docker Desktop the API can read a freshly written bind-mounted file as empty. Controlled tests complement,
 and do not replace, this live acceptance.
@@ -598,8 +623,10 @@ installation, the target stays claimed while its holder installs models, and a
 target is free again after a failed model installation (#492); a start whose
 first job record can't be stored releases the package name; and an import whose task
 is cancelled before its worker runs frees the package name, then reads `failed`
-`IMPORT_FAILED` with the cancelled message, a worker that starts late runs nothing,
-and one that started is left to settle its own job (#871). `05_transfer.sh` runs it
+`IMPORT_FAILED` with the cancelled message and logs a warning, a worker that starts late
+runs nothing, and one that started is left to settle its own job (#871); one whose task
+fails before its worker runs frees the package name, then reads `failed` `IMPORT_FAILED`
+with the error's own type and message, logged with its traceback (#932). `05_transfer.sh` runs it
 in the verify project's API container.
 
 `scripts/tests/test_ingest_errors.py` (#290) checks that damaged or unreadable ZIPs are
@@ -835,10 +862,15 @@ start gives up holding nothing and the route answers `409 EXPORT_STARTING` with 
 The bound counts once, from the second start's first wait: when the first start's write fails
 and another start takes the slot, waiting again on that one doesn't restart it (#347).
 An export task cancelled before its worker starts frees the collection's export slot and its
-delete registration, then reads `failed` with the cancelled message and `error_code` `null`,
-as does one whose task fails before its worker starts (the message names the error's type),
-and a worker that starts late does nothing; one whose worker has started is left to the worker,
-and one that ends normally leaves no bookkeeping behind (#529). An error that escapes the ingest worker is saved with the `failed` status, and a
+delete registration, then reads `failed` with the cancelled message and `error_code` `null`;
+cancelled before its first step, it keeps no bookkeeping, and one cancelled once its worker
+waits in the executor keeps an `_abandoned` entry, so a worker that starts late does nothing
+(#926). One whose task fails before its worker starts is settled the same way, with the error's
+own type and message, logged with its traceback (#926); one whose worker has started is left
+to the worker, and one that ends normally leaves no bookkeeping behind (#529). Two rare cases
+still leave an `_abandoned` entry that no worker comes to clear (documented, not fixed, #926): a task that
+had run its first step whose queued executor item is cancelled before a thread takes it, and
+one whose `to_thread` call itself raises (as at executor shutdown). An error that escapes the ingest worker is saved with the `failed` status, and a
 cancellation that escapes it is named in `errors` and reads `partial` when files completed,
 otherwise `failed` (#529).
 `02_ingest.sh` runs it in the API container. With
@@ -1153,10 +1185,12 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `browser/ui_ingest.js` | the browser side of suite 22: the Import and Prepare pages driven as a user does, the observations printed as one JSON line (#641) |
 | `ui_ingest_weaviate.py` | helper for suite 22, run in the API container: the `VfyUiIngest*` collections' documents and chunk text, read only (#641) |
 | `ui_ingest_check.py` | the checks of suite 22, one per subcommand, on the host, and its cleanup (#641) |
-| `23_llm_split.sh` | the build and answer models (#671), full runs only: with `BUILD_LLM_MODEL` set to a small model, preparation and gold standard use it and query uses the answer model |
-| `llm_split.py` | helper for suite 23, run in the API container: pulls the small model, runs the three tasks through the services' code and prints the models Ollama reports answering each (#671) |
+| `23_llm_split.sh` | the build and answer models (#671), full runs only: with `BUILD_LLM_MODEL` set to a small model, preparation and gold standard use it and query uses the answer model; skipped in external-Ollama mode, since it pulls and deletes a model (#673) |
+| `llm_split.py` | helper for suite 23, run in the API container: pulls the small model, runs the three tasks through the services' code and prints the models Ollama reports answering each (#671); refuses in external-Ollama mode (#673) |
 | `../tests/test_llm_split.py` | host-only, standard library: `llm_split.py` with stand-ins for `httpx`, `config`, `services` and `time.sleep`: the model pull tried again on a 5xx (3 attempts, waits of 5 s and 10 s) and not on a 4xx or a request error, a failed pull reported as `setup_error` with no task run; and suite 23 turning that into one failed check and no other (#922), registered by suite 23 |
 | `24_query_only.sh` | §2.6 and §10.11 — query-only mode (#670): the overlay resolved without starting it; registers `../tests/test_query_only.py`; the start-up refusal of a non-boolean `RAG_QUERY_ONLY`; the loader's refusal on a full instance; with `stack.sh run --query-only`, build and export, `stack.sh query-only-mode`, then the load, the refusals, access and Q&A on the query-only instance, and a key package loaded with its key file on standard input and refused `KEY_FILE_REQUIRED` without it (#676) |
+| `26_external_ollama.sh` | §2.7 and §10.12 — external-Ollama mode (#673): registers `../tests/test_external_ollama.py` and `../tests/test_check_external_ollama.py`; with `stack.sh run --external-ollama`, no ollama service, `python -m ollama_check`, `/health/details`, ingest through the host's Ollama, the refused export with models, an import back, a reindex and, outside `RAG_SKIP_SLOW`, hnsw and semantic questions |
+| `../tests/test_check_external_ollama.py` | host-side, standard library, run by suite 26 in every run: `scripts/check-external-ollama.sh` with stub `uname`, `lsof`, `ss`, `ip` and `docker`: loopback and docker0 pass, a wildcard or LAN address warns (exit 3), nothing listening fails (exit 1), `--host-only` skips the container check (#673) |
 | `query_only_config.py` | host-side, standard library: `docker-compose.yml` with and without `docker-compose.query-only.yml` as `docker compose config` resolves them; only the api's `RAG_QUERY_ONLY` may differ (#670) |
 | `../tests/test_query_only.py` | API image, no network (also on the host): `RAG_QUERY_ONLY` parsing, the refused and kept routes, the refusals through the app and their order, `query_only` in the user answers, `lan_mode` in the user answers (#676), the loader (usage, refusals, lock, passphrase, a key package's key file on standard input with `KEY_FILE_REQUIRED` and `KEY_FILE_INVALID` (#676), results `success`/`refused`/`failed`/`interrupted`, the Ctrl-C handler) and the access of a collection it creates (#670) |
 | `25_weaviate_upgrade.sh` | the Weaviate upgrade path (#805), full runs only: the previous Weaviate (`RAG_WEAVIATE_FROM`, else `origin/main`'s pin) writes data on a throwaway volume, the checkout's reads it back, and again after a Raft snapshot and a restart; only on the verify project |

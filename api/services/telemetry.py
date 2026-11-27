@@ -179,6 +179,7 @@ SPAN_NAMES |= ROUTES | frozenset(("rag.request", "rag.reformulate", "rag.retriev
     "rag.parse", "rag.chunk", "rag.store", "rag.retain", "rag.package", "rag.validate",
     "rag.rebuild", "rag.pair", "rag.regenerate", "rag.failure_report",
     "ollama.chat", "ollama.embed", "ollama.models", "ollama.health",
+    "ollama.version", "ollama.ps",
     "weaviate.connect", "weaviate.health", "weaviate.create", "weaviate.delete",
     "weaviate.exists", "weaviate.list", "weaviate.meta", "weaviate.config",
     "weaviate.aggregate", "weaviate.query", "weaviate.iterate", "weaviate.batch"))

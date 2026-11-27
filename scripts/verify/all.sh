@@ -40,7 +40,12 @@ fi
 if [ "${RAG_SKIP_SLOW:-0}" != "1" ]; then
   if ! sanity=$(cd "$REPO_ROOT" && docker compose exec -T api python - < scripts/verify/llm_sanity.py 2>&1); then
     printf '\nThe answer LLM is not giving usable answers:\n  %s\n' "$sanity"
-    printf 'Restart it and run again:  docker compose restart ollama\n'
+    if [ "${RAG_VERIFY_EXTERNAL_OLLAMA:-0}" = 1 ]; then
+      # External-Ollama mode (#673): the Ollama is the host's own.
+      printf 'Restart the Ollama on this host (README "External Ollama (native)") and run again.\n'
+    else
+      printf 'Restart it and run again:  docker compose restart ollama\n'
+    fi
     printf '(with the verify environment that scripts/verify/stack.sh up prints)\n\n'
     exit 2
   fi
@@ -51,7 +56,7 @@ printf '\nBuilding fixtures in %s\n' "$FIX"
 rm -rf "$FIX"; python3 ./fixtures.py "$FIX" >/dev/null
 export RAG_FIXTURES="$FIX"
 
-ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings 15_telemetry 17_auth 18_lan 19_audit 20_offline_model 21_prepare 22_ui_ingest 23_llm_split 24_query_only 25_weaviate_upgrade)
+ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings 15_telemetry 17_auth 18_lan 19_audit 20_offline_model 21_prepare 22_ui_ingest 23_llm_split 24_query_only 25_weaviate_upgrade 26_external_ollama)
 if [ "$#" -gt 0 ]; then
   SUITES=()
   for want in "$@"; do
