@@ -5,7 +5,9 @@ that section 11.2 says no archive may carry; the archives they write are then re
 `package-offline.sh` and `install-offline.sh` run with `docker` and `sleep` replaced by stubs
 on PATH that log every call, so nothing is saved, loaded or started and no stack is touched.
 `tar`, `gzip` and `zip` are real. The image list is compared with what `docker compose config` resolves for
-`docker-compose.yml`, which only reads the file.
+`docker-compose.yml`, which only reads the file. `scripts/verify/transfer_packages.py`, suite 15's
+package damager, is run on small packages of its own: one with an absolute name, a `..`, a
+symbolic or a hard link is refused with nothing written, and a safe one is damaged (#490).
 
 Runs on the host with the standard library (Python 3.9+), from the repository root:
 
@@ -23,6 +25,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -108,14 +111,39 @@ def offline_images():
     return [line.strip() for line in block.splitlines() if line.strip()]
 
 
+def ollama_image():
+    """The one ollama/ollama image of package-offline.sh's IMAGES list (#490)."""
+    found = [image for image in offline_images() if image.startswith("ollama/ollama:")]
+    assert len(found) == 1, found
+    return found[0]
+
+
 def age_image():
-    """The tag scripts/backup-common.sh gives the age image (#852, #856): the age version and
-    the first 12 hex digits of the SHA-256 of scripts/age/Dockerfile's instruction lines
-    (comments and blank lines left out)."""
-    text = (ROOT / "scripts" / "age" / "Dockerfile").read_text()
+    """The tag scripts/backup-common.sh gives the age image (#852, #856, #862): the age version
+    and the first 12 hex digits of the SHA-256 of rb_age_text's text: scripts/age/Dockerfile's
+    parser directives (the `# key=value` lines at its top) and its lines that are neither blank
+    nor a comment, then `file <path>` and the SHA-256 of each other file of scripts/age
+    (`link <path>` and the target of a link), in byte order of the path."""
+    folder = ROOT / "scripts" / "age"
+    text = (folder / "Dockerfile").read_text()
     version = re.search(r"^RUN apk add --no-cache age=(\S+)$", text, re.M).group(1)
-    lines = [line for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
-    digest = hashlib.sha256("".join(line + "\n" for line in lines).encode()).hexdigest()
+    lines, directives = [], True
+    for line in text.splitlines():
+        if directives and re.match(r"\s*#\s*[A-Za-z][A-Za-z0-9_-]*\s*=", line):
+            lines.append(line)
+            continue
+        directives = False
+        if line.strip() and not line.lstrip().startswith("#"):
+            lines.append(line)
+    hashed = "".join(line + "\n" for line in lines)
+    others = [(p.relative_to(folder).as_posix(), p) for p in folder.rglob("*")
+              if (p.is_symlink() or not p.is_dir()) and p != folder / "Dockerfile"]
+    for rel, path in sorted(others, key=lambda item: item[0].encode()):
+        if path.is_symlink():
+            hashed += f"link {rel}\n{os.readlink(path)}\n"
+        else:
+            hashed += f"file {rel}\n{hashlib.sha256(path.read_bytes()).hexdigest()}\n"
+    digest = hashlib.sha256(hashed.encode()).hexdigest()
     return f"rag-docker-age:{version}-{digest[:12]}"
 
 
@@ -278,7 +306,10 @@ class OfflinePackageTests(Workspace):
         self.assertEqual([c for c in calls if c[0] == "build"], [])
         run = next(c for c in calls if c[0] == "run")
         self.assertIn("rag-docker_ollama_models:/models:ro", run)
-        self.assertIn("ollama/ollama:0.3.14", run)
+        self.assertIn(ollama_image(), run)
+        # The export runs the listed image too (#490).
+        export = next(c for c in calls if c[0] == "run" and any(a.endswith(":/out") for a in c))
+        self.assertIn(ollama_image(), export)
 
     def test_a_top_level_env_file_is_excluded(self):
         result, out, _files = self.build({TOP_LEVEL_ENV: "SECRET=1"})
@@ -333,7 +364,7 @@ class OfflinePackageTests(Workspace):
         self.assertEqual(len(runs), 2)
         check, export = runs
         self.assertEqual(check[-len(models) - 1:], ["sh"] + models)
-        for arg in ("--network", "none", "rag-docker_ollama_models:/models:ro", "ollama/ollama:0.3.14"):
+        for arg in ("--network", "none", "rag-docker_ollama_models:/models:ro", ollama_image()):
             self.assertIn(arg, check)
         self.assertFalse(any(a.endswith(":/out") for a in check))
         self.assertTrue(any(a.endswith(":/out") for a in export))
@@ -551,17 +582,113 @@ class InstallOfflineTests(Workspace):
             ["compose", "ps"],
         ])
 
-    def test_its_wait_counts_running_services_and_gives_up_after_60_polls(self):
-        # The script says it waits for services to report healthy; it counts running ones.
-        # SPECIFICATIONS.md section 11.4 asks for no wait, so this records the behaviour (#387).
+    def test_its_wait_counts_running_services_and_fails_after_60_polls(self):
+        # The wait counts running services, as it says: compose up has already waited for the
+        # healthchecked ones. One still missing after 60 polls fails the install (#490).
         result = self.install(self.bundle("images.tar.gz", "ollama_models.tar.gz"), STUB_RUNNING="4")
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         calls = self.calls()
         polls = [c for c in calls if c == ["compose", "ps", "--services", "--filter", "status=running"]]
         self.assertEqual(len(polls), 60)
         self.assertEqual(calls.count(["sleep", "5"]), 60)
         self.assertEqual(calls[-1], ["compose", "ps"])
-        self.assertIn("Waiting for services to report healthy...", result.stdout)
+        self.assertIn("Waiting for the 5 services to be running (docker compose up has already waited "
+                      "for weaviate, ollama and api to report healthy)...", result.stdout)
+        self.assertIn("ERROR: only 4 of 5 services are running after 5 minutes.", result.stderr)
+        self.assertNotIn("http://localhost:8080", result.stdout)
+
+
+class TransferPackagesTests(unittest.TestCase):
+    """scripts/verify/transfer_packages.py checks every member before extracting (#490)."""
+    STEM = "ragpkg-test-490"
+
+    def setUp(self):
+        self.temp = Path(tempfile.mkdtemp(prefix="rd490-")).resolve()
+        self.addCleanup(shutil.rmtree, self.temp, True)
+
+    def package(self, extra=None):
+        path = self.temp / (self.STEM + ".tar.gz")
+        with tarfile.open(path, "w:gz") as tar:
+            for name, data in (("", None), ("manifest.json", b'{"files": {}}'), ("chunks.jsonl", b"{}\n")):
+                info = tarfile.TarInfo(self.STEM + ("/" + name if name else ""))
+                if data is None:
+                    info.type, info.mode = tarfile.DIRTYPE, 0o755
+                    tar.addfile(info)
+                else:
+                    info.size = len(data)
+                    tar.addfile(info, io.BytesIO(data))
+            if extra is not None:
+                data = b"" if extra.type in (tarfile.SYMTYPE, tarfile.LNKTYPE) else b"outside\n"
+                extra.size = len(data)
+                tar.addfile(extra, io.BytesIO(data))
+        return path
+
+    def damage(self, path):
+        return subprocess.run([sys.executable, str(ROOT / "scripts" / "verify" / "transfer_packages.py"),
+                               str(path), "badmanifest"], capture_output=True, text=True, timeout=60)
+
+    def test_a_package_with_an_unsafe_member_is_refused(self):
+        def link(name, kind, target):
+            info = tarfile.TarInfo(name)
+            info.type, info.linkname = kind, target
+            return info
+        cases = {
+            "an absolute name": tarfile.TarInfo("/tmp/abs-490.txt"),
+            "a '..' in its name": tarfile.TarInfo(self.STEM + "/../escape-490.txt"),
+            "not a regular file or a directory (symbolic link)":
+                link(self.STEM + "/link", tarfile.SYMTYPE, "manifest.json"),
+            "not a regular file or a directory (hard link)":
+                link(self.STEM + "/hard", tarfile.LNKTYPE, self.STEM + "/manifest.json"),
+        }
+        for case, member in cases.items():
+            with self.subTest(case):
+                result = self.damage(self.package(member))
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(f"refused member '{member.name}': {case.split(' (')[0]}; nothing was written",
+                              result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(sorted(p.name for p in self.temp.iterdir()), [self.STEM + ".tar.gz"])
+
+    def test_an_unsafe_member_writes_nothing_where_it_points(self):
+        # The work folder is made under TMPDIR, so with TMPDIR inside the test's folder a
+        # `..` would land there, and an absolute name points there too: refused, nothing is
+        # written anywhere, on the Python running the test. A FIFO and a character device are
+        # refused as well (#490, reviewer).
+        work = self.temp / "tmp"
+        work.mkdir()
+
+        def special(name, kind):
+            info = tarfile.TarInfo(name)
+            info.type = kind
+            return info
+        cases = {
+            "an absolute name": tarfile.TarInfo(str(self.temp / "abs-490.txt")),
+            "a '..' in its name": tarfile.TarInfo(self.STEM + "/../../escape-490.txt"),
+            "not a regular file or a directory (FIFO)": special(self.STEM + "/fifo", tarfile.FIFOTYPE),
+            "not a regular file or a directory (character device)":
+                special(self.STEM + "/null", tarfile.CHRTYPE),
+        }
+        for case, member in cases.items():
+            with self.subTest(case):
+                path = self.package(member)
+                result = subprocess.run(
+                    [sys.executable, str(ROOT / "scripts" / "verify" / "transfer_packages.py"),
+                     str(path), "badmanifest"],
+                    capture_output=True, text=True, timeout=60, env=dict(os.environ, TMPDIR=str(work)))
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(f"refused member '{member.name}': {case.split(' (')[0]}; nothing was written",
+                              result.stderr)
+                written = sorted(str(p.relative_to(self.temp)) for p in self.temp.rglob("*"))
+                self.assertEqual(written, [self.STEM + ".tar.gz", "tmp"])
+                path.unlink()
+
+    def test_a_safe_package_gives_its_damaged_copy(self):
+        result = self.damage(self.package())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), self.STEM + "-badmanifest.tar.gz")
+        with tarfile.open(self.temp / result.stdout.strip()) as tar:
+            manifest = tar.extractfile(self.STEM + "/manifest.json").read()
+        self.assertEqual(manifest, b"{not json")
 
 
 if __name__ == "__main__":

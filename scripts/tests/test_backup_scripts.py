@@ -61,13 +61,36 @@ def dockerfile():
     return (ROOT / 'scripts/age/Dockerfile').read_text()
 
 
-def age_image(text=None):
+DIRECTIVE = re.compile(r'\s*#\s*[A-Za-z][A-Za-z0-9_-]*\s*=')
+
+
+def age_image(text=None, folder=None):
     """The tag rb_image gives the age image: the age version and the first 12 hex digits of the
-    SHA-256 of the Dockerfile's instruction lines (comments and blank lines left out, #856)."""
-    text = dockerfile() if text is None else text
+    SHA-256 of rb_age_text's text (#856, #862): the Dockerfile's parser directives (the
+    `# key=value` lines at its top) and its lines that are neither blank nor a comment, then
+    `file <path>` and the SHA-256 of each other file of the folder (`link <path>` and the target
+    of a link), in byte order of the path. `folder` is the age folder (scripts/age), `text` its
+    Dockerfile's text."""
+    folder = ROOT / 'scripts/age' if folder is None else Path(folder)
+    text = (folder / 'Dockerfile').read_text() if text is None else text
     version = re.search(r'^RUN apk add --no-cache age=(\S+)$', text, re.M).group(1)
-    lines = [line for line in text.splitlines() if line.strip() and not line.lstrip().startswith('#')]
-    digest = hashlib.sha256(''.join(line + '\n' for line in lines).encode()).hexdigest()
+    lines, directives = [], True
+    for line in text.splitlines():
+        if directives and DIRECTIVE.match(line):
+            lines.append(line)
+            continue
+        directives = False
+        if line.strip() and not line.lstrip().startswith('#'):
+            lines.append(line)
+    hashed = ''.join(line + '\n' for line in lines)
+    others = [(p.relative_to(folder).as_posix(), p) for p in folder.rglob('*')
+              if (p.is_symlink() or not p.is_dir()) and p != folder / 'Dockerfile']
+    for rel, path in sorted(others, key=lambda item: item[0].encode()):
+        if path.is_symlink():
+            hashed += 'link ' + rel + '\n' + os.readlink(str(path)) + '\n'
+        else:
+            hashed += 'file ' + rel + '\n' + hashlib.sha256(path.read_bytes()).hexdigest() + '\n'
+    digest = hashlib.sha256(hashed.encode()).hexdigest()
     return 'rag-docker-age:' + version + '-' + digest[:12]
 
 
@@ -110,11 +133,17 @@ class StaticTests(unittest.TestCase):
             changed = {
                 'a new alpine digest': re.sub(r'@sha256:[0-9a-f]{64}', '@sha256:' + 'ab12' * 16, today),
                 'an added instruction': today + 'RUN echo added\n',
+                # A parser directive changes the build, so it changes the tag (#862).
+                'an added parser directive': '# syntax=docker/dockerfile:1\n' + today,
+                'a changed parser directive': '# syntax=docker/dockerfile:1.7\n' + today,
             }
             same = {
                 'an added comment': today + '# a comment\n',
                 'an added blank line': today + '\n   \n',
                 'a changed comment': today.replace('# The age tool', '# The age utility', 1),
+                # After the first comment a `# key=value` line is a comment, not a directive.
+                'a key=value comment after the first comment':
+                    today.replace('\n', '\n# syntax=docker/dockerfile:1\n', 1),
             }
             for name, text in list(changed.items()) + list(same.items()):
                 self.assertNotEqual(text, today, name)
@@ -127,7 +156,7 @@ class StaticTests(unittest.TestCase):
                                      universal_newlines=True)
                 self.assertEqual(run.returncode, 0, run.stderr)
                 tag = re.search(r'^tag=(\S+)$', run.stdout, re.M).group(1)
-                self.assertEqual(tag, age_image(text))
+                self.assertEqual(tag, age_image(text, folder / 'scripts/age'))
                 self.assertIn('build -q -t {} {}/scripts/age'.format(tag, folder), log.read_text().splitlines())
                 return tag
 
@@ -138,6 +167,17 @@ class StaticTests(unittest.TestCase):
             self.assertNotIn(original, tags)
             for name, text in same.items():
                 self.assertEqual(tag_of(text), original, name)
+            # Another file in scripts/age is in the build context, so it is in the tag (#862).
+            extra = folder / 'scripts/age/extra.txt'
+            extra.write_text('one\n')
+            added = tag_of(today)
+            self.assertNotEqual(added, original)
+            self.assertNotIn(added, tags)
+            extra.write_text('two\n')
+            edited = tag_of(today)
+            self.assertNotIn(edited, tags | {original, added})
+            extra.unlink()
+            self.assertEqual(tag_of(today), original)
             (folder / 'scripts/age/Dockerfile').write_text(re.sub(r'@sha256:[0-9a-f]{64}', '', today))
             log.write_text('')
             run = subprocess.run(['bash', '-c', '. scripts/backup-common.sh; rb_image'], cwd=str(folder), env=env,
@@ -146,10 +186,61 @@ class StaticTests(unittest.TestCase):
             self.assertIn('scripts/age/Dockerfile names no alpine digest', run.stderr)
             self.assertNotIn('build', log.read_text())
 
+    def test_the_tag_follows_links_and_nested_files_in_the_age_folder(self):
+        # rb_age_text hashes every entry of scripts/age but its folders: a file in a
+        # subfolder by its path there, and a link by its target, not by what it points
+        # at (#862, reviewer).
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder).resolve()
+            age = folder / 'scripts' / 'age'
+            age.mkdir(parents=True)
+            shutil.copy2(str(ROOT / 'scripts/backup-common.sh'), str(folder / 'scripts'))
+            (age / 'Dockerfile').write_text(dockerfile())
+            stub = folder / 'bin' / 'docker'
+            stub.parent.mkdir()
+            stub.write_text(STUB_DOCKER)
+            stub.chmod(0o755)
+            env = dict(os.environ, PATH=str(stub.parent) + os.pathsep + os.environ['PATH'],
+                       STUB_LOG=str(folder / 'docker.log'))
+
+            def tag():
+                run = subprocess.run(['bash', '-c', '. scripts/backup-common.sh; rb_image; echo "tag=$RB_IMAGE"'],
+                                     cwd=str(folder), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     universal_newlines=True)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                found = re.search(r'^tag=(\S+)$', run.stdout, re.M).group(1)
+                self.assertEqual(found, age_image(None, age))
+                return found
+
+            original = tag()
+            self.assertEqual(original, age_image())
+            # An empty subfolder is not in the tag; a file in it is, by its path.
+            (age / 'sub').mkdir()
+            self.assertEqual(tag(), original)
+            (age / 'sub' / 'a.txt').write_text('one\n')
+            nested = tag()
+            self.assertNotEqual(nested, original)
+            (age / 'sub' / 'a.txt').rename(age / 'a.txt')
+            moved = tag()
+            self.assertNotIn(moved, {original, nested})
+            # A link is hashed by its target: a new link, then a new target, each give a new tag.
+            (age / 'link').symlink_to('a.txt')
+            linked = tag()
+            self.assertNotIn(linked, {original, nested, moved})
+            (age / 'link').unlink()
+            (age / 'link').symlink_to('Dockerfile')
+            retargeted = tag()
+            self.assertNotIn(retargeted, {original, nested, moved, linked})
+            # Removing them all gives today's tag back.
+            (age / 'link').unlink()
+            (age / 'a.txt').unlink()
+            (age / 'sub').rmdir()
+            self.assertEqual(tag(), original)
+
     def test_the_tag_without_sha256sum_uses_shasum_and_without_either_stops(self):
         # rb_sha256 falls back to shasum where there is no sha256sum, with the same
         # tag, and with neither it stops before building anything (#856).
-        tools = {name: shutil.which(name) for name in ('sed', 'awk', 'dirname', 'basename', 'shasum')}
+        tools = {name: shutil.which(name) for name in ('sed', 'awk', 'dirname', 'basename', 'find', 'sort', 'shasum')}
         if not all(tools.values()):
             self.skipTest('missing on this host: ' + ', '.join(n for n, p in tools.items() if not p))
         with tempfile.TemporaryDirectory() as folder:

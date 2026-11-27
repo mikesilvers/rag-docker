@@ -36,15 +36,22 @@ DEFAULTS = {
 }
 
 _DIR: Path | None = None
+_FOLDER = "retrieval_configs"
 
 
 def _dir() -> Path:
     global _DIR
     if _DIR is None:
-        directory = Path(settings.upload_dir) / "retrieval_configs"
+        directory = Path(settings.upload_dir) / _FOLDER
         directory.mkdir(parents=True, exist_ok=True)
         _DIR = directory
     return _DIR
+
+
+def remove_interrupted_saves() -> None:
+    """At startup: remove the temporary files of retrieval settings saves a crash
+    interrupted (#488). The folder isn't created."""
+    settings_store.remove_interrupted_saves(Path(settings.upload_dir) / _FOLDER)
 
 
 def _safe_name(name: str) -> str:

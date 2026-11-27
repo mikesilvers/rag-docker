@@ -446,6 +446,43 @@ asyncio.run(run())
         self.assertEqual(self.path.read_bytes(), before)
         self.assertEqual([p.name for p in self.dir.glob(f".{NAME}*")], [])
 
+    def test_a_failed_sweep_is_logged_and_startup_carries_on(self):
+        # Reviewer-added (#488): the registry sweep failing is logged, and
+        # startup and the sweeps after it carry on.
+        self.write(OLD)
+        before = self.path.read_bytes()
+        script = """
+import asyncio, logging, sys
+from unittest.mock import AsyncMock, patch
+logging.basicConfig(level=logging.INFO, stream=sys.stderr)
+sys.path.insert(0, sys.argv[1])
+from main import app, lifespan
+from routers import collections as route
+from services import importer, packager, weaviate_client as wc
+staging = AsyncMock(return_value=[])
+async def run():
+    with patch.object(route, 'remove_interrupted_saves', side_effect=OSError(5, 'injected sweep fault')), \\
+         patch.object(wc, 'sweep_staging', new=staging), \\
+         patch.object(importer, 'sweep_interrupted_imports', return_value=[]), \\
+         patch.object(importer, 'sweep_stale_workdirs', return_value=[]), \\
+         patch.object(packager, 'sweep_build_leftovers', return_value=[]), \\
+         patch.object(wc, 'close_client'):
+        async with lifespan(app):
+            print('SERVING')
+    print('LATER SWEEPS RAN' if staging.await_count == 1 else 'LATER SWEEPS SKIPPED')
+asyncio.run(run())
+"""
+        env = {**os.environ, "UPLOAD_DIR": str(self.dir), "EXPORTS_DIR": str(self.dir / "exports"),
+               "SOURCES_DIR": str(self.dir / "sources")}
+        result = subprocess.run([sys.executable, "-c", script, API_DIR], capture_output=True,
+                                text=True, timeout=120, cwd=API_DIR, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("SERVING", result.stdout, result.stderr)
+        self.assertIn("LATER SWEEPS RAN", result.stdout, result.stderr)
+        self.assertIn("Startup sweep of interrupted collection registry writes failed", result.stderr)
+        self.assertIn("injected sweep fault", result.stderr)
+        self.assertEqual(self.path.read_bytes(), before)
+
 
 class ImplementationCopyTests(unittest.TestCase):
     def test_implementation_md_holds_the_current_router(self):

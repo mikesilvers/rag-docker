@@ -20,6 +20,7 @@ from models.schemas import SessionResponse, SessionValidity
 from services import ollama_client as ollama
 from services import weaviate_client as wc
 from services.collection_writes import aliases, end_job, register_job
+from services.folder_sync import sync_folder as _sync_directory  # shared helper (#488)
 
 GS_SYSTEM = (
     "You are creating evaluation data for a RAG system. Given a text chunk, generate one question "
@@ -203,14 +204,6 @@ def _record_issue(path: Path, code: str, message: str | None = None) -> None:
     _diagnostics[str(path)] = {"filename": filename, "code": code, "message": message or messages[code]}
     if changed:
         log.error("Session persistence issue %s for %s", code, path.name)
-
-
-def _sync_directory(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
 def _replace_durably(path: Path, payload: str) -> None:

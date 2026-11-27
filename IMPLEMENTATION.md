@@ -3523,15 +3523,22 @@ DEFAULTS = {
 }
 
 _DIR: Path | None = None
+_FOLDER = "ingest_configs"
 
 
 def _dir() -> Path:
     global _DIR
     if _DIR is None:
-        directory = Path(settings.upload_dir) / "ingest_configs"
+        directory = Path(settings.upload_dir) / _FOLDER
         directory.mkdir(parents=True, exist_ok=True)
         _DIR = directory
     return _DIR
+
+
+def remove_interrupted_saves() -> None:
+    """At startup: remove the temporary files of ingest settings saves a crash
+    interrupted (#488). The folder isn't created."""
+    settings_store.remove_interrupted_saves(Path(settings.upload_dir) / _FOLDER)
 
 
 def _safe_name(name: str) -> str:
@@ -3650,15 +3657,22 @@ DEFAULTS = {
 }
 
 _DIR: Path | None = None
+_FOLDER = "retrieval_configs"
 
 
 def _dir() -> Path:
     global _DIR
     if _DIR is None:
-        directory = Path(settings.upload_dir) / "retrieval_configs"
+        directory = Path(settings.upload_dir) / _FOLDER
         directory.mkdir(parents=True, exist_ok=True)
         _DIR = directory
     return _DIR
+
+
+def remove_interrupted_saves() -> None:
+    """At startup: remove the temporary files of retrieval settings saves a crash
+    interrupted (#488). The folder isn't created."""
+    settings_store.remove_interrupted_saves(Path(settings.upload_dir) / _FOLDER)
 
 
 def _safe_name(name: str) -> str:
@@ -4139,6 +4153,7 @@ from auth import access
 from auth import store as auth_store
 from config import settings
 from services import sources
+from services.folder_sync import sync_folder as _sync_dir  # shared helper (#488)
 
 log = logging.getLogger(__name__)
 _NAME = re.compile(r"[A-Z][A-Za-z0-9_]*")
@@ -4151,14 +4166,6 @@ def _root() -> Path:
     if created:
         _sync_dir(root.parent)
     return root
-
-
-def _sync_dir(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
 def atomic_json(path: Path, record: dict) -> None:
@@ -10407,6 +10414,7 @@ from models.schemas import SessionResponse, SessionValidity
 from services import ollama_client as ollama
 from services import weaviate_client as wc
 from services.collection_writes import aliases, end_job, register_job
+from services.folder_sync import sync_folder as _sync_directory  # shared helper (#488)
 
 GS_SYSTEM = (
     "You are creating evaluation data for a RAG system. Given a text chunk, generate one question "
@@ -10590,14 +10598,6 @@ def _record_issue(path: Path, code: str, message: str | None = None) -> None:
     _diagnostics[str(path)] = {"filename": filename, "code": code, "message": message or messages[code]}
     if changed:
         log.error("Session persistence issue %s for %s", code, path.name)
-
-
-def _sync_directory(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
 def _replace_durably(path: Path, payload: str) -> None:
@@ -13701,6 +13701,7 @@ from pathlib import Path
 
 from config import settings
 from services import audit
+from services.folder_sync import sync_folder as _sync_dir  # shared helper (#488)
 
 _log = logging.getLogger(__name__)
 
@@ -14099,14 +14100,6 @@ def _read_record(path: Path) -> dict:
     if "job_id" in data and data["job_id"] != path.stem:
         raise ValueError("its job_id doesn't match its name")
     return data
-
-
-def _sync_dir(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 ```
 
 ### api/services/job_lists.py
@@ -17687,6 +17680,7 @@ from models.schemas import (
 from services import audit
 from services import weaviate_client as wc
 from services.collection_writes import CollectionInUseError, aliases
+from services.folder_sync import sync_folder as _sync_folder  # shared helper (#488)
 from utils import api_error, collection_check_unavailable
 
 router = APIRouter(prefix="/collections")
@@ -17725,15 +17719,6 @@ def _load_registry() -> dict:
     if not isinstance(reg, dict):
         raise _RegistryUnreadable(f"{p} isn't a JSON object")
     return reg
-
-
-def _sync_folder(path: Path) -> None:
-    """fsync a folder, so a rename into it survives a power loss (#445)."""
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
 def _save_registry(reg: dict) -> None:
@@ -24324,6 +24309,18 @@ async def lifespan(app: FastAPI):
             await asyncio.to_thread(collection_routes.remove_interrupted_saves)
         except Exception:                                 # noqa: BLE001
             log.exception("Startup sweep of interrupted collection registry writes failed")
+        # Settings saves a crash interrupted leave temporary files beside the
+        # saved settings (#488). Each folder's sweep failing is logged alone.
+        try:
+            from services import ingest_config
+            await asyncio.to_thread(ingest_config.remove_interrupted_saves)
+        except Exception:                                 # noqa: BLE001
+            log.exception("Startup sweep of interrupted ingest settings writes failed")
+        try:
+            from services import retrieval_config
+            await asyncio.to_thread(retrieval_config.remove_interrupted_saves)
+        except Exception:                                 # noqa: BLE001
+            log.exception("Startup sweep of interrupted retrieval settings writes failed")
         try:
             from services import sources
             await asyncio.to_thread(sources.remove_interrupted_saves)
@@ -30795,7 +30792,13 @@ With API dependencies installed, run
 retrieval save contention, unique temporary paths, first-save directory races,
 failed serialization/create/write/close/replace preservation, and the folder
 fsync after the replacement, including import publication and a failed folder
-fsync (#445). The test also
+fsync (#445). It also checks (#488) that the temporary file is fsynced before the
+replacement and that a failed fsync of it keeps the old value; that the startup
+sweep removes only the `.<name>.json.<8 random>.tmp` files of interrupted saves (a
+link without following it), keeps the saved settings, look-alike names and
+sub-folders, logs and keeps one it can't remove and doesn't create a missing
+folder; and that a real lifespan run (in a child process, backend sweeps mocked)
+removes them in both `ingest_configs/` and `retrieval_configs/`. The test also
 checks affected embedded sources against `IMPLEMENTATION.md`. It uses disposable
 directories and does not connect to Weaviate or Ollama.
 
@@ -30944,7 +30947,12 @@ the cleanup with `Directory not empty` (#696). The excluded files are planted un
 in a real checkout, so the tests show `git archive` leaves them out, a top-level
 `.env.<suffix>` such as `.env.local` included (SPECIFICATIONS.md section 11.2 excludes
 `.env*`). Its
-`install-offline.sh` wait test records that the wait counts running services, not healthy ones.
+`install-offline.sh` wait test checks that the wait counts running services (compose has
+already waited for the healthchecked ones) and that the script fails, naming how many are
+running, when one is still missing after 60 polls (#490). It also runs
+`transfer_packages.py` on small packages of its own: an absolute name, a `..`, a symbolic or a
+hard link is refused with nothing written, on every Python, and a safe package is damaged
+(#490).
 
 The live checks: unknown job ids, `on_conflict` 422s, `GET /packages` with a junk
 `ragpkg-*.tar.gz`, seventeen crafted copies of the suite's package written by
@@ -31473,7 +31481,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_package_archives.py` | host-side: `package.sh` and `package-offline.sh` in a scratch git repository with `docker` stubbed hold exactly the tracked files of `HEAD`, and refuse outside a git top level (#384), run in a checkout reached through a symlink, and ignore the user's system and global git config (#447); embedded copies; registered by suite 01 |
 | `../tests/test_health.py` | controlled `/health/details` 503 body for a missing model and an unreachable Ollama or Weaviate, alone or together (#375, #415), and advisory memory (#415); the public `/health`'s status-only body and who may read the details (#750), registered by suite 01 |
 | `../tests/test_installed_authlib.py` | the Authlib installed in the built API image is the version `api/requirements.txt` pins (#565), run in the image with no network; registered by suite 01 |
-| `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388, #445): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged, the folder is fsynced after the replace, startup removes interrupted saves' temporary files; registered by suite 01 |
+| `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388, #445): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged, the folder is fsynced after the replace, startup removes interrupted saves' temporary files, and a failed startup sweep is logged and startup carries on (#488); registered by suite 01 |
 | `memory_override.py` | helper for suite 01, on the host: the in-process `RECOMMENDED_MEMORY_GB` its memory checks raise past the allocation, derived from the `allocated_gb` `/health/details` reports, so the status flips to `below_recommended` on any host (#536) |
 | `../tests/test_memory_override.py` | host-side, standard library: the derived override makes `system_info.memory_info` report `below_recommended` with a note for allocations below and above the 12.35 GB a fixed 13 GB could flip, and no override without a usable allocation (#536); embedded copies; registered by suite 01 |
 | `17_auth.sh` | §10.6 — authentication (#25): the endpoint/role matrix, sessions, origin rules, throttling, the operator command, account administration, service API keys, two-step verification (#607), per-collection access (#606); registers `../tests/test_auth.py`, `../tests/test_collection_access.py`, `../tests/test_auth_enforcement.py` and `../tests/test_verify_auth.py`; opt-in restart check |
@@ -31550,7 +31558,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
 | `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530); the nginx tag in SPECIFICATIONS.md's compose copy and 11.3 image list matches docker-compose.yml (#665), registered by infrastructure |
 | `../tests/test_upgrade_backup.py` | host-only: the README's 1.1.0 → 1.2.0 upgrade blocks, run as written under bash, `zsh -c` and interactive zsh with comments off, against stub `docker`, `git` and `curl`; the stub docker accepts only mounts inside its temp directory and only the README's two container commands: no block holds a `#` comment line; the backup skips a missing volume (a wrong prefix) and counts only existing volumes' archives, and writes each copy to a `.tmp` file that replaces the archive only once `gzip -t` passes, so a failed or corrupt copy prints `backup FAILED` and keeps an earlier archive; the rollback is gated on `git checkout v1.1.0` and checks every archive (`gzip -t`, `tar tzf`) and volume before it empties any, and a failed restore stops before `compose up`; alpine is pinned by version and digest; git ignores `backups/` (#679, #693), registered by infrastructure |
-| `../tests/test_backup_scripts.py` | runs from the host, standard library plus the docker CLI: `scripts/backup.sh` and `scripts/restore.sh` (#848) on throwaway volumes of a random project of their own (`rd848t<hex>`, with compose's labels, removed afterwards), run from a scratch git checkout with their own `HOME`: a backup then a restore gives back every file, folder, link, mode and owner; every volume gets its own key, and no two keys match over two runs; the backup folder (0700) holds only `.tgz.age` archives and `.key` files (0600), with no unencrypted archive and no key in the output; a missing volume is skipped and a running container of the project is stopped, not removed; a wrong key, a missing key file and a damaged or cut archive change nothing and stop nothing, and a wrong key or a Docker error in the check shows what age or Docker said; an extraction that fails after the check (a damaged copy fed by a docker wrapper) leaves the volume unchanged, its root's mode and owner included; a Docker error in the key step is shown, with no line holding a secret key; the prefix and location refusals, and the checkout named in another case refused where the filesystem ignores case; the age image pins (the README's alpine, an exact `age` package), its tag following the whole Dockerfile (a stub docker: a new digest or an added instruction gives a new tag, a comment or a blank line doesn't, #852, #856; with no `sha256sum` the same tag from `shasum`, and with neither a refusal before any build), a volume holding an interrupted restore's `.rag-docker-restore.*` folder backed up without it, the folder left in place, and restored without it (#856), and `*.key` in `.gitignore`. Skipped, with a message, only when the docker CLI is missing; it builds the age image (`scripts/age`) if this machine doesn't have it, which needs the network. Registered by infrastructure |
+| `../tests/test_backup_scripts.py` | runs from the host, standard library plus the docker CLI: `scripts/backup.sh` and `scripts/restore.sh` (#848) on throwaway volumes of a random project of their own (`rd848t<hex>`, with compose's labels, removed afterwards), run from a scratch git checkout with their own `HOME`: a backup then a restore gives back every file, folder, link, mode and owner; every volume gets its own key, and no two keys match over two runs; the backup folder (0700) holds only `.tgz.age` archives and `.key` files (0600), with no unencrypted archive and no key in the output; a missing volume is skipped and a running container of the project is stopped, not removed; a wrong key, a missing key file and a damaged or cut archive change nothing and stop nothing, and a wrong key or a Docker error in the check shows what age or Docker said; an extraction that fails after the check (a damaged copy fed by a docker wrapper) leaves the volume unchanged, its root's mode and owner included; a Docker error in the key step is shown, with no line holding a secret key; the prefix and location refusals, and the checkout named in another case refused where the filesystem ignores case; the age image pins (the README's alpine, an exact `age` package), its tag following the whole Dockerfile and the age folder (a stub docker: a new digest, an added instruction, an added or changed parser directive, or a file added to or changed in `scripts/age` gives a new tag, a comment, a blank line or a `# key=value` comment after the first comment doesn't, and removing the added file gives the tag back, #852, #856, #862; with no `sha256sum` the same tag from `shasum`, and with neither a refusal before any build), a volume holding an interrupted restore's `.rag-docker-restore.*` folder backed up without it, the folder left in place, and restored without it (#856), and `*.key` in `.gitignore`. Skipped, with a message, only when the docker CLI is missing; it builds the age image (`scripts/age`) if this machine doesn't have it, which needs the network. Registered by infrastructure |
 | `../tests/test_version_agreement.py` | host-only: the first-party version strings agree with each other, not with a fixed version: `ui/package.json`, the root versions in `ui/package-lock.json`, `mcp/mcpapp.py`, the two `service.version` defaults in `api/services/telemetry.py` and `RAG_OTEL_SERVICE_VERSION` in `docker-compose.telemetry.yml` and `docker-compose.telemetry.verify.yml` (#605, #656), registered by infrastructure |
 | `../tests/test_ui_dependencies.py` | host-only: the copy of `ui/package.json` embedded in `IMPLEMENTATION.md` (`### ui/package.json`) is the file, exactly, so a UI dependency bump that misses the copy fails (#532), registered by infrastructure |
 | `../tests/test_tailwind_output.py` | runs from the host, standard library plus the docker CLI: the built UI CSS keeps what the Tailwind 4 migration relies on (RD-157, #773): the `prose` and `prose-sm` rules, `relative`, `hover` on every device with no `@media (hover: hover)`, and the `@source` globs with automatic detection off (a sentinel `.jsx` file under `ui/src/` is scanned, a sentinel `.md` file is not). It builds a scratch copy of `ui/` with `npm ci --ignore-scripts` from the lock file and `vite build` in a throwaway container of the image `ui/Dockerfile` builds with (its `builder` stage), not on the host (#826), so it needs the network unless the image and the npm cache are present, and is skipped, with a message, only when the docker CLI is missing (a docker or build failure fails it); a second class reads `ui/src/index.css`, `NavBar.tsx` and `ui/Dockerfile` directly, and checks that the builder image is an image reference with a tag or a digest (a `--platform` flag, a digest pin and a registry with a port are accepted; a token starting with `-` is refused before it reaches `docker run`); a third checks, with a stub in place of docker, that a build step that times out has its named container removed (#841). Registered by infrastructure |
@@ -31559,7 +31567,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_package_refusals.py` | controlled import checks 1 and 2, collection-name and `chunks.jsonl` record refusals, registered by suite 15 |
 | `../tests/test_transfer_paths.py` | controlled transfer and tuning route regressions through the app, registered by suite 15 |
 | `../tests/test_retrieve_script.py` | controlled `retrieve.py` defaults, flags and exit codes against a stub API, registered by suite 15 |
-| `../tests/test_distribution.py` | `package.sh`, `package-offline.sh` and `install-offline.sh` with stubbed `docker`, and the image list, on the host, registered by suite 15; the offline bundle also saves the backup scripts' age image, built from the bundle's own `scripts/age` when missing, and a failed build saves nothing (#852) |
+| `../tests/test_distribution.py` | `package.sh`, `package-offline.sh` and `install-offline.sh` with stubbed `docker`, and the image list, on the host, registered by suite 15; the offline bundle also saves the backup scripts' age image, built from the bundle's own `scripts/age` when missing, and a failed build saves nothing (#852); the Ollama image the script runs is the one in its image list, the install fails when a service is still not running after 60 polls, and `transfer_packages.py` refuses a package with an unsafe member (#490) |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types, the Import page's corpus preparation rules download (#615), the page controls of #400 (see "UI control browser checks") and, last, the login page against nginx's real login rate limit (#577) |
 | `14_reindex.sh` | exact-record reindex: a host check that the embedded sources match the real files (`../tests/test_reindex_preservation.py`), 30 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
 | `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures, canonical local session IDs and exact successful-creation ownership. Verifier collection names deliberately lie outside the parent prefix-sweep namespace. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves a durable exact-name fixture receipt/directory before standalone exit; inspection must confirm terminal writer state before exact-name cleanup |
@@ -31994,7 +32002,9 @@ fsyncs the registry's folder after the replace and closes it, that a failed fold
 the save with the new file in place and no temporary file, and that API startup (the lifespan,
 in a child process with the backend sweeps mocked) removes `.collection_registry.json.*.tmp`
 leftovers while keeping the registry, other files, files in subfolders and what a link points
-to, logging a leftover it can't remove.
+to, logging a leftover it can't remove. A second lifespan run, whose registry sweep raises,
+logs the failure and still starts, with the later sweeps run and the registry unchanged
+(#488).
 
 Suite 01 ends by running `16_api_paths.sh` (#399), for API paths no other check covered. It
 runs `scripts/tests/test_api_paths.py` the same way as `test_health.py`, with `UPLOAD_DIR` a
@@ -49404,8 +49414,11 @@ print(d['status'] + ('-stored' if d['files_completed'] >= 1 else ''))" 2>/dev/nu
     api_get "/ingest/job/$none_job" > /tmp/vfy_restart_none_before.json
     # The running jobs' upload staging, which the restart kills in place (#377).
     staged=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/uploads/ingest-* 2>/dev/null' | sort)
+    # Each killed ingest holds its own staging until its worker ends, so both are there (#483).
+    staged_count=$(printf '%s' "$staged" | grep -c .)
     check "the interrupted ingests have ingest-* staging for the restart to sweep" \
-      "$([ -n "$staged" ] && echo 0 || echo 1)" "no /app/uploads/ingest-* while the jobs ran"
+      "$([ "$staged_count" -ge 2 ] && echo 0 || echo 1)" \
+      "$staged_count /app/uploads/ingest-* while the jobs ran, need one per killed ingest (2): ${staged:-none}"
     _rag_require_lock_owner
     (cd "$REPO_ROOT" && docker compose restart --timeout 0 api) >/dev/null 2>&1
     for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
@@ -50563,11 +50576,23 @@ sys.exit(0 if ok else 1)
 ENDPY
       check "hard stop settles generation with a plain reason and retained pairs" $?
       pid2=$(python3 -c "import json;print(json.load(open('/tmp/vfy_gen2_post.json'))['pairs'][0]['pair_id'])")
-      _rag_require_lock_owner
-      code=$(curl -s -m 1920 -o /tmp/vfy_gen2_regen.json -w '%{http_code}' -X POST \
-        "$API/goldstandard/regenerate" -H 'Content-Type: application/json' \
-        -d "{\"session_id\":\"$SID2\",\"pair_id\":\"$pid2\"}")
-      check_eq "regeneration succeeds after startup settlement" "$code" "200"
+      # The settlement unblocked regeneration unless it answers 409. A 502
+      # PAIR_GENERATION_FAILED is the model's reply being unusable, which the API
+      # says to try again, so only that answer is tried again, 3 attempts at most (#483).
+      regen_error=""
+      for attempt in 1 2 3; do
+        _rag_require_lock_owner
+        code=$(curl -s -m 1920 -o /tmp/vfy_gen2_regen.json -w '%{http_code}' -X POST \
+          "$API/goldstandard/regenerate" -H 'Content-Type: application/json' \
+          -d "{\"session_id\":\"$SID2\",\"pair_id\":\"$pid2\"}")
+        regen_error=$(python3 -c "import json
+try: print(json.load(open('/tmp/vfy_gen2_regen.json'))['error']['code'])
+except Exception: print('')" 2>/dev/null)
+        { [ "$code" = 502 ] && [ "$regen_error" = PAIR_GENERATION_FAILED ]; } || break
+      done
+      [ "$code" = 200 ]
+      check "regeneration succeeds after startup settlement" $? \
+        "HTTP $code${regen_error:+ $regen_error} after $attempt attempt(s)"
       api_get "/goldstandard/session/$SID2" > /tmp/vfy_gen2_final.json
       python3 - "$pid2" <<'ENDPY'
 import json,sys
@@ -52738,6 +52763,10 @@ Kinds, by the import check that refuses them:
   records, PACKAGE_CORRUPT:  badline baduuid badprops novector wrongwidth countup countdown
 The record kinds re-sign `chunks.jsonl` in the manifest, so the digests still match and only
 the record decides; `countup`/`countdown` change only the manifest, which is not digested.
+
+Every member of the package is checked before anything is extracted, on every Python (#490):
+an absolute name, a `..` in a name, or a member that is neither a regular file nor a
+directory (a link, a device, a FIFO) refuses the package, and nothing is written.
 """
 import hashlib
 import io
@@ -52752,11 +52781,27 @@ KINDS = ("nongzip", "truncated", "symlink", "hardlink", "dotdot", "twodirs", "no
          "wrongwidth", "countup", "countdown")
 
 
+def unsafe(member):
+    """Why a package member may not be extracted, or None (#490): an absolute name, a `..`
+    component, or anything but a regular file or a directory (a link, a device, a FIFO)."""
+    if member.name.startswith("/"):
+        return "an absolute name"
+    if ".." in pathlib.PurePosixPath(member.name).parts:
+        return "a '..' in its name"
+    if not (member.isfile() or member.isdir()):
+        return "not a regular file or a directory"
+    return None
+
+
 def extract(src, work):
     with tarfile.open(src) as tar:
+        for member in tar.getmembers():
+            reason = unsafe(member)
+            if reason:
+                sys.exit(f"{src.name}: refused member '{member.name}': {reason}; nothing was written")
         if hasattr(tarfile, "data_filter"):
             tar.extractall(work, filter="data")
-        else:                                   # the suite's own package, before 3.9.17
+        else:                                   # before 3.9.17: every member was checked above
             tar.extractall(work)
     return next(p for p in work.iterdir() if p.is_dir())
 
@@ -56892,13 +56937,19 @@ else
 fi
 
 echo
-echo "Waiting for services to report healthy..."
+EXPECTED=$((5 + TELEMETRY))
+echo "Waiting for the $EXPECTED services to be running (docker compose up has already waited for weaviate, ollama and api to report healthy)..."
+running=0
 for i in $(seq 1 60); do
   running=$(docker compose ps --services --filter status=running | wc -l | tr -d ' ')
-  [ "$running" = "$((5 + TELEMETRY))" ] && break
+  [ "$running" = "$EXPECTED" ] && break
   sleep 5
 done
 docker compose ps
+if [ "$running" != "$EXPECTED" ]; then
+  echo "ERROR: only $running of $EXPECTED services are running after 5 minutes. See 'docker compose ps' above, and 'docker compose logs <service>' for one that isn't running." >&2
+  exit 1
+fi
 
 echo
 echo "If the requested services are up, open http://localhost:8080"
@@ -59742,6 +59793,28 @@ class LifecycleTests(unittest.TestCase):
 if __name__=='__main__':unittest.main()
 ```
 
+### api/services/folder_sync.py
+
+```python
+"""Folder fsync shared by the API's atomic saves (#488)."""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+
+def sync_folder(path: Path) -> None:
+    """fsync a folder, so a rename into it survives a power loss (#445).
+
+    The descriptor is closed even when the fsync fails; the error propagates.
+    """
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+```
+
 ### api/services/settings_store.py
 
 ```python
@@ -59752,8 +59825,11 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import tempfile
 import threading
+
+from services.folder_sync import sync_folder as _sync_folder  # shared helper (#488)
 
 log = logging.getLogger(__name__)
 
@@ -59761,14 +59837,10 @@ log = logging.getLogger(__name__)
 # One lock also covers collection names that map to the same sanitized path.
 _write_lock = threading.Lock()
 
-
-def _sync_folder(path: Path) -> None:
-    """fsync a folder, so a rename into it survives a power loss (#445)."""
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+# The temporary names publish makes: "." + the saved file's name (a safe name,
+# A-Z, a-z, 0-9 and _, plus ".json") + "." + tempfile's 8 random characters
+# (a-z, 0-9 and _) + ".tmp" (#488).
+_LEFTOVER = re.compile(r"\.[A-Za-z0-9_]+\.json\.[a-z0-9_]{8}\.tmp")
 
 
 def publish(path: Path, config: dict) -> None:
@@ -59777,8 +59849,9 @@ def publish(path: Path, config: dict) -> None:
     Serialize the whole transaction within this API process. Exclusive temporary
     names ensure even independent processes cannot rename each other's payloads.
     A later successful save may supersede this value after atomic replacement.
-    The folder is fsynced after the replacement (#445); if that fails, the save
-    raises with the new value already in place.
+    The temporary file is fsynced before the replacement (#488), and the folder
+    after it (#445); if the folder's fsync fails, the save raises with the new
+    value already in place.
     """
     with _write_lock:
         payload = json.dumps(config, indent=2, sort_keys=True)
@@ -59790,6 +59863,8 @@ def publish(path: Path, config: dict) -> None:
             ) as output:
                 temporary = Path(output.name)
                 output.write(payload)
+                output.flush()
+                os.fsync(output.fileno())
             temporary.replace(path)
             temporary = None
             _sync_folder(path.parent)
@@ -59799,6 +59874,26 @@ def publish(path: Path, config: dict) -> None:
                     temporary.unlink(missing_ok=True)
                 except OSError:
                     log.warning("Could not remove settings temporary file %s", temporary)
+
+
+def remove_interrupted_saves(folder: Path) -> None:
+    """Remove the temporary files of saves a crash interrupted in `folder` (#488).
+
+    The saved files are whole: a save replaces one only once its temporary file
+    is complete. Called once at startup, before any request, so no save is in
+    progress. Only the names publish makes, at the top of the folder, are
+    removed; a link is removed without following it, and a leftover that can't
+    be removed is logged and kept. A missing folder is not created; an error
+    listing the folder is the sweep failing, which the caller logs.
+    """
+    if not folder.is_dir():
+        return
+    for leftover in folder.iterdir():
+        if _LEFTOVER.fullmatch(leftover.name):
+            try:
+                leftover.unlink()
+            except OSError:
+                log.exception("Could not remove interrupted settings write %s", leftover)
 ```
 
 ### scripts/tests/test_settings_implementation.py
@@ -59837,6 +59932,7 @@ import errno
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -59846,7 +59942,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
-sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api'))
+API_DIR = os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api')
+sys.path.insert(0, API_DIR)
 from config import settings
 from services import ingest_config, retrieval_config, settings_store
 
@@ -60127,6 +60224,158 @@ class SettingsPersistenceTests(unittest.TestCase):
                     service.save({**old, 'unserializable': object()})
                 self.assertEqual(service.load(old['collection']), old)
                 self.assertEqual(list(service._dir().glob('*.tmp')), [])
+
+    def test_the_temporary_file_is_fsynced_before_the_replacement(self):
+        # #488: like the registry save, the temporary file is on disk before it
+        # replaces the saved settings.
+        for service in SERVICES:
+            with self.subTest(service=service.__name__), self.fixture(service):
+                old, attempted, _ = self.values(service)
+                service.save(old)
+                events = []
+                with self.recorded(events):
+                    service.save(attempted)
+                names = [event[0] for event in events]
+                self.assertEqual(names.count('replace'), 1, events)
+                self.assertIn('fsync file', names[:names.index('replace')], events)
+                self.assertEqual(service.load(old['collection']), attempted)
+
+    def test_a_failed_temporary_file_sync_preserves_old_value(self):
+        real_fsync = os.fsync
+
+        def fsync(fd):
+            if not stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(errno.EIO, 'injected file sync fault')
+            return real_fsync(fd)
+
+        for service in SERVICES:
+            with self.subTest(service=service.__name__):
+                self.assert_failure_preserves_old_value(service,
+                    patch.object(os, 'fsync', side_effect=fsync), OSError)
+
+    def test_the_startup_sweep_removes_only_interrupted_saves(self):
+        # #488: only the temporary names publish makes, at the top of the folder.
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            folder = base / 'ingest_configs'
+            folder.mkdir()
+            outside = base / 'outside.json'
+            outside.write_text('keep')
+            removed = ['.A.json.abcd_123.tmp', '.Some_Name_2.json.zz9_x0yq.tmp']
+            for name in removed:
+                (folder / name).write_text('{"chunk_')
+            (folder / '.B.json.linkleft.tmp').symlink_to(outside)
+            kept = ['A.json', '.A.json.abc.tmp', '.A.json.abcdefgh.tmpx', 'A.json.abcdefgh.tmp',
+                    '.A-b.json.abcdefgh.tmp', '.A.json.ABCDEFGH.tmp', '.A.txt.abcdefgh.tmp']
+            for name in kept:
+                (folder / name).write_text('keep')
+            (folder / 'sub').mkdir()
+            (folder / 'sub' / '.C.json.abcdefgh.tmp').write_text('keep')
+            stuck = folder / '.D.json.abcdefgh.tmp'
+            stuck.mkdir()
+            with self.assertLogs('services.settings_store', 'ERROR') as logs:
+                settings_store.remove_interrupted_saves(folder)
+            self.assertEqual(sorted(p.name for p in folder.iterdir()),
+                             sorted(kept + ['sub', stuck.name]))
+            self.assertIn(str(stuck), '\n'.join(logs.output))
+            self.assertEqual(outside.read_text(), 'keep')
+            self.assertEqual((folder / 'sub' / '.C.json.abcdefgh.tmp').read_text(), 'keep')
+            missing = base / 'retrieval_configs'
+            settings_store.remove_interrupted_saves(missing)
+            self.assertFalse(missing.exists())
+
+    def test_startup_removes_interrupted_settings_saves(self):
+        # #488: a real lifespan run, in a child process with the backend sweeps
+        # mocked, removes leftovers in both settings folders and keeps the saves.
+        script = """
+import asyncio, sys
+from unittest.mock import AsyncMock, patch
+sys.path.insert(0, sys.argv[1])
+from main import app, lifespan
+from services import importer, packager, weaviate_client as wc
+async def run():
+    with patch.object(wc, 'sweep_staging', new=AsyncMock(return_value=[])), \\
+         patch.object(importer, 'sweep_interrupted_imports', return_value=[]), \\
+         patch.object(importer, 'sweep_stale_workdirs', return_value=[]), \\
+         patch.object(packager, 'sweep_build_leftovers', return_value=[]), \\
+         patch.object(wc, 'close_client'):
+        async with lifespan(app):
+            print('SERVING')
+asyncio.run(run())
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            uploads = Path(directory) / 'uploads'
+            saved, leftovers = [], []
+            for name in ('ingest_configs', 'retrieval_configs'):
+                folder = uploads / name
+                folder.mkdir(parents=True)
+                (folder / 'Kept.json').write_text('{"collection": "Kept"}')
+                saved.append(folder / 'Kept.json')
+                leftovers.append(folder / '.Kept.json.k1x9_q2z.tmp')
+                leftovers[-1].write_text('{"coll')
+            env = {**os.environ, 'UPLOAD_DIR': str(uploads),
+                   'EXPORTS_DIR': str(Path(directory) / 'exports'),
+                   'SOURCES_DIR': str(Path(directory) / 'sources')}
+            result = subprocess.run([sys.executable, '-c', script, API_DIR], capture_output=True,
+                                    text=True, timeout=120, cwd=API_DIR, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('SERVING', result.stdout, result.stderr)
+            self.assertEqual([p for p in leftovers if p.exists()], [], result.stderr)
+            self.assertEqual([p.read_text() for p in saved], ['{"collection": "Kept"}'] * 2)
+
+    def test_a_failed_settings_sweep_is_logged_and_startup_carries_on(self):
+        # Reviewer-added (#488): each folder's sweep failing is logged alone; the
+        # other folder's sweep, the later sweeps and startup carry on.
+        script = """
+import asyncio, logging, sys
+from unittest.mock import AsyncMock, patch
+logging.basicConfig(level=logging.INFO, stream=sys.stderr)
+sys.path.insert(0, sys.argv[1])
+failing = sys.argv[2]
+from main import app, lifespan
+from services import importer, packager, weaviate_client as wc
+from services import ingest_config, retrieval_config
+module = {'ingest_configs': ingest_config, 'retrieval_configs': retrieval_config}[failing]
+staging = AsyncMock(return_value=[])
+async def run():
+    with patch.object(module, 'remove_interrupted_saves',
+                      side_effect=OSError(5, 'injected settings sweep fault')), \\
+         patch.object(wc, 'sweep_staging', new=staging), \\
+         patch.object(importer, 'sweep_interrupted_imports', return_value=[]), \\
+         patch.object(importer, 'sweep_stale_workdirs', return_value=[]), \\
+         patch.object(packager, 'sweep_build_leftovers', return_value=[]), \\
+         patch.object(wc, 'close_client'):
+        async with lifespan(app):
+            print('SERVING')
+    print('LATER SWEEPS RAN' if staging.await_count == 1 else 'LATER SWEEPS SKIPPED')
+asyncio.run(run())
+"""
+        messages = {'ingest_configs': 'Startup sweep of interrupted ingest settings writes failed',
+                    'retrieval_configs': 'Startup sweep of interrupted retrieval settings writes failed'}
+        for failing, other in (('ingest_configs', 'retrieval_configs'),
+                               ('retrieval_configs', 'ingest_configs')):
+            with self.subTest(failing=failing), tempfile.TemporaryDirectory() as directory:
+                uploads = Path(directory) / 'uploads'
+                leftovers = {}
+                for name in (failing, other):
+                    folder = uploads / name
+                    folder.mkdir(parents=True)
+                    leftovers[name] = folder / '.Kept.json.k1x9_q2z.tmp'
+                    leftovers[name].write_text('{"coll')
+                env = {**os.environ, 'UPLOAD_DIR': str(uploads),
+                       'EXPORTS_DIR': str(Path(directory) / 'exports'),
+                       'SOURCES_DIR': str(Path(directory) / 'sources')}
+                result = subprocess.run([sys.executable, '-c', script, API_DIR, failing],
+                                        capture_output=True, text=True, timeout=120,
+                                        cwd=API_DIR, env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('SERVING', result.stdout, result.stderr)
+                self.assertIn('LATER SWEEPS RAN', result.stdout, result.stderr)
+                self.assertIn(messages[failing], result.stderr)
+                self.assertNotIn(messages[other], result.stderr)
+                self.assertIn('injected settings sweep fault', result.stderr)
+                self.assertTrue(leftovers[failing].exists(), result.stderr)
+                self.assertFalse(leftovers[other].exists(), result.stderr)
 
 
 if __name__ == '__main__':

@@ -23,6 +23,7 @@ from models.schemas import (
 from services import audit
 from services import weaviate_client as wc
 from services.collection_writes import CollectionInUseError, aliases
+from services.folder_sync import sync_folder as _sync_folder  # shared helper (#488)
 from utils import api_error, collection_check_unavailable
 
 router = APIRouter(prefix="/collections")
@@ -61,15 +62,6 @@ def _load_registry() -> dict:
     if not isinstance(reg, dict):
         raise _RegistryUnreadable(f"{p} isn't a JSON object")
     return reg
-
-
-def _sync_folder(path: Path) -> None:
-    """fsync a folder, so a rename into it survives a power loss (#445)."""
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
 def _save_registry(reg: dict) -> None:

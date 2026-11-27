@@ -19,6 +19,7 @@ from auth import access
 from auth import store as auth_store
 from config import settings
 from services import sources
+from services.folder_sync import sync_folder as _sync_dir  # shared helper (#488)
 
 log = logging.getLogger(__name__)
 _NAME = re.compile(r"[A-Z][A-Za-z0-9_]*")
@@ -31,14 +32,6 @@ def _root() -> Path:
     if created:
         _sync_dir(root.parent)
     return root
-
-
-def _sync_dir(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
 def atomic_json(path: Path, record: dict) -> None:

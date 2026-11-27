@@ -52,13 +52,19 @@ else
 fi
 
 echo
-echo "Waiting for services to report healthy..."
+EXPECTED=$((5 + TELEMETRY))
+echo "Waiting for the $EXPECTED services to be running (docker compose up has already waited for weaviate, ollama and api to report healthy)..."
+running=0
 for i in $(seq 1 60); do
   running=$(docker compose ps --services --filter status=running | wc -l | tr -d ' ')
-  [ "$running" = "$((5 + TELEMETRY))" ] && break
+  [ "$running" = "$EXPECTED" ] && break
   sleep 5
 done
 docker compose ps
+if [ "$running" != "$EXPECTED" ]; then
+  echo "ERROR: only $running of $EXPECTED services are running after 5 minutes. See 'docker compose ps' above, and 'docker compose logs <service>' for one that isn't running." >&2
+  exit 1
+fi
 
 echo
 echo "If the requested services are up, open http://localhost:8080"

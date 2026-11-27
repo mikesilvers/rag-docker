@@ -1287,8 +1287,11 @@ print(d['status'] + ('-stored' if d['files_completed'] >= 1 else ''))" 2>/dev/nu
     api_get "/ingest/job/$none_job" > /tmp/vfy_restart_none_before.json
     # The running jobs' upload staging, which the restart kills in place (#377).
     staged=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/uploads/ingest-* 2>/dev/null' | sort)
+    # Each killed ingest holds its own staging until its worker ends, so both are there (#483).
+    staged_count=$(printf '%s' "$staged" | grep -c .)
     check "the interrupted ingests have ingest-* staging for the restart to sweep" \
-      "$([ -n "$staged" ] && echo 0 || echo 1)" "no /app/uploads/ingest-* while the jobs ran"
+      "$([ "$staged_count" -ge 2 ] && echo 0 || echo 1)" \
+      "$staged_count /app/uploads/ingest-* while the jobs ran, need one per killed ingest (2): ${staged:-none}"
     _rag_require_lock_owner
     (cd "$REPO_ROOT" && docker compose restart --timeout 0 api) >/dev/null 2>&1
     for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
