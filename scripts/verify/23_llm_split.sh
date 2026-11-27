@@ -10,8 +10,18 @@
 # VfyLlmSplit, removed at the end; it creates no preparation document and no
 # gold standard session. Its model pull is retried on a 5xx; a pull that fails
 # anyway is one failed check, with the model checks skipped (#922).
-# ../tests/test_llm_split.py checks both on the host, in every run.
+# ../tests/test_llm_split.py checks both on the host, in every run but an
+# external-Ollama one.
+#
+# External-Ollama mode (#673) skips it: the Ollama there is the host's own,
+# shared with other apps, and rag-docker never pulls or deletes a model in it.
 cd "$(dirname "$0")" && . ./lib.sh
+if [ "${RAG_VERIFY_EXTERNAL_OLLAMA:-0}" = 1 ]; then
+  section "Build and answer models (#671)"
+  skip "preparation and gold standard on the build model, query on the answer model" \
+    "external-Ollama mode: this suite pulls and deletes qwen2.5:0.5b, and an external Ollama is shared, so rag-docker never writes models to it (#673)"
+  summary; exit $?
+fi
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 [ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null

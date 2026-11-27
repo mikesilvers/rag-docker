@@ -6,6 +6,8 @@ and then 10 s); a 4xx or a request error is not; a pull that fails runs no
 task and is reported as `setup_error`. `23_llm_split.sh` turns that into one
 failed check instead of a failure of every check that reads the run.
 
+In external-Ollama mode (#673) the script refuses, exit 2, before any request.
+
 The script runs in this process with stand-ins for httpx, config, services and
 time.sleep, and the suite's part that reads the script's output runs under bash
 with stand-in check helpers and docker. Standard library only; no Docker or
@@ -40,7 +42,7 @@ class FakeResponse:
         self.is_success = 200 <= status < 300
 
 
-def fake_modules(answers, record):
+def fake_modules(answers, record, external=False):
     """httpx, config and services stand-ins; `answers` are what the pulls get."""
     httpx = types.ModuleType('httpx')
 
@@ -70,7 +72,8 @@ def fake_modules(answers, record):
 
     config = types.ModuleType('config')
     config.settings = types.SimpleNamespace(ollama_host='ollama', ollama_port=11434,
-                                            build_model=BUILD, answer_model=ANSWER)
+                                            build_model=BUILD, answer_model=ANSWER,
+                                            rag_external_ollama=external)
 
     def ran(name):
         async def run(*args, **kwargs):
@@ -97,6 +100,27 @@ def run_script(answers):
     record['out'] = json.loads(stdout.getvalue().strip().splitlines()[-1])
     record['stderr'] = stderr.getvalue()
     return record
+
+
+class ExternalOllamaRefusalTests(unittest.TestCase):
+    """In external-Ollama mode (#673) the script refuses before any request: that
+    Ollama is the host's own and shared, so rag-docker never pulls or deletes a
+    model in it. (Suite 23 skips in that mode before it runs the script.)"""
+
+    def test_it_exits_2_before_any_pull_or_delete(self):
+        record = {'pulls': [], 'deletes': [], 'tasks': []}
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.dict(sys.modules, fake_modules([200], record, external=True)), \
+                mock.patch.dict(os.environ, {'RAG_LLM_SPLIT_COLLECTION': 'VfyLlmSplit'}), \
+                mock.patch('time.sleep'), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as caught:
+                runpy.run_path(str(SCRIPT), run_name='__main__')
+        self.assertEqual(caught.exception.code, 2)
+        self.assertEqual(record, {'pulls': [], 'deletes': [], 'tasks': []})
+        self.assertEqual(stdout.getvalue(), '')
+        self.assertIn('refused in external-Ollama mode (RAG_EXTERNAL_OLLAMA=true)', stderr.getvalue())
+        self.assertIn('rag-docker never writes models to it (#673)', stderr.getvalue())
 
 
 class PullTests(unittest.TestCase):

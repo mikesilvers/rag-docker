@@ -56,3 +56,13 @@ def memory_info(recommended_gb: float) -> dict:
             "Docker Desktop -> Settings -> Resources -> Memory."
         )
     return info
+
+
+def external_memory_info() -> dict:
+    """The memory report with an external Ollama (#673): the LLM isn't in Docker,
+    so there is no recommendation to compare Docker's memory with."""
+    return {
+        "status": "external",
+        "note": ("The LLM runs in the external Ollama, outside Docker, so Docker's "
+                 "memory isn't compared with RECOMMENDED_MEMORY_GB."),
+    }

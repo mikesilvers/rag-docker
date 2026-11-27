@@ -175,6 +175,21 @@ def lan_config(checkout, exports, port='8081'):
     return config
 
 
+def external_config(checkout, exports, port='8081'):
+    """passing_config as stack.sh --external-ollama resolves it (#673): no ollama
+    service, api and weaviate with extra_hosts ollama=host-gateway (as Compose
+    renders it), the api waiting only for weaviate and mounting no model store."""
+    config = passing_config(checkout, exports, port)
+    services = config['services']
+    del services['ollama']
+    services['api']['depends_on'] = {'weaviate': {'condition': 'service_healthy', 'required': True}}
+    services['api']['volumes'] = [m for m in services['api']['volumes'] if m['target'] != '/ollama']
+    for svc in ('api', 'weaviate'):
+        services[svc]['extra_hosts'] = ['ollama=host-gateway']
+    del config['volumes']['ollama_models']
+    return config
+
+
 class Sandbox:
     """Scratch TMPDIR, lock path and stubbed docker/curl for one test."""
 
@@ -405,13 +420,13 @@ class LiveGuardTests(unittest.TestCase):
         self.assertEqual(self.box.calls(), [], 'no docker or curl call may come before the refusal')
 
     def test_live_project_is_refused(self):
-        for script in ('all.sh', '02_ingest.sh', '25_weaviate_upgrade.sh'):
+        for script in ('all.sh', '02_ingest.sh', '25_weaviate_upgrade.sh', '26_external_ollama.sh'):
             with self.subTest(script=script):
                 self.assert_refused(self.box.run(['bash', str(VERIFY / script)],
                                                  COMPOSE_PROJECT_NAME='rag-docker', RAG_API='http://localhost:9/api'))
 
     def test_live_port_is_refused(self):
-        for script in ('all.sh', '02_ingest.sh', '25_weaviate_upgrade.sh'):
+        for script in ('all.sh', '02_ingest.sh', '25_weaviate_upgrade.sh', '26_external_ollama.sh'):
             with self.subTest(script=script):
                 self.assert_refused(self.box.run(['bash', str(VERIFY / script)],
                                                  COMPOSE_PROJECT_NAME='rag-verify', RAG_API='http://localhost:8080/api'))
@@ -738,6 +753,142 @@ class RestartTimingTests(unittest.TestCase):
                 self.assertIn(text, result.stdout)
 
 
+class ExternalOllamaGuardTests(ConfigGuardTests):
+    """#673: in external-Ollama mode the guard allows exactly
+    extra_hosts ollama:host-gateway on api and weaviate, and no ollama service."""
+
+    def guard_external(self, config, port='8081'):
+        path = self.dir / 'config.json'
+        path.write_text(json.dumps(config))
+        return subprocess.run(['python3', '-c', self.block, str(self.checkout), str(self.exports), port, str(path),
+                               str(self.checkout), 'external-ollama'], capture_output=True, text=True)
+
+    def test_the_external_configuration_passes_only_in_its_mode(self):
+        for hosts in (['ollama=host-gateway'], ['ollama:host-gateway']):
+            with self.subTest(hosts=hosts):
+                config = external_config(self.checkout, self.exports)
+                for svc in ('api', 'weaviate'):
+                    config['services'][svc]['extra_hosts'] = hosts
+                result = self.guard_external(config)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = self.guard(external_config(self.checkout, self.exports))
+        self.assertEqual(result.returncode, 2, 'the default mode must refuse extra_hosts')
+        self.assertIn('(h)', result.stdout)
+        self.assertIn('extra_hosts', result.stdout)
+
+    def test_its_adverse_variants_are_refused(self):
+        def mutate(change):
+            config = external_config(self.checkout, self.exports)
+            change(config)
+            return config
+        S = lambda c: c['services']
+        variants = [
+            ('k', 'another host name', mutate(lambda c: S(c)['api'].update(extra_hosts=['ollama=192.168.1.5']))),
+            ('k', 'the live stack by name', mutate(lambda c: S(c)['weaviate'].update(extra_hosts=['rag-docker-api-1=host-gateway']))),
+            ('k', 'a second entry', mutate(lambda c: S(c)['api'].update(extra_hosts=['ollama=host-gateway', 'x=host-gateway']))),
+            ('k', 'a mapping of another name', mutate(lambda c: S(c)['api'].update(extra_hosts={'other': 'host-gateway'}))),
+            ('h', 'extra_hosts on the ui', mutate(lambda c: S(c)['ui'].update(extra_hosts=['ollama=host-gateway']))),
+            ('h', 'extra_hosts on the proxy', mutate(lambda c: S(c)['proxy'].update(extra_hosts=['ollama=host-gateway']))),
+            ('h', 'network_mode host', mutate(lambda c: S(c)['api'].update(network_mode='host'))),
+            ('k', 'the ollama service still there', mutate(lambda c: S(c).update(
+                ollama=passing_config(self.checkout, self.exports)['services']['ollama']))),
+            ('c', 'a published Ollama port', mutate(lambda c: S(c)['weaviate'].update(
+                ports=[{'host_ip': '127.0.0.1', 'target': 11434, 'published': '11434', 'protocol': 'tcp'}]))),
+        ]
+        for rule, name, config in variants:
+            with self.subTest(rule=rule, variant=name):
+                result = self.guard_external(config)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn('({})'.format(rule), result.stdout + result.stderr)
+
+
+class RegenerationRetryTests(unittest.TestCase):
+    """RD-260: suite 04's regeneration retry, run on the host with curl scripted.
+
+    Only 502 PAIR_GENERATION_FAILED is tried again, 3 attempts at most (#483),
+    and a pass after a retry says so in the log.
+    """
+
+    FAILED = (502, '{"error":{"code":"PAIR_GENERATION_FAILED"}}')
+    OK = (200, '{"pair_id":"p_1","question":"q"}')
+
+    def run_helper(self, answers):
+        box = Sandbox(self)
+        script = box.root / 'answers'
+        script.write_text(''.join(f'{code}\t{body}\n' for code, body in answers))
+        calls = box.root / 'calls'
+        answer = box.root / 'answer.json'
+        stubs = textwrap.dedent(r"""
+            _rag_require_lock_owner() { echo lock >> "$CALLS"; }
+            curl() {
+              local out="" prev="" a line
+              for a in "$@"; do [ "$prev" = -o ] && out="$a"; prev="$a"; done
+              printf 'curl' >> "$CALLS"; printf '\x1f%s' "$@" >> "$CALLS"; echo >> "$CALLS"
+              line=$(sed -n "$(grep -c '^curl' "$CALLS")p" "$ANSWERS")
+              printf '%s' "${line#*$'\t'}" > "$out"
+              printf '%s' "${line%%$'\t'*}"
+            }
+        """)
+        result = box.run(['bash', '-c', f'. "{VERIFY}/lib.sh"\n{stubs}\n'
+                          'regeneration_retry_check regen gs_1 p_1 "$ANSWER"; echo "PASS=$PASS FAIL=$FAIL"'],
+                         RAG_API='http://localhost:9/api', CALLS=str(calls), ANSWERS=str(script),
+                         ANSWER=str(answer))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = calls.read_text().splitlines() if calls.exists() else []
+        requests = [line.split('\x1f')[1:] for line in lines if line.startswith('curl')]
+        return result.stdout, lines, requests, answer.read_text() if answer.exists() else None
+
+    def test_first_attempt_pass(self):
+        out, _, requests, _ = self.run_helper([self.OK])
+        self.assertEqual(len(requests), 1)
+        self.assertIn('PASS  regen\n', out)
+        self.assertIn('PASS=1 FAIL=0', out)
+        self.assertNotIn('passed on attempt', out)
+
+    def test_pass_after_retry_is_logged(self):
+        out, _, requests, _ = self.run_helper([self.FAILED, self.OK])
+        self.assertEqual(len(requests), 2)
+        self.assertIn('PASS  regen\n      passed on attempt 2 of 3; retried: attempt 1 HTTP 502 '
+                      'PAIR_GENERATION_FAILED\n', out)
+        self.assertIn('PASS=1 FAIL=0', out)
+        out, _, requests, _ = self.run_helper([self.FAILED, self.FAILED, self.OK])
+        self.assertEqual(len(requests), 3)
+        self.assertIn('      passed on attempt 3 of 3; retried: attempt 1 HTTP 502 PAIR_GENERATION_FAILED, '
+                      'attempt 2 HTTP 502 PAIR_GENERATION_FAILED\n', out)
+
+    def test_other_answers_stop_at_once(self):
+        for code, error in ((409, 'GENERATION_IN_PROGRESS'), (504, 'PAIR_GENERATION_TIMEOUT'),
+                            (502, 'OTHER_FAILURE')):
+            with self.subTest(code=code, error=error):
+                body = json.dumps({'error': {'code': error}})
+                out, _, requests, _ = self.run_helper([(code, body), self.OK])
+                self.assertEqual(len(requests), 1)
+                self.assertIn(f'FAIL  regen  — HTTP {code} {error} after 1 attempt(s)', out)
+                self.assertIn('PASS=0 FAIL=1', out)
+                self.assertNotIn('passed on attempt', out)
+
+    def test_three_attempts_at_most(self):
+        out, _, requests, _ = self.run_helper([self.FAILED] * 4 + [self.OK])
+        self.assertEqual(len(requests), 3)
+        self.assertIn('FAIL  regen  — HTTP 502 PAIR_GENERATION_FAILED after 3 attempt(s)', out)
+        self.assertNotIn('passed on attempt', out)
+
+    def test_lock_checked_and_request_kept(self):
+        _, lines, requests, _ = self.run_helper([self.FAILED, self.OK])
+        self.assertEqual([line.split('\x1f')[0] for line in lines], ['lock', 'curl', 'lock', 'curl'])
+        for args in requests:
+            with self.subTest(args=args):
+                self.assertEqual(args[args.index('-m') + 1], '1920')
+                self.assertTrue(args[args.index('-o') + 1].endswith('/answer.json'))
+                self.assertIn('http://localhost:9/api/goldstandard/regenerate', args)
+                self.assertEqual(args[args.index('-X') + 1], 'POST')
+                self.assertEqual(json.loads(args[args.index('-d') + 1]), {'session_id': 'gs_1', 'pair_id': 'p_1'})
+
+    def test_answer_file_holds_last_answer(self):
+        _, _, _, answer = self.run_helper([self.FAILED, self.OK])
+        self.assertEqual(answer, self.OK[1])
+
+
 class StackArgumentTests(unittest.TestCase):
     """S7 and S8: bad arguments are refused before any Docker command."""
 
@@ -787,6 +938,11 @@ class StackArgumentTests(unittest.TestCase):
             (['query-only-mode', '--package', 'notes.txt'],
              {'RAG_VERIFY_LOCK_HELD': '1', 'RAG_VERIFY_QUERY_ONLY': '1'}),
             (['query-only-mode'], {'RAG_VERIFY_LOCK_HELD': '1', 'RAG_VERIFY_QUERY_ONLY': '1'}),
+            # External-Ollama mode (#673): its own option, on up and run only, alone.
+            (['down', '--external-ollama'], {}),
+            (['run', '--external-ollama', '--lan'], {}),
+            (['up', '--telemetry', '--external-ollama'], {}),
+            (['run', '--query-only', '--external-ollama'], {}),
             (['bogus'], {}),
             ([], {}),
         ]
@@ -796,6 +952,49 @@ class StackArgumentTests(unittest.TestCase):
                 result = box.run(['bash', str(STACK), *argv], **env)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertEqual(box.calls(), [])
+
+
+class ExternalOllamaPreflightTests(unittest.TestCase):
+    """#673: --external-ollama checks the host's Ollama before any Docker command."""
+
+    def sandbox(self, listening, curl_code):
+        box = Sandbox(self)
+        stubs = {
+            'uname': 'echo Darwin',
+            'lsof': ('printf "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\\n'
+                     'ollama 1 u 3u IPv4 0x1 0t0 TCP %s:11434 (LISTEN)\\n" ' + listening) if listening else 'exit 1',
+        }
+        for name, body in stubs.items():
+            path = box.bin / name
+            path.write_text('#!/bin/bash\n' + body + '\n')
+            path.chmod(0o755)
+        box.env['STUB_CURL_CODE'] = curl_code
+        return box
+
+    def test_a_host_that_doesnt_follow_the_guide_is_refused_before_docker(self):
+        for listening, code, needle in (('', '200', 'nothing listens on port 11434'),
+                                        ("'*'", '200', 'listens on every address'),
+                                        ('192.168.1.5', '200', 'other machines'),
+                                        ('127.0.0.1', '000', 'no Ollama answers at http://127.0.0.1:11434')):
+            with self.subTest(listening=listening, code=code):
+                box = self.sandbox(listening, code)
+                result = box.run(['bash', str(STACK), 'up', '--external-ollama'])
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn(needle, result.stdout + result.stderr)
+                self.assertEqual([c for c in box.calls() if c[0] == 'docker'], [])
+
+    def test_up_uses_no_model_copy_and_shows_the_api_check_on_failure(self):
+        box = self.sandbox('127.0.0.1', '200')
+        (box.root / 'config.json').write_text(json.dumps(external_config(ROOT, box.exports)))
+        result = box.run(['bash', str(STACK), 'up', '--external-ollama'])
+        # The stub's `up` fails, so the start fails: after the guard and build.
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertNotIn('configuration is refused', result.stdout + result.stderr)
+        docker = [c[1:] for c in box.calls() if c[0] == 'docker']
+        self.assertFalse([c for c in docker if c[:1] == ['run']], 'the model copy must not run')
+        self.assertFalse([c for c in docker if 'rag-docker_ollama_models' in ' '.join(c)])
+        self.assertIn(['compose', '-p', 'rag-verify', 'exec', '-T', 'api', 'python', '-m', 'ollama_check'], docker)
+        self.assertTrue([c for c in docker if 'build' in c])
 
 
 class StackDockerCallTests(unittest.TestCase):
@@ -1561,6 +1760,65 @@ class ModelSyncTests(unittest.TestCase):
         bad = self.live / 'models/blobs/sha256-0000'
         bad.write_bytes(b'x')
         self.assertIn('does not match its name', self.sync().stderr)
+
+
+class ExternalOllamaNoModelWritesTests(unittest.TestCase):
+    """An external Ollama is shared (#673): no verify suite may pull or delete a
+    model in it. `stack.sh run --external-ollama <suites>` runs any suite named,
+    so each suite that pulls or deletes a model, itself or through a helper,
+    must skip when RAG_VERIFY_EXTERNAL_OLLAMA is 1."""
+
+    WRITES = re.compile(r'/api/(pull|delete|create|copy|push)\b|ollama\s+(pull|rm|cp|create|push)\b')
+    GATE = re.compile(r'RAG_VERIFY_EXTERNAL_OLLAMA')
+
+    @staticmethod
+    def code(text):
+        return '\n'.join(line for line in text.splitlines() if not line.lstrip().startswith('#'))
+
+    def suites_that_write(self):
+        writers = {}
+        files = sorted(VERIFY.glob('*.sh')) + sorted(VERIFY.glob('*.py'))
+        for path in files:
+            if path.name in ('stack.sh', 'all.sh', 'lib.sh'):
+                continue
+            if self.WRITES.search(self.code(path.read_text())):
+                writers[path.name] = path
+        suites = {}
+        for suite in sorted(VERIFY.glob('[0-9][0-9]_*.sh')):
+            text = suite.read_text()
+            hit = [name for name in writers if name == suite.name or name in text]
+            if hit:
+                suites[suite.name] = (text, hit)
+        return suites
+
+    def test_a_suite_that_writes_models_skips_in_external_mode(self):
+        suites = self.suites_that_write()
+        self.assertIn('23_llm_split.sh', suites, 'expected llm_split.py to be found as a writer')
+        for name, (text, hit) in suites.items():
+            with self.subTest(suite=name):
+                self.assertRegex(self.code(text), self.GATE,
+                              f'{name} pulls or deletes a model (through {hit}) but never '
+                              'checks RAG_VERIFY_EXTERNAL_OLLAMA, so stack.sh run '
+                              '--external-ollama would write to the shared Ollama')
+
+
+class LlmSplitExternalSkipTests(unittest.TestCase):
+    """Suite 23 pulls and deletes a model (#671), so in external-Ollama mode it
+    skips before it reaches Docker, the API or Ollama (#673)."""
+
+    def test_it_skips_with_the_reason_and_calls_nothing(self):
+        sandbox = Sandbox(self)
+        fixtures = sandbox.root / 'fixtures'
+        fixtures.mkdir()
+        out = sandbox.run(['bash', str(VERIFY / '23_llm_split.sh')],
+                          RAG_VERIFY_EXTERNAL_OLLAMA='1', RAG_FIXTURES=str(fixtures),
+                          RAG_API='http://localhost:8081/api', COMPOSE_PROJECT_NAME='rag-verify')
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn('SKIP', out.stdout)
+        self.assertIn('external-Ollama mode: this suite pulls and deletes qwen2.5:0.5b', out.stdout)
+        self.assertIn('rag-docker never writes models to it (#673)', out.stdout)
+        self.assertIn('0 passed, 0 failed, 1 skipped', out.stdout)
+        self.assertEqual(sandbox.calls(), [], 'no docker or curl call in external-Ollama mode')
 
 
 if __name__ == '__main__':
