@@ -321,6 +321,33 @@ restart_timing_check() {
   fi
 }
 
+# regeneration_retry_check <check name> <session id> <pair id> <answer file>:
+# regenerates one pair and records the result as a check that passes on 200.
+# A 502 PAIR_GENERATION_FAILED is the model's reply being unusable, which the
+# API says to try again, so only that answer is tried again, 3 attempts at most;
+# any other answer stops at once (#483). A pass after a retry prints the
+# attempt count and each retried answer, so a recurring flake shows in the log
+# (RD-260). The last answer's body is left in <answer file>.
+regeneration_retry_check() {
+  local name="$1" sid="$2" pid="$3" out="$4" attempt code="" error="" retried=""
+  for attempt in 1 2 3; do
+    _rag_require_lock_owner
+    code=$(curl -s -m 1920 -o "$out" -w '%{http_code}' -X POST \
+      "$API/goldstandard/regenerate" -H 'Content-Type: application/json' \
+      -d "{\"session_id\":\"$sid\",\"pair_id\":\"$pid\"}")
+    error=$(python3 -c "import json,sys
+try: print(json.load(open(sys.argv[1]))['error']['code'])
+except Exception: print('')" "$out" 2>/dev/null)
+    { [ "$code" = 502 ] && [ "$error" = PAIR_GENERATION_FAILED ]; } || break
+    [ "$attempt" = 3 ] || retried="${retried:+$retried, }attempt $attempt HTTP $code $error"
+  done
+  [ "$code" = 200 ]
+  check "$name" $? "HTTP $code${error:+ $error} after $attempt attempt(s)"
+  if [ "$code" = 200 ] && [ "$attempt" -gt 1 ]; then
+    printf '      passed on attempt %s of 3; retried: %s\n' "$attempt" "$retried"
+  fi
+}
+
 # Suites (NN_*.sh) are guarded as soon as they source this file. Other scripts
 # that borrow these helpers are not suites and are left alone.
 case "$(basename "$0")" in
