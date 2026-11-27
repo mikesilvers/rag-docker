@@ -30564,7 +30564,11 @@ prepares a short text (`preparation.prepare_document`, with the chat and model l
 one query (`rag_pipeline.run_query`) on the collection, recording the model Ollama reports in each
 chat reply. The checks: preparation and gold standard were answered only by `qwen2.5:0.5b`, query
 only by the answer model. Preparation writes to a temporary folder and the pair isn't stored; the
-small model is deleted from Ollama and the collection dropped at the end.
+small model is deleted from Ollama and the collection dropped at the end. The pull is tried again
+when Ollama answers with a 5xx, up to 3 attempts with waits of 5 s and 10 s; a pull that still
+fails, or fails another way, is one failed check, "the build model is pulled into the verify
+project's Ollama", with the model checks skipped, rather than a failure of each (#922).
+`../tests/test_llm_split.py` checks both on the host, in every run.
 
 `24_query_only.sh` checks query-only mode (#670, SPECIFICATIONS.md §2.6 and §10.11). In every run:
 `query_only_config.py` resolves `docker-compose.yml` with and without `docker-compose.query-only.yml` through
@@ -31577,6 +31581,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `ui_ingest_check.py` | the checks of suite 22, one per subcommand, on the host, and its cleanup (#641) |
 | `23_llm_split.sh` | the build and answer models (#671), full runs only: with `BUILD_LLM_MODEL` set to a small model, preparation and gold standard use it and query uses the answer model |
 | `llm_split.py` | helper for suite 23, run in the API container: pulls the small model, runs the three tasks through the services' code and prints the models Ollama reports answering each (#671) |
+| `../tests/test_llm_split.py` | host-only, standard library: `llm_split.py` with stand-ins for `httpx`, `config`, `services` and `time.sleep`: the model pull tried again on a 5xx (3 attempts, waits of 5 s and 10 s) and not on a 4xx or a request error, a failed pull reported as `setup_error` with no task run; and suite 23 turning that into one failed check and no other (#922), registered by suite 23 |
 | `24_query_only.sh` | §2.6 and §10.11 — query-only mode (#670): the overlay resolved without starting it; registers `../tests/test_query_only.py`; the start-up refusal of a non-boolean `RAG_QUERY_ONLY`; the loader's refusal on a full instance; with `stack.sh run --query-only`, build and export, `stack.sh query-only-mode`, then the load, the refusals, access and Q&A on the query-only instance, and a key package loaded with its key file on standard input and refused `KEY_FILE_REQUIRED` without it (#676) |
 | `query_only_config.py` | host-side, standard library: `docker-compose.yml` with and without `docker-compose.query-only.yml` as `docker compose config` resolves them; only the api's `RAG_QUERY_ONLY` may differ (#670) |
 | `../tests/test_query_only.py` | API image, no network (also on the host): `RAG_QUERY_ONLY` parsing, the refused and kept routes, the refusals through the app and their order, `query_only` in the user answers, `lan_mode` in the user answers (#676), the loader (usage, refusals, lock, passphrase, a key package's key file on standard input with `KEY_FILE_REQUIRED` and `KEY_FILE_INVALID` (#676), results `success`/`refused`/`failed`/`interrupted`, the Ctrl-C handler) and the access of a collection it creates (#670) |
@@ -31881,7 +31886,9 @@ none. Five cases cover the key export (#676): the three choices with a new key f
 offered before the package's Download with the store-apart warning and gone once the key is
 downloaded, and a key package asking for its key file, read in the browser and sent as `key`;
 the key is never shown as text. One case holds the page's key file read (#860): a read that ends after
-another key package was chosen sets nothing, and Import stays disabled. Four cases cover downloading a package (#677):
+another key package was chosen sets nothing, and Import stays disabled; the #860 fix came first, so the
+case passes without new code and guards that fix through the held-read harness (#864), not a new one.
+Four cases cover downloading a package (#677):
 - a finished export offers a Download link to its package with "Expires" in local time, and none
   when it has no expiry;
 - the package list says when a package exported here expires, and its Download link follows the
@@ -36664,7 +36671,9 @@ finally:
 # for that process only, leaving the answer model as compose sets it: the API
 # itself and the compose settings are not changed. Its collection is
 # VfyLlmSplit, removed at the end; it creates no preparation document and no
-# gold standard session.
+# gold standard session. Its model pull is retried on a 5xx; a pull that fails
+# anyway is one failed check, with the model checks skipped (#922).
+# ../tests/test_llm_split.py checks both on the host, in every run.
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -36676,6 +36685,9 @@ OUT="$(mktemp)"
 trap 'rm -f "$OUT" /tmp/vfy_llm_split_ingest.json' EXIT
 
 section "Build and answer models (#671)"
+
+python3 "$REPO_ROOT/scripts/tests/test_llm_split.py"
+check "llm_split.py retries its model pull on a 5xx and reports a failed pull as one setup error (#922)" $?
 
 if [ "$SKIP_SLOW" = "1" ]; then
   skip "preparation and gold standard on the build model, query on the answer model" \
@@ -36691,9 +36703,18 @@ check_eq "the collection for the query is ingested" "$(wait_for_job "/ingest/job
 
 (cd "$REPO_ROOT" && docker compose exec -T -e BUILD_LLM_MODEL="$SMALL" -e RAG_LLM_SPLIT_COLLECTION="$C" \
   api python - < scripts/verify/llm_split.py) > "$OUT"
-check "llm_split.py ran to the end" $? "$(tail -c 400 "$OUT")"
+ran=$?
 
 f() { python3 -c "import json,sys;print(json.loads(open(sys.argv[1]).read().strip().splitlines()[-1]).get(sys.argv[2]))" "$OUT" "$1" 2>/dev/null; }
+# A pull that failed is one setup error, not a failure of every check below (#922).
+setup_error="$(f setup_error)"
+if [ -n "$setup_error" ] && [ "$setup_error" != "None" ]; then
+  check "the build model is pulled into the verify project's Ollama" 1 "$setup_error"
+  skip "the build and answer model checks" "they need the build model pulled"
+  drop_collection "$C"
+  summary; exit $?
+fi
+check "llm_split.py ran to the end" "$ran" "$(tail -c 400 "$OUT")"
 check_eq "with BUILD_LLM_MODEL set, the API resolves it as the build model" "$(f build_model)" "$SMALL"
 answer="$(f answer_model)"
 [ -n "$answer" ] && [ "$answer" != "None" ] && [ "$answer" != "$SMALL" ]
@@ -36728,15 +36749,19 @@ standard pair and one query through the services' own code, recording the model
 Ollama reports in each /api/chat reply (the calls themselves are unchanged).
 Preparation writes its parts to a temporary folder and the pair isn't stored,
 so nothing is left behind; the build model is deleted from Ollama at the end.
+The pull is tried again when Ollama answers with a 5xx (3 attempts, waiting 5 s
+and then 10 s); a pull that still fails, or fails another way, runs no task and
+is reported as `setup_error` (#922).
 Prints one JSON line: the resolved models (as set, and as `name:tag`) and, per
 task, the sorted set of models that answered (Ollama's names, `name:tag`) and,
-when the task raised, `<task>_error`.
+when the task raised, `<task>_error`; or, when the pull failed, `setup_error`.
 """
 import asyncio
 import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import httpx
@@ -36762,9 +36787,30 @@ out = {"build_model": settings.build_model, "answer_model": settings.answer_mode
        "answer_tagged": tagged(settings.answer_model)}
 build = settings.build_model
 
-# The build model, pulled into the verify project's Ollama (removed below).
-httpx.post(f"{BASE}/api/pull", json={"name": build, "stream": False},
-           timeout=1800).raise_for_status()
+# The build model, pulled into the verify project's Ollama (removed below). A
+# 5xx, which a busy Ollama gives now and then, is tried again (#922).
+PULL_WAITS = (5, 10)                  # seconds before the 2nd and the 3rd attempt
+PULL_ATTEMPTS = len(PULL_WAITS) + 1
+
+
+def pull(name):
+    """Pulls name into Ollama: None once it is pulled, else why it wasn't."""
+    for attempt in range(1, PULL_ATTEMPTS + 1):
+        try:
+            response = httpx.post(f"{BASE}/api/pull", json={"name": name, "stream": False},
+                                  timeout=1800)
+        except httpx.HTTPError as exc:
+            return f"{type(exc).__name__}: {exc}"
+        if response.is_success:
+            return None
+        if response.status_code < 500 or attempt == PULL_ATTEMPTS:
+            tries = f"{attempt} attempt" + ("s" if attempt > 1 else "")
+            return f"HTTP {response.status_code} after {tries}: {response.text[:200]}"
+        wait = PULL_WAITS[attempt - 1]
+        print(f"pull of {name}: attempt {attempt} of {PULL_ATTEMPTS} answered HTTP "
+              f"{response.status_code}; trying again in {wait} s", file=sys.stderr)
+        time.sleep(wait)
+
 
 seen = []
 real_post = httpx.AsyncClient.post
@@ -36818,9 +36864,13 @@ async def query():
 
 
 try:
-    task("prepare", prepare())
-    task("goldstandard", gold_pair())
-    task("query", query())
+    failed = pull(build)
+    if failed:
+        out["setup_error"] = f"could not pull {build} into the verify project's Ollama: {failed}"
+    else:
+        task("prepare", prepare())
+        task("goldstandard", gold_pair())
+        task("query", query())
 finally:
     httpx.AsyncClient.post = real_post
     try:
@@ -63667,6 +63717,9 @@ async function runTransferPageTests(browser, base, reporter) {
     assert.ok(!(await text(page)).includes('AGE-SECRET-KEY'), 'the key is shown as text');
   }, { hold: ['GET /api/packages'] }]);
   cases.push(['import encryption: a key file read that ends after another package was chosen is dropped (#860)', async page => {
+    // The #860 fix was already in develop when this case was added, so it
+    // passes without new code: it guards that fix, through the held-read
+    // harness below (#864), rather than testing a new one.
     // A second package encrypted with its own key, so the key file input stays
     // shown when the selection moves to it.
     const OTHER = 'ragpkg-vfytransfera-20261021-0000-dddd2222.tar.gz.age';

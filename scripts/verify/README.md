@@ -138,7 +138,11 @@ prepares a short text (`preparation.prepare_document`, with the chat and model l
 one query (`rag_pipeline.run_query`) on the collection, recording the model Ollama reports in each
 chat reply. The checks: preparation and gold standard were answered only by `qwen2.5:0.5b`, query
 only by the answer model. Preparation writes to a temporary folder and the pair isn't stored; the
-small model is deleted from Ollama and the collection dropped at the end.
+small model is deleted from Ollama and the collection dropped at the end. The pull is tried again
+when Ollama answers with a 5xx, up to 3 attempts with waits of 5 s and 10 s; a pull that still
+fails, or fails another way, is one failed check, "the build model is pulled into the verify
+project's Ollama", with the model checks skipped, rather than a failure of each (#922).
+`../tests/test_llm_split.py` checks both on the host, in every run.
 
 `24_query_only.sh` checks query-only mode (#670, SPECIFICATIONS.md §2.6 and §10.11). In every run:
 `query_only_config.py` resolves `docker-compose.yml` with and without `docker-compose.query-only.yml` through
@@ -1151,6 +1155,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `ui_ingest_check.py` | the checks of suite 22, one per subcommand, on the host, and its cleanup (#641) |
 | `23_llm_split.sh` | the build and answer models (#671), full runs only: with `BUILD_LLM_MODEL` set to a small model, preparation and gold standard use it and query uses the answer model |
 | `llm_split.py` | helper for suite 23, run in the API container: pulls the small model, runs the three tasks through the services' code and prints the models Ollama reports answering each (#671) |
+| `../tests/test_llm_split.py` | host-only, standard library: `llm_split.py` with stand-ins for `httpx`, `config`, `services` and `time.sleep`: the model pull tried again on a 5xx (3 attempts, waits of 5 s and 10 s) and not on a 4xx or a request error, a failed pull reported as `setup_error` with no task run; and suite 23 turning that into one failed check and no other (#922), registered by suite 23 |
 | `24_query_only.sh` | §2.6 and §10.11 — query-only mode (#670): the overlay resolved without starting it; registers `../tests/test_query_only.py`; the start-up refusal of a non-boolean `RAG_QUERY_ONLY`; the loader's refusal on a full instance; with `stack.sh run --query-only`, build and export, `stack.sh query-only-mode`, then the load, the refusals, access and Q&A on the query-only instance, and a key package loaded with its key file on standard input and refused `KEY_FILE_REQUIRED` without it (#676) |
 | `query_only_config.py` | host-side, standard library: `docker-compose.yml` with and without `docker-compose.query-only.yml` as `docker compose config` resolves them; only the api's `RAG_QUERY_ONLY` may differ (#670) |
 | `../tests/test_query_only.py` | API image, no network (also on the host): `RAG_QUERY_ONLY` parsing, the refused and kept routes, the refusals through the app and their order, `query_only` in the user answers, `lan_mode` in the user answers (#676), the loader (usage, refusals, lock, passphrase, a key package's key file on standard input with `KEY_FILE_REQUIRED` and `KEY_FILE_INVALID` (#676), results `success`/`refused`/`failed`/`interrupted`, the Ctrl-C handler) and the access of a collection it creates (#670) |
@@ -1455,7 +1460,9 @@ none. Five cases cover the key export (#676): the three choices with a new key f
 offered before the package's Download with the store-apart warning and gone once the key is
 downloaded, and a key package asking for its key file, read in the browser and sent as `key`;
 the key is never shown as text. One case holds the page's key file read (#860): a read that ends after
-another key package was chosen sets nothing, and Import stays disabled. Four cases cover downloading a package (#677):
+another key package was chosen sets nothing, and Import stays disabled; the #860 fix came first, so the
+case passes without new code and guards that fix through the held-read harness (#864), not a new one.
+Four cases cover downloading a package (#677):
 - a finished export offers a Download link to its package with "Expires" in local time, and none
   when it has no expiry;
 - the package list says when a package exported here expires, and its Download link follows the
