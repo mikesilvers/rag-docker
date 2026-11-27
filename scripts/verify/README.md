@@ -503,8 +503,8 @@ fail the export early with an actionable error and publish nothing.
 writes a saved file that isn't a JSON object, one with a wrong-typed `chunk_size` and
 one with an invalid `chunk_size` into the API container, and checks through the real
 export job that each export fails with an error naming the collection, the field and
-the Chunking Configuration page, and publishes nothing; it restores the saved file
-afterwards. Crafted
+the Chunking Configuration page, publishes nothing and leaves the saved file as it
+was written (#932); it restores the saved file afterwards. Crafted
 packages are written under a `.part` name and renamed into place, because on
 Docker Desktop the API can read a freshly written bind-mounted file as empty. Controlled tests complement,
 and do not replace, this live acceptance.
@@ -623,8 +623,10 @@ installation, the target stays claimed while its holder installs models, and a
 target is free again after a failed model installation (#492); a start whose
 first job record can't be stored releases the package name; and an import whose task
 is cancelled before its worker runs frees the package name, then reads `failed`
-`IMPORT_FAILED` with the cancelled message, a worker that starts late runs nothing,
-and one that started is left to settle its own job (#871). `05_transfer.sh` runs it
+`IMPORT_FAILED` with the cancelled message and logs a warning, a worker that starts late
+runs nothing, and one that started is left to settle its own job (#871); one whose task
+fails before its worker runs frees the package name, then reads `failed` `IMPORT_FAILED`
+with the error's own type and message, logged with its traceback (#932). `05_transfer.sh` runs it
 in the verify project's API container.
 
 `scripts/tests/test_ingest_errors.py` (#290) checks that damaged or unreadable ZIPs are
@@ -860,10 +862,15 @@ start gives up holding nothing and the route answers `409 EXPORT_STARTING` with 
 The bound counts once, from the second start's first wait: when the first start's write fails
 and another start takes the slot, waiting again on that one doesn't restart it (#347).
 An export task cancelled before its worker starts frees the collection's export slot and its
-delete registration, then reads `failed` with the cancelled message and `error_code` `null`,
-as does one whose task fails before its worker starts (the message names the error's type),
-and a worker that starts late does nothing; one whose worker has started is left to the worker,
-and one that ends normally leaves no bookkeeping behind (#529). An error that escapes the ingest worker is saved with the `failed` status, and a
+delete registration, then reads `failed` with the cancelled message and `error_code` `null`;
+cancelled before its first step, it keeps no bookkeeping, and one cancelled once its worker
+waits in the executor keeps an `_abandoned` entry, so a worker that starts late does nothing
+(#926). One whose task fails before its worker starts is settled the same way, with the error's
+own type and message, logged with its traceback (#926); one whose worker has started is left
+to the worker, and one that ends normally leaves no bookkeeping behind (#529). Two rare cases
+still leave an `_abandoned` entry that no worker comes to clear (documented, not fixed, #926): a task that
+had run its first step whose queued executor item is cancelled before a thread takes it, and
+one whose `to_thread` call itself raises (as at executor shutdown). An error that escapes the ingest worker is saved with the `failed` status, and a
 cancellation that escapes it is named in `errors` and reads `partial` when files completed,
 otherwise `failed` (#529).
 `02_ingest.sh` runs it in the API container. With

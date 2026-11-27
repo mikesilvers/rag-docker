@@ -10,6 +10,7 @@ collection fails as Weaviate 1.39.6 answers it (422 "class name X already exists
 checked at runtime for #391). Orderings are arranged with events, not sleeps.
 """
 import asyncio
+import gc
 import json
 import os
 import sys
@@ -531,7 +532,11 @@ class ImportGuardTests(unittest.TestCase):
             # The store here is unbound, so it holds the record object it is given.
             importer._jobs[job_id] = Record(importer._jobs[job_id])
 
-        job_id = self.start_and_cancel(loop, "q.tar.gz", watch)
+        with self.assertLogs("services.importer", "WARNING") as logs:
+            job_id = self.start_and_cancel(loop, "q.tar.gz", watch)
+        warned = [r for r in logs.records if "cancelled before it started" in r.getMessage()]
+        self.assertEqual(len(warned), 1, logs.output)    # a warning, without a traceback (#932)
+        self.assertIsNone(warned[0].exc_info)
         job = self.job(job_id)
         self.assertEqual((job["status"], job["error_code"], job["error"]),
                          ("failed", "IMPORT_FAILED", self.CANCELLED), job)
@@ -544,6 +549,70 @@ class ImportGuardTests(unittest.TestCase):
         self.assertNotIn(job_id, importer._abandoned)
         self.assertNotIn(job_id, importer._started)
         self.assertEqual(self.job(job_id)["status"], "failed")
+
+    def test_an_import_whose_task_fails_before_its_worker_runs_is_settled(self):
+        # #932: a task that ends with an error before its worker runs (to_thread
+        # itself raised, as when the executor is shut down) frees the package
+        # name, then reads failed IMPORT_FAILED with the error's own type and
+        # message, and the warning carries its traceback.
+        loop = self.new_loop()
+        self.packages["f.tar.gz"] = "Refused"
+        real = asyncio.to_thread
+
+        async def refusing(fn, *args, **kwargs):
+            if getattr(fn, "__name__", "") == "_worker":
+                raise RuntimeError("cannot schedule new futures after shutdown")
+            return await real(fn, *args, **kwargs)
+
+        async def run():
+            before = asyncio.all_tasks()
+            job_id = await importer.start_import_job("f.tar.gz", "abort")
+            (task,) = asyncio.all_tasks() - before - {asyncio.current_task()}
+            with self.assertRaises(RuntimeError):
+                await task
+            await asyncio.sleep(0)               # the done callback has run
+            return job_id
+
+        with patch.object(asyncio, "to_thread", side_effect=refusing), \
+                self.assertLogs("services.importer", "WARNING") as logs:
+            job_id = loop.run_until_complete(run())
+        self.addCleanup(importer._abandoned.discard, job_id)   # out of scope here (#932)
+        job = self.job(job_id)
+        self.assertEqual((job["status"], job["error_code"], job["error"]),
+                         ("failed", "IMPORT_FAILED",
+                          "RuntimeError: cannot schedule new futures after shutdown"), job)
+        self.assertFalse(importer.package_busy("f.tar.gz"))
+        self.assertEqual(self.arrived, [])
+        warned = [r for r in logs.records if "failed before it started" in r.getMessage()]
+        self.assertEqual(len(warned), 1, logs.output)
+        self.assertIsInstance(warned[0].exc_info[1], RuntimeError)
+        self.assertEqual(str(warned[0].exc_info[1]), "cannot schedule new futures after shutdown")
+
+    def test_a_failed_pre_worker_import_task_is_not_reported_as_unretrieved(self):
+        # #932: the done callback retrieves the task's exception, so asyncio
+        # doesn't also report "Task exception was never retrieved" for a task
+        # nobody awaits, as the route's task isn't.
+        loop = self.new_loop()
+        self.packages["u.tar.gz"] = "Unretrieved"
+        reported = []
+        loop.set_exception_handler(lambda _loop, context: reported.append(context))
+        real = asyncio.to_thread
+
+        async def refusing(fn, *args, **kwargs):
+            if getattr(fn, "__name__", "") == "_worker":
+                raise RuntimeError("cannot schedule new futures after shutdown")
+            return await real(fn, *args, **kwargs)
+
+        with patch.object(asyncio, "to_thread", side_effect=refusing), \
+                self.assertLogs("services.importer", "WARNING"):
+            job_id = self.start(loop, "u.tar.gz", "abort")      # the task is never awaited
+            self.assertTrue(self.wait_finished(loop, job_id))
+        self.addCleanup(importer._abandoned.discard, job_id)   # out of scope here (#932)
+        loop.run_until_complete(asyncio.sleep(0))
+        gc.collect()                         # a task reports an unretrieved exception when freed
+        self.assertEqual(self.job(job_id)["error"],
+                         "RuntimeError: cannot schedule new futures after shutdown")
+        self.assertEqual([c.get("message") for c in reported], [])
 
     def test_an_import_whose_worker_started_is_not_settled_by_its_task(self):
         loop = self.new_loop()

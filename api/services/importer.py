@@ -1197,21 +1197,30 @@ def _worker(job_id: str, filename: str, on_conflict: str, passphrase: str | None
         _run(job_id, filename, on_conflict, passphrase)
 
 
-def _settle_unstarted(job_id: str, name: str) -> None:
+def _settle_unstarted(job_id: str, name: str, task: asyncio.Task) -> None:
     """A done callback: settles a job whose task ended before its worker could
     start (#871), freeing the package claim before the status turns terminal,
     so a client that sees it fail can import or download the package again. A
-    worker that started settles its own job."""
+    cancelled task reads the cancelled message; one that ended with another
+    error reads that error's type and message, and the warning carries its
+    traceback (#932). A worker that started settles its own job."""
     with _lock:
         if job_id in _started:
             _started.discard(job_id)
             return
         _abandoned.add(job_id)
         _active.discard(name)
+    # Retrieving the exception keeps asyncio from reporting it again (#932).
+    exc = None if task.cancelled() else task.exception()
+    if exc is None:
+        _log.warning("Import of %r cancelled before it started", name)
+    else:
+        _log.warning("Import of %r failed before it started", name, exc_info=exc)
     job = _jobs.get(job_id)
     # A small write on the event loop, as ingest's done callback makes (#309).
     if job is not None and job.get("status") not in jobstore.TERMINAL:
-        job.update(status="failed", error_code="IMPORT_FAILED", error=_CANCELLED)
+        job.update(status="failed", error_code="IMPORT_FAILED",
+                   error=_CANCELLED if exc is None else f"{type(exc).__name__}: {exc}")
 
 
 def package_kind(name: str) -> str | None:
@@ -1313,5 +1322,5 @@ async def start_import_job(filename: str, on_conflict: str, passphrase: str | No
         task = asyncio.create_task(asyncio.to_thread(telemetry.admitted(_worker), job_id, filename,
                                                      on_conflict, passphrase))
     # A task cancelled before its worker starts still ends its job (#871).
-    task.add_done_callback(lambda _task: _settle_unstarted(job_id, name))
+    task.add_done_callback(lambda done: _settle_unstarted(job_id, name, done))
     return job_id
