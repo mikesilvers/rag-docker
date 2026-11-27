@@ -10,6 +10,7 @@ collection fails as Weaviate 1.39.6 answers it (422 "class name X already exists
 checked at runtime for #391). Orderings are arranged with events, not sleeps.
 """
 import asyncio
+import gc
 import json
 import os
 import sys
@@ -586,6 +587,32 @@ class ImportGuardTests(unittest.TestCase):
         self.assertEqual(len(warned), 1, logs.output)
         self.assertIsInstance(warned[0].exc_info[1], RuntimeError)
         self.assertEqual(str(warned[0].exc_info[1]), "cannot schedule new futures after shutdown")
+
+    def test_a_failed_pre_worker_import_task_is_not_reported_as_unretrieved(self):
+        # #932: the done callback retrieves the task's exception, so asyncio
+        # doesn't also report "Task exception was never retrieved" for a task
+        # nobody awaits, as the route's task isn't.
+        loop = self.new_loop()
+        self.packages["u.tar.gz"] = "Unretrieved"
+        reported = []
+        loop.set_exception_handler(lambda _loop, context: reported.append(context))
+        real = asyncio.to_thread
+
+        async def refusing(fn, *args, **kwargs):
+            if getattr(fn, "__name__", "") == "_worker":
+                raise RuntimeError("cannot schedule new futures after shutdown")
+            return await real(fn, *args, **kwargs)
+
+        with patch.object(asyncio, "to_thread", side_effect=refusing), \
+                self.assertLogs("services.importer", "WARNING"):
+            job_id = self.start(loop, "u.tar.gz", "abort")      # the task is never awaited
+            self.assertTrue(self.wait_finished(loop, job_id))
+        self.addCleanup(importer._abandoned.discard, job_id)   # out of scope here (#932)
+        loop.run_until_complete(asyncio.sleep(0))
+        gc.collect()                         # a task reports an unretrieved exception when freed
+        self.assertEqual(self.job(job_id)["error"],
+                         "RuntimeError: cannot schedule new futures after shutdown")
+        self.assertEqual([c.get("message") for c in reported], [])
 
     def test_an_import_whose_worker_started_is_not_settled_by_its_task(self):
         loop = self.new_loop()

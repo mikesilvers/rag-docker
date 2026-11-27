@@ -8,6 +8,7 @@ Disposable directories only; nothing reaches a backend. The lifespan case runs
 in a child process, so the module stores of this process stay unbound.
 """
 import asyncio
+import gc
 import io
 import json
 import os
@@ -1033,6 +1034,41 @@ class StartTests(StoreTestCase):
         self.assertEqual(str(warned[0].exc_info[1]), "cannot schedule new futures after shutdown")
         self.assertIsNone(exporter.active_job_for(name))
         self.assertEqual(collection_writes.active_jobs(name), [])
+        self.assertEqual(calls, [])
+
+    def test_a_failed_pre_worker_export_task_is_not_reported_as_unretrieved(self):
+        # #926: the done callback retrieves the task's exception, so asyncio
+        # doesn't also report "Task exception was never retrieved" for a task
+        # nobody awaits, as the route's task isn't; the warning carries it.
+        module, store, calls = self.harness("export")
+        name = "Vfy926Unretrieved"
+        reported = []
+        real = asyncio.to_thread
+
+        async def refusing(fn, *args, **kwargs):
+            if getattr(fn, "__name__", "") == "_worker":
+                raise RuntimeError("cannot schedule new futures after shutdown")
+            return await real(fn, *args, **kwargs)
+
+        async def run():
+            asyncio.get_running_loop().set_exception_handler(
+                lambda _loop, context: reported.append(context))
+            job_id = await exporter.start_export_job(name)   # the task is never awaited
+            for _ in range(500):
+                if store[job_id]["status"] in jobstore.TERMINAL:
+                    break
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0)
+            gc.collect()                     # a task reports an unretrieved exception when freed
+            return job_id
+
+        with patch.object(asyncio, "to_thread", side_effect=refusing), \
+                self.assertLogs("services.exporter", "WARNING"):
+            job_id = asyncio.run(run())
+        self.addCleanup(exporter._abandoned.discard, job_id)
+        self.assertEqual(self.on_disk("export", job_id)["error"],
+                         "RuntimeError: cannot schedule new futures after shutdown")
+        self.assertEqual([c.get("message") for c in reported], [])
         self.assertEqual(calls, [])
 
     def test_an_export_that_runs_to_the_end_leaves_no_bookkeeping(self):
