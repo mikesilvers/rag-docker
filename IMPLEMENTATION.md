@@ -52360,13 +52360,13 @@ finally:
 print(json.dumps(out))
 ENDPY
   al() { python3 -c "import json,sys;print(json.load(open('/tmp/vfy_alias.json')).get(sys.argv[1]))" "$1" 2>/dev/null; }
+  [ "$(al error)" = None ] || printf '      %s\n' "$(al error)"
   check_eq "the throwaway model name isn't reported before it is installed" "$(al reported_before)" "False"
   check_eq "a model installed from a bundle into the verify model copy is reported by Ollama's /api/tags" "$(al reported_after)" "True"
   check_eq "the throwaway model's manifest is removed afterwards" "$(al removed)" "True"
   check_eq "the embedding model's own files are left unchanged" "$(al embed_untouched)" "True"
   check_eq "the temporary bundle folder is removed" "$(al bundle_removed)" "True"
   [ -s /tmp/vfy_alias.json ] || sed 's/^/      /' /tmp/vfy_alias.err | tail -5
-  [ "$(al error)" = None ] || printf '      %s\n' "$(al error)"
 else
   check "the install-then-report check runs only on the verify model copy" 1 \
     "api and ollama must both mount rag-verify-ollama-models; found: '${alias_mounts}'"

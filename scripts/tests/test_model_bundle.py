@@ -1,10 +1,13 @@
 """Bundled-model byte integrity and publication boundary, using inert bytes."""
 import hashlib
+import io
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api'))
@@ -430,6 +433,54 @@ class InterruptedPublicationTests(BundleFixture):
         models.install_model(self.pkg, self.model)
         self.assertTrue(models.is_installed(self.model))
         self.assertEqual([p.name for p in self.store.rglob('*.partial')], [])
+
+
+class InstallCheckGuardTests(unittest.TestCase):
+    """05_transfer.sh's install-then-report check (#452) refuses a models dir other
+    than /ollama before it computes or writes anything (#582, #924). The suite's
+    own heredoc runs here, not a copy, with the models dir at a temporary path."""
+
+    MARKER = 'alias, name = "vfy-install-alias:latest"'
+
+    def block(self):
+        """(the heredoc's Python, the shell lines after it up to the block's `else`)."""
+        root = repository_root()
+        if root is None: self.skipTest(NEEDS_REPOSITORY)
+        script = (root / 'scripts/verify/05_transfer.sh').read_text()
+        found = [m for m in re.finditer(r"<<'ENDPY'\n(.*?)\nENDPY\n", script, re.S) if self.MARKER in m.group(1)]
+        self.assertEqual(len(found), 1)
+        return found[0].group(1), script[found[0].end():script.index('\nelse\n', found[0].end())]
+
+    def test_refusal_writes_nothing_and_stops_the_check(self):
+        code, _ = self.block()
+        from services import importer
+        def reached(*args, **kwargs):
+            raise AssertionError('the install check went past the /ollama guard')
+        with tempfile.TemporaryDirectory() as temp:
+            store = Path(temp) / 'store'
+            store.mkdir()
+            for models_dir in (store, store / 'missing'):
+                with self.subTest(models_dir=str(models_dir)):
+                    printed = io.StringIO()
+                    with patch.object(settings, 'ollama_models_dir', str(models_dir)), \
+                         patch.object(importer, '_ollama_reports', reached), \
+                         patch.object(models, 'install_model', reached), \
+                         redirect_stdout(printed), self.assertRaises(SystemExit) as stopped:
+                        exec(compile(code, '05_transfer.sh (#452 install check)', 'exec'), {'__name__': '__main__'})
+                    self.assertEqual(stopped.exception.code, 0)
+                    self.assertEqual(json.loads(printed.getvalue()), {'error': (
+                        f'OLLAMA_MODELS_DIR is {str(models_dir)!r}, not /ollama, '
+                        'the path the mount guard checked; nothing was written')})
+                    self.assertEqual(list(store.rglob('*')), [])  # nothing written, `missing` not created
+
+    def test_refusal_message_is_printed_before_the_checks(self):
+        _, shell = self.block()
+        lines = shell.splitlines()
+        printed = [i for i, line in enumerate(lines) if 'printf' in line and '"$(al error)"' in line]
+        checks = [i for i, line in enumerate(lines) if line.lstrip().startswith('check_eq ') and '$(al ' in line]
+        self.assertEqual(len(printed), 1)
+        self.assertEqual(len(checks), 5)
+        self.assertLess(printed[0], checks[0])
 
 
 class ImplementationTests(unittest.TestCase):
