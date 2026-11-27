@@ -1426,6 +1426,7 @@ fi
 # originals, the package and the metrics must all land under the stored name.
 SC="$(printf %s "${PREFIX:0:1}" | tr '[:lower:]' '[:upper:]')${PREFIX:1}Spelling"
 SL="$(printf %s "${SC:0:1}" | tr '[:upper:]' '[:lower:]')${SC:1}"
+spsid=""
 drop_collection "$SC"
 api_post "/collections" "{\"name\":\"$SL\"}" > /tmp/vfy_sp_create.json
 check_eq "#372: creating '$SL' answers the stored name" \
@@ -1467,9 +1468,47 @@ else
   spc=$(api_get "/metrics/latency?collection=$SC&history_limit=0" | jfield "['total_records']")
   check "#372: the metrics filter finds the query under both spellings" \
     "$([ -n "$spl" ] && [ "$spl" -ge 1 ] && [ "$spl" = "$spc" ] && echo 0 || echo 1)" "lowercase=$spl stored=$spc"
+  # A gold-standard session generated under the lowercase spelling is filed
+  # under the stored name, so an export of the stored name carries it (#472).
+  api_post "/goldstandard/generate" "{\"collection\":\"$SL\",\"sample_size\":1}" > /tmp/vfy_sp_gen.json
+  spsid=$(jfield "['session_id']" < /tmp/vfy_sp_gen.json)
+  check "#472: a generation under '$SL' starts" "$([ -n "$spsid" ] && echo 0 || echo 1)" \
+    "$(head -c 300 /tmp/vfy_sp_gen.json)"
+  if [ -n "$spsid" ]; then
+    check_eq "#472: the generation under '$SL' completes" \
+      "$(wait_for_job "/goldstandard/session/$spsid" 900)" "completed"
+    check_eq "#472: the session is recorded under '$SC'" \
+      "$(api_get "/goldstandard/session/$spsid" | jfield "['collection']")" "$SC"
+    api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$SC\",\"include_models\":false}" > /tmp/vfy_sp_gexp.json
+    spgjob=$(jfield "['job_id']" < /tmp/vfy_sp_gexp.json)
+    check_eq "#472: the export of '$SC' after the generation completes" \
+      "$(wait_for_job "/export/job/$spgjob" 1800)" "completed"
+    spgpkg=$(api_get "/export/job/$spgjob" | jfield "['filename']")
+    python3 - "$EXPORTS/$spgpkg" "$spsid" "$SC" <<'ENDPY'
+import json, sys, tarfile
+pkg, sid, stored = sys.argv[1:]
+want = "goldstandard/%s.json" % sid          # under the package's top folder
+try:
+    with tarfile.open(pkg) as t:
+        member = next(m for m in t.getmembers()
+                      if m.isfile() and (m.name == want or m.name.endswith("/" + want)))
+        session = json.load(t.extractfile(member))
+except Exception as exc:                      # noqa: BLE001 -- reported as the failure
+    print("cannot read %s from %s: %s %s" % (want, pkg, type(exc).__name__, exc)); sys.exit(1)
+ok = session.get("session_id") == sid and session.get("collection") == stored
+print("session_id=%s collection=%s" % (session.get("session_id"), session.get("collection")))
+sys.exit(0 if ok else 1)
+ENDPY
+    check "#472: the export of '$SC' carries the session generated under '$SL'" $? \
+      "package $spgpkg"
+    [ -n "$spgpkg" ] && [ "$spgpkg" != "None" ] && rm -f "$EXPORTS/$spgpkg"
+  fi
 fi
 [ -n "$sppkg" ] && rm -f "$EXPORTS/$sppkg"
 drop_collection "$SC"
+# The session file outlives its collection by design (spec §8 rule 4).
+[ -z "$spsid" ] || (cd "$REPO_ROOT" && docker compose exec -T api \
+  rm -f "/app/uploads/goldstandard_sessions/$spsid.json") >/dev/null 2>&1 || true
 
 # ── downloading a package, and expiry (#677) ─────────────────────────────────
 # A full download through the proxy deletes a package exported here; an

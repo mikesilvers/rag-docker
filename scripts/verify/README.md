@@ -158,6 +158,32 @@ routes (`403 QUERY_ONLY`), a Developer's delete (`FORBIDDEN`) and no session (`4
 End User's question with an answer and citations, and an export and the package list. The project is removed when
 the run ends. Two stacks never run at once, so Docker's memory holds one answer model.
 
+`25_weaviate_upgrade.sh` checks the Weaviate upgrade path (#805): data written by the previous Weaviate opens on
+the checkout's, and a restart after a Raft snapshot works on the upgraded data. Weaviate is bumped by hand, so a
+bump's full run includes it. It runs in full runs only (maintainer decision, 2026-11-26): a `RAG_SKIP_SLOW=1` run,
+CI's among them, skips it. It upgrades from `RAG_WEAVIATE_FROM` (a plain `X.Y.Z` tag) or, when that is unset, from
+the tag in `origin/main`'s `docker-compose.yml`, the last release, read with `git show` and never fetched; it
+upgrades to the tag of the checkout's resolved configuration. A tag that isn't `X.Y.Z`, an unreadable `origin/main`
+with no `RAG_WEAVIATE_FROM`, or a previous tag newer than the checkout's is one failed check and nothing is started.
+When both tags are the same, as while `main` and `develop` pin one version, every step still runs on that version.
+It runs only on the verify project as `stack.sh` sets it up (the condition of removing its volumes, #465); anywhere
+else it fails with the reason and creates nothing. `weaviate_upgrade.py` then, on the host, creates a throwaway
+container, volume and `--internal` network named `rag-verify-wvup-<hex>` and labelled
+`com.docker.compose.project=rag-verify` and `rag-verify.check=weaviate-upgrade`, publishes nothing, and runs the
+previous tag (pulled if missing) on the fresh volume with the `weaviate` service's environment from the resolved
+configuration, except `RAFT_SNAPSHOT_THRESHOLD=8` and `RAFT_SNAPSHOT_INTERVAL=2`. From one-off containers of the
+verify project's api image on that network, with the API's own `weaviate-client`, it creates `VfyUpgrade` as the
+API creates a collection (its properties, `text2vec-ollama`, HNSW with cosine distance) and writes 12 objects with
+explicit vectors, so no model is called. It reads back the schema (class, properties, vectorizer, index type and
+distance), the count, every object with its vector, and a nearVector query's ids, order and distances; stops the
+container (60 s grace); starts the checkout's tag on the same volume; checks `/v1/meta`'s version and the same
+read-back; creates and deletes 12 throwaway collections and waits up to 180 s for a new Raft snapshot (a
+`meta.json` under `snapshots` in the volume); restarts and checks the read-back again and that the throwaway
+collections are gone. Each start must be ready within 300 s. The first failure ends the steps, with the container's
+state and last log lines, or the volume's `raft` listing; the container, volume and network are removed at the end
+in every case, and `stack.sh down` removes anything a killed run leaves. It removes no image: the previous tag may
+be the one the live stack runs.
+
 ## Entry point and verify project
 
 `stack.sh` runs everything on compose project `rag-verify`, a disposable copy of
@@ -1128,9 +1154,12 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `24_query_only.sh` | §2.6 and §10.11 — query-only mode (#670): the overlay resolved without starting it; registers `../tests/test_query_only.py`; the start-up refusal of a non-boolean `RAG_QUERY_ONLY`; the loader's refusal on a full instance; with `stack.sh run --query-only`, build and export, `stack.sh query-only-mode`, then the load, the refusals, access and Q&A on the query-only instance, and a key package loaded with its key file on standard input and refused `KEY_FILE_REQUIRED` without it (#676) |
 | `query_only_config.py` | host-side, standard library: `docker-compose.yml` with and without `docker-compose.query-only.yml` as `docker compose config` resolves them; only the api's `RAG_QUERY_ONLY` may differ (#670) |
 | `../tests/test_query_only.py` | API image, no network (also on the host): `RAG_QUERY_ONLY` parsing, the refused and kept routes, the refusals through the app and their order, `query_only` in the user answers, `lan_mode` in the user answers (#676), the loader (usage, refusals, lock, passphrase, a key package's key file on standard input with `KEY_FILE_REQUIRED` and `KEY_FILE_INVALID` (#676), results `success`/`refused`/`failed`/`interrupted`, the Ctrl-C handler) and the access of a collection it creates (#670) |
+| `25_weaviate_upgrade.sh` | the Weaviate upgrade path (#805), full runs only: the previous Weaviate (`RAG_WEAVIATE_FROM`, else `origin/main`'s pin) writes data on a throwaway volume, the checkout's reads it back, and again after a Raft snapshot and a restart; only on the verify project |
+| `weaviate_upgrade.py` | helper for suite 25, on the host with the docker CLI: the throwaway container, volume and internal network of the verify project, the steps and their checks; its client part runs in one-off api-image containers (#805) |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
 | `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
 | `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530); the nginx tag in SPECIFICATIONS.md's compose copy and 11.3 image list matches docker-compose.yml (#665), registered by infrastructure |
+| `../tests/test_weaviate_upgrade.py` | host-only: suite 25's helper with a fake `docker`: the tags it upgrades between and its refusals, the read-back comparison, the labels, no published port, the internal network, the snapshot settings, the step order, stopping at a failure, removal after a pass and a failure, never an image; the embedded copies (#805) |
 | `../tests/test_upgrade_backup.py` | host-only: the README's 1.1.0 → 1.2.0 upgrade blocks, run as written under bash, `zsh -c` and interactive zsh with comments off, against stub `docker`, `git` and `curl`; the stub docker accepts only mounts inside its temp directory and only the README's two container commands: no block holds a `#` comment line; the backup skips a missing volume (a wrong prefix) and counts only existing volumes' archives, and writes each copy to a `.tmp` file that replaces the archive only once `gzip -t` passes, so a failed or corrupt copy prints `backup FAILED` and keeps an earlier archive; the rollback is gated on `git checkout v1.1.0` and checks every archive (`gzip -t`, `tar tzf`) and volume before it empties any, and a failed restore stops before `compose up`; alpine is pinned by version and digest; git ignores `backups/` (#679, #693), registered by infrastructure |
 | `../tests/test_backup_scripts.py` | runs from the host, standard library plus the docker CLI: `scripts/backup.sh` and `scripts/restore.sh` (#848) on throwaway volumes of a random project of their own (`rd848t<hex>`, with compose's labels, removed afterwards), run from a scratch git checkout with their own `HOME`: a backup then a restore gives back every file, folder, link, mode and owner; every volume gets its own key, and no two keys match over two runs; the backup folder (0700) holds only `.tgz.age` archives and `.key` files (0600), with no unencrypted archive and no key in the output; a missing volume is skipped and a running container of the project is stopped, not removed; a wrong key, a missing key file and a damaged or cut archive change nothing and stop nothing, and a wrong key or a Docker error in the check shows what age or Docker said; an extraction that fails after the check (a damaged copy fed by a docker wrapper) leaves the volume unchanged, its root's mode and owner included; a Docker error in the key step is shown, with no line holding a secret key; the prefix and location refusals, and the checkout named in another case refused where the filesystem ignores case; the age image pins (the README's alpine, an exact `age` package), its tag following the whole Dockerfile and the age folder (a stub docker: a new digest, an added instruction, an added or changed parser directive, or a file added to or changed in `scripts/age` gives a new tag, a comment, a blank line or a `# key=value` comment after the first comment doesn't, and removing the added file gives the tag back, #852, #856, #862; with no `sha256sum` the same tag from `shasum`, and with neither a refusal before any build), a volume holding an interrupted restore's `.rag-docker-restore.*` folder backed up without it, the folder left in place, and restored without it (#856), and `*.key` in `.gitignore`. Skipped, with a message, only when the docker CLI is missing; it builds the age image (`scripts/age`) if this machine doesn't have it, which needs the network. Registered by infrastructure |
 | `../tests/test_version_agreement.py` | host-only: the first-party version strings agree with each other, not with a fixed version: `ui/package.json`, the root versions in `ui/package-lock.json`, `mcp/mcpapp.py`, the two `service.version` defaults in `api/services/telemetry.py` and `RAG_OTEL_SERVICE_VERSION` in `docker-compose.telemetry.yml` and `docker-compose.telemetry.verify.yml` (#605, #656), registered by infrastructure |
@@ -1170,7 +1199,8 @@ through the proxy that download refuses other upload state with 400 (#370).
 | `RAG_API` | `http://localhost:8080/api` | where the API is; `stack.sh` sets it to the verify project. Port 8080, the default, is refused as the live stack unless `RAG_VERIFY_LIVE=1` |
 | `RAG_EXPORTS_DIR` | `<checkout>/exports` | the host folder behind the API's `/app/exports`; `stack.sh` sets it to the verify project's own folder |
 | `RAG_VERIFY_LIVE` | `0` | `1` lets `all.sh` and the suites run against the live `rag-docker` stack, with a warning. Never used by the documented commands or the PR review, and never enables a restart of the live stack |
-| `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
+| `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call, and the Weaviate upgrade-path check (suite 25, #805) |
+| `RAG_WEAVIATE_FROM` | the tag in `origin/main`'s `docker-compose.yml` | suite 25: the Weaviate tag (`X.Y.Z`) it upgrades from (#805) |
 | `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, the query metrics reload in `03_query.sh`, the batch recovery acceptance in `05_transfer.sh`, retrieval settings and metrics across a restart and the first start from empty volumes in `16_api_paths.sh`, a session and a login lockout across a restart in `17_auth.sh`, and audit records across a restart in `19_audit.sh`); never the `rag-docker` project |
 | `RAG_RESTART_LIMIT_S` | `240` | seconds `01_infrastructure.sh`'s restart check allows from `down` to a healthy `/health`: Weaviate's `start_period` plus 60. The result line reports the measured time on a pass and on a fail (#130) |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
@@ -1543,7 +1573,8 @@ retrieval settings files, the query metric and the metrics filter, retained orig
 (`MyDocs`). It fails on the code before #372. Suite 05 then, on the verify stack, creates and
 ingests under a lowercase-first name, reads the tuning options and exports under the stored
 name, re-chunks under the lowercase name and, unless `RAG_SKIP_SLOW=1`, checks a query's
-metrics under both spellings.
+metrics under both spellings, and generates a gold-standard session under the lowercase name and checks that the
+export of the stored name carries it, as `goldstandard/<session id>.json` with the stored name (#472).
 
 Suite 01 also runs `scripts/tests/test_health.py` the same way (#375). It sends `GET /health/details`
 through the app with Ollama's `/api/tags` answered by an httpx mock transport and the Weaviate
