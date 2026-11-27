@@ -67,6 +67,6 @@ if [ "$running" != "$EXPECTED" ]; then
 fi
 
 echo
-echo "If the requested services are up, open http://localhost:8080"
+echo "The requested services are up: open http://localhost:8080"
 echo "Verify the models were restored (no download should occur):"
 echo "  docker compose exec ollama ollama list"

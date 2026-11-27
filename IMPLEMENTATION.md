@@ -57693,7 +57693,7 @@ if [ "$running" != "$EXPECTED" ]; then
 fi
 
 echo
-echo "If the requested services are up, open http://localhost:8080"
+echo "The requested services are up: open http://localhost:8080"
 echo "Verify the models were restored (no download should occur):"
 echo "  docker compose exec ollama ollama list"
 ```
@@ -72000,7 +72000,8 @@ class Offline(unittest.TestCase):
 
 class Installer(unittest.TestCase):
     def test_default_and_optional_commands_and_missing_payload(self):
-        for mode in ('default', 'optional', 'containerd', 'wrong-loaded', 'missing'):
+        # telemetry-timeout: 5 of 6 services run on every poll; slow-start: 4, 5, then 6.
+        for mode in ('default', 'optional', 'containerd', 'wrong-loaded', 'missing', 'telemetry-timeout', 'slow-start'):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as folder:
                 root = Path(folder)
                 for sub in ('scripts', 'telemetry', 'offline', 'bin'):
@@ -72014,7 +72015,7 @@ class Installer(unittest.TestCase):
                 (root/'telemetry/image.json').write_text(json.dumps({'config_ids':{'arm64':identity}}))
                 (root/'offline/images.tar.gz').touch()
                 (root/'offline/ollama_models.tar.gz').touch()
-                if mode in ('optional', 'containerd', 'wrong-loaded'):
+                if mode in ('optional', 'containerd', 'wrong-loaded', 'telemetry-timeout', 'slow-start'):
                     target = root/'offline/collector.tar'
                     archive(target, config, layer)
                     (root/'offline/collector.json').write_text(json.dumps({'architecture':'arm64',
@@ -72040,11 +72041,20 @@ elif a[:2]==['image','save']:
    data=b'wrong'; item=tarfile.TarInfo('config'); item.size=len(data)
    tar.addfile(item,io.BytesIO(data))
 elif a[:2]==['compose','ps'] and '--services' in a:
- for i in range(int(os.environ['TEST_COUNT'])): print('service'+str(i))
+ with open(os.environ['TEST_LOG']) as f: polls=sum(1 for x in f if json.loads(x)[:2]==['compose','ps'] and '--services' in json.loads(x))
+ counts=os.environ['TEST_COUNT'].split(',')
+ for i in range(int(counts[min(polls,len(counts))-1])): print('service'+str(i))
 """)
                 stub.chmod(0o755)
+                sleep = root/'bin/sleep'
+                sleep.write_text(r"""#!/usr/bin/env python3
+import json,os,sys
+with open(os.environ['TEST_LOG'],'a') as f: f.write(json.dumps(['sleep']+sys.argv[1:])+'\n')
+""")
+                sleep.chmod(0o755)
                 env = {**os.environ, 'PATH':str(root/'bin')+os.pathsep+os.environ['PATH'],
-                       'TEST_LOG':str(root/'calls'), 'TEST_ID':identity if mode=='optional' else 'sha256:'+'b'*64, 'TEST_CONFIG':identity, 'TEST_MODE':mode, 'TEST_COUNT':'5' if mode=='default' else '6'}
+                       'TEST_LOG':str(root/'calls'), 'TEST_ID':identity if mode in ('optional', 'telemetry-timeout', 'slow-start') else 'sha256:'+'b'*64, 'TEST_CONFIG':identity, 'TEST_MODE':mode,
+                       'TEST_COUNT':{'default':'5', 'telemetry-timeout':'5', 'slow-start':'4,5,6'}.get(mode, '6')}
                 run = subprocess.run(['bash', str(root/'install-offline.sh'), *([] if mode=='default' else ['--telemetry'])],
                                      env=env, text=True, capture_output=True)
                 calls = [json.loads(x) for x in (root/'calls').read_text().splitlines()]
@@ -72056,10 +72066,23 @@ elif a[:2]==['compose','ps'] and '--services' in a:
                     self.assertNotEqual(run.returncode,0)
                     self.assertFalse(any(x[0]=='load' or x[:2]==['compose','up'] for x in calls))
                     continue
+                polls = calls.count(['compose','ps','--services','--filter','status=running'])
+                if mode == 'telemetry-timeout':
+                    # One service still missing after 60 polls fails the install (#937).
+                    self.assertEqual(run.returncode,1,run.stdout+run.stderr)
+                    self.assertEqual((polls, calls.count(['sleep','5'])), (60, 60))
+                    self.assertEqual(calls[-1],['compose','ps'])
+                    self.assertIn('ERROR: only 5 of 6 services are running after 5 minutes.',run.stderr)
+                    self.assertNotIn('http://localhost:8080',run.stdout)
+                    continue
                 self.assertEqual(run.returncode,0,run.stderr)
+                if mode == 'slow-start':
+                    # The wait stops at the first poll that sees every service (#937).
+                    self.assertEqual((polls, calls.count(['sleep','5'])), (3, 2))
+                    self.assertIn('The requested services are up: open http://localhost:8080',run.stdout.splitlines())
                 up = next(x for x in calls if x[:2]==['compose','up'])
                 restore = next(x for x in calls if x[:2]==['compose','run'])
-                if mode in ('optional', 'containerd', 'wrong-loaded'):
+                if mode in ('optional', 'containerd', 'wrong-loaded', 'slow-start'):
                     self.assertIn('--pull',up); self.assertIn('never',up)
                     self.assertIn('--pull=never',restore)
                 else:
