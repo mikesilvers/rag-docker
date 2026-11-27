@@ -4,8 +4,9 @@
 or Linux would, so the listener check's decisions and the exit status are
 checked without Ollama or Docker: loopback is fine, a wildcard or a LAN address
 is a warning (Ollama has no authentication), the docker0 address is fine on
-Linux, nothing listening is a problem, and the api container's check runs
-unless --host-only. Standard library only.
+Linux (the line names the README's firewall rule it relies on), nothing
+listening is a problem (on macOS with lsof's own-user note), and the api
+container's check runs unless --host-only. Standard library only.
 
 Run: python3 scripts/tests/test_check_external_ollama.py
 """
@@ -97,6 +98,9 @@ class HelperTests(unittest.TestCase):
         out, _ = self.run_helper('Linux', ['172.17.0.1'], '--host-only')
         self.assertEqual(out.returncode, 0, out.stdout)
         self.assertIn('ok: Ollama listens on 172.17.0.1:11434 (docker0)', out.stdout)
+        # docker0 alone doesn't keep it off the LAN (#940's evaluation): the line says so.
+        self.assertIn('only with the firewall rule in README "External Ollama (native)" step 3 '
+                      'that drops port 11434 on other interfaces', out.stdout)
         out, _ = self.run_helper('Darwin', ['172.17.0.1'], '--host-only')
         self.assertEqual(out.returncode, 3, out.stdout)
 
@@ -110,6 +114,13 @@ class HelperTests(unittest.TestCase):
                 out, _ = self.run_helper(os_name, [], '--host-only')
                 self.assertEqual(out.returncode, 1)
                 self.assertIn('problem: nothing listens on port 11434', out.stdout)
+                # macOS lsof without root sees only this user's sockets (#940's evaluation).
+                note = "lsof lists only your own processes' sockets"
+                if os_name == 'Darwin':
+                    self.assertIn(note, out.stdout)
+                    self.assertIn('sudo lsof -nP -iTCP:11434 -sTCP:LISTEN', out.stdout)
+                else:
+                    self.assertNotIn(note, out.stdout)
 
     def test_a_missing_tool_is_a_warning(self):
         out, _ = self.run_helper('Darwin', ['127.0.0.1'], '--host-only', tools=('ss', 'ip'))

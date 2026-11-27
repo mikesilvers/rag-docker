@@ -15,7 +15,7 @@ import sys
 import httpx
 
 from config import settings
-from services.ollama_client import required_models, _tagged
+from services.ollama_client import required_models, tagged
 
 PREFIX = "ollama-check: "
 
@@ -47,7 +47,7 @@ def run(client: httpx.Client, out=sys.stdout) -> int:
     try:
         resp = client.get(f"{base}/api/tags")
         resp.raise_for_status()
-        reported = {_tagged(m["name"]) for m in resp.json().get("models", [])}
+        reported = {tagged(m["name"]) for m in resp.json().get("models", [])}
     except Exception as exc:                          # noqa: BLE001
         say("problem", f"couldn't list Ollama's models: {type(exc).__name__}: {exc}")
         return 1

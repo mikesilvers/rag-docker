@@ -682,9 +682,27 @@ Windows steps below are **not yet verified**.
 
 - **macOS:** the app from <https://ollama.com/download>, or `brew install ollama`.
 - **Windows:** the installer from <https://ollama.com/download> (`OllamaSetup.exe`).
-- **Linux:** the official install script, `curl -fsSL https://ollama.com/install.sh | sh`
-  (it also sets up a systemd unit), or your distribution's package. To install
-  the tested release: `curl -fsSL https://ollama.com/install.sh | OLLAMA_VERSION=0.40.18 sh`.
+- **Linux:** the tested release from its GitHub release page, checked before
+  it is installed (as the CI job does), or your distribution's package. Take
+  the sha256 from the release page's asset list
+  (<https://github.com/ollama/ollama/releases/tag/v0.40.18>); for v0.40.18 on
+  x86-64 it is the one below. The official `curl ... | sh` install script
+  downloads the binary without any check, so these steps do its work instead:
+
+  ```bash
+  sudo apt-get install -y zstd   # or your distribution's zstd package
+  curl -fsSLO https://github.com/ollama/ollama/releases/download/v0.40.18/ollama-linux-amd64.tar.zst
+  echo "b82649006cb5b54ed1237fa2d1a26a7f939a4fd03150033759acbff7ff315adf  ollama-linux-amd64.tar.zst" | sha256sum -c -
+  zstd -dc ollama-linux-amd64.tar.zst | sudo tar -xf - -C /usr/local
+  id ollama >/dev/null 2>&1 || sudo useradd -r -s /bin/false -U -m -d /usr/share/ollama ollama
+  printf '%s\n' '[Unit]' 'Description=Ollama Service' 'After=network-online.target' '' \
+    '[Service]' 'ExecStart=/usr/local/bin/ollama serve' 'User=ollama' 'Group=ollama' \
+    'Restart=always' 'RestartSec=3' '' '[Install]' 'WantedBy=default.target' \
+    | sudo tee /etc/systemd/system/ollama.service
+  sudo systemctl daemon-reload
+  ```
+
+  On ARM64, use `ollama-linux-arm64.tar.zst` and its digest from the same page.
 
 Check it with `ollama --version`.
 
@@ -693,7 +711,7 @@ Check it with `ollama --version`.
 - **macOS:** the app starts at login (keep it in the menu bar); with Homebrew,
   `brew services start ollama`.
 - **Windows:** the installed app starts at sign-in and runs in the tray.
-- **Linux:** the install script's unit: `sudo systemctl enable --now ollama`.
+- **Linux:** the unit from step 1 (or your package's): `sudo systemctl enable --now ollama`.
 
 ### 3. Reachable from Docker, not from your network
 
@@ -718,8 +736,27 @@ on `0.0.0.0`.
 
   Not the compose network's own gateway: `host-gateway` doesn't lead there.
   The `ollama` command then needs the same address: `OLLAMA_HOST=172.17.0.1:11434 ollama list`.
-  If your firewall filters traffic from Docker's bridges to the host, allow
-  TCP 11434 from the Docker subnets only.
+
+  **Then add a firewall rule.** Binding to the `docker0` address doesn't keep
+  Ollama off your network by itself: Linux accepts packets for that address on
+  any interface, so a machine on your network that routes `172.17.0.0/16`
+  through this host reaches it. Drop TCP 11434 on every interface except
+  loopback (the `ollama` command), `docker0` and the compose networks' bridges
+  (`br-...`):
+
+  ```bash
+  sudo iptables -I INPUT -p tcp --dport 11434 -j DROP
+  sudo iptables -I INPUT -p tcp --dport 11434 -i br-+ -j ACCEPT
+  sudo iptables -I INPUT -p tcp --dport 11434 -i docker0 -j ACCEPT
+  sudo iptables -I INPUT -p tcp --dport 11434 -i lo -j ACCEPT
+  ```
+
+  Each `-I` goes to the top, so the three accepts end up above the drop. These
+  rules last until the next reboot: save them with your distribution's tool
+  (for example `sudo netfilter-persistent save` on Debian and Ubuntu), or write
+  the same rules in `ufw` or `firewalld` if you use one of those.
+  `scripts/check-external-ollama.sh` can't see firewall rules: its `ok` for a
+  `docker0` listener holds only with this rule in place.
 
 ### 4. Pull the models
 
@@ -812,8 +849,11 @@ the overlay.
 ### 8. Upgrading Ollama, and going back to the contained default
 
 - **Upgrade:** the macOS app updates itself (or `brew upgrade ollama`); run the
-  Windows installer again; on Linux run the install script again (your
-  `systemctl edit` drop-in stays). Then `bash scripts/check-external-ollama.sh`.
+  Windows installer again; on Linux remove the old libraries
+  (`sudo rm -rf /usr/local/lib/ollama`), repeat step 1's download, check and
+  extraction with the new release and its digest, then
+  `sudo systemctl restart ollama` (your `systemctl edit` drop-in stays). Then
+  `bash scripts/check-external-ollama.sh`.
 - **Back to the contained default:** `docker compose -f docker-compose.yml -f
   docker-compose.external-ollama.yml down`, then `docker compose up -d`
   without the overlay. The `ollama` container pulls its models into the

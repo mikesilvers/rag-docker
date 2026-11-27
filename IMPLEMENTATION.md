@@ -1874,7 +1874,7 @@ import sys
 import httpx
 
 from config import settings
-from services.ollama_client import required_models, _tagged
+from services.ollama_client import required_models, tagged
 
 PREFIX = "ollama-check: "
 
@@ -1906,7 +1906,7 @@ def run(client: httpx.Client, out=sys.stdout) -> int:
     try:
         resp = client.get(f"{base}/api/tags")
         resp.raise_for_status()
-        reported = {_tagged(m["name"]) for m in resp.json().get("models", [])}
+        reported = {tagged(m["name"]) for m in resp.json().get("models", [])}
     except Exception as exc:                          # noqa: BLE001
         say("problem", f"couldn't list Ollama's models: {type(exc).__name__}: {exc}")
         return 1
@@ -5388,22 +5388,23 @@ async def build_chat(system: str, user: str) -> str:
     return await _chat(settings.build_model, system, user)
 
 
-def _tagged(model: str) -> str:
-    """`name:tag`, with `:latest` for a name without a tag (after its last `/`)."""
+def tagged(model: str) -> str:
+    """`name:tag`, with `:latest` for a name without a tag (after its last `/`): the
+    one tag rule for comparing model names with what Ollama lists (#673)."""
     return model if ":" in model.rsplit("/", 1)[-1] else f"{model}:latest"
 
 
 def same_model(a: str, b: str) -> bool:
     """Whether two model names are one model: `x` and `x:latest` are."""
-    return _tagged(a) == _tagged(b)
+    return tagged(a) == tagged(b)
 
 
 def required_models() -> list[str]:
     """The embedding, answer and build models, `name:tag`, each once, in that order."""
     seen: list[str] = []
     for model in (settings.embed_model, settings.answer_model, settings.build_model):
-        if _tagged(model) not in seen:
-            seen.append(_tagged(model))
+        if tagged(model) not in seen:
+            seen.append(tagged(model))
     return seen
 
 
@@ -5420,7 +5421,7 @@ async def missing_models() -> list[str] | None:
     """The required models Ollama doesn't list, tag-exact (#673), or None when it
     can't be asked."""
     try:
-        reported = {_tagged(name) for name in await list_models()}
+        reported = {tagged(name) for name in await list_models()}
     except Exception:                                 # noqa: BLE001
         return None
     return [model for model in required_models() if model not in reported]
@@ -5465,10 +5466,10 @@ async def check_health(with_version: bool = True) -> dict:
             resp = await client.get(f"{_BASE}/api/tags")
             resp.raise_for_status()
             latency_ms = int((time.monotonic() - start) * 1000)
-            models = {_tagged(m["name"]) for m in resp.json().get("models", [])}
+            models = {tagged(m["name"]) for m in resp.json().get("models", [])}
 
             def entry(model: str) -> dict:
-                ok = _tagged(model) in models
+                ok = tagged(model) in models
                 return {"status": "ok" if ok else "error", "latency_ms": latency_ms, "model": model}
 
             result = {"llm": entry(answer), "build_llm": entry(build),
@@ -15699,7 +15700,7 @@ def _ollama_reports(model: str) -> bool | None:
     missing would send the user to pull one they may already have.
     """
     from services import ollama_client
-    want = model if ":" in model.rsplit("/", 1)[-1] else f"{model}:latest"
+    want = ollama_client.tagged(model)
     try:
         return want in asyncio.run(ollama_client.list_models())
     except Exception as exc:                      # noqa: BLE001
@@ -15831,6 +15832,7 @@ def _ensure_models_external(pkg: Path, manifest: dict) -> list[str]:
     model store is read or written, and models a package bundles are left in it.
     The embedding model decides the import; the answer model is a note.
     """
+    from services import ollama_client
     notes: list[str] = []
     try:
         bundled = model_bundle.bundled_models(pkg, manifest)
@@ -15838,7 +15840,7 @@ def _ensure_models_external(pkg: Path, manifest: dict) -> list[str]:
         bundled = []
     if bundled:
         notes.append("the package bundles models; with an external Ollama they are not installed")
-    embed_ref = _tag_ref(settings.embed_model)
+    embed_ref = ollama_client.tagged(settings.embed_model)
     reported = _ollama_reports(settings.embed_model)
     if reported is None:
         raise PackageError(
@@ -15855,7 +15857,7 @@ def _ensure_models_external(pkg: Path, manifest: dict) -> list[str]:
             f"then import again.",
             {"model": embed_ref, "package_model": pkg_model, "bundled": bundled})
     notes.append(f"model '{embed_ref}' reported by the external Ollama")
-    answer_ref = _tag_ref(settings.answer_model)
+    answer_ref = ollama_client.tagged(settings.answer_model)
     answer = _ollama_reports(settings.answer_model)
     if answer is None:
         notes.append(f"model '{answer_ref}' wasn't checked: the external Ollama couldn't "
@@ -15866,11 +15868,6 @@ def _ensure_models_external(pkg: Path, manifest: dict) -> list[str]:
         notes.append(f"model '{answer_ref}' is absent from the external Ollama; pull it "
                      f"there with `ollama pull {answer_ref}` before querying")
     return notes
-
-
-def _tag_ref(model: str) -> str:
-    """`name:tag`, a name without a tag being `:latest`, as Ollama lists it."""
-    return model if ":" in model.rsplit("/", 1)[-1] else f"{model}:latest"
 
 
 # ── Building ──────────────────────────────────────────────────────────────────
@@ -40777,8 +40774,10 @@ exit $?
 # 1. On this host (macOS or Linux): what listens on TCP port 11434. Ollama has
 #    no authentication, so it should listen only where Docker reaches it:
 #    loopback (127.0.0.1, ::1) with Docker Desktop, and on Linux the docker0
-#    bridge address too. Any other address, or a wildcard (0.0.0.0, ::, *), is
-#    a warning: other machines on your network may reach it.
+#    bridge address too, which is safe only with the README's firewall rule (it
+#    can't see firewall rules). Any other address, or a wildcard (0.0.0.0, ::,
+#    *), is a warning: other machines on your network may reach it. On macOS,
+#    lsof without root sees only this user's sockets.
 # 2. From inside the api container: `python -m ollama_check`, which reaches
 #    Ollama as the stack does and checks its version and the models. It uses
 #    COMPOSE_FILE when set, else docker-compose.yml with
@@ -40851,7 +40850,12 @@ host_check() {
   [ -z "$docker0" ] || allowed="$docker0 (docker0), 127.0.0.1 or ::1"
   addresses="$(listeners)"
   if [ -z "$addresses" ]; then
-    problem "nothing listens on port $PORT on this host: start Ollama (README \"External Ollama (native)\")."
+    if [ "$OS" = Darwin ]; then
+      # Without root, lsof lists only this user's sockets.
+      problem "nothing listens on port $PORT that this user can see: start Ollama (README \"External Ollama (native)\"). Without root, lsof lists only your own processes' sockets, so an Ollama run by another user (for example with sudo brew services) isn't seen; check with: sudo lsof -nP -iTCP:$PORT -sTCP:LISTEN"
+    else
+      problem "nothing listens on port $PORT on this host: start Ollama (README \"External Ollama (native)\")."
+    fi
     return 0
   fi
   while IFS= read -r address; do
@@ -40862,7 +40866,7 @@ host_check() {
         warn "Ollama listens on every address ($address:$PORT), so other machines on your network may reach it. Ollama has no authentication; bind it to $allowed (README \"External Ollama (native)\")." ;;
       *)
         if [ -n "$docker0" ] && [ "$address" = "$docker0" ]; then
-          say ok "Ollama listens on $address:$PORT (docker0)"
+          say ok "Ollama listens on $address:$PORT (docker0); this keeps it off your network only with the firewall rule in README \"External Ollama (native)\" step 3 that drops port $PORT on other interfaces"
         else
           warn "Ollama listens on $address:$PORT, which other machines on your network may reach. Ollama has no authentication; bind it to $allowed (README \"External Ollama (native)\")."
         fi ;;
@@ -41578,8 +41582,9 @@ if __name__ == "__main__":
 or Linux would, so the listener check's decisions and the exit status are
 checked without Ollama or Docker: loopback is fine, a wildcard or a LAN address
 is a warning (Ollama has no authentication), the docker0 address is fine on
-Linux, nothing listening is a problem, and the api container's check runs
-unless --host-only. Standard library only.
+Linux (the line names the README's firewall rule it relies on), nothing
+listening is a problem (on macOS with lsof's own-user note), and the api
+container's check runs unless --host-only. Standard library only.
 
 Run: python3 scripts/tests/test_check_external_ollama.py
 """
@@ -41671,6 +41676,9 @@ class HelperTests(unittest.TestCase):
         out, _ = self.run_helper('Linux', ['172.17.0.1'], '--host-only')
         self.assertEqual(out.returncode, 0, out.stdout)
         self.assertIn('ok: Ollama listens on 172.17.0.1:11434 (docker0)', out.stdout)
+        # docker0 alone doesn't keep it off the LAN (#940's evaluation): the line says so.
+        self.assertIn('only with the firewall rule in README "External Ollama (native)" step 3 '
+                      'that drops port 11434 on other interfaces', out.stdout)
         out, _ = self.run_helper('Darwin', ['172.17.0.1'], '--host-only')
         self.assertEqual(out.returncode, 3, out.stdout)
 
@@ -41684,6 +41692,13 @@ class HelperTests(unittest.TestCase):
                 out, _ = self.run_helper(os_name, [], '--host-only')
                 self.assertEqual(out.returncode, 1)
                 self.assertIn('problem: nothing listens on port 11434', out.stdout)
+                # macOS lsof without root sees only this user's sockets (#940's evaluation).
+                note = "lsof lists only your own processes' sockets"
+                if os_name == 'Darwin':
+                    self.assertIn(note, out.stdout)
+                    self.assertIn('sudo lsof -nP -iTCP:11434 -sTCP:LISTEN', out.stdout)
+                else:
+                    self.assertNotIn(note, out.stdout)
 
     def test_a_missing_tool_is_a_warning(self):
         out, _ = self.run_helper('Darwin', ['127.0.0.1'], '--host-only', tools=('ss', 'ip'))
@@ -58635,10 +58650,13 @@ jobs:
 
   # External-Ollama mode (#673) on Linux, as README "External Ollama (native)"
   # sets it up there: the pinned native Ollama (the release the README says it
-  # was tested with), installed with its release's own install script, checked
-  # by sha256, then bound to the docker0 address with a systemd drop-in, never
-  # 0.0.0.0, and its models pulled, as a user would; rag-docker itself never
-  # pulls into it. Then `stack.sh up --external-ollama` and suite 26, with
+  # was tested with), its release asset checked by sha256 against the digest the
+  # release publishes before anything is extracted, and installed as the
+  # release's install script would (binary, user, systemd unit; the script
+  # itself fetches the binary unchecked, so it isn't run). It is bound to the
+  # docker0 address with a systemd drop-in, never 0.0.0.0, and its models
+  # pulled, as a user would; rag-docker itself never pulls into it. Then
+  # `stack.sh up --external-ollama` and suite 26, with
   # RAG_SKIP_SLOW=1 as the job above. The native model store is cached by
   # release and model names.
   external-ollama:
@@ -58650,7 +58668,8 @@ jobs:
     env:
       RAG_SKIP_SLOW: '1'
       OLLAMA_VERSION: 0.40.18
-      OLLAMA_INSTALL_SHA256: 17659c2456c9e65a3b11056b76da51774911cb822f47bf44f7f3ecc0c40528a8
+      # The published sha256 of ollama-linux-amd64.tar.zst in the v0.40.18 release.
+      OLLAMA_SHA256: b82649006cb5b54ed1237fa2d1a26a7f939a4fd03150033759acbff7ff315adf
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -58676,10 +58695,19 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q zstd
-          curl -fsSL -o "$RUNNER_TEMP/install.sh" \
-            "https://github.com/ollama/ollama/releases/download/v$OLLAMA_VERSION/install.sh"
-          echo "$OLLAMA_INSTALL_SHA256  $RUNNER_TEMP/install.sh" | sha256sum -c -
-          OLLAMA_VERSION="$OLLAMA_VERSION" sh "$RUNNER_TEMP/install.sh"
+          tarball="$RUNNER_TEMP/ollama-linux-amd64.tar.zst"
+          curl -fsSL -o "$tarball" \
+            "https://github.com/ollama/ollama/releases/download/v$OLLAMA_VERSION/ollama-linux-amd64.tar.zst"
+          echo "$OLLAMA_SHA256  $tarball" | sha256sum -c -
+          zstd -dc "$tarball" | sudo tar -xf - -C /usr/local
+          rm -f "$tarball"
+          id ollama >/dev/null 2>&1 || sudo useradd -r -s /bin/false -U -m -d /usr/share/ollama ollama
+          printf '%s\n' '[Unit]' 'Description=Ollama Service' 'After=network-online.target' '' \
+            '[Service]' 'ExecStart=/usr/local/bin/ollama serve' 'User=ollama' 'Group=ollama' \
+            'Restart=always' 'RestartSec=3' '' '[Install]' 'WantedBy=default.target' \
+            | sudo tee /etc/systemd/system/ollama.service
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now ollama
           ollama --version
 
       # README "External Ollama (native)", Linux: the docker0 address only.
@@ -58797,7 +58825,7 @@ Reads .github/workflows/verify.yml as text: its trigger, permissions and
 action pins, the stack.sh up / all.sh / stack.sh down sequence on the
 disposable verify project, the compose logs artifact and the model cache, in
 the `verify` job; and the `external-ollama` job (#673), which installs the
-pinned native Ollama from its release's install script checked by sha256, binds
+pinned native Ollama from its release asset checked by sha256, binds
 it to the docker0 address and runs suite 26 in `stack.sh up --external-ollama`. Also
 checks the README badge and the copies embedded in IMPLEMENTATION.md. The
 workflow's real run is the pull request's own; this keeps its rules from
@@ -58993,17 +59021,28 @@ class ModelCacheTests(unittest.TestCase):
 class ExternalOllamaJobTests(unittest.TestCase):
     """The external-Ollama job (#673): README "External Ollama (native)" on Linux."""
 
-    def test_pins_the_tested_release_and_its_install_script(self):
+    def test_pins_the_tested_release_and_checks_its_binary(self):
         text = external_job()
         self.assertRegex(text, r"(?m)^      OLLAMA_VERSION: 0\.40\.18$")
-        self.assertRegex(text, r"(?m)^      OLLAMA_INSTALL_SHA256: [0-9a-f]{64}$")
+        # The release asset's published digest; the install script isn't used, since it
+        # fetches the binary without a checksum (#940's evaluation).
+        self.assertRegex(text, r"(?m)^      OLLAMA_SHA256: [0-9a-f]{64}$")
+        self.assertNotIn('install.sh', code(text))
+        self.assertNotIn('OLLAMA_INSTALL_SHA256', text)
         _, step = step_with(text, 'name: Install native Ollama')
-        self.assertIn('https://github.com/ollama/ollama/releases/download/v$OLLAMA_VERSION/install.sh', step)
-        self.assertIn('echo "$OLLAMA_INSTALL_SHA256  $RUNNER_TEMP/install.sh" | sha256sum -c -', step)
-        # The check comes before the script runs, and nothing is piped into a shell.
-        self.assertLess(step.index('sha256sum -c -'), step.index('sh "$RUNNER_TEMP/install.sh"'))
+        self.assertIn('https://github.com/ollama/ollama/releases/download/v$OLLAMA_VERSION/'
+                      'ollama-linux-amd64.tar.zst', step)
+        self.assertIn('echo "$OLLAMA_SHA256  $tarball" | sha256sum -c -', step)
+        self.assertNotIn('ollama.com/download', step)
+        # The check comes before anything is extracted, and nothing is piped into a shell.
+        self.assertLess(step.index('sha256sum -c -'), step.index('tar -xf'))
+        self.assertLess(step.index('sha256sum -c -'), step.index('systemctl enable --now ollama'))
         self.assertNotRegex(code(text), r'\|[ \t]*(sudo[ \t]+)?(ba)?sh\b')
         self.assertIn('0.40.18', (ROOT / 'README.md').read_text())
+
+    def test_the_pinned_digest_is_the_one_the_readme_gives(self):
+        digest = re.search(r"(?m)^      OLLAMA_SHA256: ([0-9a-f]{64})$", external_job()).group(1)
+        self.assertIn(digest, (ROOT / 'README.md').read_text())
 
     def test_binds_ollama_to_docker0_never_every_address(self):
         text = code(external_job())

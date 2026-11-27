@@ -451,7 +451,9 @@ supported.
   `-f` list; api mounts it adds are dropped unless repeated in a later file.
 
 **The host's Ollama.** Listens on port 11434: on loopback with Docker Desktop, on the `docker0` address on Linux,
-never `0.0.0.0` (it has no authentication). It is shared with other apps and models, so rag-docker never pulls,
+never `0.0.0.0` (it has no authentication). On Linux the `docker0` bind needs a firewall rule as well, since Linux
+accepts packets for that address on any interface: TCP 11434 is accepted on `lo`, `docker0` and `br-+` and dropped on
+every other interface (the README gives the `iptables` lines). It is shared with other apps and models, so rag-docker never pulls,
 creates, copies, deletes or unloads a model in it and never changes its server-wide settings (`OLLAMA_KEEP_ALIVE`,
 `OLLAMA_NUM_PARALLEL`, `OLLAMA_CONTEXT_LENGTH`). Its only calls are `/api/chat`, `/api/embeddings` (or `/api/embed`,
 below) and the reads `/api/tags`, `/api/version` and `/api/ps`.
@@ -486,8 +488,9 @@ check the embedding model and the answer model through `/api/tags` and never ins
 `ollama pull` lines.
 
 **Checking a setup.** `bash scripts/check-external-ollama.sh` checks on the host what listens on port 11434 (`lsof`
-on macOS, `ss` on Linux; loopback, and on Linux the `docker0` address, are fine; a wildcard or any other address is a
-warning), then runs `python -m ollama_check` in the api container (the mode, reaching Ollama and its version, each
+on macOS, `ss` on Linux; loopback, and on Linux the `docker0` address, are fine, the `docker0` line saying it holds
+only with the firewall rule, which the helper can't see; a wildcard or any other address is a warning; nothing
+listening is a problem, on macOS with a note that `lsof` without root sees only this user's sockets), then runs `python -m ollama_check` in the api container (the mode, reaching Ollama and its version, each
 model tag-exact with its `ollama pull` line). Exit 0 all passed, 3 with warnings, 1 a problem, 2 usage;
 `--host-only` runs only the listener check. Both only read.
 

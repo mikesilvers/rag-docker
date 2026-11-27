@@ -87,22 +87,23 @@ async def build_chat(system: str, user: str) -> str:
     return await _chat(settings.build_model, system, user)
 
 
-def _tagged(model: str) -> str:
-    """`name:tag`, with `:latest` for a name without a tag (after its last `/`)."""
+def tagged(model: str) -> str:
+    """`name:tag`, with `:latest` for a name without a tag (after its last `/`): the
+    one tag rule for comparing model names with what Ollama lists (#673)."""
     return model if ":" in model.rsplit("/", 1)[-1] else f"{model}:latest"
 
 
 def same_model(a: str, b: str) -> bool:
     """Whether two model names are one model: `x` and `x:latest` are."""
-    return _tagged(a) == _tagged(b)
+    return tagged(a) == tagged(b)
 
 
 def required_models() -> list[str]:
     """The embedding, answer and build models, `name:tag`, each once, in that order."""
     seen: list[str] = []
     for model in (settings.embed_model, settings.answer_model, settings.build_model):
-        if _tagged(model) not in seen:
-            seen.append(_tagged(model))
+        if tagged(model) not in seen:
+            seen.append(tagged(model))
     return seen
 
 
@@ -119,7 +120,7 @@ async def missing_models() -> list[str] | None:
     """The required models Ollama doesn't list, tag-exact (#673), or None when it
     can't be asked."""
     try:
-        reported = {_tagged(name) for name in await list_models()}
+        reported = {tagged(name) for name in await list_models()}
     except Exception:                                 # noqa: BLE001
         return None
     return [model for model in required_models() if model not in reported]
@@ -164,10 +165,10 @@ async def check_health(with_version: bool = True) -> dict:
             resp = await client.get(f"{_BASE}/api/tags")
             resp.raise_for_status()
             latency_ms = int((time.monotonic() - start) * 1000)
-            models = {_tagged(m["name"]) for m in resp.json().get("models", [])}
+            models = {tagged(m["name"]) for m in resp.json().get("models", [])}
 
             def entry(model: str) -> dict:
-                ok = _tagged(model) in models
+                ok = tagged(model) in models
                 return {"status": "ok" if ok else "error", "latency_ms": latency_ms, "model": model}
 
             result = {"llm": entry(answer), "build_llm": entry(build),

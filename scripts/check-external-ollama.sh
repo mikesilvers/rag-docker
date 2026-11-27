@@ -8,8 +8,10 @@
 # 1. On this host (macOS or Linux): what listens on TCP port 11434. Ollama has
 #    no authentication, so it should listen only where Docker reaches it:
 #    loopback (127.0.0.1, ::1) with Docker Desktop, and on Linux the docker0
-#    bridge address too. Any other address, or a wildcard (0.0.0.0, ::, *), is
-#    a warning: other machines on your network may reach it.
+#    bridge address too, which is safe only with the README's firewall rule (it
+#    can't see firewall rules). Any other address, or a wildcard (0.0.0.0, ::,
+#    *), is a warning: other machines on your network may reach it. On macOS,
+#    lsof without root sees only this user's sockets.
 # 2. From inside the api container: `python -m ollama_check`, which reaches
 #    Ollama as the stack does and checks its version and the models. It uses
 #    COMPOSE_FILE when set, else docker-compose.yml with
@@ -82,7 +84,12 @@ host_check() {
   [ -z "$docker0" ] || allowed="$docker0 (docker0), 127.0.0.1 or ::1"
   addresses="$(listeners)"
   if [ -z "$addresses" ]; then
-    problem "nothing listens on port $PORT on this host: start Ollama (README \"External Ollama (native)\")."
+    if [ "$OS" = Darwin ]; then
+      # Without root, lsof lists only this user's sockets.
+      problem "nothing listens on port $PORT that this user can see: start Ollama (README \"External Ollama (native)\"). Without root, lsof lists only your own processes' sockets, so an Ollama run by another user (for example with sudo brew services) isn't seen; check with: sudo lsof -nP -iTCP:$PORT -sTCP:LISTEN"
+    else
+      problem "nothing listens on port $PORT on this host: start Ollama (README \"External Ollama (native)\")."
+    fi
     return 0
   fi
   while IFS= read -r address; do
@@ -93,7 +100,7 @@ host_check() {
         warn "Ollama listens on every address ($address:$PORT), so other machines on your network may reach it. Ollama has no authentication; bind it to $allowed (README \"External Ollama (native)\")." ;;
       *)
         if [ -n "$docker0" ] && [ "$address" = "$docker0" ]; then
-          say ok "Ollama listens on $address:$PORT (docker0)"
+          say ok "Ollama listens on $address:$PORT (docker0); this keeps it off your network only with the firewall rule in README \"External Ollama (native)\" step 3 that drops port $PORT on other interfaces"
         else
           warn "Ollama listens on $address:$PORT, which other machines on your network may reach. Ollama has no authentication; bind it to $allowed (README \"External Ollama (native)\")."
         fi ;;

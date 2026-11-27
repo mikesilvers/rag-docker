@@ -454,7 +454,7 @@ def _ollama_reports(model: str) -> bool | None:
     missing would send the user to pull one they may already have.
     """
     from services import ollama_client
-    want = model if ":" in model.rsplit("/", 1)[-1] else f"{model}:latest"
+    want = ollama_client.tagged(model)
     try:
         return want in asyncio.run(ollama_client.list_models())
     except Exception as exc:                      # noqa: BLE001
@@ -586,6 +586,7 @@ def _ensure_models_external(pkg: Path, manifest: dict) -> list[str]:
     model store is read or written, and models a package bundles are left in it.
     The embedding model decides the import; the answer model is a note.
     """
+    from services import ollama_client
     notes: list[str] = []
     try:
         bundled = model_bundle.bundled_models(pkg, manifest)
@@ -593,7 +594,7 @@ def _ensure_models_external(pkg: Path, manifest: dict) -> list[str]:
         bundled = []
     if bundled:
         notes.append("the package bundles models; with an external Ollama they are not installed")
-    embed_ref = _tag_ref(settings.embed_model)
+    embed_ref = ollama_client.tagged(settings.embed_model)
     reported = _ollama_reports(settings.embed_model)
     if reported is None:
         raise PackageError(
@@ -610,7 +611,7 @@ def _ensure_models_external(pkg: Path, manifest: dict) -> list[str]:
             f"then import again.",
             {"model": embed_ref, "package_model": pkg_model, "bundled": bundled})
     notes.append(f"model '{embed_ref}' reported by the external Ollama")
-    answer_ref = _tag_ref(settings.answer_model)
+    answer_ref = ollama_client.tagged(settings.answer_model)
     answer = _ollama_reports(settings.answer_model)
     if answer is None:
         notes.append(f"model '{answer_ref}' wasn't checked: the external Ollama couldn't "
@@ -621,11 +622,6 @@ def _ensure_models_external(pkg: Path, manifest: dict) -> list[str]:
         notes.append(f"model '{answer_ref}' is absent from the external Ollama; pull it "
                      f"there with `ollama pull {answer_ref}` before querying")
     return notes
-
-
-def _tag_ref(model: str) -> str:
-    """`name:tag`, a name without a tag being `:latest`, as Ollama lists it."""
-    return model if ":" in model.rsplit("/", 1)[-1] else f"{model}:latest"
 
 
 # ── Building ──────────────────────────────────────────────────────────────────

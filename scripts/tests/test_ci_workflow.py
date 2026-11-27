@@ -4,7 +4,7 @@ Reads .github/workflows/verify.yml as text: its trigger, permissions and
 action pins, the stack.sh up / all.sh / stack.sh down sequence on the
 disposable verify project, the compose logs artifact and the model cache, in
 the `verify` job; and the `external-ollama` job (#673), which installs the
-pinned native Ollama from its release's install script checked by sha256, binds
+pinned native Ollama from its release asset checked by sha256, binds
 it to the docker0 address and runs suite 26 in `stack.sh up --external-ollama`. Also
 checks the README badge and the copies embedded in IMPLEMENTATION.md. The
 workflow's real run is the pull request's own; this keeps its rules from
@@ -200,17 +200,28 @@ class ModelCacheTests(unittest.TestCase):
 class ExternalOllamaJobTests(unittest.TestCase):
     """The external-Ollama job (#673): README "External Ollama (native)" on Linux."""
 
-    def test_pins_the_tested_release_and_its_install_script(self):
+    def test_pins_the_tested_release_and_checks_its_binary(self):
         text = external_job()
         self.assertRegex(text, r"(?m)^      OLLAMA_VERSION: 0\.40\.18$")
-        self.assertRegex(text, r"(?m)^      OLLAMA_INSTALL_SHA256: [0-9a-f]{64}$")
+        # The release asset's published digest; the install script isn't used, since it
+        # fetches the binary without a checksum (#940's evaluation).
+        self.assertRegex(text, r"(?m)^      OLLAMA_SHA256: [0-9a-f]{64}$")
+        self.assertNotIn('install.sh', code(text))
+        self.assertNotIn('OLLAMA_INSTALL_SHA256', text)
         _, step = step_with(text, 'name: Install native Ollama')
-        self.assertIn('https://github.com/ollama/ollama/releases/download/v$OLLAMA_VERSION/install.sh', step)
-        self.assertIn('echo "$OLLAMA_INSTALL_SHA256  $RUNNER_TEMP/install.sh" | sha256sum -c -', step)
-        # The check comes before the script runs, and nothing is piped into a shell.
-        self.assertLess(step.index('sha256sum -c -'), step.index('sh "$RUNNER_TEMP/install.sh"'))
+        self.assertIn('https://github.com/ollama/ollama/releases/download/v$OLLAMA_VERSION/'
+                      'ollama-linux-amd64.tar.zst', step)
+        self.assertIn('echo "$OLLAMA_SHA256  $tarball" | sha256sum -c -', step)
+        self.assertNotIn('ollama.com/download', step)
+        # The check comes before anything is extracted, and nothing is piped into a shell.
+        self.assertLess(step.index('sha256sum -c -'), step.index('tar -xf'))
+        self.assertLess(step.index('sha256sum -c -'), step.index('systemctl enable --now ollama'))
         self.assertNotRegex(code(text), r'\|[ \t]*(sudo[ \t]+)?(ba)?sh\b')
         self.assertIn('0.40.18', (ROOT / 'README.md').read_text())
+
+    def test_the_pinned_digest_is_the_one_the_readme_gives(self):
+        digest = re.search(r"(?m)^      OLLAMA_SHA256: ([0-9a-f]{64})$", external_job()).group(1)
+        self.assertIn(digest, (ROOT / 'README.md').read_text())
 
     def test_binds_ollama_to_docker0_never_every_address(self):
         text = code(external_job())
