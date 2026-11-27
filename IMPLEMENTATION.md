@@ -30971,6 +30971,32 @@ routes (`403 QUERY_ONLY`), a Developer's delete (`FORBIDDEN`) and no session (`4
 End User's question with an answer and citations, and an export and the package list. The project is removed when
 the run ends. Two stacks never run at once, so Docker's memory holds one answer model.
 
+`25_weaviate_upgrade.sh` checks the Weaviate upgrade path (#805): data written by the previous Weaviate opens on
+the checkout's, and a restart after a Raft snapshot works on the upgraded data. Weaviate is bumped by hand, so a
+bump's full run includes it. It runs in full runs only (maintainer decision, 2026-11-26): a `RAG_SKIP_SLOW=1` run,
+CI's among them, skips it. It upgrades from `RAG_WEAVIATE_FROM` (a plain `X.Y.Z` tag) or, when that is unset, from
+the tag in `origin/main`'s `docker-compose.yml`, the last release, read with `git show` and never fetched; it
+upgrades to the tag of the checkout's resolved configuration. A tag that isn't `X.Y.Z`, an unreadable `origin/main`
+with no `RAG_WEAVIATE_FROM`, or a previous tag newer than the checkout's is one failed check and nothing is started.
+When both tags are the same, as while `main` and `develop` pin one version, every step still runs on that version.
+It runs only on the verify project as `stack.sh` sets it up (the condition of removing its volumes, #465); anywhere
+else it fails with the reason and creates nothing. `weaviate_upgrade.py` then, on the host, creates a throwaway
+container, volume and `--internal` network named `rag-verify-wvup-<hex>` and labelled
+`com.docker.compose.project=rag-verify` and `rag-verify.check=weaviate-upgrade`, publishes nothing, and runs the
+previous tag (pulled if missing) on the fresh volume with the `weaviate` service's environment from the resolved
+configuration, except `RAFT_SNAPSHOT_THRESHOLD=8` and `RAFT_SNAPSHOT_INTERVAL=2`. From one-off containers of the
+verify project's api image on that network, with the API's own `weaviate-client`, it creates `VfyUpgrade` as the
+API creates a collection (its properties, `text2vec-ollama`, HNSW with cosine distance) and writes 12 objects with
+explicit vectors, so no model is called. It reads back the schema (class, properties, vectorizer, index type and
+distance), the count, every object with its vector, and a nearVector query's ids, order and distances; stops the
+container (60 s grace); starts the checkout's tag on the same volume; checks `/v1/meta`'s version and the same
+read-back; creates and deletes 12 throwaway collections and waits up to 180 s for a new Raft snapshot (a
+`meta.json` under `snapshots` in the volume); restarts and checks the read-back again and that the throwaway
+collections are gone. Each start must be ready within 300 s. The first failure ends the steps, with the container's
+state and last log lines, or the volume's `raft` listing; the container, volume and network are removed at the end
+in every case, and `stack.sh down` removes anything a killed run leaves. It removes no image: the previous tag may
+be the one the live stack runs.
+
 ## Entry point and verify project
 
 `stack.sh` runs everything on compose project `rag-verify`, a disposable copy of
@@ -31133,7 +31159,7 @@ configuration check and both refusals, with Docker replaced by a stub, so it
 needs no stack. Two of its tests read `docker-compose.yml` with PyYAML, so they
 need PyYAML on the host; without it they are skipped.
 
-`25_external_ollama.sh` checks external-Ollama mode (#673, SPECIFICATIONS.md §2.7 and §10.12). In every run
+`26_external_ollama.sh` checks external-Ollama mode (#673, SPECIFICATIONS.md §2.7 and §10.12). In every run
 `../tests/test_external_ollama.py` runs in the API image with no network (the settings, the request bodies in both
 modes and the `/api/embed` fallback, the tag-exact check, `/health/details`, the start-up lines, import and export,
 `python -m ollama_check`, the overlay and `install-offline.sh --external-ollama`). The rest needs
@@ -31158,7 +31184,7 @@ top of the main `README.md` shows its result on `develop`. A second job,
 `external-ollama` (#673), installs the pinned native Ollama (v0.40.18) from its
 release's install script, checked by sha256, binds it to the `docker0` address,
 pulls the models (cached by release and names) and runs
-`stack.sh up --external-ollama` and suite 25 with `RAG_SKIP_SLOW=1`.
+`stack.sh up --external-ollama` and suite 26 with `RAG_SKIP_SLOW=1`.
 
 - **Up, suites, logs, down.** `stack.sh run` removes the project before its
   logs could be saved, so the workflow takes the `up` route: `stack.sh up`
@@ -31353,7 +31379,12 @@ the cleanup with `Directory not empty` (#696). The excluded files are planted un
 in a real checkout, so the tests show `git archive` leaves them out, a top-level
 `.env.<suffix>` such as `.env.local` included (SPECIFICATIONS.md section 11.2 excludes
 `.env*`). Its
-`install-offline.sh` wait test records that the wait counts running services, not healthy ones.
+`install-offline.sh` wait test checks that the wait counts running services (compose has
+already waited for the healthchecked ones) and that the script fails, naming how many are
+running, when one is still missing after 60 polls (#490). It also runs
+`transfer_packages.py` on small packages of its own: an absolute name, a `..`, a symbolic or a
+hard link is refused with nothing written, on every Python, and a safe package is damaged
+(#490).
 
 The live checks: unknown job ids, `on_conflict` 422s, `GET /packages` with a junk
 `ragpkg-*.tar.gz`, seventeen crafted copies of the suite's package written by
@@ -31953,15 +31984,18 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `23_llm_split.sh` | the build and answer models (#671), full runs only: with `BUILD_LLM_MODEL` set to a small model, preparation and gold standard use it and query uses the answer model |
 | `llm_split.py` | helper for suite 23, run in the API container: pulls the small model, runs the three tasks through the services' code and prints the models Ollama reports answering each (#671) |
 | `24_query_only.sh` | §2.6 and §10.11 — query-only mode (#670): the overlay resolved without starting it; registers `../tests/test_query_only.py`; the start-up refusal of a non-boolean `RAG_QUERY_ONLY`; the loader's refusal on a full instance; with `stack.sh run --query-only`, build and export, `stack.sh query-only-mode`, then the load, the refusals, access and Q&A on the query-only instance, and a key package loaded with its key file on standard input and refused `KEY_FILE_REQUIRED` without it (#676) |
-| `25_external_ollama.sh` | §2.7 and §10.12 — external-Ollama mode (#673): registers `../tests/test_external_ollama.py`; with `stack.sh run --external-ollama`, no ollama service, `python -m ollama_check`, `/health/details`, ingest through the host's Ollama, the refused export with models, an import back, a reindex and, outside `RAG_SKIP_SLOW`, hnsw and semantic questions |
+| `26_external_ollama.sh` | §2.7 and §10.12 — external-Ollama mode (#673): registers `../tests/test_external_ollama.py`; with `stack.sh run --external-ollama`, no ollama service, `python -m ollama_check`, `/health/details`, ingest through the host's Ollama, the refused export with models, an import back, a reindex and, outside `RAG_SKIP_SLOW`, hnsw and semantic questions |
 | `../tests/test_check_external_ollama.py` | host-side, standard library: `scripts/check-external-ollama.sh` with stub `uname`, `lsof`, `ss`, `ip` and `docker`: loopback and docker0 pass, a wildcard or LAN address warns (exit 3), nothing listening fails (exit 1), `--host-only` skips the container check (#673) |
 | `query_only_config.py` | host-side, standard library: `docker-compose.yml` with and without `docker-compose.query-only.yml` as `docker compose config` resolves them; only the api's `RAG_QUERY_ONLY` may differ (#670) |
 | `../tests/test_query_only.py` | API image, no network (also on the host): `RAG_QUERY_ONLY` parsing, the refused and kept routes, the refusals through the app and their order, `query_only` in the user answers, `lan_mode` in the user answers (#676), the loader (usage, refusals, lock, passphrase, a key package's key file on standard input with `KEY_FILE_REQUIRED` and `KEY_FILE_INVALID` (#676), results `success`/`refused`/`failed`/`interrupted`, the Ctrl-C handler) and the access of a collection it creates (#670) |
+| `25_weaviate_upgrade.sh` | the Weaviate upgrade path (#805), full runs only: the previous Weaviate (`RAG_WEAVIATE_FROM`, else `origin/main`'s pin) writes data on a throwaway volume, the checkout's reads it back, and again after a Raft snapshot and a restart; only on the verify project |
+| `weaviate_upgrade.py` | helper for suite 25, on the host with the docker CLI: the throwaway container, volume and internal network of the verify project, the steps and their checks; its client part runs in one-off api-image containers (#805) |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
 | `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
 | `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530); the nginx tag in SPECIFICATIONS.md's compose copy and 11.3 image list matches docker-compose.yml (#665), registered by infrastructure |
+| `../tests/test_weaviate_upgrade.py` | host-only: suite 25's helper with a fake `docker`: the tags it upgrades between and its refusals, the read-back comparison, the labels, no published port, the internal network, the snapshot settings, the step order, stopping at a failure, removal after a pass and a failure, never an image; the embedded copies (#805) |
 | `../tests/test_upgrade_backup.py` | host-only: the README's 1.1.0 → 1.2.0 upgrade blocks, run as written under bash, `zsh -c` and interactive zsh with comments off, against stub `docker`, `git` and `curl`; the stub docker accepts only mounts inside its temp directory and only the README's two container commands: no block holds a `#` comment line; the backup skips a missing volume (a wrong prefix) and counts only existing volumes' archives, and writes each copy to a `.tmp` file that replaces the archive only once `gzip -t` passes, so a failed or corrupt copy prints `backup FAILED` and keeps an earlier archive; the rollback is gated on `git checkout v1.1.0` and checks every archive (`gzip -t`, `tar tzf`) and volume before it empties any, and a failed restore stops before `compose up`; alpine is pinned by version and digest; git ignores `backups/` (#679, #693), registered by infrastructure |
-| `../tests/test_backup_scripts.py` | runs from the host, standard library plus the docker CLI: `scripts/backup.sh` and `scripts/restore.sh` (#848) on throwaway volumes of a random project of their own (`rd848t<hex>`, with compose's labels, removed afterwards), run from a scratch git checkout with their own `HOME`: a backup then a restore gives back every file, folder, link, mode and owner; every volume gets its own key, and no two keys match over two runs; the backup folder (0700) holds only `.tgz.age` archives and `.key` files (0600), with no unencrypted archive and no key in the output; a missing volume is skipped and a running container of the project is stopped, not removed; a wrong key, a missing key file and a damaged or cut archive change nothing and stop nothing, and a wrong key or a Docker error in the check shows what age or Docker said; an extraction that fails after the check (a damaged copy fed by a docker wrapper) leaves the volume unchanged, its root's mode and owner included; a Docker error in the key step is shown, with no line holding a secret key; the prefix and location refusals, and the checkout named in another case refused where the filesystem ignores case; the age image pins (the README's alpine, an exact `age` package), its tag following the whole Dockerfile (a stub docker: a new digest or an added instruction gives a new tag, a comment or a blank line doesn't, #852, #856; with no `sha256sum` the same tag from `shasum`, and with neither a refusal before any build), a volume holding an interrupted restore's `.rag-docker-restore.*` folder backed up without it, the folder left in place, and restored without it (#856), and `*.key` in `.gitignore`. Skipped, with a message, only when the docker CLI is missing; it builds the age image (`scripts/age`) if this machine doesn't have it, which needs the network. Registered by infrastructure |
+| `../tests/test_backup_scripts.py` | runs from the host, standard library plus the docker CLI: `scripts/backup.sh` and `scripts/restore.sh` (#848) on throwaway volumes of a random project of their own (`rd848t<hex>`, with compose's labels, removed afterwards), run from a scratch git checkout with their own `HOME`: a backup then a restore gives back every file, folder, link, mode and owner; every volume gets its own key, and no two keys match over two runs; the backup folder (0700) holds only `.tgz.age` archives and `.key` files (0600), with no unencrypted archive and no key in the output; a missing volume is skipped and a running container of the project is stopped, not removed; a wrong key, a missing key file and a damaged or cut archive change nothing and stop nothing, and a wrong key or a Docker error in the check shows what age or Docker said; an extraction that fails after the check (a damaged copy fed by a docker wrapper) leaves the volume unchanged, its root's mode and owner included; a Docker error in the key step is shown, with no line holding a secret key; the prefix and location refusals, and the checkout named in another case refused where the filesystem ignores case; the age image pins (the README's alpine, an exact `age` package), its tag following the whole Dockerfile and the age folder (a stub docker: a new digest, an added instruction, an added or changed parser directive, or a file added to or changed in `scripts/age` gives a new tag, a comment, a blank line or a `# key=value` comment after the first comment doesn't, and removing the added file gives the tag back, #852, #856, #862; with no `sha256sum` the same tag from `shasum`, and with neither a refusal before any build), a volume holding an interrupted restore's `.rag-docker-restore.*` folder backed up without it, the folder left in place, and restored without it (#856), and `*.key` in `.gitignore`. Skipped, with a message, only when the docker CLI is missing; it builds the age image (`scripts/age`) if this machine doesn't have it, which needs the network. Registered by infrastructure |
 | `../tests/test_version_agreement.py` | host-only: the first-party version strings agree with each other, not with a fixed version: `ui/package.json`, the root versions in `ui/package-lock.json`, `mcp/mcpapp.py`, the two `service.version` defaults in `api/services/telemetry.py` and `RAG_OTEL_SERVICE_VERSION` in `docker-compose.telemetry.yml` and `docker-compose.telemetry.verify.yml` (#605, #656), registered by infrastructure |
 | `../tests/test_ui_dependencies.py` | host-only: the copy of `ui/package.json` embedded in `IMPLEMENTATION.md` (`### ui/package.json`) is the file, exactly, so a UI dependency bump that misses the copy fails (#532), registered by infrastructure |
 | `../tests/test_tailwind_output.py` | runs from the host, standard library plus the docker CLI: the built UI CSS keeps what the Tailwind 4 migration relies on (RD-157, #773): the `prose` and `prose-sm` rules, `relative`, `hover` on every device with no `@media (hover: hover)`, and the `@source` globs with automatic detection off (a sentinel `.jsx` file under `ui/src/` is scanned, a sentinel `.md` file is not). It builds a scratch copy of `ui/` with `npm ci --ignore-scripts` from the lock file and `vite build` in a throwaway container of the image `ui/Dockerfile` builds with (its `builder` stage), not on the host (#826), so it needs the network unless the image and the npm cache are present, and is skipped, with a message, only when the docker CLI is missing (a docker or build failure fails it); a second class reads `ui/src/index.css`, `NavBar.tsx` and `ui/Dockerfile` directly, and checks that the builder image is an image reference with a tag or a digest (a `--platform` flag, a digest pin and a registry with a port are accepted; a token starting with `-` is refused before it reaches `docker run`); a third checks, with a stub in place of docker, that a build step that times out has its named container removed (#841). Registered by infrastructure |
@@ -31970,7 +32004,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_package_refusals.py` | controlled import checks 1 and 2, collection-name and `chunks.jsonl` record refusals, registered by suite 15 |
 | `../tests/test_transfer_paths.py` | controlled transfer and tuning route regressions through the app, registered by suite 15 |
 | `../tests/test_retrieve_script.py` | controlled `retrieve.py` defaults, flags and exit codes against a stub API, registered by suite 15 |
-| `../tests/test_distribution.py` | `package.sh`, `package-offline.sh` and `install-offline.sh` with stubbed `docker`, and the image list, on the host, registered by suite 15; the offline bundle also saves the backup scripts' age image, built from the bundle's own `scripts/age` when missing, and a failed build saves nothing (#852) |
+| `../tests/test_distribution.py` | `package.sh`, `package-offline.sh` and `install-offline.sh` with stubbed `docker`, and the image list, on the host, registered by suite 15; the offline bundle also saves the backup scripts' age image, built from the bundle's own `scripts/age` when missing, and a failed build saves nothing (#852); the Ollama image the script runs is the one in its image list, the install fails when a service is still not running after 60 polls, and `transfer_packages.py` refuses a package with an unsafe member (#490) |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types, the Import page's corpus preparation rules download (#615), the page controls of #400 (see "UI control browser checks") and, last, the login page against nginx's real login rate limit (#577) |
 | `14_reindex.sh` | exact-record reindex: a host check that the embedded sources match the real files (`../tests/test_reindex_preservation.py`), 30 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
 | `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures, canonical local session IDs and exact successful-creation ownership. Verifier collection names deliberately lie outside the parent prefix-sweep namespace. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves a durable exact-name fixture receipt/directory before standalone exit; inspection must confirm terminal writer state before exact-name cleanup |
@@ -31999,7 +32033,8 @@ through the proxy that download refuses other upload state with 400 (#370).
 | `RAG_API` | `http://localhost:8080/api` | where the API is; `stack.sh` sets it to the verify project. Port 8080, the default, is refused as the live stack unless `RAG_VERIFY_LIVE=1` |
 | `RAG_EXPORTS_DIR` | `<checkout>/exports` | the host folder behind the API's `/app/exports`; `stack.sh` sets it to the verify project's own folder |
 | `RAG_VERIFY_LIVE` | `0` | `1` lets `all.sh` and the suites run against the live `rag-docker` stack, with a warning. Never used by the documented commands or the PR review, and never enables a restart of the live stack |
-| `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
+| `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call, and the Weaviate upgrade-path check (suite 25, #805) |
+| `RAG_WEAVIATE_FROM` | the tag in `origin/main`'s `docker-compose.yml` | suite 25: the Weaviate tag (`X.Y.Z`) it upgrades from (#805) |
 | `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, the query metrics reload in `03_query.sh`, the batch recovery acceptance in `05_transfer.sh`, retrieval settings and metrics across a restart and the first start from empty volumes in `16_api_paths.sh`, a session and a login lockout across a restart in `17_auth.sh`, and audit records across a restart in `19_audit.sh`); never the `rag-docker` project |
 | `RAG_RESTART_LIMIT_S` | `240` | seconds `01_infrastructure.sh`'s restart check allows from `down` to a healthy `/health`: Weaviate's `start_period` plus 60. The result line reports the measured time on a pass and on a fail (#130) |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
@@ -32372,7 +32407,8 @@ retrieval settings files, the query metric and the metrics filter, retained orig
 (`MyDocs`). It fails on the code before #372. Suite 05 then, on the verify stack, creates and
 ingests under a lowercase-first name, reads the tuning options and exports under the stored
 name, re-chunks under the lowercase name and, unless `RAG_SKIP_SLOW=1`, checks a query's
-metrics under both spellings.
+metrics under both spellings, and generates a gold-standard session under the lowercase name and checks that the
+export of the stored name carries it, as `goldstandard/<session id>.json` with the stored name (#472).
 
 Suite 01 also runs `scripts/tests/test_health.py` the same way (#375). It sends `GET /health/details`
 through the app with Ollama's `/api/tags` answered by an httpx mock transport and the Weaviate
@@ -32669,7 +32705,7 @@ printf '\nBuilding fixtures in %s\n' "$FIX"
 rm -rf "$FIX"; python3 ./fixtures.py "$FIX" >/dev/null
 export RAG_FIXTURES="$FIX"
 
-ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings 15_telemetry 17_auth 18_lan 19_audit 20_offline_model 21_prepare 22_ui_ingest 23_llm_split 24_query_only 25_external_ollama)
+ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings 15_telemetry 17_auth 18_lan 19_audit 20_offline_model 21_prepare 22_ui_ingest 23_llm_split 24_query_only 25_weaviate_upgrade 26_external_ollama)
 if [ "$#" -gt 0 ]; then
   SUITES=()
   for want in "$@"; do
@@ -32786,7 +32822,7 @@ exit "$overall"
 # with the `ollama pull` lines. The model copy is not used. The guard then
 # allows exactly `ollama:host-gateway` as extra_hosts on api and weaviate, and
 # nothing else, and refuses a configuration that still has an ollama service.
-# Without suite names, an --external-ollama run runs 25_external_ollama.
+# Without suite names, an --external-ollama run runs 26_external_ollama.
 #
 # --telemetry checks the collector image against this checkout's own
 # telemetry/image.json, so a PR that changes the pin is refused. To evaluate
@@ -33573,7 +33609,7 @@ case "$CMD" in
     # A query-only run checks query-only mode (#670).
     [ "$QUERY_ONLY" = 0 ] || [ "${#ARGS[@]}" -gt 0 ] || ARGS=(24_query_only)
     # An external-Ollama run checks external-Ollama mode (#673).
-    [ "$EXTERNAL" = 0 ] || [ "${#ARGS[@]}" -gt 0 ] || ARGS=(25_external_ollama)
+    [ "$EXTERNAL" = 0 ] || [ "${#ARGS[@]}" -gt 0 ] || ARGS=(26_external_ollama)
     # In the background with job control on, all.sh leads a process group of
     # its own (pgid $!), which stop_suite ends; and `wait`, unlike a foreground
     # command, returns as soon as INT or TERM arrives, so the traps act at once.
@@ -38676,6 +38712,612 @@ if __name__ == "__main__":
     sys.exit(main(sys.argv))
 ```
 
+### scripts/verify/25_weaviate_upgrade.sh
+
+```bash
+#!/usr/bin/env bash
+# The Weaviate upgrade path (#805): data written by the previous Weaviate opens
+# on the checkout's, and a restart after a Raft snapshot works on upgraded data.
+#
+# Full runs only (maintainer decision 2026-11-26): a run with RAG_SKIP_SLOW=1,
+# CI's among them, skips it. The tag it upgrades from is RAG_WEAVIATE_FROM, or
+# else the one in origin/main's docker-compose.yml, the last release; the tag it
+# upgrades to is the checkout's. When they are the same, the write, restart and
+# restart-after-snapshot steps still run on that one version.
+#
+# Only on the verify project as stack.sh sets it up (the condition of removing
+# its volumes, #465): weaviate_upgrade.py creates a throwaway container, volume
+# and internal network labelled as part of rag-verify, publishes nothing, and
+# removes them at the end; `stack.sh down` removes whatever a killed run leaves.
+# It never touches the project's own services or volumes, and removes no image.
+cd "$(dirname "$0")" && . ./lib.sh
+REPO_ROOT="$(cd ../.. && pwd)"
+require_stack
+OUT="$(mktemp)"; ERR="$(mktemp)"; CONFIG="$(mktemp)"
+trap 'rm -f "$OUT" "$ERR" "$CONFIG"' EXIT
+
+section "Weaviate upgrade path (#805)"
+
+if [ "$SKIP_SLOW" = "1" ]; then
+  skip "the Weaviate upgrade path from the release on main to the checkout" \
+    "full runs only; set RAG_SKIP_SLOW=0 to include it"
+  summary; exit $?
+fi
+
+refusal=$(volume_removal_refusal_reason)
+if [ -n "$refusal" ]; then
+  check "the Weaviate upgrade path runs only on the verify project" 1 "$refusal"
+  summary; exit $?
+fi
+
+_rag_require_lock_owner
+if ! (cd "$REPO_ROOT" && docker compose config --format json) > "$CONFIG" 2> "$ERR"; then
+  check "the verify project's configuration resolves" 1 "$(tail -c 400 "$ERR")"
+  summary; exit $?
+fi
+api_image=$(cd "$REPO_ROOT" && docker compose images -q api 2>/dev/null | head -n 1)
+if [ -z "$api_image" ]; then
+  check "the verify project's api image is there" 1 "docker compose images -q api gave nothing"
+  summary; exit $?
+fi
+
+python3 ./weaviate_upgrade.py run --checkout "$REPO_ROOT" --api-image "$api_image" \
+  --compose-json "$CONFIG" > "$OUT" 2> "$ERR"
+status=$?
+lines=0
+while IFS=$'\t' read -r result name detail; do
+  case "$result" in
+    PASS) check "$name" 0; lines=$((lines+1)) ;;
+    FAIL) check "$name" 1 "$detail"; lines=$((lines+1)) ;;
+  esac
+done < "$OUT"
+if [ "$lines" -eq 0 ] || { [ "$status" -ne 0 ] && [ "$FAIL" -eq 0 ]; }; then
+  check "weaviate_upgrade.py ran to the end" 1 "exit $status: $(tail -c 600 "$ERR")"
+fi
+summary
+```
+
+### scripts/verify/weaviate_upgrade.py
+
+```python
+"""The Weaviate upgrade path, on throwaway resources of the verify project (#805).
+
+Run by 25_weaviate_upgrade.sh, in full runs only. Host side, standard library, Python 3.9+:
+
+    python3 weaviate_upgrade.py run --checkout DIR --api-image ID --compose-json FILE
+
+FILE is the verify project's `docker compose config --format json`. The check starts the
+previous Weaviate tag (RAG_WEAVIATE_FROM, or the tag in origin/main's docker-compose.yml) on a
+fresh volume, writes a collection with vectors, stops it, starts the checkout's tag on the same
+volume and compares what reads back. It then makes Weaviate take a Raft snapshot, restarts it
+and compares again.
+
+Everything it creates, a container, a volume and an internal network, is named
+rag-verify-wvup-<hex> and labelled as part of the rag-verify project, so `stack.sh down` removes
+whatever a killed run leaves; nothing is published on the host. The requests come from one-off
+containers of the verify project's api image, which run this same file in client mode:
+
+    python - client <phase> <host> < weaviate_upgrade.py      (in the api image)
+
+with the weaviate-client the API uses. Images are never removed: the previous tag may be the one
+the live stack runs.
+
+Prints one line per check, `PASS<TAB>name` or `FAIL<TAB>name<TAB>detail`, and exits 1 when any
+check failed.
+"""
+import json
+import math
+import os
+import re
+import secrets
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+IMAGE = 'semitechnologies/weaviate'
+TAG = re.compile(r'^\d+\.\d+\.\d+$')
+COMPOSE_PIN = re.compile(r'^\s+image: ' + re.escape(IMAGE) + r':(\S+)\s*$', re.M)
+LABEL_PROJECT = 'com.docker.compose.project=rag-verify'
+LABEL_CHECK = 'rag-verify.check=weaviate-upgrade'
+# Low enough that a snapshot is taken within the check (compose: 128 and 30).
+SNAPSHOT_ENV = {'RAFT_SNAPSHOT_THRESHOLD': '8', 'RAFT_SNAPSHOT_INTERVAL': '2'}
+DATA_PATH = '/var/lib/weaviate'
+COLLECTION = 'VfyUpgrade'
+CHURN_PREFIX = 'VfyUpgradeChurn'
+OBJECTS = 12
+CHURN = 12
+DIMENSIONS = 8
+READY_S = 300
+SNAPSHOT_S = 180
+STOP_GRACE_S = 60
+POLL_S = 2
+VECTOR_TOLERANCE = 1e-6
+DISTANCE_TOLERANCE = 1e-5
+
+
+class Refusal(Exception):
+    """The check can't run as asked; the message says why and what to do."""
+
+
+class StepFailed(Exception):
+    def __init__(self, detail):
+        super().__init__(detail)
+        self.detail = detail
+
+
+# ── tags (D2) ────────────────────────────────────────────────────────────────
+
+def _version(tag):
+    return tuple(int(part) for part in tag.split('.'))
+
+
+def git_main_compose(checkout):
+    """origin/main's docker-compose.yml, or None when it can't be read. Never fetches."""
+    try:
+        result = subprocess.run(['git', '-C', str(checkout), 'show', 'origin/main:docker-compose.yml'],
+                                capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def resolve_tags(compose, env, main_compose):
+    """(from_tag, from_source, to_tag). `main_compose` is a callable giving origin/main's
+    docker-compose.yml text, or None."""
+    image = str(compose.get('services', {}).get('weaviate', {}).get('image', ''))
+    prefix = IMAGE + ':'
+    to_tag = image[len(prefix):] if image.startswith(prefix) else ''
+    if not TAG.match(to_tag):
+        raise Refusal("the checkout's Weaviate image is '{}', not {}:<X.Y.Z>".format(image, IMAGE))
+    override = env.get('RAG_WEAVIATE_FROM', '')
+    if override:
+        from_tag, source = override, 'RAG_WEAVIATE_FROM'
+        if not TAG.match(from_tag):
+            raise Refusal("RAG_WEAVIATE_FROM must be a plain X.Y.Z Weaviate tag, not '{}'".format(from_tag))
+    else:
+        text = main_compose()
+        match = COMPOSE_PIN.search(text) if text is not None else None
+        if match is None:
+            raise Refusal("origin/main's docker-compose.yml can't be read or names no {} image; "
+                          "set RAG_WEAVIATE_FROM=<X.Y.Z> to the tag to upgrade from".format(IMAGE))
+        from_tag, source = match.group(1), 'origin/main'
+        if not TAG.match(from_tag):
+            raise Refusal("origin/main pins Weaviate '{}', not a plain X.Y.Z tag; "
+                          "set RAG_WEAVIATE_FROM=<X.Y.Z>".format(from_tag))
+    if _version(from_tag) > _version(to_tag):
+        raise Refusal('{} ({}) is newer than the checkout\'s {}: that is not an upgrade'.format(
+            from_tag, source, to_tag))
+    return from_tag, source, to_tag
+
+
+def weaviate_env(compose):
+    """The verify project's weaviate environment, with the snapshot settings lowered."""
+    env = compose.get('services', {}).get('weaviate', {}).get('environment') or {}
+    if isinstance(env, list):          # compose normally gives a mapping; accept KEY=VALUE too
+        env = dict(item.split('=', 1) if '=' in item else (item, '') for item in env)
+    merged = {str(key): '' if value is None else str(value) for key, value in env.items()}
+    merged.update(SNAPSHOT_ENV)
+    return ['{}={}'.format(key, merged[key]) for key in sorted(merged)]
+
+
+# ── comparing what reads back (S8) ───────────────────────────────────────────
+
+def compare(baseline, current):
+    """None when `current` reads back as `baseline`, else the first difference."""
+    if current.get('schema') != baseline.get('schema'):
+        return 'schema differs: {} != {}'.format(json.dumps(current.get('schema')),
+                                                 json.dumps(baseline.get('schema')))
+    if current.get('count') != baseline.get('count'):
+        return 'count {} != {}'.format(current.get('count'), baseline.get('count'))
+    want, got = baseline.get('objects', {}), current.get('objects', {})
+    if sorted(got) != sorted(want):
+        return 'object ids differ: {} != {}'.format(sorted(got), sorted(want))
+    for key in sorted(want):
+        if got[key].get('properties') != want[key].get('properties'):
+            return 'object {} properties {} != {}'.format(key, got[key].get('properties'),
+                                                          want[key].get('properties'))
+        a, b = got[key].get('vector') or [], want[key].get('vector') or []
+        if len(a) != len(b) or any(abs(x - y) > VECTOR_TOLERANCE for x, y in zip(a, b)):
+            return 'object {} vector {} != {}'.format(key, a, b)
+    a, b = current.get('near', []), baseline.get('near', [])
+    if [hit[0] for hit in a] != [hit[0] for hit in b]:
+        return 'nearVector ids {} != {}'.format([hit[0] for hit in a], [hit[0] for hit in b])
+    for (key, x), (_, y) in zip(a, b):
+        if abs(x - y) > DISTANCE_TOLERANCE:
+            return 'nearVector distance of {} {} != {}'.format(key, x, y)
+    return None
+
+
+# ── Docker ───────────────────────────────────────────────────────────────────
+
+class Docker:
+    def run(self, args, input=None, timeout=120):
+        try:
+            result = subprocess.run(['docker'] + list(args), input=input, capture_output=True,
+                                    text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return 124, '', 'docker {} timed out after {}s'.format(' '.join(args[:2]), timeout)
+        except OSError as exc:
+            return 127, '', str(exc)
+        return result.returncode, result.stdout, result.stderr
+
+
+def _tail(text, lines=5):
+    return ' | '.join(line.strip() for line in (text or '').strip().splitlines()[-lines:])
+
+
+def _one_line(text, limit=800):
+    text = re.sub(r'\s+', ' ', str(text)).strip()
+    return text if len(text) <= limit else text[:limit] + '...'
+
+
+class Run:
+    def __init__(self, docker, api_image, compose, tags, script, sleep=time.sleep, clock=time.monotonic,
+                 name=None, out=sys.stdout):
+        self.docker = docker
+        self.api_image = api_image
+        self.compose = compose
+        self.from_tag, self.source, self.to_tag = tags
+        self.script = script
+        self.sleep = sleep
+        self.clock = clock
+        self.name = name or 'rag-verify-wvup-' + secrets.token_hex(4)
+        self.out = out
+        self.failed = False
+
+    # results
+    def result(self, name, ok, detail=''):
+        if ok:
+            self.out.write('PASS\t{}\n'.format(_one_line(name)))
+        else:
+            self.failed = True
+            self.out.write('FAIL\t{}\t{}\n'.format(_one_line(name), _one_line(detail or 'failed')))
+        self.out.flush()
+
+    def labels(self):
+        return ['--label', LABEL_PROJECT, '--label', LABEL_CHECK]
+
+    # resources
+    def cleanup_leftovers(self):
+        filters = ['--filter', 'label=' + LABEL_PROJECT, '--filter', 'label=' + LABEL_CHECK]
+        for listing, remove in ((['ps', '-aq'], ['rm', '-f']), (['volume', 'ls', '-q'], ['volume', 'rm']),
+                                (['network', 'ls', '-q'], ['network', 'rm'])):
+            code, out, _ = self.docker.run(listing + filters)
+            ids = out.split() if code == 0 else []
+            if ids:
+                self.docker.run(remove + ids)
+
+    def ensure_image(self, tag):
+        image = '{}:{}'.format(IMAGE, tag)
+        if self.docker.run(['image', 'inspect', image])[0] == 0:
+            return
+        code, out, err = self.docker.run(['pull', image], timeout=600)
+        if code != 0:
+            raise StepFailed('docker pull {} failed: {}'.format(image, _tail(out + '\n' + err)))
+
+    def create(self):
+        for args in (['network', 'create', '--internal'] + self.labels() + [self.name],
+                     ['volume', 'create'] + self.labels() + [self.name]):
+            code, out, err = self.docker.run(args)
+            if code != 0:
+                raise StepFailed('docker {} failed: {}'.format(' '.join(args[:2]), _tail(out + '\n' + err)))
+
+    def diagnostics(self):
+        _, state, _ = self.docker.run(['inspect', '-f', '{{.State.Status}} exit={{.State.ExitCode}}', self.name])
+        _, out, err = self.docker.run(['logs', '--tail', '20', self.name])
+        return 'state: {}; last log lines: {}'.format(state.strip() or 'unknown', _tail(out + '\n' + err, 20))
+
+    def start(self, tag):
+        args = ['run', '-d', '--name', self.name] + self.labels() + ['--network', self.name,
+                '-v', '{}:{}'.format(self.name, DATA_PATH)]
+        for pair in weaviate_env(self.compose):
+            args += ['-e', pair]
+        args.append('{}:{}'.format(IMAGE, tag))
+        code, out, err = self.docker.run(args, timeout=300)
+        if code != 0:
+            raise StepFailed('docker run {}:{} failed: {}'.format(IMAGE, tag, _tail(out + '\n' + err)))
+        self.wait_ready()
+
+    def wait_ready(self):
+        deadline = self.clock() + READY_S
+        while True:
+            code, _, _ = self.docker.run(['exec', self.name, 'wget', '-q', '--spider',
+                                          'http://localhost:8080/v1/.well-known/ready'], timeout=30)
+            if code == 0:
+                return
+            _, running, _ = self.docker.run(['inspect', '-f', '{{.State.Running}}', self.name])
+            if running.strip() != 'true':
+                raise StepFailed('the container stopped before it was ready; ' + self.diagnostics())
+            if self.clock() >= deadline:
+                raise StepFailed('not ready within {}s; {}'.format(READY_S, self.diagnostics()))
+            self.sleep(POLL_S)
+
+    def stop(self):
+        code, out, err = self.docker.run(['stop', '-t', str(STOP_GRACE_S), self.name], timeout=STOP_GRACE_S + 60)
+        if code != 0:
+            raise StepFailed('docker stop failed: {}'.format(_tail(out + '\n' + err)))
+
+    def client(self, phase):
+        args = ['run', '--rm', '-i', '--network', self.name] + self.labels() + [
+            self.api_image, 'python', '-', 'client', phase, self.name]
+        code, out, err = self.docker.run(args, input=self.script, timeout=600)
+        lines = [line for line in out.strip().splitlines() if line.strip()]
+        try:
+            answer = json.loads(lines[-1]) if lines else None
+        except ValueError:
+            answer = None
+        if code != 0 or not isinstance(answer, dict):
+            raise StepFailed('client {} failed (exit {}): {}'.format(phase, code, _tail(err + '\n' + out)))
+        return answer
+
+    def version(self, want):
+        got = self.client('meta').get('version')
+        if got != want:
+            raise StepFailed('/v1/meta reports {!r}, wanted {!r}'.format(got, want))
+
+    def snapshots(self):
+        code, out, _ = self.docker.run(['exec', self.name, 'find', DATA_PATH, '-path', '*snapshots*',
+                                        '-name', 'meta.json'], timeout=60)
+        return set(out.split()) if code == 0 else set()
+
+    def raft_listing(self):
+        _, out, err = self.docker.run(['exec', self.name, 'find', DATA_PATH + '/raft'], timeout=60)
+        return _tail(out + '\n' + err, 40)
+
+    def wait_snapshot(self, before):
+        deadline = self.clock() + SNAPSHOT_S
+        while True:
+            if self.snapshots() - before:
+                return
+            if self.clock() >= deadline:
+                raise StepFailed('no new Raft snapshot within {}s; {} holds: {}'.format(
+                    SNAPSHOT_S, DATA_PATH + '/raft', self.raft_listing()))
+            self.sleep(POLL_S)
+
+    def remove(self):
+        self.docker.run(['rm', '-f', self.name], timeout=120)
+        self.docker.run(['volume', 'rm', self.name])
+        self.docker.run(['network', 'rm', self.name])
+        left = []
+        for kind, listing in (('container', ['ps', '-aq']), ('volume', ['volume', 'ls', '-q']),
+                              ('network', ['network', 'ls', '-q'])):
+            code, out, _ = self.docker.run(listing + ['--filter', 'name=' + self.name,
+                                                      '--filter', 'label=' + LABEL_CHECK])
+            if code != 0 or out.strip():
+                left.append(kind)
+        self.result('the throwaway container, volume and network are removed', not left,
+                    'left: ' + ', '.join(left) + ' ' + self.name)
+
+    # the steps (S6)
+    def steps(self):
+        f, t = self.from_tag, self.to_tag
+
+        def step(name, action):
+            try:
+                action()
+            except StepFailed as exc:
+                self.result(name, False, exc.detail)
+                return False
+            self.result(name, True)
+            return True
+
+        state = {}
+
+        def first_start():
+            self.ensure_image(f)
+            self.create()
+            self.start(f)
+            self.version(f)
+
+        def write():
+            state['baseline'] = self.client('write')
+            if state['baseline'].get('count') != OBJECTS:
+                raise StepFailed('wrote {} objects, {} read back'.format(OBJECTS, state['baseline'].get('count')))
+
+        def upgrade():
+            self.stop()
+            code, out, err = self.docker.run(['rm', self.name])
+            if code != 0:
+                raise StepFailed('docker rm failed: {}'.format(_tail(out + '\n' + err)))
+            self.start(t)
+            self.version(t)
+
+        def same(after):
+            def check():
+                current = self.client('read')
+                difference = compare(state['baseline'], current)
+                if difference:
+                    raise StepFailed(difference)
+                if after:
+                    churned = [c for c in current.get('collections', []) if c.startswith(CHURN_PREFIX)]
+                    if churned:
+                        raise StepFailed('throwaway collections still exist: {}'.format(churned))
+            return check
+
+        def snapshot():
+            before = self.snapshots()
+            answer = self.client('churn')
+            if answer.get('churned') != CHURN:
+                raise StepFailed('churn answered {}'.format(answer))
+            self.wait_snapshot(before)
+
+        def restart():
+            self.stop()
+            code, out, err = self.docker.run(['start', self.name], timeout=120)
+            if code != 0:
+                raise StepFailed('docker start failed: {}'.format(_tail(out + '\n' + err)))
+            self.wait_ready()
+            self.version(t)
+
+        plan = (
+            ('{f} starts on a fresh volume and reports {f}', first_start),
+            ('data written on {f} reads back ({n} objects with vectors)', write),
+            ("{t} starts on {f}'s volume and reports {t}", upgrade),
+            ('after the upgrade the schema, count, objects and nearVector match', same(False)),
+            ('{t} takes a Raft snapshot after {c} collections are created and deleted', snapshot),
+            ('{t} restarts after the snapshot and reports {t}', restart),
+            ('after the restart the data matches and the throwaway collections are gone', same(True)),
+        )
+        for name, action in plan:
+            if not step(name.format(f=f, t=t, n=OBJECTS, c=CHURN), action):
+                return
+
+    def run(self):
+        self.cleanup_leftovers()
+        try:
+            self.steps()
+        finally:
+            self.remove()
+        return 1 if self.failed else 0
+
+
+def host_main(argv, docker=None, env=None, main_compose=None, out=sys.stdout):
+    import argparse
+    parser = argparse.ArgumentParser(prog='weaviate_upgrade.py')
+    parser.add_argument('command', choices=['run'])
+    parser.add_argument('--checkout', required=True)
+    parser.add_argument('--api-image', required=True)
+    parser.add_argument('--compose-json', required=True)
+    args = parser.parse_args(argv)
+    env = os.environ if env is None else env
+    compose = json.loads(Path(args.compose_json).read_text())
+    if main_compose is None:
+        def main_compose():
+            return git_main_compose(args.checkout)
+    try:
+        tags = resolve_tags(compose, env, main_compose)
+    except Refusal as exc:
+        out.write('FAIL\tthe upgrade path to the checkout\'s Weaviate\t{}\n'.format(_one_line(exc)))
+        return 1
+    f, source, t = tags
+    out.write('PASS\tupgrade path {} ({}) -> {} (checkout){}\n'.format(
+        f, source, t, ': same version' if f == t else ''))
+    out.flush()
+    script = Path(__file__).read_text()
+    return Run(docker or Docker(), args.api_image, compose, tags, script, out=out).run()
+
+
+# ── client mode, in the api image ────────────────────────────────────────────
+
+def _http_json(host, path):
+    import urllib.request
+    with urllib.request.urlopen('http://{}:8080{}'.format(host, path), timeout=60) as response:
+        return json.loads(response.read().decode())
+
+
+def _connect(host):
+    import weaviate
+    deadline = time.monotonic() + 60
+    while True:
+        try:
+            return weaviate.connect_to_custom(http_host=host, http_port=8080, http_secure=False,
+                                              grpc_host=host, grpc_port=50051, grpc_secure=False)
+        except Exception:                          # noqa: BLE001 — gRPC can lag /ready
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(2)
+
+
+def _vector(i):
+    return [math.sin(i + k) for k in range(DIMENSIONS)]
+
+
+def _read(host, client):
+    from weaviate.classes.query import MetadataQuery
+    schema = _http_json(host, '/v1/schema/' + COLLECTION)
+    projection = {
+        'class': schema.get('class'),
+        'properties': sorted([p.get('name'), p.get('dataType')] for p in schema.get('properties', [])),
+        'vectorizer': schema.get('vectorizer'),
+        'vectorIndexType': schema.get('vectorIndexType'),
+        'distance': (schema.get('vectorIndexConfig') or {}).get('distance'),
+    }
+    coll = client.collections.get(COLLECTION)
+    count = coll.aggregate.over_all(total_count=True).total_count
+    objects = {}
+    for i in range(OBJECTS):
+        key = str(uuid.UUID(int=i + 1))
+        obj = coll.query.fetch_object_by_id(key, include_vector=True)
+        if obj is None:
+            objects[key] = {'properties': None, 'vector': None}
+            continue
+        vector = obj.vector
+        if isinstance(vector, dict):
+            vector = vector.get('default', next(iter(vector.values()), None))
+        objects[key] = {'properties': json.loads(json.dumps(obj.properties, sort_keys=True, default=str)),
+                        'vector': list(vector) if vector is not None else None}
+    hits = coll.query.near_vector(near_vector=[math.cos(k) for k in range(DIMENSIONS)], limit=5,
+                                  return_metadata=MetadataQuery(distance=True)).objects
+    near = [[str(hit.uuid), hit.metadata.distance] for hit in hits]
+    collections = sorted(c.get('class') for c in _http_json(host, '/v1/schema').get('classes', []))
+    return {'schema': projection, 'count': count, 'objects': objects, 'near': near, 'collections': collections}
+
+
+def client_main(argv):
+    phase, host = argv[0], argv[1]
+    if phase == 'meta':
+        print(json.dumps({'version': _http_json(host, '/v1/meta').get('version')}))
+        return 0
+    from datetime import datetime, timedelta, timezone
+    from weaviate.classes.config import Configure, DataType, Property, VectorDistances
+    from weaviate.classes.data import DataObject
+    client = _connect(host)
+    try:
+        if phase == 'write':
+            # As weaviate_client._create_collection_sync creates a collection, with its defaults.
+            client.collections.create(
+                name=COLLECTION,
+                vectorizer_config=Configure.Vectorizer.text2vec_ollama(
+                    # Never called: every object carries its vector.
+                    api_endpoint='http://ollama:11434', model='nomic-embed-text',
+                    vectorize_collection_name=False),
+                vector_index_config=Configure.VectorIndex.hnsw(distance_metric=VectorDistances.COSINE,
+                                                               ef_construction=128, max_connections=64, ef=64),
+                properties=[
+                    Property(name='content', data_type=DataType.TEXT, index_searchable=True, index_filterable=True),
+                    Property(name='source_file', data_type=DataType.TEXT, index_searchable=False, index_filterable=True),
+                    Property(name='source_type', data_type=DataType.TEXT, index_searchable=False, index_filterable=True),
+                    Property(name='chunk_index', data_type=DataType.INT, index_filterable=True),
+                    Property(name='chunk_strategy', data_type=DataType.TEXT, index_searchable=False, index_filterable=True),
+                    Property(name='chunk_size', data_type=DataType.INT, index_filterable=True),
+                    Property(name='chunk_overlap', data_type=DataType.INT, index_filterable=True),
+                    Property(name='created_at', data_type=DataType.DATE, index_filterable=True),
+                ])
+            start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            objects = [DataObject(uuid=uuid.UUID(int=i + 1), vector=_vector(i), properties={
+                'content': 'Upgrade check chunk {} of the Weaviate upgrade path.'.format(i),
+                'source_file': 'upgrade-{}.txt'.format(i % 3), 'source_type': 'txt',
+                'chunk_index': i, 'chunk_strategy': 'fixed', 'chunk_size': 400, 'chunk_overlap': 40,
+                'created_at': start + timedelta(days=i)}) for i in range(OBJECTS)]
+            outcome = client.collections.get(COLLECTION).data.insert_many(objects)
+            if outcome.has_errors:
+                print('insert errors: {}'.format(getattr(outcome, 'errors', outcome)), file=sys.stderr)
+                return 1
+            print(json.dumps(_read(host, client)))
+        elif phase == 'read':
+            print(json.dumps(_read(host, client)))
+        elif phase == 'churn':
+            for i in range(CHURN):
+                name = '{}{}'.format(CHURN_PREFIX, i)
+                client.collections.create(name=name, vectorizer_config=Configure.Vectorizer.none())
+                client.collections.delete(name)
+            print(json.dumps({'churned': CHURN}))
+        else:
+            print('unknown phase {!r}'.format(phase), file=sys.stderr)
+            return 2
+    finally:
+        client.close()
+    return 0
+
+
+if __name__ == '__main__':
+    if len(sys.argv) > 1 and sys.argv[1] == 'client':
+        sys.exit(client_main(sys.argv[2:]))
+    sys.exit(host_main(sys.argv[1:]))
+```
+
 ### scripts/tests/test_lan_mode.py
 
 ````python
@@ -39958,7 +40600,7 @@ if __name__ == "__main__":
     unittest.main(verbosity=2)
 ```
 
-### scripts/verify/25_external_ollama.sh
+### scripts/verify/26_external_ollama.sh
 
 ```bash
 #!/usr/bin/env bash
@@ -40222,7 +40864,7 @@ path and the refused export with models, `python -m ollama_check`, the overlay
 file and the base file's two settings, and install-offline.sh's options.
 
 Runs with the API's dependencies, on the host (`~/.venvs/rag-api/bin/python`) or
-in the built API image with no network (`25_external_ollama.sh`):
+in the built API image with no network (`26_external_ollama.sh`):
 
     docker run --rm --network none -v "$PWD:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api \\
       "$(docker compose images -q api)" python scripts/tests/test_external_ollama.py
@@ -53595,6 +54237,7 @@ fi
 # originals, the package and the metrics must all land under the stored name.
 SC="$(printf %s "${PREFIX:0:1}" | tr '[:lower:]' '[:upper:]')${PREFIX:1}Spelling"
 SL="$(printf %s "${SC:0:1}" | tr '[:upper:]' '[:lower:]')${SC:1}"
+spsid=""
 drop_collection "$SC"
 api_post "/collections" "{\"name\":\"$SL\"}" > /tmp/vfy_sp_create.json
 check_eq "#372: creating '$SL' answers the stored name" \
@@ -53636,9 +54279,47 @@ else
   spc=$(api_get "/metrics/latency?collection=$SC&history_limit=0" | jfield "['total_records']")
   check "#372: the metrics filter finds the query under both spellings" \
     "$([ -n "$spl" ] && [ "$spl" -ge 1 ] && [ "$spl" = "$spc" ] && echo 0 || echo 1)" "lowercase=$spl stored=$spc"
+  # A gold-standard session generated under the lowercase spelling is filed
+  # under the stored name, so an export of the stored name carries it (#472).
+  api_post "/goldstandard/generate" "{\"collection\":\"$SL\",\"sample_size\":1}" > /tmp/vfy_sp_gen.json
+  spsid=$(jfield "['session_id']" < /tmp/vfy_sp_gen.json)
+  check "#472: a generation under '$SL' starts" "$([ -n "$spsid" ] && echo 0 || echo 1)" \
+    "$(head -c 300 /tmp/vfy_sp_gen.json)"
+  if [ -n "$spsid" ]; then
+    check_eq "#472: the generation under '$SL' completes" \
+      "$(wait_for_job "/goldstandard/session/$spsid" 900)" "completed"
+    check_eq "#472: the session is recorded under '$SC'" \
+      "$(api_get "/goldstandard/session/$spsid" | jfield "['collection']")" "$SC"
+    api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$SC\",\"include_models\":false}" > /tmp/vfy_sp_gexp.json
+    spgjob=$(jfield "['job_id']" < /tmp/vfy_sp_gexp.json)
+    check_eq "#472: the export of '$SC' after the generation completes" \
+      "$(wait_for_job "/export/job/$spgjob" 1800)" "completed"
+    spgpkg=$(api_get "/export/job/$spgjob" | jfield "['filename']")
+    python3 - "$EXPORTS/$spgpkg" "$spsid" "$SC" <<'ENDPY'
+import json, sys, tarfile
+pkg, sid, stored = sys.argv[1:]
+want = "goldstandard/%s.json" % sid          # under the package's top folder
+try:
+    with tarfile.open(pkg) as t:
+        member = next(m for m in t.getmembers()
+                      if m.isfile() and (m.name == want or m.name.endswith("/" + want)))
+        session = json.load(t.extractfile(member))
+except Exception as exc:                      # noqa: BLE001 -- reported as the failure
+    print("cannot read %s from %s: %s %s" % (want, pkg, type(exc).__name__, exc)); sys.exit(1)
+ok = session.get("session_id") == sid and session.get("collection") == stored
+print("session_id=%s collection=%s" % (session.get("session_id"), session.get("collection")))
+sys.exit(0 if ok else 1)
+ENDPY
+    check "#472: the export of '$SC' carries the session generated under '$SL'" $? \
+      "package $spgpkg"
+    [ -n "$spgpkg" ] && [ "$spgpkg" != "None" ] && rm -f "$EXPORTS/$spgpkg"
+  fi
 fi
 [ -n "$sppkg" ] && rm -f "$EXPORTS/$sppkg"
 drop_collection "$SC"
+# The session file outlives its collection by design (spec §8 rule 4).
+[ -z "$spsid" ] || (cd "$REPO_ROOT" && docker compose exec -T api \
+  rm -f "/app/uploads/goldstandard_sessions/$spsid.json") >/dev/null 2>&1 || true
 
 # ── downloading a package, and expiry (#677) ─────────────────────────────────
 # A full download through the proxy deletes a package exported here; an
@@ -54282,6 +54963,10 @@ Kinds, by the import check that refuses them:
   records, PACKAGE_CORRUPT:  badline baduuid badprops novector wrongwidth countup countdown
 The record kinds re-sign `chunks.jsonl` in the manifest, so the digests still match and only
 the record decides; `countup`/`countdown` change only the manifest, which is not digested.
+
+Every member of the package is checked before anything is extracted, on every Python (#490):
+an absolute name, a `..` in a name, or a member that is neither a regular file nor a
+directory (a link, a device, a FIFO) refuses the package, and nothing is written.
 """
 import hashlib
 import io
@@ -54296,11 +54981,27 @@ KINDS = ("nongzip", "truncated", "symlink", "hardlink", "dotdot", "twodirs", "no
          "wrongwidth", "countup", "countdown")
 
 
+def unsafe(member):
+    """Why a package member may not be extracted, or None (#490): an absolute name, a `..`
+    component, or anything but a regular file or a directory (a link, a device, a FIFO)."""
+    if member.name.startswith("/"):
+        return "an absolute name"
+    if ".." in pathlib.PurePosixPath(member.name).parts:
+        return "a '..' in its name"
+    if not (member.isfile() or member.isdir()):
+        return "not a regular file or a directory"
+    return None
+
+
 def extract(src, work):
     with tarfile.open(src) as tar:
+        for member in tar.getmembers():
+            reason = unsafe(member)
+            if reason:
+                sys.exit(f"{src.name}: refused member '{member.name}': {reason}; nothing was written")
         if hasattr(tarfile, "data_filter"):
             tar.extractall(work, filter="data")
-        else:                                   # the suite's own package, before 3.9.17
+        else:                                   # before 3.9.17: every member was checked above
             tar.extractall(work)
     return next(p for p in work.iterdir() if p.is_dir())
 
@@ -57852,7 +58553,7 @@ jobs:
   # was tested with), installed with its release's own install script, checked
   # by sha256, then bound to the docker0 address with a systemd drop-in, never
   # 0.0.0.0, and its models pulled, as a user would; rag-docker itself never
-  # pulls into it. Then `stack.sh up --external-ollama` and suite 25, with
+  # pulls into it. Then `stack.sh up --external-ollama` and suite 26, with
   # RAG_SKIP_SLOW=1 as the job above. The native model store is cached by
   # release and model names.
   external-ollama:
@@ -57950,7 +58651,7 @@ jobs:
             | while read -r var; do printf '%s=%s\n' "$var" "${!var}"; done >> "$GITHUB_ENV"
 
       - name: Run the external-Ollama suite
-        run: bash scripts/verify/all.sh 25_external_ollama
+        run: bash scripts/verify/all.sh 26_external_ollama
 
       - name: Collect the compose logs
         if: always()
@@ -58012,7 +58713,7 @@ action pins, the stack.sh up / all.sh / stack.sh down sequence on the
 disposable verify project, the compose logs artifact and the model cache, in
 the `verify` job; and the `external-ollama` job (#673), which installs the
 pinned native Ollama from its release's install script checked by sha256, binds
-it to the docker0 address and runs suite 25 in `stack.sh up --external-ollama`. Also
+it to the docker0 address and runs suite 26 in `stack.sh up --external-ollama`. Also
 checks the README badge and the copies embedded in IMPLEMENTATION.md. The
 workflow's real run is the pull request's own; this keeps its rules from
 drifting. Standard library only; no Docker or stack needed.
@@ -58231,7 +58932,7 @@ class ExternalOllamaJobTests(unittest.TestCase):
         order = [step_with(text, needle)[0] for needle in (
             'name: Install native Ollama', 'name: Bind Ollama', 'name: Pull the models',
             'bash scripts/verify/stack.sh up --external-ollama',
-            'bash scripts/verify/all.sh 25_external_ollama',
+            'bash scripts/verify/all.sh 26_external_ollama',
             'docker compose -p rag-verify logs', 'actions/upload-artifact@',
             'bash scripts/verify/stack.sh down')]
         self.assertEqual(order, sorted(order))
@@ -58697,14 +59398,24 @@ else
 fi
 
 echo
-echo "Waiting for services to report healthy..."
+# Five services, six with telemetry; one fewer with an external Ollama (#673).
+EXPECTED=$((5 + TELEMETRY - EXTERNAL))
+if [ "$EXTERNAL" = 1 ]; then
+  echo "Waiting for the $EXPECTED services to be running (docker compose up has already waited for weaviate and api to report healthy)..."
+else
+  echo "Waiting for the $EXPECTED services to be running (docker compose up has already waited for weaviate, ollama and api to report healthy)..."
+fi
+running=0
 for i in $(seq 1 60); do
   running=$(docker compose ps --services --filter status=running | wc -l | tr -d ' ')
-  # Five services, six with telemetry; one fewer with an external Ollama.
-  [ "$running" = "$((5 + TELEMETRY - EXTERNAL))" ] && break
+  [ "$running" = "$EXPECTED" ] && break
   sleep 5
 done
 docker compose ps
+if [ "$running" != "$EXPECTED" ]; then
+  echo "ERROR: only $running of $EXPECTED services are running after 5 minutes. See 'docker compose ps' above, and 'docker compose logs <service>' for one that isn't running." >&2
+  exit 1
+fi
 
 echo
 echo "If the requested services are up, open http://localhost:8080"

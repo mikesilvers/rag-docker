@@ -14,6 +14,10 @@ Kinds, by the import check that refuses them:
   records, PACKAGE_CORRUPT:  badline baduuid badprops novector wrongwidth countup countdown
 The record kinds re-sign `chunks.jsonl` in the manifest, so the digests still match and only
 the record decides; `countup`/`countdown` change only the manifest, which is not digested.
+
+Every member of the package is checked before anything is extracted, on every Python (#490):
+an absolute name, a `..` in a name, or a member that is neither a regular file nor a
+directory (a link, a device, a FIFO) refuses the package, and nothing is written.
 """
 import hashlib
 import io
@@ -28,11 +32,27 @@ KINDS = ("nongzip", "truncated", "symlink", "hardlink", "dotdot", "twodirs", "no
          "wrongwidth", "countup", "countdown")
 
 
+def unsafe(member):
+    """Why a package member may not be extracted, or None (#490): an absolute name, a `..`
+    component, or anything but a regular file or a directory (a link, a device, a FIFO)."""
+    if member.name.startswith("/"):
+        return "an absolute name"
+    if ".." in pathlib.PurePosixPath(member.name).parts:
+        return "a '..' in its name"
+    if not (member.isfile() or member.isdir()):
+        return "not a regular file or a directory"
+    return None
+
+
 def extract(src, work):
     with tarfile.open(src) as tar:
+        for member in tar.getmembers():
+            reason = unsafe(member)
+            if reason:
+                sys.exit(f"{src.name}: refused member '{member.name}': {reason}; nothing was written")
         if hasattr(tarfile, "data_filter"):
             tar.extractall(work, filter="data")
-        else:                                   # the suite's own package, before 3.9.17
+        else:                                   # before 3.9.17: every member was checked above
             tar.extractall(work)
     return next(p for p in work.iterdir() if p.is_dir())
 

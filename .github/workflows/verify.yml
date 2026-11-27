@@ -144,7 +144,7 @@ jobs:
   # was tested with), installed with its release's own install script, checked
   # by sha256, then bound to the docker0 address with a systemd drop-in, never
   # 0.0.0.0, and its models pulled, as a user would; rag-docker itself never
-  # pulls into it. Then `stack.sh up --external-ollama` and suite 25, with
+  # pulls into it. Then `stack.sh up --external-ollama` and suite 26, with
   # RAG_SKIP_SLOW=1 as the job above. The native model store is cached by
   # release and model names.
   external-ollama:
@@ -242,7 +242,7 @@ jobs:
             | while read -r var; do printf '%s=%s\n' "$var" "${!var}"; done >> "$GITHUB_ENV"
 
       - name: Run the external-Ollama suite
-        run: bash scripts/verify/all.sh 25_external_ollama
+        run: bash scripts/verify/all.sh 26_external_ollama
 
       - name: Collect the compose logs
         if: always()

@@ -71,7 +71,7 @@
 # with the `ollama pull` lines. The model copy is not used. The guard then
 # allows exactly `ollama:host-gateway` as extra_hosts on api and weaviate, and
 # nothing else, and refuses a configuration that still has an ollama service.
-# Without suite names, an --external-ollama run runs 25_external_ollama.
+# Without suite names, an --external-ollama run runs 26_external_ollama.
 #
 # --telemetry checks the collector image against this checkout's own
 # telemetry/image.json, so a PR that changes the pin is refused. To evaluate
@@ -858,7 +858,7 @@ case "$CMD" in
     # A query-only run checks query-only mode (#670).
     [ "$QUERY_ONLY" = 0 ] || [ "${#ARGS[@]}" -gt 0 ] || ARGS=(24_query_only)
     # An external-Ollama run checks external-Ollama mode (#673).
-    [ "$EXTERNAL" = 0 ] || [ "${#ARGS[@]}" -gt 0 ] || ARGS=(25_external_ollama)
+    [ "$EXTERNAL" = 0 ] || [ "${#ARGS[@]}" -gt 0 ] || ARGS=(26_external_ollama)
     # In the background with job control on, all.sh leads a process group of
     # its own (pgid $!), which stop_suite ends; and `wait`, unlike a foreground
     # command, returns as soon as INT or TERM arrives, so the traps act at once.

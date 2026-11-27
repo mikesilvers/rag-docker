@@ -35,7 +35,7 @@ REGISTERED = (
     ('scripts/tests/test_scanned_pdf_ocr.py', '02_ingest.sh', True),
     ('scripts/tests/test_large_corpus.py', '02_ingest.sh', True),
     ('scripts/tests/test_ingest_estimate.py', '02_ingest.sh', True),
-    ('scripts/tests/test_external_ollama.py', '25_external_ollama.sh', True),
+    ('scripts/tests/test_external_ollama.py', '26_external_ollama.sh', True),
 )
 
 

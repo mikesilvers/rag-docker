@@ -9,7 +9,7 @@ path and the refused export with models, `python -m ollama_check`, the overlay
 file and the base file's two settings, and install-offline.sh's options.
 
 Runs with the API's dependencies, on the host (`~/.venvs/rag-api/bin/python`) or
-in the built API image with no network (`25_external_ollama.sh`):
+in the built API image with no network (`26_external_ollama.sh`):
 
     docker run --rm --network none -v "$PWD:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api \\
       "$(docker compose images -q api)" python scripts/tests/test_external_ollama.py

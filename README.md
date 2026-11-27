@@ -1790,7 +1790,7 @@ and rebuilding alone does not resolve changes because Docker installs the lock.
 
 **Node (`ui/`)** — `package-lock.json` is committed and `npm ci` installs from it exactly. Regenerate with `npm install --package-lock-only` after editing `package.json`.
 
-**Docker images** — Weaviate and Ollama are updated by hand: Dependabot ignores `semitechnologies/weaviate` and `ollama/ollama` (the reasons are in `.github/dependabot.yml`), so no automatic notice of their security releases arrives. At each release plan, check [Weaviate's releases](https://github.com/weaviate/weaviate/releases) for security fixes.
+**Docker images** — Weaviate and Ollama are updated by hand: Dependabot ignores `semitechnologies/weaviate` and `ollama/ollama` (the reasons are in `.github/dependabot.yml`), so no automatic notice of their security releases arrives. At each release plan, check [Weaviate's releases](https://github.com/weaviate/weaviate/releases) for security fixes. A Weaviate bump's full verify run (`bash scripts/verify/stack.sh run`, without `RAG_SKIP_SLOW`) includes suite 25, which starts the release's Weaviate (the tag on `main`) on a throwaway volume and upgrades it to the new pin (`scripts/verify/README.md`, #805).
 
 ## MCP server (parked)
 

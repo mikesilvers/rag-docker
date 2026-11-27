@@ -5,7 +5,7 @@ action pins, the stack.sh up / all.sh / stack.sh down sequence on the
 disposable verify project, the compose logs artifact and the model cache, in
 the `verify` job; and the `external-ollama` job (#673), which installs the
 pinned native Ollama from its release's install script checked by sha256, binds
-it to the docker0 address and runs suite 25 in `stack.sh up --external-ollama`. Also
+it to the docker0 address and runs suite 26 in `stack.sh up --external-ollama`. Also
 checks the README badge and the copies embedded in IMPLEMENTATION.md. The
 workflow's real run is the pull request's own; this keeps its rules from
 drifting. Standard library only; no Docker or stack needed.
@@ -224,7 +224,7 @@ class ExternalOllamaJobTests(unittest.TestCase):
         order = [step_with(text, needle)[0] for needle in (
             'name: Install native Ollama', 'name: Bind Ollama', 'name: Pull the models',
             'bash scripts/verify/stack.sh up --external-ollama',
-            'bash scripts/verify/all.sh 25_external_ollama',
+            'bash scripts/verify/all.sh 26_external_ollama',
             'docker compose -p rag-verify logs', 'actions/upload-artifact@',
             'bash scripts/verify/stack.sh down')]
         self.assertEqual(order, sorted(order))
