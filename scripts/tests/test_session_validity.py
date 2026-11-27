@@ -428,6 +428,80 @@ class ValidityServiceTests(unittest.TestCase):
         current = gs.get_session('gs_11111111')
         self.assertTrue(current['stale']); self.assertEqual(current['stale_reason'], 'Synthetic replacement')
 
+    def test_uncertain_durability_marking_is_rolled_back_by_a_session_write(self):
+        # Reviewer (#275): a marking write that replaced the file but couldn't
+        # confirm durability is undone by a session write; an uncertain restore
+        # keeps its own diagnostic instead of the rollback-failed wording.
+        real_save = gs._save_session_sync
+        for restore_uncertain in (False, True):
+            with self.subTest(restore_uncertain=restore_uncertain):
+                gs._sessions = {}; self.data = session(); gs.store_session(self.data)
+                self._two_spellings()
+                def save(snapshot):
+                    sid = snapshot['session_id']
+                    if sid == 'gs_22222222':
+                        raise gs.GoldStandardError('SESSION_WRITE_FAILED', 'Synthetic write fault', 503)
+                    real_save(snapshot)
+                    if sid == 'gs_11111111' and (snapshot.get('stale') or restore_uncertain):
+                        gs._record_issue(gs._session_key(sid), 'SESSION_DURABILITY_UNCERTAIN')
+                        raise gs.GoldStandardError('SESSION_DURABILITY_UNCERTAIN', 'Synthetic fsync fault', 503)
+                real_marker = gs._write_pending_marker
+                with patch.object(gs, '_save_session_sync', side_effect=save), \
+                     patch.object(gs, '_write_pending_marker', side_effect=lambda sid, f: False if sid == 'gs_22222222' else real_marker(sid, f)), \
+                     self.assertRaises(gs.GoldStandardError):
+                    gs.mark_stale('ValidityFixture', 'Synthetic replacement', require_durable=True)
+                diagnostic = gs._diagnostics.get(str(gs._session_key('gs_11111111')), {})
+                if restore_uncertain:
+                    self.assertEqual(diagnostic.get('code'), 'SESSION_DURABILITY_UNCERTAIN')
+                    self.assertNotEqual(diagnostic.get('message'), gs._ROLLBACK_FAILED_MESSAGE)
+                self.assertFalse(gs._pending_path('gs_11111111').exists())
+                for reload in (False, True):
+                    if reload:
+                        gs._sessions = {}; gs.load_sessions_from_disk()
+                    for sid in ('gs_47abcdef', 'gs_11111111', 'gs_22222222'):
+                        with self.subTest(session=sid, reload=reload):
+                            self.assertFalse(gs.get_session(sid).get('stale', False))
+
+    def test_unreadable_earlier_marker_keeps_session_historical(self):
+        # Reviewer (#275): when the earlier pending marker can't be read, the
+        # rollback can't know what to restore, so the session stays historical
+        # (memory and the written marker) and the rollback failure is reported.
+        self._two_spellings()
+        real_text = gs._pending_marker_text
+        def text(sid):
+            if sid == 'gs_11111111':
+                raise OSError('Synthetic read fault')
+            return real_text(sid)
+        save, marker = self._failing_writes(lambda s: s['session_id'] in ('gs_11111111', 'gs_22222222'), {'gs_22222222'})
+        with save, marker, patch.object(gs, '_pending_marker_text', side_effect=text), self.assertRaises(gs.GoldStandardError):
+            gs.mark_stale('ValidityFixture', 'Synthetic replacement', require_durable=True)
+        self.assertTrue(gs.get_session('gs_11111111')['stale'])
+        self.assertFalse(gs.get_session('gs_22222222').get('stale', False))
+        self.assertTrue(gs._pending_path('gs_11111111').exists())
+        self.assertEqual(gs._diagnostics[str(gs._session_key('gs_11111111'))]['message'], gs._ROLLBACK_FAILED_MESSAGE)
+        gs._sessions = {}; gs.load_sessions_from_disk()
+        self.assertTrue(gs.get_session('gs_11111111')['stale'])
+        self.assertFalse(gs.get_session('gs_22222222').get('stale', False))
+
+    def test_unreadable_earlier_marker_on_an_unsaved_session_is_historical_until_restart(self):
+        # #571: gs_22222222 failed both writes and its earlier pending marker
+        # can't be read, so its marker lives only in memory: it stays stale
+        # there, and the diagnostic says historical only until restart.
+        self._two_spellings()
+        real_text = gs._pending_marker_text
+        def text(sid):
+            if sid == 'gs_22222222':
+                raise OSError('Synthetic read fault')
+            return real_text(sid)
+        save, marker = self._failing_writes(lambda s: s['session_id'] == 'gs_22222222', {'gs_22222222'})
+        with save, marker, patch.object(gs, '_pending_marker_text', side_effect=text), self.assertRaises(gs.GoldStandardError):
+            gs.mark_stale('ValidityFixture', 'Synthetic replacement', require_durable=True)
+        self.assertTrue(gs.get_session('gs_22222222')['stale'])
+        self.assertEqual(gs._diagnostics[str(gs._session_key('gs_22222222'))]['message'], gs._ROLLBACK_UNTIL_RESTART_MESSAGE)
+        self.assertFalse(gs.get_session('gs_11111111').get('stale', False))
+        gs._sessions = {}; gs.load_sessions_from_disk()
+        self.assertFalse(gs.get_session('gs_22222222').get('stale', False))
+
     def test_request_validation_errors_use_project_envelope_without_input(self):
         from fastapi.testclient import TestClient
         from main import app

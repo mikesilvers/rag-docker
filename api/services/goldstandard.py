@@ -79,6 +79,7 @@ def _now_iso() -> str:
 
 
 _ROLLBACK_FAILED_MESSAGE = "A stale marker from an aborted collection replacement could not be removed, so the session stays historical. Check local storage."
+_ROLLBACK_UNTIL_RESTART_MESSAGE = "A stale marker from an aborted collection replacement could not be rolled back, so the session is treated as historical only until restart. Check local storage."
 # Rollback bookkeeping for an aborted durable marking (#275): a field the
 # session didn't have, a pending marker the call didn't touch, and a pending
 # marker whose earlier content couldn't be read.
@@ -657,7 +658,12 @@ def _roll_back_markers(undo: list[dict]) -> None:
                     continue
                 log.exception("Could not roll back the stale marker of session %s", session_id)
                 if _diagnostics.get(str(key), {}).get("code", "SESSION_WRITE_FAILED") == "SESSION_WRITE_FAILED":
-                    _record_issue(key, "SESSION_WRITE_FAILED", _ROLLBACK_FAILED_MESSAGE)
+                    # Neither of this call's writes reached disk, so the marker
+                    # lives only in memory until restart (#571).
+                    until_restart = (entry["marker"] is _UNKNOWN and not entry["file_written"]
+                                     and not entry.get("marker_saved", True))
+                    _record_issue(key, "SESSION_WRITE_FAILED",
+                                  _ROLLBACK_UNTIL_RESTART_MESSAGE if until_restart else _ROLLBACK_FAILED_MESSAGE)
 
 
 def _flag_sessions(collection: str, flag: str, reason: str, *, require_durable: bool = False,
@@ -706,6 +712,7 @@ def _flag_sessions(collection: str, flag: str, reason: str, *, require_durable: 
             # completed delete/rebuild cannot export this session as a current
             # baseline. A pending marker carries it across restart; a later
             # successful session write persists it and removes the pending marker.
+            entry = None
             if undo is not None:
                 try:
                     earlier_marker = _pending_marker_text(session["session_id"])
@@ -713,8 +720,9 @@ def _flag_sessions(collection: str, flag: str, reason: str, *, require_durable: 
                     earlier_marker = _UNKNOWN
                 # An uncertain-durability write did replace the session file.
                 replaced = isinstance(exc, GoldStandardError) and exc.code == "SESSION_DURABILITY_UNCERTAIN"
-                undo.append({"session_id": session["session_id"], "previous": previous,
-                             "file_written": replaced, "marker": earlier_marker})
+                entry = {"session_id": session["session_id"], "previous": previous,
+                         "file_written": replaced, "marker": earlier_marker}
+                undo.append(entry)
             with _state_lock:
                 current = _sessions.get(session["session_id"])
                 if current is not None:
@@ -725,6 +733,8 @@ def _flag_sessions(collection: str, flag: str, reason: str, *, require_durable: 
             log.exception("Could not durably mark session %s %s", session["session_id"], flag)
             saved = _write_pending_marker(session["session_id"],
                                           {flag: True, f"{flag}_reason": reason, f"{flag}_at": now})
+            if entry is not None:
+                entry["marker_saved"] = saved
             with _state_lock:
                 key = _session_key(session["session_id"])
                 # An uncertain-durability report keeps its own wording.
