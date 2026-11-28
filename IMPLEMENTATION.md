@@ -6909,6 +6909,7 @@ import mimetypes
 import os
 import posixpath
 import shutil
+import struct
 import tempfile
 import time
 import uuid
@@ -8188,6 +8189,79 @@ def _declared_ratio_member(members: list[tuple[zipfile.ZipInfo, str | None]]) ->
     return None
 
 
+# The end-of-central-directory record and the ZIP64 records before it (#928).
+_EOCD = struct.Struct("<4s4H2LH")          # 22 bytes, signature PK\x05\x06
+_ZIP64_LOCATOR = struct.Struct("<4sLQL")   # 20 bytes, signature PK\x06\x07
+_ZIP64_EOCD = struct.Struct("<4sQ2H2L4Q")  # 56 bytes, signature PK\x06\x06
+_MAX_ZIP_COMMENT = 0xFFFF
+
+
+def _declared_entries(path: Path) -> int | None:
+    """The entry total a ZIP declares, read from its end only (#928), or None.
+
+    Finds the end-of-central-directory record as zipfile does: the last 22
+    bytes when the archive has no comment, otherwise the last occurrence of
+    its signature in the last 22 + 65,535 bytes. When a ZIP64 locator comes
+    just before it, the ZIP64 record's total is the count, whatever the
+    record's 16-bit field says. The central directory itself is never read.
+    None when there is no such record or it doesn't hold together: zipfile
+    then decides, as before.
+    """
+    try:
+        with open(path, "rb") as f:
+            size = f.seek(0, 2)
+            if size < _EOCD.size:
+                return None
+            f.seek(size - _EOCD.size)
+            record = f.read(_EOCD.size)
+            if record[:4] == b"PK\x05\x06" and record[-2:] == b"\x00\x00":
+                pos = size - _EOCD.size
+            else:
+                # An archive comment follows the record.
+                start = max(size - _EOCD.size - _MAX_ZIP_COMMENT, 0)
+                f.seek(start)
+                tail = f.read(size - start)
+                found = tail.rfind(b"PK\x05\x06")
+                if found < 0 or len(tail) - found < _EOCD.size:
+                    return None
+                pos = start + found
+                record = tail[found:found + _EOCD.size]
+            total = _EOCD.unpack(record)[4]
+
+            if pos < _ZIP64_LOCATOR.size:
+                return total
+            f.seek(pos - _ZIP64_LOCATOR.size)
+            locator = f.read(_ZIP64_LOCATOR.size)
+            if locator[:4] != b"PK\x06\x07":
+                return total
+            _, disk, reloff, disks = _ZIP64_LOCATOR.unpack(locator)
+            if disk != 0 or disks > 1:
+                return None
+            # Where the ZIP64 record sits when nothing comes between it and
+            # the locator.
+            place = pos - _ZIP64_LOCATOR.size - _ZIP64_EOCD.size
+            if reloff > place:
+                return None
+            f.seek(reloff)
+            data = f.read(_ZIP64_EOCD.size)
+            extra = place - reloff
+            if data[:4] != b"PK\x06\x06" and reloff != place:
+                # Data prepended to the archive shifts every offset.
+                f.seek(place)
+                data = f.read(_ZIP64_EOCD.size)
+                extra = 0
+            if len(data) != _ZIP64_EOCD.size or data[:4] != b"PK\x06\x06":
+                return None
+            (_, record_size, _, _, _, _, _, entries, dir_size,
+             dir_offset) = _ZIP64_EOCD.unpack(data)
+            if (dir_offset + dir_size != reloff
+                    or record_size + 12 != _ZIP64_EOCD.size + extra):
+                return None
+            return entries
+    except OSError:
+        return None
+
+
 def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBudget) -> None:
     """Validate one uploaded ZIP, then queue its supported members.
 
@@ -8203,14 +8277,26 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBu
     in a worker thread: it can take seconds, and on the event loop it stalled
     every other request.
 
-    Before that, a ZIP with more than max_zip_members entries is refused (#28).
+    Before that, a ZIP with more than max_zip_members entries is refused (#28):
+    first on the total it declares, before zipfile opens it and loads its
+    central directory (#928), then on the entries zipfile loaded, since zipfile
+    reads every entry the directory holds whatever the total says.
     After the declared total, each member's declared sizes are checked against
     the ratio cap, and while reading, the bytes it actually decompresses. Members
     whose path leaves the archive are validated and counted like the others, so
     a damaged one refuses the zip, but are never extracted: they are listed in
     skipped (#28).
+
+    This is the only reader of uploaded ZIPs: ingest and document preparation
+    both reach it through stage_uploads (#928).
     """
     remedy = "Re-create the zip and upload it again."
+    # The total the ZIP declares, before zipfile loads its central directory
+    # (#928): an oversized list is refused without that memory. Unreadable
+    # (None): zipfile decides below, as before.
+    declared = _declared_entries(dest)
+    if declared is not None and declared > settings.max_zip_members:
+        raise _too_many_members(safe_name, declared)
     try:
         archive = zipfile.ZipFile(dest, "r")
     except (zipfile.BadZipFile, OSError, ValueError) as exc:
@@ -8227,7 +8313,9 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBu
     with archive as z:
         entries = z.infolist()
         # Every entry counts, folders and members that are never extracted
-        # included, before anything is read (#28).
+        # included, before anything is read (#28). Checked again here: zipfile
+        # loads every entry the central directory holds, so a declared total
+        # that understates them is caught now, once they are in memory (#928).
         if len(entries) > settings.max_zip_members:
             raise _too_many_members(safe_name, len(entries))
 
@@ -31549,24 +31637,28 @@ the one that tells off-loop from on-loop work). Cases there that use a large mem
 repeated byte only to reach the total store it uncompressed, so the ratio cap (#28) doesn't
 refuse it first.
 
-`scripts/tests/test_zip_limits.py` (#28) checks the member-count and compression-ratio caps
-with a member cap of 20 set through `MAX_ZIP_MEMBERS` (`02_ingest.sh` passes it to the
-container; the test sets it when absent): the settings and their 5,000 and 200 defaults, 20
-entries accepted and 21 refused before any member is read, folders, unsupported files, macOS
-metadata and members leaving the archive all counted, the count per ZIP and winning over
-damage, 5,001 entries refused at the default; the ratio rule (under 1 MiB exempt, exactly the
-ratio accepted), a declared ratio refused before anything is read, a stored member and gzip
-output not counted toward the ratio, a member refused while read within a block of passing the
-ratio, the expansion cap winning over the ratio and the ratio over an earlier unreadable member;
-the count winning over the declared total, and the total over the ratio while a member is read
-(#534); members whose path leaves the archive validated (a corrupt one refuses the ZIP, an
-encrypted one makes it `ARCHIVE_UNSUPPORTED`), counted, never staged and listed in `skipped`;
-and `detail.members` bounded to the ten members the message names, with `members_omitted`
-(0 at exactly ten). `02_ingest.sh` runs it in the API container, checks
-that the API takes `MAX_ZIP_MEMBERS` 5,000 and `MAX_ZIP_MEMBER_RATIO` 200 from
-`docker-compose.yml`, then sends `zip_many_members.zip` (5,001 entries) and
-`zip_high_ratio.zip` (2 MiB of zeros, Deflate) through the proxy and checks each is refused
-with `ARCHIVE_TOO_MANY_MEMBERS` or `ARCHIVE_RATIO_TOO_HIGH` and the exact message and `detail`.
+`scripts/tests/test_zip_limits.py` (#28) checks the member-count and compression-ratio caps with
+a member cap of 20 set through `MAX_ZIP_MEMBERS` (`02_ingest.sh` passes it to the container; the
+test sets it when absent): the settings and their 5,000 and 200 defaults, 20 entries accepted
+and 21 refused before any member is read, folders, unsupported files, macOS metadata and members
+leaving the archive all counted, the count per ZIP and winning over damage, 5,001 entries
+refused at the default; the count the ZIP declares in its end-of-central-directory record (after
+an archive comment, or in the ZIP64 record) refused before zipfile opens it, and winning over a
+damaged central directory, a record that understates the count refused once loaded, a missing
+record still `ARCHIVE_UNREADABLE`, and the record reader's results, zipfile's own ZIP64 output
+and `stage_uploads` included (#928); the ratio rule (under 1 MiB exempt, exactly the ratio
+accepted), a declared ratio refused before anything is read, a stored member and gzip output not
+counted toward the ratio, a member refused while read within a block of passing the ratio, the
+expansion cap winning over the ratio and the ratio over an earlier unreadable member; the count
+winning over the declared total, and the total over the ratio while a member is read (#534);
+members whose path leaves the archive validated (a corrupt one refuses the ZIP, an encrypted one
+makes it `ARCHIVE_UNSUPPORTED`), counted, never staged and listed in `skipped`; and
+`detail.members` bounded to the ten members the message names, with `members_omitted` (0 at
+exactly ten). `02_ingest.sh` runs it in the API container, checks that the API takes
+`MAX_ZIP_MEMBERS` 5,000 and `MAX_ZIP_MEMBER_RATIO` 200 from `docker-compose.yml`, then sends
+`zip_many_members.zip` (5,001 entries) and `zip_high_ratio.zip` (2 MiB of zeros, Deflate)
+through the proxy and checks each is refused with `ARCHIVE_TOO_MANY_MEMBERS` or
+`ARCHIVE_RATIO_TOO_HIGH` and the exact message and `detail`.
 
 `scripts/tests/test_json_ingest.py` (#295) checks that ordinary JSON becomes readable
 `key: value` text: dotted and indexed paths, scalar arrays on one line, file key order,
