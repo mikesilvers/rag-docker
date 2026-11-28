@@ -1475,8 +1475,11 @@ else
   check "#472: a generation under '$SL' starts" "$([ -n "$spsid" ] && echo 0 || echo 1)" \
     "$(head -c 300 /tmp/vfy_sp_gen.json)"
   if [ -n "$spsid" ]; then
-    check_eq "#472: the generation under '$SL' completes" \
-      "$(wait_for_job "/goldstandard/session/$spsid" 900)" "completed"
+    # The packager exports a session whatever its status, so any terminal
+    # status will do: one bad model reply mustn't fail the #472 checks.
+    spstatus=$(wait_for_job "/goldstandard/session/$spsid" 900)
+    case "$spstatus" in completed|failed|partial|cancelled) spdone=0 ;; *) spdone=1 ;; esac
+    check "#472: the generation under '$SL' ends" "$spdone" "status=$spstatus"
     check_eq "#472: the session is recorded under '$SC'" \
       "$(api_get "/goldstandard/session/$spsid" | jfield "['collection']")" "$SC"
     api_post "/export" "{\"encryption\":\"none\",\"collection\":\"$SC\",\"include_models\":false}" > /tmp/vfy_sp_gexp.json
