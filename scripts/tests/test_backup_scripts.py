@@ -269,6 +269,20 @@ class StaticTests(unittest.TestCase):
             self.assertFalse(log.exists() and log.read_text(), 'docker was called: ' + (
                 log.read_text() if log.exists() else ''))
 
+    def test_the_age_listing_leaves_pipefail_off_in_the_caller(self):
+        # rb_age_text sets pipefail only in its own subshell (#937): a readable
+        # scripts/age still succeeds, and the scripts that source it keep pipefail off,
+        # under each bash on this machine (macOS's /bin/bash 3.2 included).
+        for bash in sorted({b for b in (shutil.which('bash'), '/bin/bash') if b and os.path.exists(b)}):
+            with self.subTest(bash=bash):
+                run = subprocess.run([bash, '-c', '. scripts/backup-common.sh; rb_age_text >/dev/null; '
+                                      'echo "status=$?"; set -o | grep "^pipefail"'],
+                                     cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     universal_newlines=True)
+                self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+                self.assertIn('status=0', run.stdout, run.stderr)
+                self.assertRegex(run.stdout, r'(?m)^pipefail\s+off$', run.stdout + run.stderr)
+
     def test_the_tag_without_sha256sum_uses_shasum_and_without_either_stops(self):
         # rb_sha256 falls back to shasum where there is no sha256sum, with the same
         # tag, and with neither it stops before building anything (#856).
