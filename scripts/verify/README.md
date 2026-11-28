@@ -358,7 +358,7 @@ need PyYAML on the host; without it they are skipped.
 
 `26_external_ollama.sh` checks external-Ollama mode (#673, SPECIFICATIONS.md §2.7 and §10.12). In every run
 `../tests/test_external_ollama.py` runs in the API image with no network (the settings, the request bodies in both
-modes and the `/api/embed` fallback, the tag-exact check, `/health/details`, the start-up lines, import and export,
+modes and the embedding endpoint (`/api/embed` only, #936), the tag-exact check, `/health/details`, the start-up lines, import and export,
 `python -m ollama_check`, the overlay and `install-offline.sh --external-ollama`). The rest needs
 `stack.sh run --external-ollama`, which runs this suite alone, on a host whose native Ollama is set up as the main
 README's "External Ollama (native)" says, with its models already pulled: `stack.sh` first runs
@@ -674,24 +674,28 @@ the one that tells off-loop from on-loop work). Cases there that use a large mem
 repeated byte only to reach the total store it uncompressed, so the ratio cap (#28) doesn't
 refuse it first.
 
-`scripts/tests/test_zip_limits.py` (#28) checks the member-count and compression-ratio caps
-with a member cap of 20 set through `MAX_ZIP_MEMBERS` (`02_ingest.sh` passes it to the
-container; the test sets it when absent): the settings and their 5,000 and 200 defaults, 20
-entries accepted and 21 refused before any member is read, folders, unsupported files, macOS
-metadata and members leaving the archive all counted, the count per ZIP and winning over
-damage, 5,001 entries refused at the default; the ratio rule (under 1 MiB exempt, exactly the
-ratio accepted), a declared ratio refused before anything is read, a stored member and gzip
-output not counted toward the ratio, a member refused while read within a block of passing the
-ratio, the expansion cap winning over the ratio and the ratio over an earlier unreadable member;
-the count winning over the declared total, and the total over the ratio while a member is read
-(#534); members whose path leaves the archive validated (a corrupt one refuses the ZIP, an
-encrypted one makes it `ARCHIVE_UNSUPPORTED`), counted, never staged and listed in `skipped`;
-and `detail.members` bounded to the ten members the message names, with `members_omitted`
-(0 at exactly ten). `02_ingest.sh` runs it in the API container, checks
-that the API takes `MAX_ZIP_MEMBERS` 5,000 and `MAX_ZIP_MEMBER_RATIO` 200 from
-`docker-compose.yml`, then sends `zip_many_members.zip` (5,001 entries) and
-`zip_high_ratio.zip` (2 MiB of zeros, Deflate) through the proxy and checks each is refused
-with `ARCHIVE_TOO_MANY_MEMBERS` or `ARCHIVE_RATIO_TOO_HIGH` and the exact message and `detail`.
+`scripts/tests/test_zip_limits.py` (#28) checks the member-count and compression-ratio caps with
+a member cap of 20 set through `MAX_ZIP_MEMBERS` (`02_ingest.sh` passes it to the container; the
+test sets it when absent): the settings and their 5,000 and 200 defaults, 20 entries accepted
+and 21 refused before any member is read, folders, unsupported files, macOS metadata and members
+leaving the archive all counted, the count per ZIP and winning over damage, 5,001 entries
+refused at the default; the count the ZIP declares in its end-of-central-directory record (after
+an archive comment, or in the ZIP64 record) refused before zipfile opens it, and winning over a
+damaged central directory, a record that understates the count refused once loaded, a missing
+record still `ARCHIVE_UNREADABLE`, and the record reader's results, zipfile's own ZIP64 output
+and `stage_uploads` included (#928); the ratio rule (under 1 MiB exempt, exactly the ratio
+accepted), a declared ratio refused before anything is read, a stored member and gzip output not
+counted toward the ratio, a member refused while read within a block of passing the ratio, the
+expansion cap winning over the ratio and the ratio over an earlier unreadable member; the count
+winning over the declared total, and the total over the ratio while a member is read (#534);
+members whose path leaves the archive validated (a corrupt one refuses the ZIP, an encrypted one
+makes it `ARCHIVE_UNSUPPORTED`), counted, never staged and listed in `skipped`; and
+`detail.members` bounded to the ten members the message names, with `members_omitted` (0 at
+exactly ten). `02_ingest.sh` runs it in the API container, checks that the API takes
+`MAX_ZIP_MEMBERS` 5,000 and `MAX_ZIP_MEMBER_RATIO` 200 from `docker-compose.yml`, then sends
+`zip_many_members.zip` (5,001 entries) and `zip_high_ratio.zip` (2 MiB of zeros, Deflate)
+through the proxy and checks each is refused with `ARCHIVE_TOO_MANY_MEMBERS` or
+`ARCHIVE_RATIO_TOO_HIGH` and the exact message and `detail`.
 
 `scripts/tests/test_json_ingest.py` (#295) checks that ordinary JSON becomes readable
 `key: value` text: dotted and indexed paths, scalar arrays on one line, file key order,
@@ -1140,6 +1144,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_metrics.py` | controlled metrics-file regressions (#374): a failed write keeps the answer, the bound, crash-safe compaction, reload after a restart; registered by suite 03 |
 | `../tests/test_citation_score.py` | controlled citation-score regressions (#376): each metric's distance-to-score conversion, best first, missing values and unknown metrics as `null`, a failed metric read as the 503, the metric read on every query; registered by suite 03 |
 | `citation_score.py` | helper for suite 03 (#376), run in the API container: citation scores of known vectors on a real Weaviate for each distance metric, and after a collection is recreated with another metric |
+| `query_embedding.py` | helper for suite 03 (#936), run in the API container: Ollama's two embedding endpoints compared for one text, the API's query vector against Weaviate's stored one, and `dot` and `l2-squared` collections citing their own fixture with the `semantic` mode's scores |
 | `08_overlap.sh` | called by suite02 (and thus all.sh); runs `test_overlap_chunks.py` in the API image with the repository mounted read-only and no network; real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds, and a file over the output limits stored as parts inside them (#621) |
 | `../tests/test_overlap_chunks.py` | controlled overlap-window, per-file limit, ingest-worker and tuning-budget (parts, #621) regressions and the `IMPLEMENTATION.md` mirror check, registered by suite08 (#340) |
@@ -1200,7 +1205,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530); the nginx tag in SPECIFICATIONS.md's compose copy and 11.3 image list matches docker-compose.yml (#665), registered by infrastructure |
 | `../tests/test_weaviate_upgrade.py` | host-only: suite 25's helper with a fake `docker`: the tags it upgrades between and its refusals, the read-back comparison, the labels, no published port, the internal network, the snapshot settings, the step order, stopping at a failure, removal after a pass and a failure, never an image; the embedded copies (#805), registered by infrastructure |
 | `../tests/test_upgrade_backup.py` | host-only: the README's 1.1.0 → 1.2.0 upgrade blocks, run as written under bash, `zsh -c` and interactive zsh with comments off, against stub `docker`, `git` and `curl`; the stub docker accepts only mounts inside its temp directory and only the README's two container commands: no block holds a `#` comment line; the backup skips a missing volume (a wrong prefix) and counts only existing volumes' archives, and writes each copy to a `.tmp` file that replaces the archive only once `gzip -t` passes, so a failed or corrupt copy prints `backup FAILED` and keeps an earlier archive; the rollback is gated on `git checkout v1.1.0` and checks every archive (`gzip -t`, `tar tzf`) and volume before it empties any, and a failed restore stops before `compose up`; alpine is pinned by version and digest; git ignores `backups/` (#679, #693), registered by infrastructure |
-| `../tests/test_backup_scripts.py` | runs from the host, standard library plus the docker CLI: `scripts/backup.sh` and `scripts/restore.sh` (#848) on throwaway volumes of a random project of their own (`rd848t<hex>`, with compose's labels, removed afterwards), run from a scratch git checkout with their own `HOME`: a backup then a restore gives back every file, folder, link, mode and owner; every volume gets its own key, and no two keys match over two runs; the backup folder (0700) holds only `.tgz.age` archives and `.key` files (0600), with no unencrypted archive and no key in the output; a missing volume is skipped and a running container of the project is stopped, not removed; a wrong key, a missing key file and a damaged or cut archive change nothing and stop nothing, and a wrong key or a Docker error in the check shows what age or Docker said; an extraction that fails after the check (a damaged copy fed by a docker wrapper) leaves the volume unchanged, its root's mode and owner included; a Docker error in the key step is shown, with no line holding a secret key; the prefix and location refusals, and the checkout named in another case refused where the filesystem ignores case; the age image pins (the README's alpine, an exact `age` package), its tag following the whole Dockerfile and the age folder (a stub docker: a new digest, an added instruction, an added or changed parser directive, or a file added to or changed in `scripts/age` gives a new tag, a comment, a blank line or a `# key=value` comment after the first comment doesn't, and removing the added file gives the tag back, #852, #856, #862; with no `sha256sum` the same tag from `shasum`, and with neither a refusal before any build), a volume holding an interrupted restore's `.rag-docker-restore.*` folder backed up without it, the folder left in place, and restored without it (#856), and `*.key` in `.gitignore`. Skipped, with a message, only when the docker CLI is missing; it builds the age image (`scripts/age`) if this machine doesn't have it, which needs the network. Registered by infrastructure |
+| `../tests/test_backup_scripts.py` | runs from the host, standard library plus the docker CLI: `scripts/backup.sh` and `scripts/restore.sh` (#848) on throwaway volumes of a random project of their own (`rd848t<hex>`, with compose's labels, removed afterwards), run from a scratch git checkout with their own `HOME`: a backup then a restore gives back every file, folder, link, mode and owner; every volume gets its own key, and no two keys match over two runs; the backup folder (0700) holds only `.tgz.age` archives and `.key` files (0600), with no unencrypted archive and no key in the output; a missing volume is skipped and a running container of the project is stopped, not removed; a wrong key, a missing key file and a damaged or cut archive change nothing and stop nothing, and a wrong key or a Docker error in the check shows what age or Docker said; an extraction that fails after the check (a damaged copy fed by a docker wrapper) leaves the volume unchanged, its root's mode and owner included; a Docker error in the key step is shown, with no line holding a secret key; the prefix and location refusals, and the checkout named in another case refused where the filesystem ignores case; the age image pins (the README's alpine, an exact `age` package), its tag following the whole Dockerfile and the age folder (a stub docker: a new digest, an added instruction, an added or changed parser directive, or a file added to or changed in `scripts/age` gives a new tag, a comment, a blank line or a `# key=value` comment after the first comment doesn't, and removing the added file gives the tag back, #852, #856, #862; with no `sha256sum` the same tag from `shasum`, and with neither a refusal before any build; an unreadable entry in `scripts/age` stops `rb_image` before any docker call, and the listing leaves `pipefail` off in the scripts that source it, #937), a volume holding an interrupted restore's `.rag-docker-restore.*` folder backed up without it, the folder left in place, and restored without it (#856), and `*.key` in `.gitignore`. Skipped, with a message, only when the docker CLI is missing; it builds the age image (`scripts/age`) if this machine doesn't have it, which needs the network. Registered by infrastructure |
 | `../tests/test_version_agreement.py` | host-only: the first-party version strings agree with each other, not with a fixed version: `ui/package.json`, the root versions in `ui/package-lock.json`, `mcp/mcpapp.py`, the two `service.version` defaults in `api/services/telemetry.py` and `RAG_OTEL_SERVICE_VERSION` in `docker-compose.telemetry.yml` and `docker-compose.telemetry.verify.yml` (#605, #656), registered by infrastructure |
 | `../tests/test_ui_dependencies.py` | host-only: the copy of `ui/package.json` embedded in `IMPLEMENTATION.md` (`### ui/package.json`) is the file, exactly, so a UI dependency bump that misses the copy fails (#532), registered by infrastructure |
 | `../tests/test_tailwind_output.py` | runs from the host, standard library plus the docker CLI: the built UI CSS keeps what the Tailwind 4 migration relies on (RD-157, #773): the `prose` and `prose-sm` rules, `relative`, `hover` on every device with no `@media (hover: hover)`, and the `@source` globs with automatic detection off (a sentinel `.jsx` file under `ui/src/` is scanned, a sentinel `.md` file is not). It builds a scratch copy of `ui/` with `npm ci --ignore-scripts` from the lock file and `vite build` in a throwaway container of the image `ui/Dockerfile` builds with (its `builder` stage), not on the host (#826), so it needs the network unless the image and the npm cache are present, and is skipped, with a message, only when the docker CLI is missing (a docker or build failure fails it); a second class reads `ui/src/index.css`, `NavBar.tsx` and `ui/Dockerfile` directly, and checks that the builder image is an image reference with a tag or a digest (a `--platform` flag, a digest pin and a registry with a port are accepted; a token starting with `-` is refused before it reaches `docker run`); a third checks, with a stub in place of docker, that a build step that times out has its named container removed (#841). Registered by infrastructure |
@@ -1729,6 +1734,17 @@ vectors, asks `/query` in the `hnsw` and `flat` modes with the models controlled
 scores against the expected similarities; then it deletes the cosine collection, recreates it
 with l2-squared, and checks the next query uses the new metric. With models, the suite checks
 that in each of the four modes the citation scores are numbers, highest first.
+
+Suite 03 also checks that `hnsw` and `flat` query vectors are the ones Weaviate makes (#936,
+SPECIFICATIONS.md §2.7), in every run. `query_embedding.py` runs in the verify project's API
+container with the embedding model real and the reformulation and answer controlled. It reports,
+for one text, the norms of Ollama's `/api/embeddings` and `/api/embed` vectors and their cosine,
+and fails only if `/api/embed`'s isn't unit length. It creates an owned `dot` collection (flat
+index) and an owned `l2-squared` collection (hnsw index), each with its own three fixtures
+embedded by Weaviate; checks that the API's vector for a text is the one Weaviate stored for a
+probe object holding only that text (deleted before the questions); and, for a known question in
+each collection, that the `hnsw` and `flat` modes cite its own fixture first, with the `semantic`
+mode's scores for the same chunks (within 1e-3). Its collections are deleted at the end.
 `browser/query_config.js` (suite 06) checks that the Q&A page shows a score with 3 decimals and
 `n/a` for a `null` score.
 

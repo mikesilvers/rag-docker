@@ -5302,7 +5302,6 @@ def _sample_chunks_sync(collection_name: str, limit: int, seed: int | None = Non
 ```python
 from __future__ import annotations
 from services import telemetry
-import logging
 import re
 import time
 
@@ -5311,12 +5310,6 @@ import httpx
 from config import settings
 
 _BASE = f"http://{settings.ollama_host}:{settings.ollama_port}"
-_log = logging.getLogger(__name__)
-
-# Set once /api/embeddings answers 404 for a missing route: an Ollama that has
-# dropped the older endpoint, superseded by /api/embed (#673). Every later
-# embedding goes to /api/embed, the endpoint Weaviate's text2vec-ollama calls.
-_use_embed = False
 
 
 def keep_alive() -> int | str:
@@ -5327,43 +5320,24 @@ def keep_alive() -> int | str:
     return int(value) if re.fullmatch(r"-?[0-9]+", value) else value
 
 
-def _route_missing(resp: httpx.Response) -> bool:
-    """A 404 for the route itself, not for the model: Ollama answers a missing
-    model with a JSON `error` ("model ... not found"), and a missing route with
-    plain text ("404 page not found")."""
-    if resp.status_code != 404:
-        return False
-    try:
-        body = resp.json()
-    except ValueError:
-        return True
-    return not (isinstance(body, dict) and "error" in body)
-
-
 @telemetry.traced("ollama.embed")
 async def embed(text: str) -> list[float]:
+    """The query vector for `text`: `/api/embed`, the endpoint and body Weaviate's
+    text2vec-ollama uses, so it is the unit-length vector Weaviate stores for the
+    same text (#936). `/api/embeddings` returns the model's raw vector, not unit
+    length, which put `dot` and `l2-squared` scores on another scale. An empty
+    `embeddings` (an empty text) gives `[]`."""
     # keep_alive only: the embedding model keeps its own context (num_ctx), as
     # Weaviate's own embedding calls do (#673).
-    global _use_embed
     async with httpx.AsyncClient(timeout=60.0) as client:
-        if not _use_embed:
-            resp = await client.post(
-                f"{_BASE}/api/embeddings",
-                json={"model": settings.embed_model, "prompt": text,
-                      "keep_alive": keep_alive()},
-            )
-            if not _route_missing(resp):
-                resp.raise_for_status()
-                return resp.json()["embedding"]
-            _use_embed = True
-            _log.warning("Ollama answered 404 for /api/embeddings; using /api/embed from now on")
         resp = await client.post(
             f"{_BASE}/api/embed",
             json={"model": settings.embed_model, "input": text,
                   "keep_alive": keep_alive()},
         )
         resp.raise_for_status()
-        return resp.json()["embeddings"][0]
+        embeddings = resp.json()["embeddings"]
+        return embeddings[0] if embeddings else []
 
 
 async def _chat(model: str, system: str, user: str) -> str:
@@ -6909,6 +6883,7 @@ import mimetypes
 import os
 import posixpath
 import shutil
+import struct
 import tempfile
 import time
 import uuid
@@ -8188,6 +8163,79 @@ def _declared_ratio_member(members: list[tuple[zipfile.ZipInfo, str | None]]) ->
     return None
 
 
+# The end-of-central-directory record and the ZIP64 records before it (#928).
+_EOCD = struct.Struct("<4s4H2LH")          # 22 bytes, signature PK\x05\x06
+_ZIP64_LOCATOR = struct.Struct("<4sLQL")   # 20 bytes, signature PK\x06\x07
+_ZIP64_EOCD = struct.Struct("<4sQ2H2L4Q")  # 56 bytes, signature PK\x06\x06
+_MAX_ZIP_COMMENT = 0xFFFF
+
+
+def _declared_entries(path: Path) -> int | None:
+    """The entry total a ZIP declares, read from its end only (#928), or None.
+
+    Finds the end-of-central-directory record as zipfile does: the last 22
+    bytes when the archive has no comment, otherwise the last occurrence of
+    its signature in the last 22 + 65,535 bytes. When a ZIP64 locator comes
+    just before it, the ZIP64 record's total is the count, whatever the
+    record's 16-bit field says. The central directory itself is never read.
+    None when there is no such record or it doesn't hold together: zipfile
+    then decides, as before.
+    """
+    try:
+        with open(path, "rb") as f:
+            size = f.seek(0, 2)
+            if size < _EOCD.size:
+                return None
+            f.seek(size - _EOCD.size)
+            record = f.read(_EOCD.size)
+            if record[:4] == b"PK\x05\x06" and record[-2:] == b"\x00\x00":
+                pos = size - _EOCD.size
+            else:
+                # An archive comment follows the record.
+                start = max(size - _EOCD.size - _MAX_ZIP_COMMENT, 0)
+                f.seek(start)
+                tail = f.read(size - start)
+                found = tail.rfind(b"PK\x05\x06")
+                if found < 0 or len(tail) - found < _EOCD.size:
+                    return None
+                pos = start + found
+                record = tail[found:found + _EOCD.size]
+            total = _EOCD.unpack(record)[4]
+
+            if pos < _ZIP64_LOCATOR.size:
+                return total
+            f.seek(pos - _ZIP64_LOCATOR.size)
+            locator = f.read(_ZIP64_LOCATOR.size)
+            if locator[:4] != b"PK\x06\x07":
+                return total
+            _, disk, reloff, disks = _ZIP64_LOCATOR.unpack(locator)
+            if disk != 0 or disks > 1:
+                return None
+            # Where the ZIP64 record sits when nothing comes between it and
+            # the locator.
+            place = pos - _ZIP64_LOCATOR.size - _ZIP64_EOCD.size
+            if reloff > place:
+                return None
+            f.seek(reloff)
+            data = f.read(_ZIP64_EOCD.size)
+            extra = place - reloff
+            if data[:4] != b"PK\x06\x06" and reloff != place:
+                # Data prepended to the archive shifts every offset.
+                f.seek(place)
+                data = f.read(_ZIP64_EOCD.size)
+                extra = 0
+            if len(data) != _ZIP64_EOCD.size or data[:4] != b"PK\x06\x06":
+                return None
+            (_, record_size, _, _, _, _, _, entries, dir_size,
+             dir_offset) = _ZIP64_EOCD.unpack(data)
+            if (dir_offset + dir_size != reloff
+                    or record_size + 12 != _ZIP64_EOCD.size + extra):
+                return None
+            return entries
+    except OSError:
+        return None
+
+
 def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBudget) -> None:
     """Validate one uploaded ZIP, then queue its supported members.
 
@@ -8203,14 +8251,26 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBu
     in a worker thread: it can take seconds, and on the event loop it stalled
     every other request.
 
-    Before that, a ZIP with more than max_zip_members entries is refused (#28).
+    Before that, a ZIP with more than max_zip_members entries is refused (#28):
+    first on the total it declares, before zipfile opens it and loads its
+    central directory (#928), then on the entries zipfile loaded, since zipfile
+    reads every entry the directory holds whatever the total says.
     After the declared total, each member's declared sizes are checked against
     the ratio cap, and while reading, the bytes it actually decompresses. Members
     whose path leaves the archive are validated and counted like the others, so
     a damaged one refuses the zip, but are never extracted: they are listed in
     skipped (#28).
+
+    This is the only reader of uploaded ZIPs: ingest and document preparation
+    both reach it through stage_uploads (#928).
     """
     remedy = "Re-create the zip and upload it again."
+    # The total the ZIP declares, before zipfile loads its central directory
+    # (#928): an oversized list is refused without that memory. Unreadable
+    # (None): zipfile decides below, as before.
+    declared = _declared_entries(dest)
+    if declared is not None and declared > settings.max_zip_members:
+        raise _too_many_members(safe_name, declared)
     try:
         archive = zipfile.ZipFile(dest, "r")
     except (zipfile.BadZipFile, OSError, ValueError) as exc:
@@ -8227,7 +8287,9 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBu
     with archive as z:
         entries = z.infolist()
         # Every entry counts, folders and members that are never extracted
-        # included, before anything is read (#28).
+        # included, before anything is read (#28). Checked again here: zipfile
+        # loads every entry the central directory holds, so a declared total
+        # that understates them is caught now, once they are in memory (#928).
         if len(entries) > settings.max_zip_members:
             raise _too_many_members(safe_name, len(entries))
 
@@ -31233,7 +31295,7 @@ need PyYAML on the host; without it they are skipped.
 
 `26_external_ollama.sh` checks external-Ollama mode (#673, SPECIFICATIONS.md §2.7 and §10.12). In every run
 `../tests/test_external_ollama.py` runs in the API image with no network (the settings, the request bodies in both
-modes and the `/api/embed` fallback, the tag-exact check, `/health/details`, the start-up lines, import and export,
+modes and the embedding endpoint (`/api/embed` only, #936), the tag-exact check, `/health/details`, the start-up lines, import and export,
 `python -m ollama_check`, the overlay and `install-offline.sh --external-ollama`). The rest needs
 `stack.sh run --external-ollama`, which runs this suite alone, on a host whose native Ollama is set up as the main
 README's "External Ollama (native)" says, with its models already pulled: `stack.sh` first runs
@@ -31549,24 +31611,28 @@ the one that tells off-loop from on-loop work). Cases there that use a large mem
 repeated byte only to reach the total store it uncompressed, so the ratio cap (#28) doesn't
 refuse it first.
 
-`scripts/tests/test_zip_limits.py` (#28) checks the member-count and compression-ratio caps
-with a member cap of 20 set through `MAX_ZIP_MEMBERS` (`02_ingest.sh` passes it to the
-container; the test sets it when absent): the settings and their 5,000 and 200 defaults, 20
-entries accepted and 21 refused before any member is read, folders, unsupported files, macOS
-metadata and members leaving the archive all counted, the count per ZIP and winning over
-damage, 5,001 entries refused at the default; the ratio rule (under 1 MiB exempt, exactly the
-ratio accepted), a declared ratio refused before anything is read, a stored member and gzip
-output not counted toward the ratio, a member refused while read within a block of passing the
-ratio, the expansion cap winning over the ratio and the ratio over an earlier unreadable member;
-the count winning over the declared total, and the total over the ratio while a member is read
-(#534); members whose path leaves the archive validated (a corrupt one refuses the ZIP, an
-encrypted one makes it `ARCHIVE_UNSUPPORTED`), counted, never staged and listed in `skipped`;
-and `detail.members` bounded to the ten members the message names, with `members_omitted`
-(0 at exactly ten). `02_ingest.sh` runs it in the API container, checks
-that the API takes `MAX_ZIP_MEMBERS` 5,000 and `MAX_ZIP_MEMBER_RATIO` 200 from
-`docker-compose.yml`, then sends `zip_many_members.zip` (5,001 entries) and
-`zip_high_ratio.zip` (2 MiB of zeros, Deflate) through the proxy and checks each is refused
-with `ARCHIVE_TOO_MANY_MEMBERS` or `ARCHIVE_RATIO_TOO_HIGH` and the exact message and `detail`.
+`scripts/tests/test_zip_limits.py` (#28) checks the member-count and compression-ratio caps with
+a member cap of 20 set through `MAX_ZIP_MEMBERS` (`02_ingest.sh` passes it to the container; the
+test sets it when absent): the settings and their 5,000 and 200 defaults, 20 entries accepted
+and 21 refused before any member is read, folders, unsupported files, macOS metadata and members
+leaving the archive all counted, the count per ZIP and winning over damage, 5,001 entries
+refused at the default; the count the ZIP declares in its end-of-central-directory record (after
+an archive comment, or in the ZIP64 record) refused before zipfile opens it, and winning over a
+damaged central directory, a record that understates the count refused once loaded, a missing
+record still `ARCHIVE_UNREADABLE`, and the record reader's results, zipfile's own ZIP64 output
+and `stage_uploads` included (#928); the ratio rule (under 1 MiB exempt, exactly the ratio
+accepted), a declared ratio refused before anything is read, a stored member and gzip output not
+counted toward the ratio, a member refused while read within a block of passing the ratio, the
+expansion cap winning over the ratio and the ratio over an earlier unreadable member; the count
+winning over the declared total, and the total over the ratio while a member is read (#534);
+members whose path leaves the archive validated (a corrupt one refuses the ZIP, an encrypted one
+makes it `ARCHIVE_UNSUPPORTED`), counted, never staged and listed in `skipped`; and
+`detail.members` bounded to the ten members the message names, with `members_omitted` (0 at
+exactly ten). `02_ingest.sh` runs it in the API container, checks that the API takes
+`MAX_ZIP_MEMBERS` 5,000 and `MAX_ZIP_MEMBER_RATIO` 200 from `docker-compose.yml`, then sends
+`zip_many_members.zip` (5,001 entries) and `zip_high_ratio.zip` (2 MiB of zeros, Deflate)
+through the proxy and checks each is refused with `ARCHIVE_TOO_MANY_MEMBERS` or
+`ARCHIVE_RATIO_TOO_HIGH` and the exact message and `detail`.
 
 `scripts/tests/test_json_ingest.py` (#295) checks that ordinary JSON becomes readable
 `key: value` text: dotted and indexed paths, scalar arrays on one line, file key order,
@@ -32015,6 +32081,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_metrics.py` | controlled metrics-file regressions (#374): a failed write keeps the answer, the bound, crash-safe compaction, reload after a restart; registered by suite 03 |
 | `../tests/test_citation_score.py` | controlled citation-score regressions (#376): each metric's distance-to-score conversion, best first, missing values and unknown metrics as `null`, a failed metric read as the 503, the metric read on every query; registered by suite 03 |
 | `citation_score.py` | helper for suite 03 (#376), run in the API container: citation scores of known vectors on a real Weaviate for each distance metric, and after a collection is recreated with another metric |
+| `query_embedding.py` | helper for suite 03 (#936), run in the API container: Ollama's two embedding endpoints compared for one text, the API's query vector against Weaviate's stored one, and `dot` and `l2-squared` collections citing their own fixture with the `semantic` mode's scores |
 | `08_overlap.sh` | called by suite02 (and thus all.sh); runs `test_overlap_chunks.py` in the API image with the repository mounted read-only and no network; real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds, and a file over the output limits stored as parts inside them (#621) |
 | `../tests/test_overlap_chunks.py` | controlled overlap-window, per-file limit, ingest-worker and tuning-budget (parts, #621) regressions and the `IMPLEMENTATION.md` mirror check, registered by suite08 (#340) |
@@ -32075,7 +32142,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530); the nginx tag in SPECIFICATIONS.md's compose copy and 11.3 image list matches docker-compose.yml (#665), registered by infrastructure |
 | `../tests/test_weaviate_upgrade.py` | host-only: suite 25's helper with a fake `docker`: the tags it upgrades between and its refusals, the read-back comparison, the labels, no published port, the internal network, the snapshot settings, the step order, stopping at a failure, removal after a pass and a failure, never an image; the embedded copies (#805), registered by infrastructure |
 | `../tests/test_upgrade_backup.py` | host-only: the README's 1.1.0 → 1.2.0 upgrade blocks, run as written under bash, `zsh -c` and interactive zsh with comments off, against stub `docker`, `git` and `curl`; the stub docker accepts only mounts inside its temp directory and only the README's two container commands: no block holds a `#` comment line; the backup skips a missing volume (a wrong prefix) and counts only existing volumes' archives, and writes each copy to a `.tmp` file that replaces the archive only once `gzip -t` passes, so a failed or corrupt copy prints `backup FAILED` and keeps an earlier archive; the rollback is gated on `git checkout v1.1.0` and checks every archive (`gzip -t`, `tar tzf`) and volume before it empties any, and a failed restore stops before `compose up`; alpine is pinned by version and digest; git ignores `backups/` (#679, #693), registered by infrastructure |
-| `../tests/test_backup_scripts.py` | runs from the host, standard library plus the docker CLI: `scripts/backup.sh` and `scripts/restore.sh` (#848) on throwaway volumes of a random project of their own (`rd848t<hex>`, with compose's labels, removed afterwards), run from a scratch git checkout with their own `HOME`: a backup then a restore gives back every file, folder, link, mode and owner; every volume gets its own key, and no two keys match over two runs; the backup folder (0700) holds only `.tgz.age` archives and `.key` files (0600), with no unencrypted archive and no key in the output; a missing volume is skipped and a running container of the project is stopped, not removed; a wrong key, a missing key file and a damaged or cut archive change nothing and stop nothing, and a wrong key or a Docker error in the check shows what age or Docker said; an extraction that fails after the check (a damaged copy fed by a docker wrapper) leaves the volume unchanged, its root's mode and owner included; a Docker error in the key step is shown, with no line holding a secret key; the prefix and location refusals, and the checkout named in another case refused where the filesystem ignores case; the age image pins (the README's alpine, an exact `age` package), its tag following the whole Dockerfile and the age folder (a stub docker: a new digest, an added instruction, an added or changed parser directive, or a file added to or changed in `scripts/age` gives a new tag, a comment, a blank line or a `# key=value` comment after the first comment doesn't, and removing the added file gives the tag back, #852, #856, #862; with no `sha256sum` the same tag from `shasum`, and with neither a refusal before any build), a volume holding an interrupted restore's `.rag-docker-restore.*` folder backed up without it, the folder left in place, and restored without it (#856), and `*.key` in `.gitignore`. Skipped, with a message, only when the docker CLI is missing; it builds the age image (`scripts/age`) if this machine doesn't have it, which needs the network. Registered by infrastructure |
+| `../tests/test_backup_scripts.py` | runs from the host, standard library plus the docker CLI: `scripts/backup.sh` and `scripts/restore.sh` (#848) on throwaway volumes of a random project of their own (`rd848t<hex>`, with compose's labels, removed afterwards), run from a scratch git checkout with their own `HOME`: a backup then a restore gives back every file, folder, link, mode and owner; every volume gets its own key, and no two keys match over two runs; the backup folder (0700) holds only `.tgz.age` archives and `.key` files (0600), with no unencrypted archive and no key in the output; a missing volume is skipped and a running container of the project is stopped, not removed; a wrong key, a missing key file and a damaged or cut archive change nothing and stop nothing, and a wrong key or a Docker error in the check shows what age or Docker said; an extraction that fails after the check (a damaged copy fed by a docker wrapper) leaves the volume unchanged, its root's mode and owner included; a Docker error in the key step is shown, with no line holding a secret key; the prefix and location refusals, and the checkout named in another case refused where the filesystem ignores case; the age image pins (the README's alpine, an exact `age` package), its tag following the whole Dockerfile and the age folder (a stub docker: a new digest, an added instruction, an added or changed parser directive, or a file added to or changed in `scripts/age` gives a new tag, a comment, a blank line or a `# key=value` comment after the first comment doesn't, and removing the added file gives the tag back, #852, #856, #862; with no `sha256sum` the same tag from `shasum`, and with neither a refusal before any build; an unreadable entry in `scripts/age` stops `rb_image` before any docker call, and the listing leaves `pipefail` off in the scripts that source it, #937), a volume holding an interrupted restore's `.rag-docker-restore.*` folder backed up without it, the folder left in place, and restored without it (#856), and `*.key` in `.gitignore`. Skipped, with a message, only when the docker CLI is missing; it builds the age image (`scripts/age`) if this machine doesn't have it, which needs the network. Registered by infrastructure |
 | `../tests/test_version_agreement.py` | host-only: the first-party version strings agree with each other, not with a fixed version: `ui/package.json`, the root versions in `ui/package-lock.json`, `mcp/mcpapp.py`, the two `service.version` defaults in `api/services/telemetry.py` and `RAG_OTEL_SERVICE_VERSION` in `docker-compose.telemetry.yml` and `docker-compose.telemetry.verify.yml` (#605, #656), registered by infrastructure |
 | `../tests/test_ui_dependencies.py` | host-only: the copy of `ui/package.json` embedded in `IMPLEMENTATION.md` (`### ui/package.json`) is the file, exactly, so a UI dependency bump that misses the copy fails (#532), registered by infrastructure |
 | `../tests/test_tailwind_output.py` | runs from the host, standard library plus the docker CLI: the built UI CSS keeps what the Tailwind 4 migration relies on (RD-157, #773): the `prose` and `prose-sm` rules, `relative`, `hover` on every device with no `@media (hover: hover)`, and the `@source` globs with automatic detection off (a sentinel `.jsx` file under `ui/src/` is scanned, a sentinel `.md` file is not). It builds a scratch copy of `ui/` with `npm ci --ignore-scripts` from the lock file and `vite build` in a throwaway container of the image `ui/Dockerfile` builds with (its `builder` stage), not on the host (#826), so it needs the network unless the image and the npm cache are present, and is skipped, with a message, only when the docker CLI is missing (a docker or build failure fails it); a second class reads `ui/src/index.css`, `NavBar.tsx` and `ui/Dockerfile` directly, and checks that the builder image is an image reference with a tag or a digest (a `--platform` flag, a digest pin and a registry with a port are accepted; a token starting with `-` is refused before it reaches `docker run`); a third checks, with a stub in place of docker, that a build step that times out has its named container removed (#841). Registered by infrastructure |
@@ -32604,6 +32671,17 @@ vectors, asks `/query` in the `hnsw` and `flat` modes with the models controlled
 scores against the expected similarities; then it deletes the cosine collection, recreates it
 with l2-squared, and checks the next query uses the new metric. With models, the suite checks
 that in each of the four modes the citation scores are numbers, highest first.
+
+Suite 03 also checks that `hnsw` and `flat` query vectors are the ones Weaviate makes (#936,
+SPECIFICATIONS.md §2.7), in every run. `query_embedding.py` runs in the verify project's API
+container with the embedding model real and the reformulation and answer controlled. It reports,
+for one text, the norms of Ollama's `/api/embeddings` and `/api/embed` vectors and their cosine,
+and fails only if `/api/embed`'s isn't unit length. It creates an owned `dot` collection (flat
+index) and an owned `l2-squared` collection (hnsw index), each with its own three fixtures
+embedded by Weaviate; checks that the API's vector for a text is the one Weaviate stored for a
+probe object holding only that text (deleted before the questions); and, for a known question in
+each collection, that the `hnsw` and `flat` modes cite its own fixture first, with the `semantic`
+mode's scores for the same chunks (within 1e-3). Its collections are deleted at the end.
 `browser/query_config.js` (suite 06) checks that the Q&A page shows a score with 3 decimals and
 `n/a` for a `null` score.
 
@@ -41041,8 +41119,8 @@ exit 0
 
 The settings (RAG_EXTERNAL_OLLAMA, OLLAMA_NUM_CTX, OLLAMA_KEEP_ALIVE), the bodies
 of rag-docker's own Ollama requests in both modes (num_ctx on chat only,
-keep_alive everywhere) and the /api/embed fallback (for a missing route only,
-never a missing model), the tag-exact model check, the version and, in external
+keep_alive everywhere) and the embedding endpoint (`/api/embed` only, #936),
+the tag-exact model check, the version and, in external
 mode, the memory report and what Ollama has loaded in /health/details, the
 start-up lines for missing models, import's check-only path and the refused
 export with models, `python -m ollama_check`, the overlay file and the base
@@ -41098,13 +41176,13 @@ class FakeOllama:
     """An Ollama answering /api/tags, /api/version, /api/ps, /api/chat and the two
     embedding endpoints, recording every request's path and JSON body."""
 
-    def __init__(self, models=None, down=False, version="0.40.18", embeddings_gone=False,
-                 loaded=None, ps_fails=False, embed_model_missing=False):
+    def __init__(self, models=None, down=False, version="0.40.18", loaded=None,
+                 ps_fails=False, embed_model_missing=False, empty_embeddings=False):
         self.models = models
         self.down = down
         self.version = version
-        self.embeddings_gone = embeddings_gone
         self.embed_model_missing = embed_model_missing
+        self.empty_embeddings = empty_embeddings
         self.loaded = loaded if loaded is not None else []
         self.ps_fails = ps_fails
         self.requests = []
@@ -41129,14 +41207,15 @@ class FakeOllama:
         if path == "/api/chat":
             return httpx.Response(200, json={"message": {"content": "an answer"}})
         if path == "/api/embeddings":
-            if self.embeddings_gone:
-                return httpx.Response(404, text="404 page not found")
-            if self.embed_model_missing:
-                # The route is there; the model isn't (Ollama's own JSON error).
-                return httpx.Response(404, json={"error": f'model "{body["model"]}" not found, '
-                                                          "try pulling it first"})
+            # Still answered, with another vector, so a test sees which one was asked.
             return httpx.Response(200, json={"embedding": [0.1, 0.2, 0.3]})
         if path == "/api/embed":
+            if self.embed_model_missing:
+                # Ollama's own JSON error for a model it doesn't have.
+                return httpx.Response(404, json={"error": f'model "{body["model"]}" not found, '
+                                                          "try pulling it first"})
+            if self.empty_embeddings:
+                return httpx.Response(200, json={"embeddings": []})
             return httpx.Response(200, json={"embeddings": [[0.4, 0.5, 0.6]]})
         return httpx.Response(404)
 
@@ -41214,10 +41293,6 @@ class SettingsTests(unittest.TestCase):
 class RequestBodyTests(unittest.TestCase):
     """S3: the same bodies in both modes; num_ctx on chat only."""
 
-    def setUp(self):
-        ollama_client._use_embed = False
-        self.addCleanup(setattr, ollama_client, "_use_embed", False)
-
     def test_chat_carries_num_ctx_and_keep_alive_in_both_modes(self):
         for on in (False, True):
             with self.subTest(external=on), external(on), \
@@ -41242,74 +41317,53 @@ class RequestBodyTests(unittest.TestCase):
                 asyncio.run(ollama_client.chat("system", "user"))
                 asyncio.run(ollama_client.build_chat("system", "user"))
                 asyncio.run(ollama_client.embed("a question"))
-                bodies = fake.bodies("/api/chat") + fake.bodies("/api/embeddings")
+                bodies = fake.bodies("/api/chat") + fake.bodies("/api/embed")
                 self.assertEqual(len(bodies), 3)
                 for body in bodies:
                     self.assertEqual(body["keep_alive"], sent)
                     self.assertIs(type(body["keep_alive"]), type(sent))
 
-    def test_keep_alive_in_seconds_is_a_number_on_api_embed_too(self):
-        with patch.object(settings, "ollama_keep_alive", "300"), \
-                FakeOllama(embeddings_gone=True).serving() as fake, \
-                self.assertLogs("services.ollama_client", "WARNING"):
-            asyncio.run(ollama_client.embed("one"))
-        [body] = fake.bodies("/api/embed")
-        self.assertEqual(body["keep_alive"], 300)
-        self.assertIs(type(body["keep_alive"]), int)
-
-    def test_embedding_carries_keep_alive_and_no_num_ctx(self):
+    def test_embedding_goes_to_api_embed_with_keep_alive_and_no_num_ctx(self):
+        # The endpoint and body Weaviate's text2vec-ollama uses, so the query vector
+        # is the unit-length one Weaviate stores; never /api/embeddings (#936).
         for on in (False, True):
             with self.subTest(external=on), external(on), FakeOllama().serving() as fake:
                 vector = asyncio.run(ollama_client.embed("a question"))
-                self.assertEqual(vector, [0.1, 0.2, 0.3])
-                [body] = fake.bodies("/api/embeddings")
-                self.assertEqual(body, {"model": settings.embed_model, "prompt": "a question",
+                self.assertEqual(vector, [0.4, 0.5, 0.6])
+                self.assertEqual(len(fake.requests), 1)
+                [body] = fake.bodies("/api/embed")
+                self.assertEqual(body, {"model": settings.embed_model, "input": "a question",
                                         "keep_alive": ollama_client.keep_alive()})
                 self.assertNotIn("options", body)
-                self.assertEqual(fake.bodies("/api/embed"), [])
+                self.assertEqual(fake.bodies("/api/embeddings"), [])
 
-    def test_a_404_from_embeddings_falls_back_to_embed_for_good(self):
-        with FakeOllama(embeddings_gone=True).serving() as fake, self.assertLogs(
-                "services.ollama_client", "WARNING") as logs:
-            self.assertEqual(asyncio.run(ollama_client.embed("one")), [0.4, 0.5, 0.6])
-            self.assertEqual(asyncio.run(ollama_client.embed("two")), [0.4, 0.5, 0.6])
-        self.assertEqual(len(fake.bodies("/api/embeddings")), 1, "the older endpoint is asked once")
-        self.assertEqual(fake.bodies("/api/embed"), [
-            {"model": settings.embed_model, "input": "one", "keep_alive": ollama_client.keep_alive()},
-            {"model": settings.embed_model, "input": "two", "keep_alive": ollama_client.keep_alive()}])
-        self.assertEqual(len(logs.records), 1)
-        self.assertIn("using /api/embed", logs.output[0])
-
-    def test_a_missing_model_404_is_an_error_not_a_fallback(self):
-        with FakeOllama(embed_model_missing=True).serving() as fake, \
-                self.assertNoLogs("services.ollama_client", "WARNING"):
+    def test_a_missing_model_404_raises(self):
+        with FakeOllama(embed_model_missing=True).serving() as fake:
             with self.assertRaises(httpx.HTTPStatusError) as caught:
                 asyncio.run(ollama_client.embed("x"))
         self.assertEqual(caught.exception.response.status_code, 404)
-        self.assertIs(ollama_client._use_embed, False, "the endpoint stays /api/embeddings")
-        self.assertEqual(fake.bodies("/api/embed"), [])
-        self.assertEqual(len(fake.bodies("/api/embeddings")), 1)
+        self.assertEqual(len(fake.bodies("/api/embed")), 1)
+        self.assertEqual(fake.bodies("/api/embeddings"), [])
 
-    def test_only_a_404_without_a_json_error_is_a_missing_route(self):
-        for response, missing in ((httpx.Response(404, text="404 page not found"), True),
-                                  (httpx.Response(404), True),
-                                  (httpx.Response(404, json=["not", "an", "object"]), True),
-                                  (httpx.Response(404, json={"error": "model not found"}), False),
-                                  (httpx.Response(200, json={"embedding": [1.0]}), False),
-                                  (httpx.Response(500, text="oops"), False)):
-            with self.subTest(status=response.status_code, body=response.text):
-                self.assertIs(ollama_client._route_missing(response), missing)
+    def test_another_error_raises(self):
+        paths = []
 
-    def test_another_error_is_not_a_fallback(self):
         def failing(request):
+            paths.append(request.url.path)
             return httpx.Response(500)
-        fake = FakeOllama()
-        fake.__call__ = failing
         with patch.object(httpx, "AsyncClient",
                           lambda *a, **k: REAL_ASYNC_CLIENT(*a, **{**k, "transport": httpx.MockTransport(failing)})):
             with self.assertRaises(httpx.HTTPStatusError):
                 asyncio.run(ollama_client.embed("x"))
-        self.assertIs(ollama_client._use_embed, False)
+        self.assertEqual(paths, ["/api/embed"])
+
+    def test_no_embeddings_gives_an_empty_vector(self):
+        # Ollama answers an empty input with no embeddings; the vector is empty, as
+        # /api/embeddings answered an empty prompt.
+        with FakeOllama(empty_embeddings=True).serving() as fake:
+            self.assertEqual(asyncio.run(ollama_client.embed("")), [])
+        self.assertEqual(fake.bodies("/api/embed"), [
+            {"model": settings.embed_model, "input": "", "keep_alive": ollama_client.keep_alive()}])
 
     def test_version_and_ps_have_their_own_span_names(self):
         names = []
@@ -52237,6 +52291,10 @@ check "a failed metrics write keeps the answer; metrics.jsonl is bounded and rel
 check "citation scores convert each metric's distance, best first; missing reads as null (#376)" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/citation_score.py)
 check "real Weaviate: cosine, dot and l2-squared scores, and a recreated collection's new metric (#376)" $?
+# hnsw and flat query vectors are the ones Weaviate makes (/api/embed, #936): the
+# embedding model is real, the reformulation and answer controlled.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/query_embedding.py)
+check "hnsw and flat query vectors match Weaviate's (/api/embed): dot and l2-squared collections return their own fixture, scores as semantic's (#936)" $?
 
 drop_collection "$C"; make_collection "$C"
 curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
@@ -52488,6 +52546,206 @@ if failures:
     print("FAIL " + "; ".join(failures), flush=True)
     sys.exit(1)
 print("PASS citation scores convert by each collection's metric, best first", flush=True)
+```
+
+### scripts/verify/query_embedding.py
+
+```python
+"""The API's query vectors are the ones Weaviate makes, on a real Ollama and Weaviate (#936).
+
+Inside the disposable API container (`03_query.sh`):
+
+    docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/query_embedding.py
+
+Weaviate's text2vec-ollama embeds documents (and `semantic`/`hybrid` questions)
+through Ollama's `/api/embed`, which returns unit-length vectors; the API embeds
+`hnsw`/`flat` questions itself. This first reports, for one text, the norms of
+Ollama's `/api/embeddings` and `/api/embed` vectors and their cosine (step 1 of
+#936, on the verify project's Ollama), and fails only if `/api/embed`'s vector
+isn't unit length. Then it creates an owned `dot` collection (flat index) and an
+owned `l2-squared` collection (hnsw index), each with its own three fixtures,
+embedded by Weaviate, and checks that:
+
+- the vector the API makes for a fixture's text matches the one Weaviate stored
+  for a probe object holding only that text (deleted before the questions);
+- a known question returns its own fixture first in the `hnsw` and `flat` modes;
+- each `hnsw`/`flat` citation's score equals the `semantic` mode's for the same
+  chunk (a query vector of another length would change `dot` and `l2-squared`
+  scores).
+
+The question's reformulation and the answer are controlled (no answer-model
+work); the embedding model is real. Its collections are deleted at the end,
+pass or fail.
+"""
+import asyncio
+import math
+import os
+import sys
+import tempfile
+import uuid
+from unittest.mock import AsyncMock, patch
+
+import httpx
+from fastapi.testclient import TestClient
+
+from config import settings
+from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
+from services import ollama_client
+from services import weaviate_client as wc
+
+prefix = os.environ.get("RAG_TEST_PREFIX", "Vfy") + "QEmbed" + uuid.uuid4().hex[:8]
+
+# metric -> (index type, fixtures, a known question about the second fixture).
+# Lowercase and under 200 characters, so a citation's excerpt is the whole text.
+CASES = {
+    "dot": ("flat", [
+        "the cafeteria opens at seven in the morning and serves breakfast until ten.",
+        "employees must submit travel expense reports within thirty days of returning.",
+        "the parking garage is closed on weekends for cleaning and repairs.",
+    ], "how long do i have to file a travel expense report?"),
+    "l2-squared": ("hnsw", [
+        "the library lends laptops to students for up to two weeks at a time.",
+        "fire drills happen on the first monday of every month at noon.",
+        "the gym pool is heated to twenty-eight degrees all year round.",
+    ], "when are the monthly fire drills held?"),
+}
+
+client = TestClient(app, headers=auth_testing.headers())
+created = []
+failures = []
+
+
+def norm(vector):
+    return math.sqrt(sum(v * v for v in vector))
+
+
+def cosine(a, b):
+    return sum(x * y for x, y in zip(a, b)) / (norm(a) * norm(b))
+
+
+def report(ok, message):
+    print(("PASS " if ok else "FAIL ") + message, flush=True)
+    if not ok:
+        failures.append(message)
+
+
+def step_one():
+    """Both endpoints' vectors for one text on the running Ollama (informational,
+    except that /api/embed must be unit length)."""
+    text = "who approves overtime?"
+    with httpx.Client(timeout=120.0) as http:
+        embed = http.post(f"{ollama_client._BASE}/api/embed",
+                          json={"model": settings.embed_model, "input": text})
+        embed.raise_for_status()
+        unit = embed.json()["embeddings"][0]
+        try:
+            legacy = http.post(f"{ollama_client._BASE}/api/embeddings",
+                               json={"model": settings.embed_model, "prompt": text})
+            legacy.raise_for_status()
+            raw = legacy.json()["embedding"]
+            print(f"INFO {settings.embed_model}: /api/embeddings norm {norm(raw):.4f}, "
+                  f"/api/embed norm {norm(unit):.4f}, cosine {cosine(raw, unit):.6f}", flush=True)
+        except Exception as error:  # noqa: BLE001
+            print(f"INFO /api/embeddings didn't answer: {error!r}; /api/embed norm {norm(unit):.4f}",
+                  flush=True)
+    report(abs(norm(unit) - 1) <= 1e-3, f"/api/embed returns a unit-length vector (norm {norm(unit):.6f})")
+
+
+def create(name, metric, index_type, fixtures):
+    response = client.post("/collections", json={"name": name, "index_type": index_type,
+                                                  "distance_metric": metric})
+    assert response.status_code == 201, response.text
+    created.append(name)
+    coll = wc.get_client().collections.get(name)
+    for i, text in enumerate(fixtures):
+        # Weaviate embeds it (/api/embed); a citation needs source_file and chunk_index.
+        coll.data.insert(properties={"content": text, "source_file": "query-embedding.txt",
+                                     "chunk_index": i})
+    return coll
+
+
+def stored_vector_matches(coll, metric, text):
+    """Weaviate embeds an object's text properties joined by spaces, each preceded by
+    its name (the collection's properties have vectorize_property_name on), so the
+    probe has only `content` and its stored vector is Ollama's /api/embed vector of
+    `content <text>`. The API's vector for that same string must match it: the same
+    endpoint, body and normalisation. (The bare text differs, cosine about 0.97, by
+    design: a question is embedded without a property name, as Weaviate's own
+    near_text does; the score checks below cover that.) The probe is deleted before
+    any question is asked."""
+    probe = coll.data.insert(properties={"content": text})
+    try:
+        vector = coll.query.fetch_object_by_id(probe, include_vector=True).vector
+        stored = vector.get("default") if isinstance(vector, dict) else vector
+    finally:
+        coll.data.delete_by_id(probe)
+    mine = asyncio.run(ollama_client.embed("content " + text))
+    ok = (stored is not None and len(stored) == len(mine)
+          and cosine(stored, mine) >= 0.9999 and abs(norm(stored) - norm(mine)) <= 1e-3)
+    detail = ("no stored vector" if stored is None else
+              f"cosine {cosine(stored, mine):.6f}, norms {norm(stored):.4f} and {norm(mine):.4f}")
+    report(ok, f"{metric}: the API's vector for a fixture's document string is the one Weaviate stored ({detail})")
+
+
+def ask(name, question, mode):
+    with patch("services.rag_pipeline.ollama.chat", new=AsyncMock(return_value=question)):
+        response = client.post("/query", json={"collection": name, "question": question,
+                                               "retrieval_mode": mode, "top_k": 3,
+                                               "include_citations": True})
+    if response.status_code != 200:
+        return None, f"{response.status_code} {response.text[:300]}"
+    return response.json()["citations"], None
+
+
+def check_queries(name, metric, fixtures, question):
+    semantic, error = ask(name, question, "semantic")
+    if error:
+        report(False, f"{metric}, semantic mode: {error}")
+        return
+    expected = {c["excerpt"]: c["score"] for c in semantic}
+    for mode in ("hnsw", "flat"):
+        citations, error = ask(name, question, mode)
+        label = f"{metric} collection, {mode} mode"
+        if error:
+            report(False, f"{label}: {error}")
+            continue
+        first = citations[0]["excerpt"] if citations else None
+        report(first == fixtures[1], f"{label}: its own fixture comes first ({first!r})")
+        got = {c["excerpt"]: c["score"] for c in citations}
+        ok = (set(got) == set(expected)
+              and all(isinstance(got[k], (int, float)) and isinstance(expected[k], (int, float))
+                      and abs(got[k] - expected[k]) <= 1e-3 for k in got))
+        report(ok, f"{label}: scores as the semantic mode's ({sorted(got.values(), reverse=True)} "
+                   f"vs {sorted(expected.values(), reverse=True)})")
+
+
+with tempfile.TemporaryDirectory(prefix="query-embedding-") as directory, \
+        patch.object(settings, "upload_dir", directory):
+    try:
+        step_one()
+        for metric, (index_type, fixtures, question) in CASES.items():
+            name = prefix + ("Dot" if metric == "dot" else "L2")
+            coll = create(name, metric, index_type, fixtures)
+            stored_vector_matches(coll, metric, fixtures[0])
+            check_queries(name, metric, fixtures, question)
+    except Exception as error:  # noqa: BLE001
+        failures.append(f"unexpected error: {error!r}")
+    finally:
+        for name in created:
+            try:
+                if wc._collection_exists_sync(name):
+                    response = client.delete("/collections/" + name + "?confirm=true")
+                    if response.status_code != 200:
+                        failures.append(f"cleanup {name}: {response.status_code} {response.text}")
+            except Exception as error:  # noqa: BLE001
+                failures.append(f"cleanup {name}: {error!r}")
+        wc.close_client()
+
+if failures:
+    print("FAIL " + "; ".join(failures), flush=True)
+    sys.exit(1)
+print("PASS hnsw and flat query vectors are Weaviate's: own fixtures first, scores as semantic's", flush=True)
 ```
 
 ### scripts/verify/12_persistence.sh
@@ -59719,7 +59977,7 @@ if [ "$running" != "$EXPECTED" ]; then
 fi
 
 echo
-echo "If the requested services are up, open http://localhost:8080"
+echo "The requested services are up: open http://localhost:8080"
 if [ "$EXTERNAL" = 1 ]; then
   echo "On the Ollama host, pull the models rag-docker uses (it never pulls them itself):"
   # Read from the base file alone: the overlay leaves the ollama service out,
@@ -74049,7 +74307,8 @@ class Offline(unittest.TestCase):
 
 class Installer(unittest.TestCase):
     def test_default_and_optional_commands_and_missing_payload(self):
-        for mode in ('default', 'optional', 'containerd', 'wrong-loaded', 'missing'):
+        # telemetry-timeout: 5 of 6 services run on every poll; slow-start: 4, 5, then 6.
+        for mode in ('default', 'optional', 'containerd', 'wrong-loaded', 'missing', 'telemetry-timeout', 'slow-start'):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as folder:
                 root = Path(folder)
                 for sub in ('scripts', 'telemetry', 'offline', 'bin'):
@@ -74063,7 +74322,7 @@ class Installer(unittest.TestCase):
                 (root/'telemetry/image.json').write_text(json.dumps({'config_ids':{'arm64':identity}}))
                 (root/'offline/images.tar.gz').touch()
                 (root/'offline/ollama_models.tar.gz').touch()
-                if mode in ('optional', 'containerd', 'wrong-loaded'):
+                if mode in ('optional', 'containerd', 'wrong-loaded', 'telemetry-timeout', 'slow-start'):
                     target = root/'offline/collector.tar'
                     archive(target, config, layer)
                     (root/'offline/collector.json').write_text(json.dumps({'architecture':'arm64',
@@ -74089,11 +74348,20 @@ elif a[:2]==['image','save']:
    data=b'wrong'; item=tarfile.TarInfo('config'); item.size=len(data)
    tar.addfile(item,io.BytesIO(data))
 elif a[:2]==['compose','ps'] and '--services' in a:
- for i in range(int(os.environ['TEST_COUNT'])): print('service'+str(i))
+ with open(os.environ['TEST_LOG']) as f: polls=sum(1 for x in f if json.loads(x)[:2]==['compose','ps'] and '--services' in json.loads(x))
+ counts=os.environ['TEST_COUNT'].split(',')
+ for i in range(int(counts[min(polls,len(counts))-1])): print('service'+str(i))
 """)
                 stub.chmod(0o755)
+                sleep = root/'bin/sleep'
+                sleep.write_text(r"""#!/usr/bin/env python3
+import json,os,sys
+with open(os.environ['TEST_LOG'],'a') as f: f.write(json.dumps(['sleep']+sys.argv[1:])+'\n')
+""")
+                sleep.chmod(0o755)
                 env = {**os.environ, 'PATH':str(root/'bin')+os.pathsep+os.environ['PATH'],
-                       'TEST_LOG':str(root/'calls'), 'TEST_ID':identity if mode=='optional' else 'sha256:'+'b'*64, 'TEST_CONFIG':identity, 'TEST_MODE':mode, 'TEST_COUNT':'5' if mode=='default' else '6'}
+                       'TEST_LOG':str(root/'calls'), 'TEST_ID':identity if mode in ('optional', 'telemetry-timeout', 'slow-start') else 'sha256:'+'b'*64, 'TEST_CONFIG':identity, 'TEST_MODE':mode,
+                       'TEST_COUNT':{'default':'5', 'telemetry-timeout':'5', 'slow-start':'4,5,6'}.get(mode, '6')}
                 run = subprocess.run(['bash', str(root/'install-offline.sh'), *([] if mode=='default' else ['--telemetry'])],
                                      env=env, text=True, capture_output=True)
                 calls = [json.loads(x) for x in (root/'calls').read_text().splitlines()]
@@ -74105,10 +74373,23 @@ elif a[:2]==['compose','ps'] and '--services' in a:
                     self.assertNotEqual(run.returncode,0)
                     self.assertFalse(any(x[0]=='load' or x[:2]==['compose','up'] for x in calls))
                     continue
+                polls = calls.count(['compose','ps','--services','--filter','status=running'])
+                if mode == 'telemetry-timeout':
+                    # One service still missing after 60 polls fails the install (#937).
+                    self.assertEqual(run.returncode,1,run.stdout+run.stderr)
+                    self.assertEqual((polls, calls.count(['sleep','5'])), (60, 60))
+                    self.assertEqual(calls[-1],['compose','ps'])
+                    self.assertIn('ERROR: only 5 of 6 services are running after 5 minutes.',run.stderr)
+                    self.assertNotIn('http://localhost:8080',run.stdout)
+                    continue
                 self.assertEqual(run.returncode,0,run.stderr)
+                if mode == 'slow-start':
+                    # The wait stops at the first poll that sees every service (#937).
+                    self.assertEqual((polls, calls.count(['sleep','5'])), (3, 2))
+                    self.assertIn('The requested services are up: open http://localhost:8080',run.stdout.splitlines())
                 up = next(x for x in calls if x[:2]==['compose','up'])
                 restore = next(x for x in calls if x[:2]==['compose','run'])
-                if mode in ('optional', 'containerd', 'wrong-loaded'):
+                if mode in ('optional', 'containerd', 'wrong-loaded', 'slow-start'):
                     self.assertIn('--pull',up); self.assertIn('never',up)
                     self.assertIn('--pull=never',restore)
                 else:
