@@ -99,7 +99,7 @@ sys.exit(0 if any('reported by the external Ollama' in n for n in notes) else 1)
 check "the import checked the embedding model through the external Ollama" $? "$(head -c 400 /tmp/vfy_eo.json)"
 imported=$(jfield "['collection']" < /tmp/vfy_eo.json)
 
-section "Reindex keeps the stored endpoint (http://ollama:11434)"
+section "Reindex keeps the stored endpoint (http://ollama:${RAG_VERIFY_OLLAMA_PORT:-11434})"
 api_post "/tune/reindex" "{\"collection\":\"$C\"}" > /tmp/vfy_eo.json
 rjob=$(jfield "['job_id']" < /tmp/vfy_eo.json)
 check_eq "a reindex of the collection completes" "$([ -n "$rjob" ] && wait_for_job "/tune/job/$rjob" 1800 || echo "refused: $(head -c 200 /tmp/vfy_eo.json)")" "completed"

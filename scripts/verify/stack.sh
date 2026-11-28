@@ -63,15 +63,21 @@
 # --external-ollama (#673) runs the verify project in external-Ollama mode (the
 # checkout's docker-compose.external-ollama.yml): no ollama service, and api and
 # weaviate reach an Ollama installed natively on this host as `ollama`, through
-# host-gateway. Before anything else it checks that host the way the README's
-# guide does: scripts/check-external-ollama.sh --host-only must pass with no
+# host-gateway. That Ollama's port is RAG_VERIFY_OLLAMA_PORT (default 11434;
+# #954), so a test-only Ollama on its own port can serve the verify project.
+# Before anything else it checks that host the way the README's guide does:
+# scripts/check-external-ollama.sh --host-only --port <port> must pass with no
 # warning (Ollama listening only on loopback, or on Linux the docker0 address),
-# and that Ollama must answer on port 11434. Nothing here installs Ollama or
+# and that Ollama must answer on that port. Nothing here installs Ollama or
 # pulls a model into it: its models must already be there, or the start fails
-# with the `ollama pull` lines. The model copy is not used. The guard then
-# allows exactly `ollama:host-gateway` as extra_hosts on api and weaviate, and
-# nothing else, and refuses a configuration that still has an ollama service.
-# Without suite names, an --external-ollama run runs 26_external_ollama.
+# with the `ollama pull` lines. The model copy is not used. host-gateway maps a
+# name, not a port, so the harness's docker-compose.external-ollama.verify.yml,
+# loaded last, gives the api OLLAMA_PORT and weaviate its endpoint at that port.
+# The guard then allows exactly `ollama:host-gateway` as extra_hosts on api and
+# weaviate, and nothing else, and refuses a configuration that still has an
+# ollama service. Without suite names, an --external-ollama run runs
+# 26_external_ollama; `run --external-ollama all` runs every suite, and the
+# checks that need the ollama container skip (#954).
 #
 # --telemetry checks the collector image against this checkout's own
 # telemetry/image.json, so a PR that changes the pin is refused. To evaluate
@@ -194,6 +200,13 @@ if [ "$CMD" = query-only-mode ]; then
     || fail "query-only-mode needs --package with a package name (ragpkg-*.tar.gz), not '$QO_PACKAGE'."
 fi
 [ "$PIN_SET" = 0 ] || [ "$TELEMETRY" = 1 ] || fail "--telemetry-pin requires --telemetry."
+# `all` (#954): every suite, only as the one suite name of run --external-ollama.
+for arg in ${ARGS[@]+"${ARGS[@]}"}; do
+  if [ "$arg" = all ]; then
+    { [ "$CMD" = run ] && [ "$EXTERNAL" = 1 ] && [ "${#ARGS[@]}" -eq 1 ]; } \
+      || fail "'all' runs every suite, and only as the one suite name of run --external-ollama."
+  fi
+done
 
 PORT="${RAG_VERIFY_PORT:-8081}"
 case "$PORT" in
@@ -203,6 +216,19 @@ esac
 PORT=$((10#$PORT))
 { [ "$PORT" -ge 1024 ] && [ "$PORT" -le 65535 ]; } || fail "RAG_VERIFY_PORT must be from 1024 to 65535, not $PORT."
 [ "$PORT" -ne 8080 ] || fail "RAG_VERIFY_PORT can't be 8080: that is the live rag-docker stack's port."
+
+# The native Ollama's port in external-Ollama mode (#954): read only there.
+if [ "$EXTERNAL" = 1 ]; then
+  OLLAMA_PORT="${RAG_VERIFY_OLLAMA_PORT:-11434}"
+  case "$OLLAMA_PORT" in
+    ''|*[!0-9]*) fail "RAG_VERIFY_OLLAMA_PORT must be a port number from 1 to 65535, not '$OLLAMA_PORT'." ;;
+  esac
+  [ "${#OLLAMA_PORT}" -le 5 ] || fail "RAG_VERIFY_OLLAMA_PORT must be a port number from 1 to 65535, not '$OLLAMA_PORT'."
+  OLLAMA_PORT=$((10#$OLLAMA_PORT))
+  { [ "$OLLAMA_PORT" -ge 1 ] && [ "$OLLAMA_PORT" -le 65535 ]; } \
+    || fail "RAG_VERIFY_OLLAMA_PORT must be a port number from 1 to 65535, not '$RAG_VERIFY_OLLAMA_PORT'."
+  export RAG_VERIFY_OLLAMA_PORT="$OLLAMA_PORT"
+fi
 
 if [ "$CMD" != down ]; then
   { [ -d "$CHECKOUT" ] && [ -f "$CHECKOUT/docker-compose.yml" ]; } \
@@ -216,16 +242,16 @@ fi
 if [ "$EXTERNAL" = 1 ]; then
   [ -f "$CHECKOUT/docker-compose.external-ollama.yml" ] \
     || fail "--external-ollama needs a checkout with docker-compose.external-ollama.yml: $CHECKOUT"
-  bash "$HARNESS/scripts/check-external-ollama.sh" --host-only \
+  bash "$HARNESS/scripts/check-external-ollama.sh" --host-only --port "$OLLAMA_PORT" \
     || fail "the host's Ollama isn't set up as README \"External Ollama (native)\" says (above): it must listen on loopback, or on Linux the docker0 address, and nowhere else."
   OLLAMA_ADDR=127.0.0.1
   if [ "$(uname -s)" = Linux ]; then
     OLLAMA_ADDR=$(ip -4 -o addr show docker0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
     [ -n "$OLLAMA_ADDR" ] || fail "--external-ollama on Linux needs the docker0 bridge, where Ollama listens."
   fi
-  code=$(command curl -s -o /dev/null -m 5 -w '%{http_code}' "http://$OLLAMA_ADDR:11434/api/version" 2>/dev/null)
+  code=$(command curl -s -o /dev/null -m 5 -w '%{http_code}' "http://$OLLAMA_ADDR:$OLLAMA_PORT/api/version" 2>/dev/null)
   [ "$code" = 200 ] \
-    || fail "no Ollama answers at http://$OLLAMA_ADDR:11434 (HTTP $code). Install and start it as README \"External Ollama (native)\" says, with its models pulled."
+    || fail "no Ollama answers at http://$OLLAMA_ADDR:$OLLAMA_PORT (HTTP $code). Install and start it as README \"External Ollama (native)\" says, with its models pulled."
 fi
 
 # The reviewed collector pin (#532): the evaluator's file, never the checkout's.
@@ -341,7 +367,7 @@ export RAG_VERIFY_LAN="$LAN"
 # External-Ollama mode (#673): its configuration from the start.
 export RAG_VERIFY_EXTERNAL_OLLAMA="$EXTERNAL"
 if [ "$EXTERNAL" = 1 ]; then
-  export COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$CHECKOUT/docker-compose.external-ollama.yml:$HARNESS/docker-compose.verify.yml"
+  export COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$CHECKOUT/docker-compose.external-ollama.yml:$HARNESS/docker-compose.verify.yml:$HARNESS/docker-compose.external-ollama.verify.yml"
   GUARD_MODE=external-ollama
 fi
 # Query-only mode's configuration (#670), switched to by query-only-mode.
@@ -828,6 +854,9 @@ do_up() {
       printf 'export %s=%q\n' "$var" "${!var}"
     done
   fi
+  if [ "$EXTERNAL" = 1 ]; then
+    printf 'export %s=%q\n' RAG_VERIFY_OLLAMA_PORT "$RAG_VERIFY_OLLAMA_PORT"
+  fi
   if [ "$TELEMETRY" = 1 ]; then
     for var in COMPOSE_PROFILES RAG_VERIFY_HARNESS RAG_VERIFY_CHECKOUT RAG_VERIFY_OTEL_ENABLED RAG_VERIFY_TELEMETRY_PIN; do
       printf 'export %s=%q\n' "$var" "${!var}"
@@ -857,8 +886,13 @@ case "$CMD" in
     [ "$LAN" = 0 ] || [ "${#ARGS[@]}" -gt 0 ] || ARGS=(18_lan)
     # A query-only run checks query-only mode (#670).
     [ "$QUERY_ONLY" = 0 ] || [ "${#ARGS[@]}" -gt 0 ] || ARGS=(24_query_only)
-    # An external-Ollama run checks external-Ollama mode (#673).
-    [ "$EXTERNAL" = 0 ] || [ "${#ARGS[@]}" -gt 0 ] || ARGS=(26_external_ollama)
+    # An external-Ollama run checks external-Ollama mode (#673), or with `all`
+    # runs every suite (#954): all.sh with no names.
+    if [ "$EXTERNAL" = 1 ] && [ "${ARGS[*]-}" = all ]; then
+      ARGS=()
+    elif [ "$EXTERNAL" = 1 ] && [ "${#ARGS[@]}" -eq 0 ]; then
+      ARGS=(26_external_ollama)
+    fi
     # In the background with job control on, all.sh leads a process group of
     # its own (pgid $!), which stop_suite ends; and `wait`, unlike a foreground
     # command, returns as soon as INT or TERM arrives, so the traps act at once.

@@ -1,0 +1,16 @@
+# Overlay for external-Ollama mode on the disposable verify project (#673, #954).
+# Loaded only by scripts/verify/stack.sh --external-ollama, last, after the
+# checkout's docker-compose.external-ollama.yml and docker-compose.verify.yml,
+# from the harness checkout. Run any other way, it refuses to resolve.
+#
+# The native Ollama's port is RAG_VERIFY_OLLAMA_PORT (default 11434, set by
+# stack.sh). host-gateway maps the name `ollama` to the host, not a port, so the
+# api and weaviate are given the port here: every Ollama URL and every
+# collection's stored endpoint is then http://ollama:<port>.
+services:
+  api:
+    environment:
+      OLLAMA_PORT: "${RAG_VERIFY_OLLAMA_PORT:?set by scripts/verify/stack.sh}"
+  weaviate:
+    environment:
+      TEXT2VEC_OLLAMA_APIENDPOINT: "http://ollama:${RAG_VERIFY_OLLAMA_PORT:?set by scripts/verify/stack.sh}"
