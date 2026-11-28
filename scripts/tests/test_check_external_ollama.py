@@ -23,17 +23,17 @@ SCRIPT = ROOT / 'scripts/check-external-ollama.sh'
 LSOF_HEADER = 'COMMAND   PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME'
 
 
-def lsof_line(address):
-    return 'ollama  4242 mike    3u  IPv4 0x1234567890abcdef      0t0  TCP {}:11434 (LISTEN)'.format(address)
+def lsof_line(address, port=11434):
+    return 'ollama  4242 mike    3u  IPv4 0x1234567890abcdef      0t0  TCP {}:{} (LISTEN)'.format(address, port)
 
 
-def ss_line(address):
-    return 'LISTEN 0      4096      {}:11434      0.0.0.0:*'.format(address)
+def ss_line(address, port=11434):
+    return 'LISTEN 0      4096      {}:{}      0.0.0.0:*'.format(address, port)
 
 
 class HelperTests(unittest.TestCase):
     def run_helper(self, os_name, listening, *args, docker0='172.17.0.1', tools=('lsof', 'ss', 'ip'),
-                   docker_status=0, compose_file=None):
+                   docker_status=0, compose_file=None, port=11434):
         folder = Path(tempfile.mkdtemp())
         self.addCleanup(lambda: __import__('shutil').rmtree(folder, ignore_errors=True))
         log = folder / 'log'
@@ -43,10 +43,10 @@ class HelperTests(unittest.TestCase):
                       'echo "ollama-check: ok: stub"; exit {}'.format(log, log, docker_status),
         }
         if 'lsof' in tools:
-            body = '\n'.join([LSOF_HEADER] + [lsof_line(a) for a in listening]) if listening else ''
+            body = '\n'.join([LSOF_HEADER] + [lsof_line(a, port) for a in listening]) if listening else ''
             stubs['lsof'] = 'cat <<\'EOF\'\n{}\nEOF'.format(body) if body else 'exit 1'
         if 'ss' in tools:
-            body = '\n'.join(ss_line(a) for a in listening)
+            body = '\n'.join(ss_line(a, port) for a in listening)
             stubs['ss'] = 'cat <<\'EOF\'\n{}\nEOF'.format(body) if body else 'exit 0'
         if 'ip' in tools:
             stubs['ip'] = ('echo "4: docker0    inet {}/16 brd 172.17.255.255 scope global docker0"'.format(docker0)
@@ -79,6 +79,35 @@ class HelperTests(unittest.TestCase):
         self.assertIn('ok: Ollama listens on ::1:11434 (loopback)', out.stdout)
         self.assertIn('docker compose exec -T api python -m ollama_check', calls)
         self.assertIn('COMPOSE_FILE=docker-compose.yml:docker-compose.external-ollama.yml', calls)
+
+    # --port N (#954): stack.sh --external-ollama passes RAG_VERIFY_OLLAMA_PORT.
+    def test_another_port_is_checked_and_named(self):
+        for os_name in ('Darwin', 'Linux'):
+            with self.subTest(os=os_name):
+                out, calls = self.run_helper(os_name, ['127.0.0.1'], '--host-only', '--port', '11435', port=11435)
+                self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+                self.assertIn('ok: Ollama listens on 127.0.0.1:11435 (loopback)', out.stdout)
+                self.assertEqual(calls, '')
+        out, _ = self.run_helper('Linux', ['0.0.0.0'], '--host-only', '--port', '11435', port=11435)
+        self.assertEqual(out.returncode, 3, out.stdout)
+        self.assertIn('warning: Ollama listens on every address (0.0.0.0:11435)', out.stdout)
+
+    def test_a_listener_on_the_default_port_only_is_nothing_on_another(self):
+        out, _ = self.run_helper('Darwin', ['127.0.0.1'], '--host-only', '--port', '11435')
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn('problem: nothing listens on port 11435', out.stdout)
+        self.assertIn('sudo lsof -nP -iTCP:11435 -sTCP:LISTEN', out.stdout)
+        self.assertNotIn('11434', out.stdout)
+
+    def test_a_bad_port_is_a_usage_error(self):
+        for args in (['--port', 'abc'], ['--port', '0'], ['--port', '70000'], ['--port', '123456'],
+                     ['--port', ''], ['--port', '-1'], ['--port']):
+            with self.subTest(args=args):
+                out, calls = self.run_helper('Darwin', ['127.0.0.1'], '--host-only', *args)
+                self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+                self.assertIn('--port N', out.stderr)
+                self.assertEqual(out.stdout, '')
+                self.assertEqual(calls, '')
 
     def test_a_wildcard_is_a_warning(self):
         for os_name, address in (('Darwin', '*'), ('Linux', '0.0.0.0'), ('Linux', '[::]'), ('Linux', '*')):

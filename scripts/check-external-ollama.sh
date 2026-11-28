@@ -31,17 +31,16 @@ usage() {
 }
 
 HOST_ONLY=0
-PORT_ARG=""
+PORT=11434
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --host-only) HOST_ONLY=1; shift ;;
-    --port) [ "$#" -ge 2 ] || usage; PORT_ARG="$2"; shift 2 ;;
+    --port) [ "$#" -ge 2 ] || usage; PORT="$2"; shift 2 ;;
     -h|--help) usage ;;
     *) usage ;;
   esac
 done
 
-PORT="${PORT_ARG:-11434}"
 case "$PORT" in ''|*[!0-9]*) usage ;; esac
 [ "${#PORT}" -le 5 ] || usage
 PORT=$((10#$PORT))
