@@ -11,6 +11,8 @@ bash scripts/verify/stack.sh run 02 04              # only the named suites
 bash scripts/verify/stack.sh run --lan              # LAN mode, TLS on loopback only (#26)
 bash scripts/verify/stack.sh run --query-only       # query-only mode on a second instance (#670)
 bash scripts/verify/stack.sh run --external-ollama  # a native Ollama on this host (#673)
+bash scripts/verify/stack.sh run --external-ollama all  # every suite in external-Ollama mode (#954)
+RAG_VERIFY_OLLAMA_PORT=11435 bash scripts/verify/stack.sh run --external-ollama all  # a native Ollama on another port
 ```
 
 Exits non-zero if any check fails.
@@ -204,8 +206,8 @@ against" below).
 
 | Command | What it does |
 |---|---|
-| `stack.sh run [--checkout DIR] [--telemetry [--telemetry-pin FILE] \| --lan \| --query-only \| --external-ollama] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
-| `stack.sh up [--checkout DIR] [--pull] [--telemetry [--telemetry-pin FILE] \| --lan \| --query-only \| --external-ollama]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. `--telemetry` brings it up in the same telemetry configuration as `run --telemetry` (see "Optional Collector acceptance") and also prints `COMPOSE_PROFILES`, `RAG_VERIFY_HARNESS`, `RAG_VERIFY_CHECKOUT`, `RAG_VERIFY_OTEL_ENABLED` and `RAG_VERIFY_TELEMETRY_PIN`. `--telemetry-pin FILE` supplies a reviewed collector pin (see "Evaluating a collector pin change"). |
+| `stack.sh run [--checkout DIR] [--telemetry [--telemetry-pin FILE] \| --lan \| --query-only \| --external-ollama] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. With `--external-ollama`, no suite names runs `26_external_ollama` only and the one name `all` runs every suite (#954); `all` is refused anywhere else. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
+| `stack.sh up [--checkout DIR] [--pull] [--telemetry [--telemetry-pin FILE] \| --lan \| --query-only \| --external-ollama]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. `--telemetry` brings it up in the same telemetry configuration as `run --telemetry` (see "Optional Collector acceptance") and also prints `COMPOSE_PROFILES`, `RAG_VERIFY_HARNESS`, `RAG_VERIFY_CHECKOUT`, `RAG_VERIFY_OTEL_ENABLED` and `RAG_VERIFY_TELEMETRY_PIN`. `--telemetry-pin FILE` supplies a reviewed collector pin (see "Evaluating a collector pin change"). `--external-ollama` also prints `RAG_VERIFY_OLLAMA_PORT`, the native Ollama's port (#954). |
 | `stack.sh down` | Removes the project: its containers, network, volumes, images and exports folder. |
 | `stack.sh query-only-mode --package NAME [--checkout DIR]` | Only for `24_query_only.sh`, under the inherited lock of a `run --query-only` (#670): keeps package NAME aside, removes the project's containers, network and volumes (not its images or the model copy), puts the package back alone in an empty exports folder, and starts the project again from the checkout's `docker-compose.query-only.yml`, after the configuration check and without a build, as a second instance on another machine would be. |
 
@@ -362,14 +364,29 @@ modes and the `/api/embed` fallback, the tag-exact check, `/health/details`, the
 `python -m ollama_check`, the overlay and `install-offline.sh --external-ollama`). The rest needs
 `stack.sh run --external-ollama`, which runs this suite alone, on a host whose native Ollama is set up as the main
 README's "External Ollama (native)" says, with its models already pulled: `stack.sh` first runs
-`scripts/check-external-ollama.sh --host-only` from the harness (Ollama listening only on loopback, or on Linux the
-`docker0` address; a warning fails the run) and asks the host's Ollama for `/api/version`, before any Docker command;
+`scripts/check-external-ollama.sh --host-only --port <port>` from the harness (Ollama listening only on loopback, or on
+Linux the `docker0` address; a warning fails the run) and asks the host's Ollama for `/api/version`, before any Docker
+command;
 it never installs Ollama or pulls a model, and the model copy isn't used. The guard then allows `extra_hosts` exactly
 `ollama:host-gateway` on api and weaviate, and refuses a configuration that still has an ollama service. The suite
 checks that no ollama service runs, `python -m ollama_check` in the api container, `/health/details` (the version,
 memory `external`, `ollama_loaded`), an ingest (Weaviate embeds through the host's Ollama), the refused export with
 models and an export without them imported back, a reindex, and outside `RAG_SKIP_SLOW=1` `hnsw` and `semantic`
 questions with citations. Its first real run is the tests reviewer's: the fix agent ran only host tests.
+
+The native Ollama's port is `RAG_VERIFY_OLLAMA_PORT` (#954), default 11434, read only with `--external-ollama`: a
+port number from 1 to 65535, or the run stops before any Docker command. It reaches the listener check (`--port`), the
+`/api/version` probe and, through the harness overlay `docker-compose.external-ollama.verify.yml` loaded last, the
+api's `OLLAMA_PORT` and weaviate's `TEXT2VEC_OLLAMA_APIENDPOINT`: host-gateway maps the name `ollama` to the host, not a
+port, so without the overlay the containers would reach port 11434 whatever the setting. That lets a test-only native
+Ollama on its own port serve verify runs while the shared one on 11434 is left alone. `up --external-ollama` prints the
+setting with its other `export` lines; the overlay refuses to resolve without it. `stack.sh run --external-ollama all`
+runs every suite in external-Ollama mode. The checks that need the ollama container skip there, each with an
+"external-Ollama mode:" reason, and the before-release container run covers them: `01_infrastructure`'s exact service
+inventory (and its repeats after the opt-in restarts; suite 26 checks that no ollama service runs),
+`05_transfer`'s E30 mismatch exports (they ask for models, which external mode refuses first) and its #452
+install-then-report check (no ollama container mounts the model copy), and all of `23_llm_split`. The rest of each
+suite runs.
 
 ## Continuous integration
 
@@ -1136,6 +1153,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `lan_stack.py` | the stack checks of `18_lan.sh` in a `--lan` run, one per subcommand (#26) |
 | `../tests/test_lan_mode.py` | API image, no network: `RAG_LAN_MODE` parsing, the startup refusal (also through `import main`), the certificate step, both nginx configurations, `lan_stack.py`'s rate-limit check against faked answers (#598), embedded copies (#26) |
 | `docker-compose.lan.verify.yml` | the harness overlay of a `--lan` run: TLS on loopback at the verify port, the verify image for `tls-init`, reserved test names (#26) |
+| `docker-compose.external-ollama.verify.yml` | the harness overlay of an `--external-ollama` run, loaded last: the api's `OLLAMA_PORT` and weaviate's `TEXT2VEC_OLLAMA_APIENDPOINT` at `RAG_VERIFY_OLLAMA_PORT`, the native Ollama's port (#954) |
 | `16_api_paths.sh` | ingest, query, metrics and health API paths (#399), run last by suite 01: `NO_SUPPORTED_FILES`, `JOB_NOT_FOUND`, schema rules, the proxy's `/api/` timeouts, `/metrics/latency`, a default query and its metric (LLM); opt-in restart and first-start checks |
 | `../tests/test_api_paths.py` | controlled ingest error, `/query` default, §6 prompt, query metric, retrieval-config file, ingest-config file (#515), `/metrics/latency` and `/health` probe regressions (#399), registered by `16_api_paths.sh` |
 | `../tests/test_ollama_entrypoint.py` | `ollama/entrypoint.sh` with stub commands, on the host: skip present models, timed pull, retries (#399), registered by `16_api_paths.sh` |
@@ -1194,7 +1212,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_llm_split.py` | host-only, standard library: `llm_split.py` with stand-ins for `httpx`, `config`, `services` and `time.sleep`: the model pull tried again on a 5xx (3 attempts, waits of 5 s and 10 s) and not on a 4xx or a request error, a failed pull reported as `setup_error` with no task run; and suite 23 turning that into one failed check and no other (#922), registered by suite 23 |
 | `24_query_only.sh` | §2.6 and §10.11 — query-only mode (#670): the overlay resolved without starting it; registers `../tests/test_query_only.py`; the start-up refusal of a non-boolean `RAG_QUERY_ONLY`; the loader's refusal on a full instance; with `stack.sh run --query-only`, build and export, `stack.sh query-only-mode`, then the load, the refusals, access and Q&A on the query-only instance, and a key package loaded with its key file on standard input and refused `KEY_FILE_REQUIRED` without it (#676) |
 | `26_external_ollama.sh` | §2.7 and §10.12 — external-Ollama mode (#673): registers `../tests/test_external_ollama.py` and `../tests/test_check_external_ollama.py`; with `stack.sh run --external-ollama`, no ollama service, `python -m ollama_check`, `/health/details`, ingest through the host's Ollama, the refused export with models, an import back, a reindex and, outside `RAG_SKIP_SLOW`, hnsw and semantic questions |
-| `../tests/test_check_external_ollama.py` | host-side, standard library, run by suite 26 in every run: `scripts/check-external-ollama.sh` with stub `uname`, `lsof`, `ss`, `ip` and `docker`: loopback and docker0 pass, a wildcard or LAN address warns (exit 3), nothing listening fails (exit 1), `--host-only` skips the container check (#673) |
+| `../tests/test_check_external_ollama.py` | host-side, standard library, run by suite 26 in every run: `scripts/check-external-ollama.sh` with stub `uname`, `lsof`, `ss`, `ip` and `docker`: loopback and docker0 pass, a wildcard or LAN address warns (exit 3), nothing listening fails (exit 1), `--host-only` skips the container check (#673), `--port N` checks another port and a bad one is a usage error (#954) |
 | `query_only_config.py` | host-side, standard library: `docker-compose.yml` with and without `docker-compose.query-only.yml` as `docker compose config` resolves them; only the api's `RAG_QUERY_ONLY` may differ (#670) |
 | `../tests/test_query_only.py` | API image, no network (also on the host): `RAG_QUERY_ONLY` parsing, the refused and kept routes, the refusals through the app and their order, `query_only` in the user answers, `lan_mode` in the user answers (#676), the loader (usage, refusals, lock, passphrase, a key package's key file on standard input with `KEY_FILE_REQUIRED` and `KEY_FILE_INVALID` (#676), results `success`/`refused`/`failed`/`interrupted`, the Ctrl-C handler) and the access of a collection it creates (#670) |
 | `25_weaviate_upgrade.sh` | the Weaviate upgrade path (#805), full runs only: the previous Weaviate (`RAG_WEAVIATE_FROM`, else `origin/main`'s pin) writes data on a throwaway volume, the checkout's reads it back, and again after a Raft snapshot and a restart; only on the verify project |
