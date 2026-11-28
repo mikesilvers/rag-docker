@@ -11459,6 +11459,13 @@ def _roll_back_markers(undo: list[dict]) -> None:
                 if _diagnostics.get(str(key), {}).get("code", "SESSION_WRITE_FAILED") == "SESSION_WRITE_FAILED":
                     # Neither of this call's writes reached disk, so the marker
                     # lives only in memory until restart (#571).
+                    # `not file_written` is defensive: an uncertain-durability
+                    # marking write records its own diagnostic, so the guard
+                    # above skips this message. It matters only if a concurrent
+                    # write for this session changed that diagnostic before the
+                    # rollback; the session file then holds the marker, so the
+                    # session stays historical across restart and the
+                    # rollback-failed message is the right one.
                     until_restart = (entry["marker"] is _UNKNOWN and not entry["file_written"]
                                      and not entry.get("marker_saved", True))
                     _record_issue(key, "SESSION_WRITE_FAILED",

@@ -497,6 +497,7 @@ class ValidityServiceTests(unittest.TestCase):
         with save, marker, patch.object(gs, '_pending_marker_text', side_effect=text), self.assertRaises(gs.GoldStandardError):
             gs.mark_stale('ValidityFixture', 'Synthetic replacement', require_durable=True)
         self.assertTrue(gs.get_session('gs_22222222')['stale'])
+        self.assertEqual(gs.get_session('gs_22222222')['stale_reason'], 'Synthetic replacement')
         self.assertEqual(gs._diagnostics[str(gs._session_key('gs_22222222'))]['message'], gs._ROLLBACK_UNTIL_RESTART_MESSAGE)
         self.assertFalse(gs.get_session('gs_11111111').get('stale', False))
         gs._sessions = {}; gs.load_sessions_from_disk()
