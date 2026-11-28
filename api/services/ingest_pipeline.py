@@ -10,6 +10,7 @@ import mimetypes
 import os
 import posixpath
 import shutil
+import struct
 import tempfile
 import time
 import uuid
@@ -1289,6 +1290,79 @@ def _declared_ratio_member(members: list[tuple[zipfile.ZipInfo, str | None]]) ->
     return None
 
 
+# The end-of-central-directory record and the ZIP64 records before it (#928).
+_EOCD = struct.Struct("<4s4H2LH")          # 22 bytes, signature PK\x05\x06
+_ZIP64_LOCATOR = struct.Struct("<4sLQL")   # 20 bytes, signature PK\x06\x07
+_ZIP64_EOCD = struct.Struct("<4sQ2H2L4Q")  # 56 bytes, signature PK\x06\x06
+_MAX_ZIP_COMMENT = 0xFFFF
+
+
+def _declared_entries(path: Path) -> int | None:
+    """The entry total a ZIP declares, read from its end only (#928), or None.
+
+    Finds the end-of-central-directory record as zipfile does: the last 22
+    bytes when the archive has no comment, otherwise the last occurrence of
+    its signature in the last 22 + 65,535 bytes. When a ZIP64 locator comes
+    just before it, the ZIP64 record's total is the count, whatever the
+    record's 16-bit field says. The central directory itself is never read.
+    None when there is no such record or it doesn't hold together: zipfile
+    then decides, as before.
+    """
+    try:
+        with open(path, "rb") as f:
+            size = f.seek(0, 2)
+            if size < _EOCD.size:
+                return None
+            f.seek(size - _EOCD.size)
+            record = f.read(_EOCD.size)
+            if record[:4] == b"PK\x05\x06" and record[-2:] == b"\x00\x00":
+                pos = size - _EOCD.size
+            else:
+                # An archive comment follows the record.
+                start = max(size - _EOCD.size - _MAX_ZIP_COMMENT, 0)
+                f.seek(start)
+                tail = f.read(size - start)
+                found = tail.rfind(b"PK\x05\x06")
+                if found < 0 or len(tail) - found < _EOCD.size:
+                    return None
+                pos = start + found
+                record = tail[found:found + _EOCD.size]
+            total = _EOCD.unpack(record)[4]
+
+            if pos < _ZIP64_LOCATOR.size:
+                return total
+            f.seek(pos - _ZIP64_LOCATOR.size)
+            locator = f.read(_ZIP64_LOCATOR.size)
+            if locator[:4] != b"PK\x06\x07":
+                return total
+            _, disk, reloff, disks = _ZIP64_LOCATOR.unpack(locator)
+            if disk != 0 or disks > 1:
+                return None
+            # Where the ZIP64 record sits when nothing comes between it and
+            # the locator.
+            place = pos - _ZIP64_LOCATOR.size - _ZIP64_EOCD.size
+            if reloff > place:
+                return None
+            f.seek(reloff)
+            data = f.read(_ZIP64_EOCD.size)
+            extra = place - reloff
+            if data[:4] != b"PK\x06\x06" and reloff != place:
+                # Data prepended to the archive shifts every offset.
+                f.seek(place)
+                data = f.read(_ZIP64_EOCD.size)
+                extra = 0
+            if len(data) != _ZIP64_EOCD.size or data[:4] != b"PK\x06\x06":
+                return None
+            (_, record_size, _, _, _, _, _, entries, dir_size,
+             dir_offset) = _ZIP64_EOCD.unpack(data)
+            if (dir_offset + dir_size != reloff
+                    or record_size + 12 != _ZIP64_EOCD.size + extra):
+                return None
+            return entries
+    except OSError:
+        return None
+
+
 def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBudget) -> None:
     """Validate one uploaded ZIP, then queue its supported members.
 
@@ -1304,14 +1378,26 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBu
     in a worker thread: it can take seconds, and on the event loop it stalled
     every other request.
 
-    Before that, a ZIP with more than max_zip_members entries is refused (#28).
+    Before that, a ZIP with more than max_zip_members entries is refused (#28):
+    first on the total it declares, before zipfile opens it and loads its
+    central directory (#928), then on the entries zipfile loaded, since zipfile
+    reads every entry the directory holds whatever the total says.
     After the declared total, each member's declared sizes are checked against
     the ratio cap, and while reading, the bytes it actually decompresses. Members
     whose path leaves the archive are validated and counted like the others, so
     a damaged one refuses the zip, but are never extracted: they are listed in
     skipped (#28).
+
+    This is the only reader of uploaded ZIPs: ingest and document preparation
+    both reach it through stage_uploads (#928).
     """
     remedy = "Re-create the zip and upload it again."
+    # The total the ZIP declares, before zipfile loads its central directory
+    # (#928): an oversized list is refused without that memory. Unreadable
+    # (None): zipfile decides below, as before.
+    declared = _declared_entries(dest)
+    if declared is not None and declared > settings.max_zip_members:
+        raise _too_many_members(safe_name, declared)
     try:
         archive = zipfile.ZipFile(dest, "r")
     except (zipfile.BadZipFile, OSError, ValueError) as exc:
@@ -1328,7 +1414,9 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBu
     with archive as z:
         entries = z.infolist()
         # Every entry counts, folders and members that are never extracted
-        # included, before anything is read (#28).
+        # included, before anything is read (#28). Checked again here: zipfile
+        # loads every entry the central directory holds, so a declared total
+        # that understates them is caught now, once they are in memory (#928).
         if len(entries) > settings.max_zip_members:
             raise _too_many_members(safe_name, len(entries))
 

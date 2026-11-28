@@ -8,6 +8,7 @@ Disposable directories only; nothing reaches a backend. The lifespan case runs
 in a child process, so the module stores of this process stay unbound.
 """
 import asyncio
+import gc
 import io
 import json
 import os
@@ -866,6 +867,8 @@ class StartTests(StoreTestCase):
     def test_an_export_cancelled_before_its_worker_runs_is_settled(self):
         # #529: a task ended before its worker thread started frees the slot and
         # the registration, then reads failed with the #521 message, error_code null.
+        # Cancelled before its first step, it never handed its worker to the
+        # executor, so no worker can come late and it keeps no bookkeeping (#926).
         module, store, calls = self.harness("export")
         name = "Vfy529Queued"
         seen = []
@@ -890,7 +893,8 @@ class StartTests(StoreTestCase):
                 await asyncio.sleep(0.01)
             return job_id
 
-        with patch.object(store, "_changed", side_effect=spy):
+        with patch.object(store, "_changed", side_effect=spy), \
+                self.assertLogs("services.exporter", "WARNING") as logs:
             job_id = asyncio.run(run())
         record = self.on_disk("export", job_id)
         self.assertEqual(record["status"], "failed")
@@ -901,6 +905,53 @@ class StartTests(StoreTestCase):
         self.assertIsNone(exporter.active_job_for(name))
         self.assertEqual(collection_writes.active_jobs(name), [])
         self.assertEqual(calls, [])
+        self.assertNotIn(job_id, exporter._abandoned)
+        self.assertNotIn(job_id, exporter._started)
+        warned = [r for r in logs.records if "cancelled before it started" in r.getMessage()]
+        self.assertEqual(len(warned), 1, logs.output)
+        self.assertIsNone(warned[0].exc_info)
+
+    def test_an_export_cancelled_after_its_worker_was_submitted_is_settled(self):
+        # #529, #926: a task cancelled once its worker is waiting in the executor
+        # is settled the same way and keeps an _abandoned entry, so a worker whose
+        # thread then starts late finds its job settled and runs nothing.
+        module, store, calls = self.harness("export")
+        name = "Vfy926Queued"
+        real = asyncio.to_thread
+        handed = asyncio.Event()             # the worker is waiting in the executor
+
+        async def queued(fn, *args, **kwargs):
+            if getattr(fn, "__name__", "") == "_worker":
+                handed.set()
+                await asyncio.Event().wait()     # queued: no thread ever takes it
+            return await real(fn, *args, **kwargs)
+
+        async def run():
+            before = asyncio.all_tasks()
+            job_id = await exporter.start_export_job(name)
+            (task,) = asyncio.all_tasks() - before - {asyncio.current_task()}
+            await asyncio.wait_for(handed.wait(), 10)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            for _ in range(500):
+                if store[job_id]["status"] in jobstore.TERMINAL:
+                    break
+                await asyncio.sleep(0.01)
+            return job_id
+
+        with patch.object(asyncio, "to_thread", side_effect=queued):
+            job_id = asyncio.run(run())
+        self.addCleanup(exporter._abandoned.discard, job_id)
+        record = self.on_disk("export", job_id)
+        self.assertEqual(record["status"], "failed")
+        self.assertEqual(record["error"], "CancelledError: the export was cancelled before it "
+                                          "finished. Start the export again.")
+        self.assertIsNone(record.get("error_code"))
+        self.assertIsNone(exporter.active_job_for(name))
+        self.assertEqual(collection_writes.active_jobs(name), [])
+        self.assertEqual(calls, [])
+        self.assertIn(job_id, exporter._abandoned)
         # a worker that starts late finds its job settled and does nothing
         exporter._worker(job_id, name, False)
         self.assertEqual(calls, [])
@@ -940,10 +991,11 @@ class StartTests(StoreTestCase):
         self.release_export(name, job_id)
 
     def test_an_export_whose_task_fails_before_its_worker_runs_is_settled(self):
-        # #529: a task that ends with an error before its worker runs (to_thread
-        # itself raised, as when the executor is shut down) is settled like a
-        # cancelled one: slot and registration freed, then failed, error_code null,
-        # and the error names the exception's type.
+        # #529, #926: a task that ends with an error before its worker runs
+        # (to_thread itself raised, as when the executor is shut down) is settled
+        # like a cancelled one: slot and registration freed, then failed,
+        # error_code null. The error is the exception's own type and message, and
+        # the warning carries its traceback.
         module, store, calls = self.harness("export")
         name = "Vfy529Refused"
         real = asyncio.to_thread
@@ -965,16 +1017,58 @@ class StartTests(StoreTestCase):
                 await asyncio.sleep(0.01)
             return job_id
 
-        with patch.object(asyncio, "to_thread", side_effect=refusing):
+        with patch.object(asyncio, "to_thread", side_effect=refusing), \
+                self.assertLogs("services.exporter", "WARNING") as logs:
             job_id = asyncio.run(run())
+        # A marked task whose to_thread raised keeps its entry: a documented
+        # leftover (#926), cleared here.
+        self.assertIn(job_id, exporter._abandoned)
         self.addCleanup(exporter._abandoned.discard, job_id)
         record = self.on_disk("export", job_id)
         self.assertEqual(record["status"], "failed")
-        self.assertEqual(record["error"], "RuntimeError: the export was cancelled before it "
-                                          "finished. Start the export again.")
+        self.assertEqual(record["error"], "RuntimeError: cannot schedule new futures after shutdown")
         self.assertIsNone(record.get("error_code"))
+        warned = [r for r in logs.records if "failed before it started" in r.getMessage()]
+        self.assertEqual(len(warned), 1, logs.output)
+        self.assertIsInstance(warned[0].exc_info[1], RuntimeError)
+        self.assertEqual(str(warned[0].exc_info[1]), "cannot schedule new futures after shutdown")
         self.assertIsNone(exporter.active_job_for(name))
         self.assertEqual(collection_writes.active_jobs(name), [])
+        self.assertEqual(calls, [])
+
+    def test_a_failed_pre_worker_export_task_is_not_reported_as_unretrieved(self):
+        # #926: the done callback retrieves the task's exception, so asyncio
+        # doesn't also report "Task exception was never retrieved" for a task
+        # nobody awaits, as the route's task isn't; the warning carries it.
+        module, store, calls = self.harness("export")
+        name = "Vfy926Unretrieved"
+        reported = []
+        real = asyncio.to_thread
+
+        async def refusing(fn, *args, **kwargs):
+            if getattr(fn, "__name__", "") == "_worker":
+                raise RuntimeError("cannot schedule new futures after shutdown")
+            return await real(fn, *args, **kwargs)
+
+        async def run():
+            asyncio.get_running_loop().set_exception_handler(
+                lambda _loop, context: reported.append(context))
+            job_id = await exporter.start_export_job(name)   # the task is never awaited
+            for _ in range(500):
+                if store[job_id]["status"] in jobstore.TERMINAL:
+                    break
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0)
+            gc.collect()                     # a task reports an unretrieved exception when freed
+            return job_id
+
+        with patch.object(asyncio, "to_thread", side_effect=refusing), \
+                self.assertLogs("services.exporter", "WARNING"):
+            job_id = asyncio.run(run())
+        self.addCleanup(exporter._abandoned.discard, job_id)
+        self.assertEqual(self.on_disk("export", job_id)["error"],
+                         "RuntimeError: cannot schedule new futures after shutdown")
+        self.assertEqual([c.get("message") for c in reported], [])
         self.assertEqual(calls, [])
 
     def test_an_export_that_runs_to_the_end_leaves_no_bookkeeping(self):

@@ -6883,6 +6883,7 @@ import mimetypes
 import os
 import posixpath
 import shutil
+import struct
 import tempfile
 import time
 import uuid
@@ -8162,6 +8163,79 @@ def _declared_ratio_member(members: list[tuple[zipfile.ZipInfo, str | None]]) ->
     return None
 
 
+# The end-of-central-directory record and the ZIP64 records before it (#928).
+_EOCD = struct.Struct("<4s4H2LH")          # 22 bytes, signature PK\x05\x06
+_ZIP64_LOCATOR = struct.Struct("<4sLQL")   # 20 bytes, signature PK\x06\x07
+_ZIP64_EOCD = struct.Struct("<4sQ2H2L4Q")  # 56 bytes, signature PK\x06\x06
+_MAX_ZIP_COMMENT = 0xFFFF
+
+
+def _declared_entries(path: Path) -> int | None:
+    """The entry total a ZIP declares, read from its end only (#928), or None.
+
+    Finds the end-of-central-directory record as zipfile does: the last 22
+    bytes when the archive has no comment, otherwise the last occurrence of
+    its signature in the last 22 + 65,535 bytes. When a ZIP64 locator comes
+    just before it, the ZIP64 record's total is the count, whatever the
+    record's 16-bit field says. The central directory itself is never read.
+    None when there is no such record or it doesn't hold together: zipfile
+    then decides, as before.
+    """
+    try:
+        with open(path, "rb") as f:
+            size = f.seek(0, 2)
+            if size < _EOCD.size:
+                return None
+            f.seek(size - _EOCD.size)
+            record = f.read(_EOCD.size)
+            if record[:4] == b"PK\x05\x06" and record[-2:] == b"\x00\x00":
+                pos = size - _EOCD.size
+            else:
+                # An archive comment follows the record.
+                start = max(size - _EOCD.size - _MAX_ZIP_COMMENT, 0)
+                f.seek(start)
+                tail = f.read(size - start)
+                found = tail.rfind(b"PK\x05\x06")
+                if found < 0 or len(tail) - found < _EOCD.size:
+                    return None
+                pos = start + found
+                record = tail[found:found + _EOCD.size]
+            total = _EOCD.unpack(record)[4]
+
+            if pos < _ZIP64_LOCATOR.size:
+                return total
+            f.seek(pos - _ZIP64_LOCATOR.size)
+            locator = f.read(_ZIP64_LOCATOR.size)
+            if locator[:4] != b"PK\x06\x07":
+                return total
+            _, disk, reloff, disks = _ZIP64_LOCATOR.unpack(locator)
+            if disk != 0 or disks > 1:
+                return None
+            # Where the ZIP64 record sits when nothing comes between it and
+            # the locator.
+            place = pos - _ZIP64_LOCATOR.size - _ZIP64_EOCD.size
+            if reloff > place:
+                return None
+            f.seek(reloff)
+            data = f.read(_ZIP64_EOCD.size)
+            extra = place - reloff
+            if data[:4] != b"PK\x06\x06" and reloff != place:
+                # Data prepended to the archive shifts every offset.
+                f.seek(place)
+                data = f.read(_ZIP64_EOCD.size)
+                extra = 0
+            if len(data) != _ZIP64_EOCD.size or data[:4] != b"PK\x06\x06":
+                return None
+            (_, record_size, _, _, _, _, _, entries, dir_size,
+             dir_offset) = _ZIP64_EOCD.unpack(data)
+            if (dir_offset + dir_size != reloff
+                    or record_size + 12 != _ZIP64_EOCD.size + extra):
+                return None
+            return entries
+    except OSError:
+        return None
+
+
 def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBudget) -> None:
     """Validate one uploaded ZIP, then queue its supported members.
 
@@ -8177,14 +8251,26 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBu
     in a worker thread: it can take seconds, and on the event loop it stalled
     every other request.
 
-    Before that, a ZIP with more than max_zip_members entries is refused (#28).
+    Before that, a ZIP with more than max_zip_members entries is refused (#28):
+    first on the total it declares, before zipfile opens it and loads its
+    central directory (#928), then on the entries zipfile loaded, since zipfile
+    reads every entry the directory holds whatever the total says.
     After the declared total, each member's declared sizes are checked against
     the ratio cap, and while reading, the bytes it actually decompresses. Members
     whose path leaves the archive are validated and counted like the others, so
     a damaged one refuses the zip, but are never extracted: they are listed in
     skipped (#28).
+
+    This is the only reader of uploaded ZIPs: ingest and document preparation
+    both reach it through stage_uploads (#928).
     """
     remedy = "Re-create the zip and upload it again."
+    # The total the ZIP declares, before zipfile loads its central directory
+    # (#928): an oversized list is refused without that memory. Unreadable
+    # (None): zipfile decides below, as before.
+    declared = _declared_entries(dest)
+    if declared is not None and declared > settings.max_zip_members:
+        raise _too_many_members(safe_name, declared)
     try:
         archive = zipfile.ZipFile(dest, "r")
     except (zipfile.BadZipFile, OSError, ValueError) as exc:
@@ -8201,7 +8287,9 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBu
     with archive as z:
         entries = z.infolist()
         # Every entry counts, folders and members that are never extracted
-        # included, before anything is read (#28).
+        # included, before anything is read (#28). Checked again here: zipfile
+        # loads every entry the central directory holds, so a declared total
+        # that understates them is caught now, once they are in memory (#928).
         if len(entries) > settings.max_zip_members:
             raise _too_many_members(safe_name, len(entries))
 
@@ -14797,8 +14885,23 @@ async def start_export_job(collection: str, include_models: bool = False,
     # to_thread keeps the blocking Weaviate iteration off the event loop, so an
     # export does not stall the API: queries and other collections carry on, and
     # only guarded writes to this collection wait for it (spec §6.1, #509).
-    task = asyncio.create_task(asyncio.to_thread(telemetry.admitted(_worker), job_id, collection,
-                                                 include_models, passphrase, encryption))
+    # The task marks itself when its coroutine first runs, before it hands the
+    # worker to the executor (#926). A task that ends unmarked was cancelled
+    # before its first step: its worker can never run, so its job needs no
+    # _abandoned entry. A marked task whose worker hasn't started keeps one, so
+    # a worker whose thread starts late finds its job settled (#529). An entry
+    # can still stay when a marked task's queued executor item is cancelled
+    # before a thread runs it, or when to_thread itself raises (as at executor
+    # shutdown): the worker never comes to clear it. Set and read on the loop.
+    submitted = False
+
+    async def _submit() -> None:
+        nonlocal submitted
+        submitted = True
+        await asyncio.to_thread(telemetry.admitted(_worker), job_id, collection,
+                                include_models, passphrase, encryption)
+
+    task = asyncio.create_task(_submit())
 
     def _done(task: asyncio.Task) -> None:
         # _run ends the registration first; this also covers a task that never
@@ -14811,18 +14914,27 @@ async def start_export_job(collection: str, include_models: bool = False,
                 # The worker ran, or is running: it settles its own job.
                 _started.discard(job_id)
                 return
-            _abandoned.add(job_id)
+            if submitted:
+                _abandoned.add(job_id)
             if _active.get(collection) == job_id:
                 del _active[collection]
-        _log.warning("Export of %r cancelled before it started", collection)
+        # Retrieving the exception keeps asyncio from reporting it again; the
+        # warning carries its traceback instead (#926).
+        exc = None if task.cancelled() else task.exception()
+        if exc is None:
+            _log.warning("Export of %r cancelled before it started", collection)
+        else:
+            _log.warning("Export of %r failed before it started", collection, exc_info=exc)
         job = _jobs.get(job_id)
         # This write stays on the event loop, as ingest's done callback's does
         # (#309): a done callback is synchronous and saves one small record.
-        # error_code stays null, as for a build that is cancelled (#529).
+        # error_code stays null, as for a build that is cancelled (#529); an
+        # error other than a cancellation records its own type and message, as
+        # _run records an unexpected failure (#926).
         if job is not None and job.get("status") not in jobstore.TERMINAL:
-            name = "CancelledError" if task.cancelled() else type(task.exception()).__name__
-            job.update(status="failed", error=f"{name}: the export was cancelled before it "
-                       "finished. Start the export again.")
+            error = ("CancelledError: the export was cancelled before it finished. "
+                     "Start the export again." if exc is None else f"{type(exc).__name__}: {exc}")
+            job.update(status="failed", error=error)
 
     task.add_done_callback(_done)
     return job_id
@@ -16437,21 +16549,30 @@ def _worker(job_id: str, filename: str, on_conflict: str, passphrase: str | None
         _run(job_id, filename, on_conflict, passphrase)
 
 
-def _settle_unstarted(job_id: str, name: str) -> None:
+def _settle_unstarted(job_id: str, name: str, task: asyncio.Task) -> None:
     """A done callback: settles a job whose task ended before its worker could
     start (#871), freeing the package claim before the status turns terminal,
     so a client that sees it fail can import or download the package again. A
-    worker that started settles its own job."""
+    cancelled task reads the cancelled message; one that ended with another
+    error reads that error's type and message, and the warning carries its
+    traceback (#932). A worker that started settles its own job."""
     with _lock:
         if job_id in _started:
             _started.discard(job_id)
             return
         _abandoned.add(job_id)
         _active.discard(name)
+    # Retrieving the exception keeps asyncio from reporting it again (#932).
+    exc = None if task.cancelled() else task.exception()
+    if exc is None:
+        _log.warning("Import of %r cancelled before it started", name)
+    else:
+        _log.warning("Import of %r failed before it started", name, exc_info=exc)
     job = _jobs.get(job_id)
     # A small write on the event loop, as ingest's done callback makes (#309).
     if job is not None and job.get("status") not in jobstore.TERMINAL:
-        job.update(status="failed", error_code="IMPORT_FAILED", error=_CANCELLED)
+        job.update(status="failed", error_code="IMPORT_FAILED",
+                   error=_CANCELLED if exc is None else f"{type(exc).__name__}: {exc}")
 
 
 def package_kind(name: str) -> str | None:
@@ -16553,7 +16674,7 @@ async def start_import_job(filename: str, on_conflict: str, passphrase: str | No
         task = asyncio.create_task(asyncio.to_thread(telemetry.admitted(_worker), job_id, filename,
                                                      on_conflict, passphrase))
     # A task cancelled before its worker starts still ends its job (#871).
-    task.add_done_callback(lambda _task: _settle_unstarted(job_id, name))
+    task.add_done_callback(lambda done: _settle_unstarted(job_id, name, done))
     return job_id
 ```
 
@@ -31319,8 +31440,8 @@ fail the export early with an actionable error and publish nothing.
 writes a saved file that isn't a JSON object, one with a wrong-typed `chunk_size` and
 one with an invalid `chunk_size` into the API container, and checks through the real
 export job that each export fails with an error naming the collection, the field and
-the Chunking Configuration page, and publishes nothing; it restores the saved file
-afterwards. Crafted
+the Chunking Configuration page, publishes nothing and leaves the saved file as it
+was written (#932); it restores the saved file afterwards. Crafted
 packages are written under a `.part` name and renamed into place, because on
 Docker Desktop the API can read a freshly written bind-mounted file as empty. Controlled tests complement,
 and do not replace, this live acceptance.
@@ -31439,8 +31560,10 @@ installation, the target stays claimed while its holder installs models, and a
 target is free again after a failed model installation (#492); a start whose
 first job record can't be stored releases the package name; and an import whose task
 is cancelled before its worker runs frees the package name, then reads `failed`
-`IMPORT_FAILED` with the cancelled message, a worker that starts late runs nothing,
-and one that started is left to settle its own job (#871). `05_transfer.sh` runs it
+`IMPORT_FAILED` with the cancelled message and logs a warning, a worker that starts late
+runs nothing, and one that started is left to settle its own job (#871); one whose task
+fails before its worker runs frees the package name, then reads `failed` `IMPORT_FAILED`
+with the error's own type and message, logged with its traceback (#932). `05_transfer.sh` runs it
 in the verify project's API container.
 
 `scripts/tests/test_ingest_errors.py` (#290) checks that damaged or unreadable ZIPs are
@@ -31488,24 +31611,28 @@ the one that tells off-loop from on-loop work). Cases there that use a large mem
 repeated byte only to reach the total store it uncompressed, so the ratio cap (#28) doesn't
 refuse it first.
 
-`scripts/tests/test_zip_limits.py` (#28) checks the member-count and compression-ratio caps
-with a member cap of 20 set through `MAX_ZIP_MEMBERS` (`02_ingest.sh` passes it to the
-container; the test sets it when absent): the settings and their 5,000 and 200 defaults, 20
-entries accepted and 21 refused before any member is read, folders, unsupported files, macOS
-metadata and members leaving the archive all counted, the count per ZIP and winning over
-damage, 5,001 entries refused at the default; the ratio rule (under 1 MiB exempt, exactly the
-ratio accepted), a declared ratio refused before anything is read, a stored member and gzip
-output not counted toward the ratio, a member refused while read within a block of passing the
-ratio, the expansion cap winning over the ratio and the ratio over an earlier unreadable member;
-the count winning over the declared total, and the total over the ratio while a member is read
-(#534); members whose path leaves the archive validated (a corrupt one refuses the ZIP, an
-encrypted one makes it `ARCHIVE_UNSUPPORTED`), counted, never staged and listed in `skipped`;
-and `detail.members` bounded to the ten members the message names, with `members_omitted`
-(0 at exactly ten). `02_ingest.sh` runs it in the API container, checks
-that the API takes `MAX_ZIP_MEMBERS` 5,000 and `MAX_ZIP_MEMBER_RATIO` 200 from
-`docker-compose.yml`, then sends `zip_many_members.zip` (5,001 entries) and
-`zip_high_ratio.zip` (2 MiB of zeros, Deflate) through the proxy and checks each is refused
-with `ARCHIVE_TOO_MANY_MEMBERS` or `ARCHIVE_RATIO_TOO_HIGH` and the exact message and `detail`.
+`scripts/tests/test_zip_limits.py` (#28) checks the member-count and compression-ratio caps with
+a member cap of 20 set through `MAX_ZIP_MEMBERS` (`02_ingest.sh` passes it to the container; the
+test sets it when absent): the settings and their 5,000 and 200 defaults, 20 entries accepted
+and 21 refused before any member is read, folders, unsupported files, macOS metadata and members
+leaving the archive all counted, the count per ZIP and winning over damage, 5,001 entries
+refused at the default; the count the ZIP declares in its end-of-central-directory record (after
+an archive comment, or in the ZIP64 record) refused before zipfile opens it, and winning over a
+damaged central directory, a record that understates the count refused once loaded, a missing
+record still `ARCHIVE_UNREADABLE`, and the record reader's results, zipfile's own ZIP64 output
+and `stage_uploads` included (#928); the ratio rule (under 1 MiB exempt, exactly the ratio
+accepted), a declared ratio refused before anything is read, a stored member and gzip output not
+counted toward the ratio, a member refused while read within a block of passing the ratio, the
+expansion cap winning over the ratio and the ratio over an earlier unreadable member; the count
+winning over the declared total, and the total over the ratio while a member is read (#534);
+members whose path leaves the archive validated (a corrupt one refuses the ZIP, an encrypted one
+makes it `ARCHIVE_UNSUPPORTED`), counted, never staged and listed in `skipped`; and
+`detail.members` bounded to the ten members the message names, with `members_omitted` (0 at
+exactly ten). `02_ingest.sh` runs it in the API container, checks that the API takes
+`MAX_ZIP_MEMBERS` 5,000 and `MAX_ZIP_MEMBER_RATIO` 200 from `docker-compose.yml`, then sends
+`zip_many_members.zip` (5,001 entries) and `zip_high_ratio.zip` (2 MiB of zeros, Deflate)
+through the proxy and checks each is refused with `ARCHIVE_TOO_MANY_MEMBERS` or
+`ARCHIVE_RATIO_TOO_HIGH` and the exact message and `detail`.
 
 `scripts/tests/test_json_ingest.py` (#295) checks that ordinary JSON becomes readable
 `key: value` text: dotted and indexed paths, scalar arrays on one line, file key order,
@@ -31676,10 +31803,15 @@ start gives up holding nothing and the route answers `409 EXPORT_STARTING` with 
 The bound counts once, from the second start's first wait: when the first start's write fails
 and another start takes the slot, waiting again on that one doesn't restart it (#347).
 An export task cancelled before its worker starts frees the collection's export slot and its
-delete registration, then reads `failed` with the cancelled message and `error_code` `null`,
-as does one whose task fails before its worker starts (the message names the error's type),
-and a worker that starts late does nothing; one whose worker has started is left to the worker,
-and one that ends normally leaves no bookkeeping behind (#529). An error that escapes the ingest worker is saved with the `failed` status, and a
+delete registration, then reads `failed` with the cancelled message and `error_code` `null`;
+cancelled before its first step, it keeps no bookkeeping, and one cancelled once its worker
+waits in the executor keeps an `_abandoned` entry, so a worker that starts late does nothing
+(#926). One whose task fails before its worker starts is settled the same way, with the error's
+own type and message, logged with its traceback (#926); one whose worker has started is left
+to the worker, and one that ends normally leaves no bookkeeping behind (#529). Two rare cases
+still leave an `_abandoned` entry that no worker comes to clear (documented, not fixed, #926): a task that
+had run its first step whose queued executor item is cancelled before a thread takes it, and
+one whose `to_thread` call itself raises (as at executor shutdown). An error that escapes the ingest worker is saved with the `failed` status, and a
 cancellation that escapes it is named in `errors` and reads `partial` when files completed,
 otherwise `failed` (#529).
 `02_ingest.sh` runs it in the API container. With
@@ -69161,8 +69293,9 @@ Writes the collection's saved ingest settings file directly in the API
 container, as an older API or a hand edit could leave it (the API's own save
 refuses these values), then checks through the real export job that each
 invalid file fails the export with an error naming the collection, the failing
-field and the Chunking Configuration page, and that no package is published.
-The collection's saved settings file is restored on exit.
+field and the Chunking Configuration page, that no package is published, and
+that the refused export leaves the saved file as it was written (#932). The
+collection's saved settings file is restored on exit.
 """
 import json
 import os
@@ -69229,11 +69362,16 @@ def run(api, collection, exports, repo_root):
     def listing():
         return sorted(p.name for p in exports.iterdir())
 
-    saved = json.loads(in_api(READ).strip().splitlines()[-1])
+    def saved_file():
+        """The saved settings file's text, or None when there is none."""
+        return json.loads(in_api(READ).strip().splitlines()[-1])
+
+    saved = saved_file()
     try:
         for value, needle in CASES:
             # Bypasses the save contract, which refuses these values.
             in_api(WRITE, json.dumps(value))
+            written = saved_file()
             before = listing()
             job = wait('/export/job/' + request('/export', {'collection': collection, 'encryption': 'none',
                                                             'include_models': False})['job_id'])
@@ -69245,6 +69383,9 @@ def run(api, collection, exports, repo_root):
                    and 'Chunking Configuration page' in error, error)
             expect(f'invalid saved ingest settings {value!r}: no package or staging is left',
                    listing() == before, sorted(set(listing()) ^ set(before)))
+            after = saved_file()
+            expect(f'invalid saved ingest settings {value!r}: the saved settings file is unchanged',
+                   after == written, {'written': written, 'after': after})
     finally:
         if saved is None:
             in_api(REMOVE)
@@ -74839,6 +74980,7 @@ Disposable directories only; nothing reaches a backend. The lifespan case runs
 in a child process, so the module stores of this process stay unbound.
 """
 import asyncio
+import gc
 import io
 import json
 import os
@@ -75697,6 +75839,8 @@ class StartTests(StoreTestCase):
     def test_an_export_cancelled_before_its_worker_runs_is_settled(self):
         # #529: a task ended before its worker thread started frees the slot and
         # the registration, then reads failed with the #521 message, error_code null.
+        # Cancelled before its first step, it never handed its worker to the
+        # executor, so no worker can come late and it keeps no bookkeeping (#926).
         module, store, calls = self.harness("export")
         name = "Vfy529Queued"
         seen = []
@@ -75721,7 +75865,8 @@ class StartTests(StoreTestCase):
                 await asyncio.sleep(0.01)
             return job_id
 
-        with patch.object(store, "_changed", side_effect=spy):
+        with patch.object(store, "_changed", side_effect=spy), \
+                self.assertLogs("services.exporter", "WARNING") as logs:
             job_id = asyncio.run(run())
         record = self.on_disk("export", job_id)
         self.assertEqual(record["status"], "failed")
@@ -75732,6 +75877,53 @@ class StartTests(StoreTestCase):
         self.assertIsNone(exporter.active_job_for(name))
         self.assertEqual(collection_writes.active_jobs(name), [])
         self.assertEqual(calls, [])
+        self.assertNotIn(job_id, exporter._abandoned)
+        self.assertNotIn(job_id, exporter._started)
+        warned = [r for r in logs.records if "cancelled before it started" in r.getMessage()]
+        self.assertEqual(len(warned), 1, logs.output)
+        self.assertIsNone(warned[0].exc_info)
+
+    def test_an_export_cancelled_after_its_worker_was_submitted_is_settled(self):
+        # #529, #926: a task cancelled once its worker is waiting in the executor
+        # is settled the same way and keeps an _abandoned entry, so a worker whose
+        # thread then starts late finds its job settled and runs nothing.
+        module, store, calls = self.harness("export")
+        name = "Vfy926Queued"
+        real = asyncio.to_thread
+        handed = asyncio.Event()             # the worker is waiting in the executor
+
+        async def queued(fn, *args, **kwargs):
+            if getattr(fn, "__name__", "") == "_worker":
+                handed.set()
+                await asyncio.Event().wait()     # queued: no thread ever takes it
+            return await real(fn, *args, **kwargs)
+
+        async def run():
+            before = asyncio.all_tasks()
+            job_id = await exporter.start_export_job(name)
+            (task,) = asyncio.all_tasks() - before - {asyncio.current_task()}
+            await asyncio.wait_for(handed.wait(), 10)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            for _ in range(500):
+                if store[job_id]["status"] in jobstore.TERMINAL:
+                    break
+                await asyncio.sleep(0.01)
+            return job_id
+
+        with patch.object(asyncio, "to_thread", side_effect=queued):
+            job_id = asyncio.run(run())
+        self.addCleanup(exporter._abandoned.discard, job_id)
+        record = self.on_disk("export", job_id)
+        self.assertEqual(record["status"], "failed")
+        self.assertEqual(record["error"], "CancelledError: the export was cancelled before it "
+                                          "finished. Start the export again.")
+        self.assertIsNone(record.get("error_code"))
+        self.assertIsNone(exporter.active_job_for(name))
+        self.assertEqual(collection_writes.active_jobs(name), [])
+        self.assertEqual(calls, [])
+        self.assertIn(job_id, exporter._abandoned)
         # a worker that starts late finds its job settled and does nothing
         exporter._worker(job_id, name, False)
         self.assertEqual(calls, [])
@@ -75771,10 +75963,11 @@ class StartTests(StoreTestCase):
         self.release_export(name, job_id)
 
     def test_an_export_whose_task_fails_before_its_worker_runs_is_settled(self):
-        # #529: a task that ends with an error before its worker runs (to_thread
-        # itself raised, as when the executor is shut down) is settled like a
-        # cancelled one: slot and registration freed, then failed, error_code null,
-        # and the error names the exception's type.
+        # #529, #926: a task that ends with an error before its worker runs
+        # (to_thread itself raised, as when the executor is shut down) is settled
+        # like a cancelled one: slot and registration freed, then failed,
+        # error_code null. The error is the exception's own type and message, and
+        # the warning carries its traceback.
         module, store, calls = self.harness("export")
         name = "Vfy529Refused"
         real = asyncio.to_thread
@@ -75796,16 +75989,58 @@ class StartTests(StoreTestCase):
                 await asyncio.sleep(0.01)
             return job_id
 
-        with patch.object(asyncio, "to_thread", side_effect=refusing):
+        with patch.object(asyncio, "to_thread", side_effect=refusing), \
+                self.assertLogs("services.exporter", "WARNING") as logs:
             job_id = asyncio.run(run())
+        # A marked task whose to_thread raised keeps its entry: a documented
+        # leftover (#926), cleared here.
+        self.assertIn(job_id, exporter._abandoned)
         self.addCleanup(exporter._abandoned.discard, job_id)
         record = self.on_disk("export", job_id)
         self.assertEqual(record["status"], "failed")
-        self.assertEqual(record["error"], "RuntimeError: the export was cancelled before it "
-                                          "finished. Start the export again.")
+        self.assertEqual(record["error"], "RuntimeError: cannot schedule new futures after shutdown")
         self.assertIsNone(record.get("error_code"))
+        warned = [r for r in logs.records if "failed before it started" in r.getMessage()]
+        self.assertEqual(len(warned), 1, logs.output)
+        self.assertIsInstance(warned[0].exc_info[1], RuntimeError)
+        self.assertEqual(str(warned[0].exc_info[1]), "cannot schedule new futures after shutdown")
         self.assertIsNone(exporter.active_job_for(name))
         self.assertEqual(collection_writes.active_jobs(name), [])
+        self.assertEqual(calls, [])
+
+    def test_a_failed_pre_worker_export_task_is_not_reported_as_unretrieved(self):
+        # #926: the done callback retrieves the task's exception, so asyncio
+        # doesn't also report "Task exception was never retrieved" for a task
+        # nobody awaits, as the route's task isn't; the warning carries it.
+        module, store, calls = self.harness("export")
+        name = "Vfy926Unretrieved"
+        reported = []
+        real = asyncio.to_thread
+
+        async def refusing(fn, *args, **kwargs):
+            if getattr(fn, "__name__", "") == "_worker":
+                raise RuntimeError("cannot schedule new futures after shutdown")
+            return await real(fn, *args, **kwargs)
+
+        async def run():
+            asyncio.get_running_loop().set_exception_handler(
+                lambda _loop, context: reported.append(context))
+            job_id = await exporter.start_export_job(name)   # the task is never awaited
+            for _ in range(500):
+                if store[job_id]["status"] in jobstore.TERMINAL:
+                    break
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0)
+            gc.collect()                     # a task reports an unretrieved exception when freed
+            return job_id
+
+        with patch.object(asyncio, "to_thread", side_effect=refusing), \
+                self.assertLogs("services.exporter", "WARNING"):
+            job_id = asyncio.run(run())
+        self.addCleanup(exporter._abandoned.discard, job_id)
+        self.assertEqual(self.on_disk("export", job_id)["error"],
+                         "RuntimeError: cannot schedule new futures after shutdown")
+        self.assertEqual([c.get("message") for c in reported], [])
         self.assertEqual(calls, [])
 
     def test_an_export_that_runs_to_the_end_leaves_no_bookkeeping(self):

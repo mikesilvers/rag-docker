@@ -17,6 +17,7 @@ import io
 import json
 import logging
 import os
+import struct
 import sys
 import tempfile
 import unittest
@@ -72,6 +73,50 @@ def ratio_message(name, member):
             f"{RATIO:,} times its compressed size, which is refused as a possible zip bomb, so "
             f"nothing from it was imported. Remove that file from the zip, or upload it on its "
             f"own, and upload again.")
+
+
+EOCD = struct.Struct("<4s4H2LH")
+
+
+def with_comment(members, comment):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        for name, data in members:
+            z.writestr(name, data)
+        z.comment = comment
+    return buf.getvalue()
+
+
+def entries(count, prefix="m"):
+    return [(f"{prefix}{i:02}.txt", "t") for i in range(count)]
+
+
+def zip64(data):
+    """Rewrite a ZIP with no comment into the ZIP64 layout: a ZIP64 record and
+    locator before an end record whose count, size and offset are 0xFFFF /
+    0xFFFFFFFF, so the count is only in the ZIP64 record (#928)."""
+    pos = len(data) - EOCD.size
+    _, _, _, _, total, dir_size, dir_offset, comment = EOCD.unpack(data[pos:])
+    assert comment == 0 and dir_offset + dir_size == pos
+    record = struct.pack("<4sQ2H2L4Q", b"PK\x06\x06", 44, 45, 45, 0, 0,
+                         total, total, dir_size, dir_offset)
+    locator = struct.pack("<4sLQL", b"PK\x06\x07", 0, pos, 1)
+    end = EOCD.pack(b"PK\x05\x06", 0, 0, 0xFFFF, 0xFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0)
+    return data[:pos] + record + locator + end
+
+
+def set_declared(data, count):
+    """Set both of the end record's 16-bit counts, leaving the directory as it is."""
+    pos = len(data) - EOCD.size
+    fields = list(EOCD.unpack(data[pos:]))
+    fields[3] = fields[4] = count
+    return data[:pos] + EOCD.pack(*fields)
+
+
+def unreadable(name):
+    return (f"'{name}' is damaged and can't be read, so nothing from it was imported. It may "
+            f"be truncated (for example an incomplete download or copy) or corrupt. Re-create "
+            f"the zip and upload it again.")
 
 
 class SettingTests(unittest.TestCase):
@@ -433,6 +478,134 @@ class DetailBoundTests(Harness):
         rejected = ingest_pipeline.UploadRejected("ARCHIVE_UNREADABLE", "m", "f.zip", members)
         self.assertEqual(rejected.detail, {"file": "f.zip", "members": members[:10],
                                            "members_omitted": 1})
+
+
+class DeclaredCountTests(unittest.TestCase):
+    """The entry total read from a ZIP's end, before zipfile opens it (#928)."""
+
+    def declared(self, data):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a.zip"
+            path.write_bytes(data)
+            return ingest_pipeline._declared_entries(path)
+
+    def test_a_plain_zip_declares_its_count(self):
+        self.assertEqual(self.declared(zip_bytes(entries(5))), 5)
+
+    def test_an_archive_comment_is_searched_past(self):
+        data = with_comment(entries(5), b"A comment of some length. " * 100)
+        self.assertNotEqual(data[-EOCD.size:-EOCD.size + 4], b"PK\x05\x06")
+        self.assertEqual(self.declared(data), 5)
+
+    def test_a_comment_at_its_longest_is_searched_past(self):
+        self.assertEqual(self.declared(with_comment(entries(5), b"c" * 0xFFFF)), 5)
+
+    def test_a_signature_inside_the_comment_is_read_as_zipfile_reads_it(self):
+        # zipfile takes the last occurrence of the signature; so does the reader.
+        fake = EOCD.pack(b"PK\x05\x06", 0, 0, 7, 7, 0, 0, 0)
+        data = with_comment(entries(5), b"before " + fake)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a.zip"
+            path.write_bytes(data)
+            with open(path, "rb") as f:
+                endrec = zipfile._EndRecData(f)
+            self.assertEqual(ingest_pipeline._declared_entries(path),
+                             endrec[4] if endrec else None)
+        self.assertEqual(endrec[4], 7)
+
+    def test_a_zip64_count_replaces_the_16_bit_field(self):
+        data = zip64(zip_bytes(entries(5)))
+        self.assertEqual(EOCD.unpack(data[-EOCD.size:])[4], 0xFFFF)
+        self.assertEqual(self.declared(data), 5)
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            self.assertEqual(len(z.infolist()), 5)
+
+    def test_zipfiles_own_zip64_output(self):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
+            for i in range(0x10000):
+                z.writestr(f"{i}", "")
+        data = buf.getvalue()
+        self.assertEqual(EOCD.unpack(data[-EOCD.size:])[4], 0xFFFF)
+        self.assertEqual(self.declared(data), 0x10000)
+
+    def test_0xffff_without_a_zip64_record_is_taken_as_written(self):
+        self.assertEqual(self.declared(set_declared(zip_bytes(entries(5)), 0xFFFF)), 0xFFFF)
+
+    def test_no_readable_end_record_gives_none(self):
+        data = zip_bytes(entries(5))
+        self.assertIsNone(self.declared(b""))
+        self.assertIsNone(self.declared(data[:EOCD.size - 1]))
+        self.assertIsNone(self.declared(data[:len(data) - EOCD.size]))
+        self.assertIsNone(self.declared(data[:len(data) - 5]))
+
+    def test_a_zip64_locator_naming_several_disks_gives_none(self):
+        data = bytearray(zip64(zip_bytes(entries(5))))
+        locator = len(data) - EOCD.size - 20
+        data[locator + 16:locator + 20] = struct.pack("<L", 2)
+        self.assertIsNone(self.declared(bytes(data)))
+
+    def test_a_missing_zip64_record_gives_none(self):
+        data = bytearray(zip64(zip_bytes(entries(5))))
+        record = len(data) - EOCD.size - 20 - 56
+        data[record:record + 4] = b"XXXX"
+        self.assertIsNone(self.declared(bytes(data)))
+
+
+class DeclaredCountRefusalTests(Harness):
+    """A ZIP that declares more than the cap is refused before zipfile opens
+    it; one whose declared total understates it is refused once loaded (#928)."""
+
+    def opening(self):
+        return patch.object(ingest_pipeline.zipfile, "ZipFile", wraps=zipfile.ZipFile)
+
+    def assert_too_many(self, name, data, count=MEMBERS + 1):
+        with self.opening() as opened:
+            status, body = self.post(upload(name, data))
+        self.assert_refused(status, body, "ARCHIVE_TOO_MANY_MEMBERS",
+                            too_many(name, count, MEMBERS),
+                            {"file": name, "members": [], "members_omitted": 0})
+        return opened
+
+    def test_over_the_cap_is_refused_before_zipfile_opens_it(self):
+        for name, data in [("plain.zip", zip_bytes(entries(MEMBERS + 1))),
+                           ("comment.zip", with_comment(entries(MEMBERS + 1), b"note " * 50)),
+                           ("zip64.zip", zip64(zip_bytes(entries(MEMBERS + 1))))]:
+            with self.subTest(name):
+                self.assert_too_many(name, data).assert_not_called()
+
+    def test_a_zip64_archive_at_the_cap_is_accepted(self):
+        status, body = self.post(upload("zip64.zip", zip64(zip_bytes(entries(MEMBERS)))))
+        self.assertEqual(status, 202, body)
+        self.assertEqual(len(self.queued_names()), MEMBERS)
+
+    def test_the_declared_count_wins_over_a_damaged_directory(self):
+        data = bytearray(zip_bytes(entries(MEMBERS + 1), zipfile.ZIP_STORED))
+        dir_offset = EOCD.unpack(bytes(data[-EOCD.size:]))[6]
+        data[dir_offset:dir_offset + 4] = b"XXXX"
+        with self.assertRaises(zipfile.BadZipFile):
+            zipfile.ZipFile(io.BytesIO(bytes(data)))
+        self.assert_too_many("damaged.zip", bytes(data)).assert_not_called()
+
+    def test_an_understated_count_is_refused_once_loaded(self):
+        data = set_declared(zip_bytes(entries(MEMBERS + 1)), 1)
+        self.assert_too_many("forged.zip", data).assert_called()
+
+    def test_no_end_record_is_still_unreadable(self):
+        data = zip_bytes(entries(3))
+        data = data[:len(data) - EOCD.size]
+        status, body = self.post(upload("cut.zip", data))
+        self.assert_refused(status, body, "ARCHIVE_UNREADABLE", unreadable("cut.zip"),
+                            {"file": "cut.zip", "members": [], "members_omitted": 0})
+
+    def test_stage_uploads_refuses_it_for_preparation_too(self):
+        # Document preparation stages its uploads through the same function.
+        data = zip_bytes(entries(MEMBERS + 1))
+        with tempfile.TemporaryDirectory() as tmp, self.opening() as opened:
+            with self.assertRaises(ingest_pipeline.UploadRejected) as caught:
+                asyncio.run(ingest_pipeline.stage_uploads([upload("prep.zip", data)], Path(tmp)))
+        self.assertEqual(caught.exception.code, "ARCHIVE_TOO_MANY_MEMBERS")
+        opened.assert_not_called()
 
 
 if __name__ == "__main__":

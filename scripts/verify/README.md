@@ -503,8 +503,8 @@ fail the export early with an actionable error and publish nothing.
 writes a saved file that isn't a JSON object, one with a wrong-typed `chunk_size` and
 one with an invalid `chunk_size` into the API container, and checks through the real
 export job that each export fails with an error naming the collection, the field and
-the Chunking Configuration page, and publishes nothing; it restores the saved file
-afterwards. Crafted
+the Chunking Configuration page, publishes nothing and leaves the saved file as it
+was written (#932); it restores the saved file afterwards. Crafted
 packages are written under a `.part` name and renamed into place, because on
 Docker Desktop the API can read a freshly written bind-mounted file as empty. Controlled tests complement,
 and do not replace, this live acceptance.
@@ -623,8 +623,10 @@ installation, the target stays claimed while its holder installs models, and a
 target is free again after a failed model installation (#492); a start whose
 first job record can't be stored releases the package name; and an import whose task
 is cancelled before its worker runs frees the package name, then reads `failed`
-`IMPORT_FAILED` with the cancelled message, a worker that starts late runs nothing,
-and one that started is left to settle its own job (#871). `05_transfer.sh` runs it
+`IMPORT_FAILED` with the cancelled message and logs a warning, a worker that starts late
+runs nothing, and one that started is left to settle its own job (#871); one whose task
+fails before its worker runs frees the package name, then reads `failed` `IMPORT_FAILED`
+with the error's own type and message, logged with its traceback (#932). `05_transfer.sh` runs it
 in the verify project's API container.
 
 `scripts/tests/test_ingest_errors.py` (#290) checks that damaged or unreadable ZIPs are
@@ -672,24 +674,28 @@ the one that tells off-loop from on-loop work). Cases there that use a large mem
 repeated byte only to reach the total store it uncompressed, so the ratio cap (#28) doesn't
 refuse it first.
 
-`scripts/tests/test_zip_limits.py` (#28) checks the member-count and compression-ratio caps
-with a member cap of 20 set through `MAX_ZIP_MEMBERS` (`02_ingest.sh` passes it to the
-container; the test sets it when absent): the settings and their 5,000 and 200 defaults, 20
-entries accepted and 21 refused before any member is read, folders, unsupported files, macOS
-metadata and members leaving the archive all counted, the count per ZIP and winning over
-damage, 5,001 entries refused at the default; the ratio rule (under 1 MiB exempt, exactly the
-ratio accepted), a declared ratio refused before anything is read, a stored member and gzip
-output not counted toward the ratio, a member refused while read within a block of passing the
-ratio, the expansion cap winning over the ratio and the ratio over an earlier unreadable member;
-the count winning over the declared total, and the total over the ratio while a member is read
-(#534); members whose path leaves the archive validated (a corrupt one refuses the ZIP, an
-encrypted one makes it `ARCHIVE_UNSUPPORTED`), counted, never staged and listed in `skipped`;
-and `detail.members` bounded to the ten members the message names, with `members_omitted`
-(0 at exactly ten). `02_ingest.sh` runs it in the API container, checks
-that the API takes `MAX_ZIP_MEMBERS` 5,000 and `MAX_ZIP_MEMBER_RATIO` 200 from
-`docker-compose.yml`, then sends `zip_many_members.zip` (5,001 entries) and
-`zip_high_ratio.zip` (2 MiB of zeros, Deflate) through the proxy and checks each is refused
-with `ARCHIVE_TOO_MANY_MEMBERS` or `ARCHIVE_RATIO_TOO_HIGH` and the exact message and `detail`.
+`scripts/tests/test_zip_limits.py` (#28) checks the member-count and compression-ratio caps with
+a member cap of 20 set through `MAX_ZIP_MEMBERS` (`02_ingest.sh` passes it to the container; the
+test sets it when absent): the settings and their 5,000 and 200 defaults, 20 entries accepted
+and 21 refused before any member is read, folders, unsupported files, macOS metadata and members
+leaving the archive all counted, the count per ZIP and winning over damage, 5,001 entries
+refused at the default; the count the ZIP declares in its end-of-central-directory record (after
+an archive comment, or in the ZIP64 record) refused before zipfile opens it, and winning over a
+damaged central directory, a record that understates the count refused once loaded, a missing
+record still `ARCHIVE_UNREADABLE`, and the record reader's results, zipfile's own ZIP64 output
+and `stage_uploads` included (#928); the ratio rule (under 1 MiB exempt, exactly the ratio
+accepted), a declared ratio refused before anything is read, a stored member and gzip output not
+counted toward the ratio, a member refused while read within a block of passing the ratio, the
+expansion cap winning over the ratio and the ratio over an earlier unreadable member; the count
+winning over the declared total, and the total over the ratio while a member is read (#534);
+members whose path leaves the archive validated (a corrupt one refuses the ZIP, an encrypted one
+makes it `ARCHIVE_UNSUPPORTED`), counted, never staged and listed in `skipped`; and
+`detail.members` bounded to the ten members the message names, with `members_omitted` (0 at
+exactly ten). `02_ingest.sh` runs it in the API container, checks that the API takes
+`MAX_ZIP_MEMBERS` 5,000 and `MAX_ZIP_MEMBER_RATIO` 200 from `docker-compose.yml`, then sends
+`zip_many_members.zip` (5,001 entries) and `zip_high_ratio.zip` (2 MiB of zeros, Deflate)
+through the proxy and checks each is refused with `ARCHIVE_TOO_MANY_MEMBERS` or
+`ARCHIVE_RATIO_TOO_HIGH` and the exact message and `detail`.
 
 `scripts/tests/test_json_ingest.py` (#295) checks that ordinary JSON becomes readable
 `key: value` text: dotted and indexed paths, scalar arrays on one line, file key order,
@@ -860,10 +866,15 @@ start gives up holding nothing and the route answers `409 EXPORT_STARTING` with 
 The bound counts once, from the second start's first wait: when the first start's write fails
 and another start takes the slot, waiting again on that one doesn't restart it (#347).
 An export task cancelled before its worker starts frees the collection's export slot and its
-delete registration, then reads `failed` with the cancelled message and `error_code` `null`,
-as does one whose task fails before its worker starts (the message names the error's type),
-and a worker that starts late does nothing; one whose worker has started is left to the worker,
-and one that ends normally leaves no bookkeeping behind (#529). An error that escapes the ingest worker is saved with the `failed` status, and a
+delete registration, then reads `failed` with the cancelled message and `error_code` `null`;
+cancelled before its first step, it keeps no bookkeeping, and one cancelled once its worker
+waits in the executor keeps an `_abandoned` entry, so a worker that starts late does nothing
+(#926). One whose task fails before its worker starts is settled the same way, with the error's
+own type and message, logged with its traceback (#926); one whose worker has started is left
+to the worker, and one that ends normally leaves no bookkeeping behind (#529). Two rare cases
+still leave an `_abandoned` entry that no worker comes to clear (documented, not fixed, #926): a task that
+had run its first step whose queued executor item is cancelled before a thread takes it, and
+one whose `to_thread` call itself raises (as at executor shutdown). An error that escapes the ingest worker is saved with the `failed` status, and a
 cancellation that escapes it is named in `errors` and reads `partial` when files completed,
 otherwise `failed` (#529).
 `02_ingest.sh` runs it in the API container. With
