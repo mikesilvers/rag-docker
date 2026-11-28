@@ -52664,20 +52664,26 @@ def create(name, metric, index_type, fixtures):
 
 
 def stored_vector_matches(coll, metric, text):
-    """Weaviate embeds all of an object's text properties joined by spaces, so the
-    probe has only `content`; it is deleted before any question is asked."""
+    """Weaviate embeds an object's text properties joined by spaces, each preceded by
+    its name (the collection's properties have vectorize_property_name on), so the
+    probe has only `content` and its stored vector is Ollama's /api/embed vector of
+    `content <text>`. The API's vector for that same string must match it: the same
+    endpoint, body and normalisation. (The bare text differs, cosine about 0.97, by
+    design: a question is embedded without a property name, as Weaviate's own
+    near_text does; the score checks below cover that.) The probe is deleted before
+    any question is asked."""
     probe = coll.data.insert(properties={"content": text})
     try:
         vector = coll.query.fetch_object_by_id(probe, include_vector=True).vector
         stored = vector.get("default") if isinstance(vector, dict) else vector
     finally:
         coll.data.delete_by_id(probe)
-    mine = asyncio.run(ollama_client.embed(text))
+    mine = asyncio.run(ollama_client.embed("content " + text))
     ok = (stored is not None and len(stored) == len(mine)
           and cosine(stored, mine) >= 0.9999 and abs(norm(stored) - norm(mine)) <= 1e-3)
     detail = ("no stored vector" if stored is None else
               f"cosine {cosine(stored, mine):.6f}, norms {norm(stored):.4f} and {norm(mine):.4f}")
-    report(ok, f"{metric}: the API's vector for a fixture is the one Weaviate stored ({detail})")
+    report(ok, f"{metric}: the API's vector for a fixture's document string is the one Weaviate stored ({detail})")
 
 
 def ask(name, question, mode):
