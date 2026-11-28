@@ -32167,7 +32167,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530); the nginx tag in SPECIFICATIONS.md's compose copy and 11.3 image list matches docker-compose.yml (#665), registered by infrastructure |
 | `../tests/test_weaviate_upgrade.py` | host-only: suite 25's helper with a fake `docker`: the tags it upgrades between and its refusals, the read-back comparison, the labels, no published port, the internal network, the snapshot settings, the step order, stopping at a failure, removal after a pass and a failure, never an image; the embedded copies (#805) |
 | `../tests/test_upgrade_backup.py` | host-only: the README's 1.1.0 → 1.2.0 upgrade blocks, run as written under bash, `zsh -c` and interactive zsh with comments off, against stub `docker`, `git` and `curl`; the stub docker accepts only mounts inside its temp directory and only the README's two container commands: no block holds a `#` comment line; the backup skips a missing volume (a wrong prefix) and counts only existing volumes' archives, and writes each copy to a `.tmp` file that replaces the archive only once `gzip -t` passes, so a failed or corrupt copy prints `backup FAILED` and keeps an earlier archive; the rollback is gated on `git checkout v1.1.0` and checks every archive (`gzip -t`, `tar tzf`) and volume before it empties any, and a failed restore stops before `compose up`; alpine is pinned by version and digest; git ignores `backups/` (#679, #693), registered by infrastructure |
-| `../tests/test_backup_scripts.py` | runs from the host, standard library plus the docker CLI: `scripts/backup.sh` and `scripts/restore.sh` (#848) on throwaway volumes of a random project of their own (`rd848t<hex>`, with compose's labels, removed afterwards), run from a scratch git checkout with their own `HOME`: a backup then a restore gives back every file, folder, link, mode and owner; every volume gets its own key, and no two keys match over two runs; the backup folder (0700) holds only `.tgz.age` archives and `.key` files (0600), with no unencrypted archive and no key in the output; a missing volume is skipped and a running container of the project is stopped, not removed; a wrong key, a missing key file and a damaged or cut archive change nothing and stop nothing, and a wrong key or a Docker error in the check shows what age or Docker said; an extraction that fails after the check (a damaged copy fed by a docker wrapper) leaves the volume unchanged, its root's mode and owner included; a Docker error in the key step is shown, with no line holding a secret key; the prefix and location refusals, and the checkout named in another case refused where the filesystem ignores case; the age image pins (the README's alpine, an exact `age` package), its tag following the whole Dockerfile and the age folder (a stub docker: a new digest, an added instruction, an added or changed parser directive, or a file added to or changed in `scripts/age` gives a new tag, a comment, a blank line or a `# key=value` comment after the first comment doesn't, and removing the added file gives the tag back, #852, #856, #862; with no `sha256sum` the same tag from `shasum`, and with neither a refusal before any build), a volume holding an interrupted restore's `.rag-docker-restore.*` folder backed up without it, the folder left in place, and restored without it (#856), and `*.key` in `.gitignore`. Skipped, with a message, only when the docker CLI is missing; it builds the age image (`scripts/age`) if this machine doesn't have it, which needs the network. Registered by infrastructure |
+| `../tests/test_backup_scripts.py` | runs from the host, standard library plus the docker CLI: `scripts/backup.sh` and `scripts/restore.sh` (#848) on throwaway volumes of a random project of their own (`rd848t<hex>`, with compose's labels, removed afterwards), run from a scratch git checkout with their own `HOME`: a backup then a restore gives back every file, folder, link, mode and owner; every volume gets its own key, and no two keys match over two runs; the backup folder (0700) holds only `.tgz.age` archives and `.key` files (0600), with no unencrypted archive and no key in the output; a missing volume is skipped and a running container of the project is stopped, not removed; a wrong key, a missing key file and a damaged or cut archive change nothing and stop nothing, and a wrong key or a Docker error in the check shows what age or Docker said; an extraction that fails after the check (a damaged copy fed by a docker wrapper) leaves the volume unchanged, its root's mode and owner included; a Docker error in the key step is shown, with no line holding a secret key; the prefix and location refusals, and the checkout named in another case refused where the filesystem ignores case; the age image pins (the README's alpine, an exact `age` package), its tag following the whole Dockerfile and the age folder (a stub docker: a new digest, an added instruction, an added or changed parser directive, or a file added to or changed in `scripts/age` gives a new tag, a comment, a blank line or a `# key=value` comment after the first comment doesn't, and removing the added file gives the tag back, #852, #856, #862; with no `sha256sum` the same tag from `shasum`, and with neither a refusal before any build; an unreadable entry in `scripts/age` stops `rb_image` before any docker call, and the listing leaves `pipefail` off in the scripts that source it, #937), a volume holding an interrupted restore's `.rag-docker-restore.*` folder backed up without it, the folder left in place, and restored without it (#856), and `*.key` in `.gitignore`. Skipped, with a message, only when the docker CLI is missing; it builds the age image (`scripts/age`) if this machine doesn't have it, which needs the network. Registered by infrastructure |
 | `../tests/test_version_agreement.py` | host-only: the first-party version strings agree with each other, not with a fixed version: `ui/package.json`, the root versions in `ui/package-lock.json`, `mcp/mcpapp.py`, the two `service.version` defaults in `api/services/telemetry.py` and `RAG_OTEL_SERVICE_VERSION` in `docker-compose.telemetry.yml` and `docker-compose.telemetry.verify.yml` (#605, #656), registered by infrastructure |
 | `../tests/test_ui_dependencies.py` | host-only: the copy of `ui/package.json` embedded in `IMPLEMENTATION.md` (`### ui/package.json`) is the file, exactly, so a UI dependency bump that misses the copy fails (#532), registered by infrastructure |
 | `../tests/test_tailwind_output.py` | runs from the host, standard library plus the docker CLI: the built UI CSS keeps what the Tailwind 4 migration relies on (RD-157, #773): the `prose` and `prose-sm` rules, `relative`, `hover` on every device with no `@media (hover: hover)`, and the `@source` globs with automatic detection off (a sentinel `.jsx` file under `ui/src/` is scanned, a sentinel `.md` file is not). It builds a scratch copy of `ui/` with `npm ci --ignore-scripts` from the lock file and `vite build` in a throwaway container of the image `ui/Dockerfile` builds with (its `builder` stage), not on the host (#826), so it needs the network unless the image and the npm cache are present, and is skipped, with a message, only when the docker CLI is missing (a docker or build failure fails it); a second class reads `ui/src/index.css`, `NavBar.tsx` and `ui/Dockerfile` directly, and checks that the builder image is an image reference with a tag or a digest (a `--platform` flag, a digest pin and a registry with a port are accepted; a token starting with `-` is refused before it reaches `docker run`); a third checks, with a stub in place of docker, that a build step that times out has its named container removed (#841). Registered by infrastructure |
@@ -59806,7 +59806,7 @@ if [ "$running" != "$EXPECTED" ]; then
 fi
 
 echo
-echo "If the requested services are up, open http://localhost:8080"
+echo "The requested services are up: open http://localhost:8080"
 if [ "$EXTERNAL" = 1 ]; then
   echo "On the Ollama host, pull the models rag-docker uses (it never pulls them itself):"
   # Read from the base file alone: the overlay leaves the ollama service out,
@@ -74136,7 +74136,8 @@ class Offline(unittest.TestCase):
 
 class Installer(unittest.TestCase):
     def test_default_and_optional_commands_and_missing_payload(self):
-        for mode in ('default', 'optional', 'containerd', 'wrong-loaded', 'missing'):
+        # telemetry-timeout: 5 of 6 services run on every poll; slow-start: 4, 5, then 6.
+        for mode in ('default', 'optional', 'containerd', 'wrong-loaded', 'missing', 'telemetry-timeout', 'slow-start'):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as folder:
                 root = Path(folder)
                 for sub in ('scripts', 'telemetry', 'offline', 'bin'):
@@ -74150,7 +74151,7 @@ class Installer(unittest.TestCase):
                 (root/'telemetry/image.json').write_text(json.dumps({'config_ids':{'arm64':identity}}))
                 (root/'offline/images.tar.gz').touch()
                 (root/'offline/ollama_models.tar.gz').touch()
-                if mode in ('optional', 'containerd', 'wrong-loaded'):
+                if mode in ('optional', 'containerd', 'wrong-loaded', 'telemetry-timeout', 'slow-start'):
                     target = root/'offline/collector.tar'
                     archive(target, config, layer)
                     (root/'offline/collector.json').write_text(json.dumps({'architecture':'arm64',
@@ -74176,11 +74177,20 @@ elif a[:2]==['image','save']:
    data=b'wrong'; item=tarfile.TarInfo('config'); item.size=len(data)
    tar.addfile(item,io.BytesIO(data))
 elif a[:2]==['compose','ps'] and '--services' in a:
- for i in range(int(os.environ['TEST_COUNT'])): print('service'+str(i))
+ with open(os.environ['TEST_LOG']) as f: polls=sum(1 for x in f if json.loads(x)[:2]==['compose','ps'] and '--services' in json.loads(x))
+ counts=os.environ['TEST_COUNT'].split(',')
+ for i in range(int(counts[min(polls,len(counts))-1])): print('service'+str(i))
 """)
                 stub.chmod(0o755)
+                sleep = root/'bin/sleep'
+                sleep.write_text(r"""#!/usr/bin/env python3
+import json,os,sys
+with open(os.environ['TEST_LOG'],'a') as f: f.write(json.dumps(['sleep']+sys.argv[1:])+'\n')
+""")
+                sleep.chmod(0o755)
                 env = {**os.environ, 'PATH':str(root/'bin')+os.pathsep+os.environ['PATH'],
-                       'TEST_LOG':str(root/'calls'), 'TEST_ID':identity if mode=='optional' else 'sha256:'+'b'*64, 'TEST_CONFIG':identity, 'TEST_MODE':mode, 'TEST_COUNT':'5' if mode=='default' else '6'}
+                       'TEST_LOG':str(root/'calls'), 'TEST_ID':identity if mode in ('optional', 'telemetry-timeout', 'slow-start') else 'sha256:'+'b'*64, 'TEST_CONFIG':identity, 'TEST_MODE':mode,
+                       'TEST_COUNT':{'default':'5', 'telemetry-timeout':'5', 'slow-start':'4,5,6'}.get(mode, '6')}
                 run = subprocess.run(['bash', str(root/'install-offline.sh'), *([] if mode=='default' else ['--telemetry'])],
                                      env=env, text=True, capture_output=True)
                 calls = [json.loads(x) for x in (root/'calls').read_text().splitlines()]
@@ -74192,10 +74202,23 @@ elif a[:2]==['compose','ps'] and '--services' in a:
                     self.assertNotEqual(run.returncode,0)
                     self.assertFalse(any(x[0]=='load' or x[:2]==['compose','up'] for x in calls))
                     continue
+                polls = calls.count(['compose','ps','--services','--filter','status=running'])
+                if mode == 'telemetry-timeout':
+                    # One service still missing after 60 polls fails the install (#937).
+                    self.assertEqual(run.returncode,1,run.stdout+run.stderr)
+                    self.assertEqual((polls, calls.count(['sleep','5'])), (60, 60))
+                    self.assertEqual(calls[-1],['compose','ps'])
+                    self.assertIn('ERROR: only 5 of 6 services are running after 5 minutes.',run.stderr)
+                    self.assertNotIn('http://localhost:8080',run.stdout)
+                    continue
                 self.assertEqual(run.returncode,0,run.stderr)
+                if mode == 'slow-start':
+                    # The wait stops at the first poll that sees every service (#937).
+                    self.assertEqual((polls, calls.count(['sleep','5'])), (3, 2))
+                    self.assertIn('The requested services are up: open http://localhost:8080',run.stdout.splitlines())
                 up = next(x for x in calls if x[:2]==['compose','up'])
                 restore = next(x for x in calls if x[:2]==['compose','run'])
-                if mode in ('optional', 'containerd', 'wrong-loaded'):
+                if mode in ('optional', 'containerd', 'wrong-loaded', 'slow-start'):
                     self.assertIn('--pull',up); self.assertIn('never',up)
                     self.assertIn('--pull=never',restore)
                 else:

@@ -49,17 +49,23 @@ rb_age_text() {
        { d = 0 }
        /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
        { print }' "$dir/Dockerfile" || return 1
-  # The loop runs in a subshell (the last part of a pipeline): `exit` ends it.
-  (cd "$dir" && find . ! -type d ! -path ./Dockerfile) | sed 's|^\./||' | LC_ALL=C sort |
-    while IFS= read -r rel; do
-      if [ -L "$dir/$rel" ]; then
-        target=$(readlink "$dir/$rel") || exit 1
-        printf 'link %s\n%s\n' "$rel" "$target"
-      else
-        printf 'file %s\n' "$rel"
-        rb_sha256 < "$dir/$rel" || exit 1
-      fi
-    done
+  # The listing runs in a subshell with pipefail, so a failed find, sed or sort
+  # fails the function (#937) without setting the option in the caller. The
+  # loop runs in a subshell of its own (the last part of a pipeline): `exit`
+  # ends it.
+  (
+    set -o pipefail
+    (cd "$dir" && find . ! -type d ! -path ./Dockerfile) | sed 's|^\./||' | LC_ALL=C sort |
+      while IFS= read -r rel; do
+        if [ -L "$dir/$rel" ]; then
+          target=$(readlink "$dir/$rel") || exit 1
+          printf 'link %s\n%s\n' "$rel" "$target"
+        else
+          printf 'file %s\n' "$rel"
+          rb_sha256 < "$dir/$rel" || exit 1
+        fi
+      done
+  )
 }
 
 # Sets RB_IMAGE, building the image if this machine doesn't have it. The tag
