@@ -358,7 +358,7 @@ need PyYAML on the host; without it they are skipped.
 
 `26_external_ollama.sh` checks external-Ollama mode (#673, SPECIFICATIONS.md §2.7 and §10.12). In every run
 `../tests/test_external_ollama.py` runs in the API image with no network (the settings, the request bodies in both
-modes and the `/api/embed` fallback, the tag-exact check, `/health/details`, the start-up lines, import and export,
+modes and the embedding endpoint (`/api/embed` only, #936), the tag-exact check, `/health/details`, the start-up lines, import and export,
 `python -m ollama_check`, the overlay and `install-offline.sh --external-ollama`). The rest needs
 `stack.sh run --external-ollama`, which runs this suite alone, on a host whose native Ollama is set up as the main
 README's "External Ollama (native)" says, with its models already pulled: `stack.sh` first runs
@@ -1144,6 +1144,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_metrics.py` | controlled metrics-file regressions (#374): a failed write keeps the answer, the bound, crash-safe compaction, reload after a restart; registered by suite 03 |
 | `../tests/test_citation_score.py` | controlled citation-score regressions (#376): each metric's distance-to-score conversion, best first, missing values and unknown metrics as `null`, a failed metric read as the 503, the metric read on every query; registered by suite 03 |
 | `citation_score.py` | helper for suite 03 (#376), run in the API container: citation scores of known vectors on a real Weaviate for each distance metric, and after a collection is recreated with another metric |
+| `query_embedding.py` | helper for suite 03 (#936), run in the API container: Ollama's two embedding endpoints compared for one text, the API's query vector against Weaviate's stored one, and `dot` and `l2-squared` collections citing their own fixture with the `semantic` mode's scores |
 | `08_overlap.sh` | called by suite02 (and thus all.sh); runs `test_overlap_chunks.py` in the API image with the repository mounted read-only and no network; real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds, and a file over the output limits stored as parts inside them (#621) |
 | `../tests/test_overlap_chunks.py` | controlled overlap-window, per-file limit, ingest-worker and tuning-budget (parts, #621) regressions and the `IMPLEMENTATION.md` mirror check, registered by suite08 (#340) |
@@ -1733,6 +1734,17 @@ vectors, asks `/query` in the `hnsw` and `flat` modes with the models controlled
 scores against the expected similarities; then it deletes the cosine collection, recreates it
 with l2-squared, and checks the next query uses the new metric. With models, the suite checks
 that in each of the four modes the citation scores are numbers, highest first.
+
+Suite 03 also checks that `hnsw` and `flat` query vectors are the ones Weaviate makes (#936,
+SPECIFICATIONS.md §2.7), in every run. `query_embedding.py` runs in the verify project's API
+container with the embedding model real and the reformulation and answer controlled. It reports,
+for one text, the norms of Ollama's `/api/embeddings` and `/api/embed` vectors and their cosine,
+and fails only if `/api/embed`'s isn't unit length. It creates an owned `dot` collection (flat
+index) and an owned `l2-squared` collection (hnsw index), each with its own three fixtures
+embedded by Weaviate; checks that the API's vector for a text is the one Weaviate stored for a
+probe object holding only that text (deleted before the questions); and, for a known question in
+each collection, that the `hnsw` and `flat` modes cite its own fixture first, with the `semantic`
+mode's scores for the same chunks (within 1e-3). Its collections are deleted at the end.
 `browser/query_config.js` (suite 06) checks that the Q&A page shows a score with 3 decimals and
 `n/a` for a `null` score.
 

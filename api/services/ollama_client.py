@@ -1,6 +1,5 @@
 from __future__ import annotations
 from services import telemetry
-import logging
 import re
 import time
 
@@ -9,12 +8,6 @@ import httpx
 from config import settings
 
 _BASE = f"http://{settings.ollama_host}:{settings.ollama_port}"
-_log = logging.getLogger(__name__)
-
-# Set once /api/embeddings answers 404 for a missing route: an Ollama that has
-# dropped the older endpoint, superseded by /api/embed (#673). Every later
-# embedding goes to /api/embed, the endpoint Weaviate's text2vec-ollama calls.
-_use_embed = False
 
 
 def keep_alive() -> int | str:
@@ -25,43 +18,24 @@ def keep_alive() -> int | str:
     return int(value) if re.fullmatch(r"-?[0-9]+", value) else value
 
 
-def _route_missing(resp: httpx.Response) -> bool:
-    """A 404 for the route itself, not for the model: Ollama answers a missing
-    model with a JSON `error` ("model ... not found"), and a missing route with
-    plain text ("404 page not found")."""
-    if resp.status_code != 404:
-        return False
-    try:
-        body = resp.json()
-    except ValueError:
-        return True
-    return not (isinstance(body, dict) and "error" in body)
-
-
 @telemetry.traced("ollama.embed")
 async def embed(text: str) -> list[float]:
+    """The query vector for `text`: `/api/embed`, the endpoint and body Weaviate's
+    text2vec-ollama uses, so it is the unit-length vector Weaviate stores for the
+    same text (#936). `/api/embeddings` returns the model's raw vector, not unit
+    length, which put `dot` and `l2-squared` scores on another scale. An empty
+    `embeddings` (an empty text) gives `[]`."""
     # keep_alive only: the embedding model keeps its own context (num_ctx), as
     # Weaviate's own embedding calls do (#673).
-    global _use_embed
     async with httpx.AsyncClient(timeout=60.0) as client:
-        if not _use_embed:
-            resp = await client.post(
-                f"{_BASE}/api/embeddings",
-                json={"model": settings.embed_model, "prompt": text,
-                      "keep_alive": keep_alive()},
-            )
-            if not _route_missing(resp):
-                resp.raise_for_status()
-                return resp.json()["embedding"]
-            _use_embed = True
-            _log.warning("Ollama answered 404 for /api/embeddings; using /api/embed from now on")
         resp = await client.post(
             f"{_BASE}/api/embed",
             json={"model": settings.embed_model, "input": text,
                   "keep_alive": keep_alive()},
         )
         resp.raise_for_status()
-        return resp.json()["embeddings"][0]
+        embeddings = resp.json()["embeddings"]
+        return embeddings[0] if embeddings else []
 
 
 async def _chat(model: str, system: str, user: str) -> str:

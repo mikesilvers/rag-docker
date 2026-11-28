@@ -2,8 +2,8 @@
 
 The settings (RAG_EXTERNAL_OLLAMA, OLLAMA_NUM_CTX, OLLAMA_KEEP_ALIVE), the bodies
 of rag-docker's own Ollama requests in both modes (num_ctx on chat only,
-keep_alive everywhere) and the /api/embed fallback (for a missing route only,
-never a missing model), the tag-exact model check, the version and, in external
+keep_alive everywhere) and the embedding endpoint (`/api/embed` only, #936),
+the tag-exact model check, the version and, in external
 mode, the memory report and what Ollama has loaded in /health/details, the
 start-up lines for missing models, import's check-only path and the refused
 export with models, `python -m ollama_check`, the overlay file and the base
@@ -59,13 +59,13 @@ class FakeOllama:
     """An Ollama answering /api/tags, /api/version, /api/ps, /api/chat and the two
     embedding endpoints, recording every request's path and JSON body."""
 
-    def __init__(self, models=None, down=False, version="0.40.18", embeddings_gone=False,
-                 loaded=None, ps_fails=False, embed_model_missing=False):
+    def __init__(self, models=None, down=False, version="0.40.18", loaded=None,
+                 ps_fails=False, embed_model_missing=False, empty_embeddings=False):
         self.models = models
         self.down = down
         self.version = version
-        self.embeddings_gone = embeddings_gone
         self.embed_model_missing = embed_model_missing
+        self.empty_embeddings = empty_embeddings
         self.loaded = loaded if loaded is not None else []
         self.ps_fails = ps_fails
         self.requests = []
@@ -90,14 +90,15 @@ class FakeOllama:
         if path == "/api/chat":
             return httpx.Response(200, json={"message": {"content": "an answer"}})
         if path == "/api/embeddings":
-            if self.embeddings_gone:
-                return httpx.Response(404, text="404 page not found")
-            if self.embed_model_missing:
-                # The route is there; the model isn't (Ollama's own JSON error).
-                return httpx.Response(404, json={"error": f'model "{body["model"]}" not found, '
-                                                          "try pulling it first"})
+            # Still answered, with another vector, so a test sees which one was asked.
             return httpx.Response(200, json={"embedding": [0.1, 0.2, 0.3]})
         if path == "/api/embed":
+            if self.embed_model_missing:
+                # Ollama's own JSON error for a model it doesn't have.
+                return httpx.Response(404, json={"error": f'model "{body["model"]}" not found, '
+                                                          "try pulling it first"})
+            if self.empty_embeddings:
+                return httpx.Response(200, json={"embeddings": []})
             return httpx.Response(200, json={"embeddings": [[0.4, 0.5, 0.6]]})
         return httpx.Response(404)
 
@@ -175,10 +176,6 @@ class SettingsTests(unittest.TestCase):
 class RequestBodyTests(unittest.TestCase):
     """S3: the same bodies in both modes; num_ctx on chat only."""
 
-    def setUp(self):
-        ollama_client._use_embed = False
-        self.addCleanup(setattr, ollama_client, "_use_embed", False)
-
     def test_chat_carries_num_ctx_and_keep_alive_in_both_modes(self):
         for on in (False, True):
             with self.subTest(external=on), external(on), \
@@ -203,74 +200,53 @@ class RequestBodyTests(unittest.TestCase):
                 asyncio.run(ollama_client.chat("system", "user"))
                 asyncio.run(ollama_client.build_chat("system", "user"))
                 asyncio.run(ollama_client.embed("a question"))
-                bodies = fake.bodies("/api/chat") + fake.bodies("/api/embeddings")
+                bodies = fake.bodies("/api/chat") + fake.bodies("/api/embed")
                 self.assertEqual(len(bodies), 3)
                 for body in bodies:
                     self.assertEqual(body["keep_alive"], sent)
                     self.assertIs(type(body["keep_alive"]), type(sent))
 
-    def test_keep_alive_in_seconds_is_a_number_on_api_embed_too(self):
-        with patch.object(settings, "ollama_keep_alive", "300"), \
-                FakeOllama(embeddings_gone=True).serving() as fake, \
-                self.assertLogs("services.ollama_client", "WARNING"):
-            asyncio.run(ollama_client.embed("one"))
-        [body] = fake.bodies("/api/embed")
-        self.assertEqual(body["keep_alive"], 300)
-        self.assertIs(type(body["keep_alive"]), int)
-
-    def test_embedding_carries_keep_alive_and_no_num_ctx(self):
+    def test_embedding_goes_to_api_embed_with_keep_alive_and_no_num_ctx(self):
+        # The endpoint and body Weaviate's text2vec-ollama uses, so the query vector
+        # is the unit-length one Weaviate stores; never /api/embeddings (#936).
         for on in (False, True):
             with self.subTest(external=on), external(on), FakeOllama().serving() as fake:
                 vector = asyncio.run(ollama_client.embed("a question"))
-                self.assertEqual(vector, [0.1, 0.2, 0.3])
-                [body] = fake.bodies("/api/embeddings")
-                self.assertEqual(body, {"model": settings.embed_model, "prompt": "a question",
+                self.assertEqual(vector, [0.4, 0.5, 0.6])
+                self.assertEqual(len(fake.requests), 1)
+                [body] = fake.bodies("/api/embed")
+                self.assertEqual(body, {"model": settings.embed_model, "input": "a question",
                                         "keep_alive": ollama_client.keep_alive()})
                 self.assertNotIn("options", body)
-                self.assertEqual(fake.bodies("/api/embed"), [])
+                self.assertEqual(fake.bodies("/api/embeddings"), [])
 
-    def test_a_404_from_embeddings_falls_back_to_embed_for_good(self):
-        with FakeOllama(embeddings_gone=True).serving() as fake, self.assertLogs(
-                "services.ollama_client", "WARNING") as logs:
-            self.assertEqual(asyncio.run(ollama_client.embed("one")), [0.4, 0.5, 0.6])
-            self.assertEqual(asyncio.run(ollama_client.embed("two")), [0.4, 0.5, 0.6])
-        self.assertEqual(len(fake.bodies("/api/embeddings")), 1, "the older endpoint is asked once")
-        self.assertEqual(fake.bodies("/api/embed"), [
-            {"model": settings.embed_model, "input": "one", "keep_alive": ollama_client.keep_alive()},
-            {"model": settings.embed_model, "input": "two", "keep_alive": ollama_client.keep_alive()}])
-        self.assertEqual(len(logs.records), 1)
-        self.assertIn("using /api/embed", logs.output[0])
-
-    def test_a_missing_model_404_is_an_error_not_a_fallback(self):
-        with FakeOllama(embed_model_missing=True).serving() as fake, \
-                self.assertNoLogs("services.ollama_client", "WARNING"):
+    def test_a_missing_model_404_raises(self):
+        with FakeOllama(embed_model_missing=True).serving() as fake:
             with self.assertRaises(httpx.HTTPStatusError) as caught:
                 asyncio.run(ollama_client.embed("x"))
         self.assertEqual(caught.exception.response.status_code, 404)
-        self.assertIs(ollama_client._use_embed, False, "the endpoint stays /api/embeddings")
-        self.assertEqual(fake.bodies("/api/embed"), [])
-        self.assertEqual(len(fake.bodies("/api/embeddings")), 1)
+        self.assertEqual(len(fake.bodies("/api/embed")), 1)
+        self.assertEqual(fake.bodies("/api/embeddings"), [])
 
-    def test_only_a_404_without_a_json_error_is_a_missing_route(self):
-        for response, missing in ((httpx.Response(404, text="404 page not found"), True),
-                                  (httpx.Response(404), True),
-                                  (httpx.Response(404, json=["not", "an", "object"]), True),
-                                  (httpx.Response(404, json={"error": "model not found"}), False),
-                                  (httpx.Response(200, json={"embedding": [1.0]}), False),
-                                  (httpx.Response(500, text="oops"), False)):
-            with self.subTest(status=response.status_code, body=response.text):
-                self.assertIs(ollama_client._route_missing(response), missing)
+    def test_another_error_raises(self):
+        paths = []
 
-    def test_another_error_is_not_a_fallback(self):
         def failing(request):
+            paths.append(request.url.path)
             return httpx.Response(500)
-        fake = FakeOllama()
-        fake.__call__ = failing
         with patch.object(httpx, "AsyncClient",
                           lambda *a, **k: REAL_ASYNC_CLIENT(*a, **{**k, "transport": httpx.MockTransport(failing)})):
             with self.assertRaises(httpx.HTTPStatusError):
                 asyncio.run(ollama_client.embed("x"))
-        self.assertIs(ollama_client._use_embed, False)
+        self.assertEqual(paths, ["/api/embed"])
+
+    def test_no_embeddings_gives_an_empty_vector(self):
+        # Ollama answers an empty input with no embeddings; the vector is empty, as
+        # /api/embeddings answered an empty prompt.
+        with FakeOllama(empty_embeddings=True).serving() as fake:
+            self.assertEqual(asyncio.run(ollama_client.embed("")), [])
+        self.assertEqual(fake.bodies("/api/embed"), [
+            {"model": settings.embed_model, "input": "", "keep_alive": ollama_client.keep_alive()}])
 
     def test_version_and_ps_have_their_own_span_names(self):
         names = []
