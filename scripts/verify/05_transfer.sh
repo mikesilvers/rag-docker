@@ -204,6 +204,13 @@ sys.exit(0 if model and coll.get("embedding_model") == model == man["embedding"]
 ENDPY
 check "E30: a matching collection records its stored model in collection.json and the manifest" $? "$(tail -1 /tmp/vfy_e30_match.txt)"
 
+# E30's mismatch exports ask for models, which external-Ollama mode refuses
+# before the mismatch check (MODELS_NOT_EXPORTABLE, suite 26), so they skip
+# there (#954). The block below is not indented: it holds a heredoc.
+if [ "${RAG_VERIFY_EXTERNAL_OLLAMA:-0}" = 1 ]; then
+  skip "E30: exports of mismatched collections refuse with the re-embedding remedy and leave nothing behind" \
+    "external-Ollama mode: these exports ask for models, which external mode refuses first (MODELS_NOT_EXPORTABLE, checked by suite 26); the before-release container run covers them (#954)"
+else
 # Collections the API would never create: an equal-width vector from another
 # model's name, a named-vector schema, and no vectorizer. Each export must fail
 # with the re-embedding remedy and leave nothing in the exports folder.
@@ -253,6 +260,7 @@ for e30c in "$E30_DRIFT" "$E30_NAMED" "$E30_NONE"; do
 done
 e30_collections drop >/dev/null 2>&1
 check "E30: mismatch fixtures removed" $?
+fi
 
 # ── corruption is detected ───────────────────────────────────────────────────
 python3 - "$EXPORTS/$PKG" <<'ENDPY'
@@ -962,6 +970,12 @@ e27c=$(m e27_collection); [ -n "$e27c" ] && [ "$e27c" != "None" ] && [ "$e27c" !
 # that one manifest is written. It runs only when both the api and ollama
 # containers mount rag-verify-ollama-models, never the live volume; stack.sh's
 # copy sync removes anything left behind on the next `up`.
+# External-Ollama mode (#954): there is no ollama container or model copy to
+# install into. The block below is not indented: it holds a heredoc.
+if [ "${RAG_VERIFY_EXTERNAL_OLLAMA:-0}" = 1 ]; then
+  skip "a model installed from a bundle is reported by Ollama's /api/tags (#452)" \
+    "external-Ollama mode: no ollama container mounts the verify model copy, and rag-docker never writes a model in an external Ollama (#673); the before-release container run covers it (#954)"
+else
 alias_mounts=$(cd "$REPO_ROOT" && for mount in api:/ollama ollama:/root/.ollama; do
   docker inspect -f "{{range .Mounts}}{{if eq .Destination \"${mount#*:}\"}}{{.Name}}{{end}}{{end}}" \
     "$(docker compose ps -q "${mount%%:*}")" 2>/dev/null
@@ -1018,6 +1032,7 @@ ENDPY
 else
   check "the install-then-report check runs only on the verify model copy" 1 \
     "api and ollama must both mount rag-verify-ollama-models; found: '${alias_mounts}'"
+fi
 fi
 
 # ── tuning ───────────────────────────────────────────────────────────────────

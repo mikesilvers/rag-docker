@@ -4,8 +4,10 @@
 #
 #   bash scripts/check-external-ollama.sh              # on the host, from anywhere
 #   bash scripts/check-external-ollama.sh --host-only  # only the listener check
+#   bash scripts/check-external-ollama.sh --port N     # another port (default 11434)
 #
-# 1. On this host (macOS or Linux): what listens on TCP port 11434. Ollama has
+# 1. On this host (macOS or Linux): what listens on TCP port 11434 (or --port N,
+#    as stack.sh --external-ollama passes RAG_VERIFY_OLLAMA_PORT, #954). Ollama has
 #    no authentication, so it should listen only where Docker reaches it:
 #    loopback (127.0.0.1, ::1) with Docker Desktop, and on Linux the docker0
 #    bridge address too, which is safe only with the README's firewall rule (it
@@ -24,20 +26,25 @@
 set -uo pipefail
 
 usage() {
-  sed -n '5,6p' "${BASH_SOURCE[0]}" | sed 's/^#  //' >&2
+  sed -n '5,7p' "${BASH_SOURCE[0]}" | sed 's/^#  //' >&2
   exit 2
 }
 
 HOST_ONLY=0
+PORT=11434
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --host-only) HOST_ONLY=1; shift ;;
+    --port) [ "$#" -ge 2 ] || usage; PORT="$2"; shift 2 ;;
     -h|--help) usage ;;
     *) usage ;;
   esac
 done
 
-PORT=11434
+case "$PORT" in ''|*[!0-9]*) usage ;; esac
+[ "${#PORT}" -le 5 ] || usage
+PORT=$((10#$PORT))
+{ [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ]; } || usage
 WARNINGS=0
 PROBLEMS=0
 say() { printf 'check-external-ollama: %s: %s\n' "$1" "$2"; }

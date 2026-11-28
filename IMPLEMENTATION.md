@@ -499,6 +499,27 @@ services:
       RAG_LAN_HOSTNAMES: "vfy-lan.invalid,192.0.2.10"
 ```
 
+### docker-compose.external-ollama.verify.yml
+
+```yaml
+# Overlay for external-Ollama mode on the disposable verify project (#673, #954).
+# Loaded only by scripts/verify/stack.sh --external-ollama, last, after the
+# checkout's docker-compose.external-ollama.yml and docker-compose.verify.yml,
+# from the harness checkout. Run any other way, it refuses to resolve.
+#
+# The native Ollama's port is RAG_VERIFY_OLLAMA_PORT (default 11434, set by
+# stack.sh). host-gateway maps the name `ollama` to the host, not a port, so the
+# api and weaviate are given the port here: every Ollama URL and every
+# collection's stored endpoint is then http://ollama:<port>.
+services:
+  api:
+    environment:
+      OLLAMA_PORT: "${RAG_VERIFY_OLLAMA_PORT:?set by scripts/verify/stack.sh}"
+  weaviate:
+    environment:
+      TEXT2VEC_OLLAMA_APIENDPOINT: "http://ollama:${RAG_VERIFY_OLLAMA_PORT:?set by scripts/verify/stack.sh}"
+```
+
 ### ollama/entrypoint.sh
 
 ```bash
@@ -30974,6 +30995,8 @@ bash scripts/verify/stack.sh run 02 04              # only the named suites
 bash scripts/verify/stack.sh run --lan              # LAN mode, TLS on loopback only (#26)
 bash scripts/verify/stack.sh run --query-only       # query-only mode on a second instance (#670)
 bash scripts/verify/stack.sh run --external-ollama  # a native Ollama on this host (#673)
+bash scripts/verify/stack.sh run --external-ollama all  # every suite in external-Ollama mode (#954)
+RAG_VERIFY_OLLAMA_PORT=11435 bash scripts/verify/stack.sh run --external-ollama all  # a native Ollama on another port
 ```
 
 Exits non-zero if any check fails.
@@ -31167,8 +31190,8 @@ against" below).
 
 | Command | What it does |
 |---|---|
-| `stack.sh run [--checkout DIR] [--telemetry [--telemetry-pin FILE] \| --lan \| --query-only \| --external-ollama] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
-| `stack.sh up [--checkout DIR] [--pull] [--telemetry [--telemetry-pin FILE] \| --lan \| --query-only \| --external-ollama]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. `--telemetry` brings it up in the same telemetry configuration as `run --telemetry` (see "Optional Collector acceptance") and also prints `COMPOSE_PROFILES`, `RAG_VERIFY_HARNESS`, `RAG_VERIFY_CHECKOUT`, `RAG_VERIFY_OTEL_ENABLED` and `RAG_VERIFY_TELEMETRY_PIN`. `--telemetry-pin FILE` supplies a reviewed collector pin (see "Evaluating a collector pin change"). |
+| `stack.sh run [--checkout DIR] [--telemetry [--telemetry-pin FILE] \| --lan \| --query-only \| --external-ollama] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. With `--external-ollama`, no suite names runs `26_external_ollama` only and the one name `all` runs every suite (#954); `all` is refused anywhere else. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
+| `stack.sh up [--checkout DIR] [--pull] [--telemetry [--telemetry-pin FILE] \| --lan \| --query-only \| --external-ollama]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. `--telemetry` brings it up in the same telemetry configuration as `run --telemetry` (see "Optional Collector acceptance") and also prints `COMPOSE_PROFILES`, `RAG_VERIFY_HARNESS`, `RAG_VERIFY_CHECKOUT`, `RAG_VERIFY_OTEL_ENABLED` and `RAG_VERIFY_TELEMETRY_PIN`. `--telemetry-pin FILE` supplies a reviewed collector pin (see "Evaluating a collector pin change"). `--external-ollama` also prints `RAG_VERIFY_OLLAMA_PORT`, the native Ollama's port (#954). |
 | `stack.sh down` | Removes the project: its containers, network, volumes, images and exports folder. |
 | `stack.sh query-only-mode --package NAME [--checkout DIR]` | Only for `24_query_only.sh`, under the inherited lock of a `run --query-only` (#670): keeps package NAME aside, removes the project's containers, network and volumes (not its images or the model copy), puts the package back alone in an empty exports folder, and starts the project again from the checkout's `docker-compose.query-only.yml`, after the configuration check and without a build, as a second instance on another machine would be. |
 
@@ -31325,14 +31348,29 @@ modes and the `/api/embed` fallback, the tag-exact check, `/health/details`, the
 `python -m ollama_check`, the overlay and `install-offline.sh --external-ollama`). The rest needs
 `stack.sh run --external-ollama`, which runs this suite alone, on a host whose native Ollama is set up as the main
 README's "External Ollama (native)" says, with its models already pulled: `stack.sh` first runs
-`scripts/check-external-ollama.sh --host-only` from the harness (Ollama listening only on loopback, or on Linux the
-`docker0` address; a warning fails the run) and asks the host's Ollama for `/api/version`, before any Docker command;
+`scripts/check-external-ollama.sh --host-only --port <port>` from the harness (Ollama listening only on loopback, or on
+Linux the `docker0` address; a warning fails the run) and asks the host's Ollama for `/api/version`, before any Docker
+command;
 it never installs Ollama or pulls a model, and the model copy isn't used. The guard then allows `extra_hosts` exactly
 `ollama:host-gateway` on api and weaviate, and refuses a configuration that still has an ollama service. The suite
 checks that no ollama service runs, `python -m ollama_check` in the api container, `/health/details` (the version,
 memory `external`, `ollama_loaded`), an ingest (Weaviate embeds through the host's Ollama), the refused export with
 models and an export without them imported back, a reindex, and outside `RAG_SKIP_SLOW=1` `hnsw` and `semantic`
 questions with citations. Its first real run is the tests reviewer's: the fix agent ran only host tests.
+
+The native Ollama's port is `RAG_VERIFY_OLLAMA_PORT` (#954), default 11434, read only with `--external-ollama`: a
+port number from 1 to 65535, or the run stops before any Docker command. It reaches the listener check (`--port`), the
+`/api/version` probe and, through the harness overlay `docker-compose.external-ollama.verify.yml` loaded last, the
+api's `OLLAMA_PORT` and weaviate's `TEXT2VEC_OLLAMA_APIENDPOINT`: host-gateway maps the name `ollama` to the host, not a
+port, so without the overlay the containers would reach port 11434 whatever the setting. That lets a test-only native
+Ollama on its own port serve verify runs while the shared one on 11434 is left alone. `up --external-ollama` prints the
+setting with its other `export` lines; the overlay refuses to resolve without it. `stack.sh run --external-ollama all`
+runs every suite in external-Ollama mode. The checks that need the ollama container skip there, each with an
+"external-Ollama mode:" reason, and the before-release container run covers them: `01_infrastructure`'s exact service
+inventory (and its repeats after the opt-in restarts; suite 26 checks that no ollama service runs),
+`05_transfer`'s E30 mismatch exports (they ask for models, which external mode refuses first) and its #452
+install-then-report check (no ollama container mounts the model copy), and all of `23_llm_split`. The rest of each
+suite runs.
 
 ## Continuous integration
 
@@ -32099,6 +32137,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `lan_stack.py` | the stack checks of `18_lan.sh` in a `--lan` run, one per subcommand (#26) |
 | `../tests/test_lan_mode.py` | API image, no network: `RAG_LAN_MODE` parsing, the startup refusal (also through `import main`), the certificate step, both nginx configurations, `lan_stack.py`'s rate-limit check against faked answers (#598), embedded copies (#26) |
 | `docker-compose.lan.verify.yml` | the harness overlay of a `--lan` run: TLS on loopback at the verify port, the verify image for `tls-init`, reserved test names (#26) |
+| `docker-compose.external-ollama.verify.yml` | the harness overlay of an `--external-ollama` run, loaded last: the api's `OLLAMA_PORT` and weaviate's `TEXT2VEC_OLLAMA_APIENDPOINT` at `RAG_VERIFY_OLLAMA_PORT`, the native Ollama's port (#954) |
 | `16_api_paths.sh` | ingest, query, metrics and health API paths (#399), run last by suite 01: `NO_SUPPORTED_FILES`, `JOB_NOT_FOUND`, schema rules, the proxy's `/api/` timeouts, `/metrics/latency`, a default query and its metric (LLM); opt-in restart and first-start checks |
 | `../tests/test_api_paths.py` | controlled ingest error, `/query` default, §6 prompt, query metric, retrieval-config file, ingest-config file (#515), `/metrics/latency` and `/health` probe regressions (#399), registered by `16_api_paths.sh` |
 | `../tests/test_ollama_entrypoint.py` | `ollama/entrypoint.sh` with stub commands, on the host: skip present models, timed pull, retries (#399), registered by `16_api_paths.sh` |
@@ -32157,7 +32196,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_llm_split.py` | host-only, standard library: `llm_split.py` with stand-ins for `httpx`, `config`, `services` and `time.sleep`: the model pull tried again on a 5xx (3 attempts, waits of 5 s and 10 s) and not on a 4xx or a request error, a failed pull reported as `setup_error` with no task run; and suite 23 turning that into one failed check and no other (#922), registered by suite 23 |
 | `24_query_only.sh` | §2.6 and §10.11 — query-only mode (#670): the overlay resolved without starting it; registers `../tests/test_query_only.py`; the start-up refusal of a non-boolean `RAG_QUERY_ONLY`; the loader's refusal on a full instance; with `stack.sh run --query-only`, build and export, `stack.sh query-only-mode`, then the load, the refusals, access and Q&A on the query-only instance, and a key package loaded with its key file on standard input and refused `KEY_FILE_REQUIRED` without it (#676) |
 | `26_external_ollama.sh` | §2.7 and §10.12 — external-Ollama mode (#673): registers `../tests/test_external_ollama.py` and `../tests/test_check_external_ollama.py`; with `stack.sh run --external-ollama`, no ollama service, `python -m ollama_check`, `/health/details`, ingest through the host's Ollama, the refused export with models, an import back, a reindex and, outside `RAG_SKIP_SLOW`, hnsw and semantic questions |
-| `../tests/test_check_external_ollama.py` | host-side, standard library, run by suite 26 in every run: `scripts/check-external-ollama.sh` with stub `uname`, `lsof`, `ss`, `ip` and `docker`: loopback and docker0 pass, a wildcard or LAN address warns (exit 3), nothing listening fails (exit 1), `--host-only` skips the container check (#673) |
+| `../tests/test_check_external_ollama.py` | host-side, standard library, run by suite 26 in every run: `scripts/check-external-ollama.sh` with stub `uname`, `lsof`, `ss`, `ip` and `docker`: loopback and docker0 pass, a wildcard or LAN address warns (exit 3), nothing listening fails (exit 1), `--host-only` skips the container check (#673), `--port N` checks another port and a bad one is a usage error (#954) |
 | `query_only_config.py` | host-side, standard library: `docker-compose.yml` with and without `docker-compose.query-only.yml` as `docker compose config` resolves them; only the api's `RAG_QUERY_ONLY` may differ (#670) |
 | `../tests/test_query_only.py` | API image, no network (also on the host): `RAG_QUERY_ONLY` parsing, the refused and kept routes, the refusals through the app and their order, `query_only` in the user answers, `lan_mode` in the user answers (#676), the loader (usage, refusals, lock, passphrase, a key package's key file on standard input with `KEY_FILE_REQUIRED` and `KEY_FILE_INVALID` (#676), results `success`/`refused`/`failed`/`interrupted`, the Ctrl-C handler) and the access of a collection it creates (#670) |
 | `25_weaviate_upgrade.sh` | the Weaviate upgrade path (#805), full runs only: the previous Weaviate (`RAG_WEAVIATE_FROM`, else `origin/main`'s pin) writes data on a throwaway volume, the checkout's reads it back, and again after a Raft snapshot and a restart; only on the verify project |
@@ -32988,15 +33027,21 @@ exit "$overall"
 # --external-ollama (#673) runs the verify project in external-Ollama mode (the
 # checkout's docker-compose.external-ollama.yml): no ollama service, and api and
 # weaviate reach an Ollama installed natively on this host as `ollama`, through
-# host-gateway. Before anything else it checks that host the way the README's
-# guide does: scripts/check-external-ollama.sh --host-only must pass with no
+# host-gateway. That Ollama's port is RAG_VERIFY_OLLAMA_PORT (default 11434;
+# #954), so a test-only Ollama on its own port can serve the verify project.
+# Before anything else it checks that host the way the README's guide does:
+# scripts/check-external-ollama.sh --host-only --port <port> must pass with no
 # warning (Ollama listening only on loopback, or on Linux the docker0 address),
-# and that Ollama must answer on port 11434. Nothing here installs Ollama or
+# and that Ollama must answer on that port. Nothing here installs Ollama or
 # pulls a model into it: its models must already be there, or the start fails
-# with the `ollama pull` lines. The model copy is not used. The guard then
-# allows exactly `ollama:host-gateway` as extra_hosts on api and weaviate, and
-# nothing else, and refuses a configuration that still has an ollama service.
-# Without suite names, an --external-ollama run runs 26_external_ollama.
+# with the `ollama pull` lines. The model copy is not used. host-gateway maps a
+# name, not a port, so the harness's docker-compose.external-ollama.verify.yml,
+# loaded last, gives the api OLLAMA_PORT and weaviate its endpoint at that port.
+# The guard then allows exactly `ollama:host-gateway` as extra_hosts on api and
+# weaviate, and nothing else, and refuses a configuration that still has an
+# ollama service. Without suite names, an --external-ollama run runs
+# 26_external_ollama; `run --external-ollama all` runs every suite, and the
+# checks that need the ollama container skip (#954).
 #
 # --telemetry checks the collector image against this checkout's own
 # telemetry/image.json, so a PR that changes the pin is refused. To evaluate
@@ -33119,6 +33164,13 @@ if [ "$CMD" = query-only-mode ]; then
     || fail "query-only-mode needs --package with a package name (ragpkg-*.tar.gz), not '$QO_PACKAGE'."
 fi
 [ "$PIN_SET" = 0 ] || [ "$TELEMETRY" = 1 ] || fail "--telemetry-pin requires --telemetry."
+# `all` (#954): every suite, only as the one suite name of run --external-ollama.
+for arg in ${ARGS[@]+"${ARGS[@]}"}; do
+  if [ "$arg" = all ]; then
+    { [ "$CMD" = run ] && [ "$EXTERNAL" = 1 ] && [ "${#ARGS[@]}" -eq 1 ]; } \
+      || fail "'all' runs every suite, and only as the one suite name of run --external-ollama."
+  fi
+done
 
 PORT="${RAG_VERIFY_PORT:-8081}"
 case "$PORT" in
@@ -33128,6 +33180,19 @@ esac
 PORT=$((10#$PORT))
 { [ "$PORT" -ge 1024 ] && [ "$PORT" -le 65535 ]; } || fail "RAG_VERIFY_PORT must be from 1024 to 65535, not $PORT."
 [ "$PORT" -ne 8080 ] || fail "RAG_VERIFY_PORT can't be 8080: that is the live rag-docker stack's port."
+
+# The native Ollama's port in external-Ollama mode (#954): read only there.
+if [ "$EXTERNAL" = 1 ]; then
+  OLLAMA_PORT="${RAG_VERIFY_OLLAMA_PORT:-11434}"
+  case "$OLLAMA_PORT" in
+    ''|*[!0-9]*) fail "RAG_VERIFY_OLLAMA_PORT must be a port number from 1 to 65535, not '$OLLAMA_PORT'." ;;
+  esac
+  [ "${#OLLAMA_PORT}" -le 5 ] || fail "RAG_VERIFY_OLLAMA_PORT must be a port number from 1 to 65535, not '$OLLAMA_PORT'."
+  OLLAMA_PORT=$((10#$OLLAMA_PORT))
+  { [ "$OLLAMA_PORT" -ge 1 ] && [ "$OLLAMA_PORT" -le 65535 ]; } \
+    || fail "RAG_VERIFY_OLLAMA_PORT must be a port number from 1 to 65535, not '$RAG_VERIFY_OLLAMA_PORT'."
+  export RAG_VERIFY_OLLAMA_PORT="$OLLAMA_PORT"
+fi
 
 if [ "$CMD" != down ]; then
   { [ -d "$CHECKOUT" ] && [ -f "$CHECKOUT/docker-compose.yml" ]; } \
@@ -33141,16 +33206,16 @@ fi
 if [ "$EXTERNAL" = 1 ]; then
   [ -f "$CHECKOUT/docker-compose.external-ollama.yml" ] \
     || fail "--external-ollama needs a checkout with docker-compose.external-ollama.yml: $CHECKOUT"
-  bash "$HARNESS/scripts/check-external-ollama.sh" --host-only \
+  bash "$HARNESS/scripts/check-external-ollama.sh" --host-only --port "$OLLAMA_PORT" \
     || fail "the host's Ollama isn't set up as README \"External Ollama (native)\" says (above): it must listen on loopback, or on Linux the docker0 address, and nowhere else."
   OLLAMA_ADDR=127.0.0.1
   if [ "$(uname -s)" = Linux ]; then
     OLLAMA_ADDR=$(ip -4 -o addr show docker0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
     [ -n "$OLLAMA_ADDR" ] || fail "--external-ollama on Linux needs the docker0 bridge, where Ollama listens."
   fi
-  code=$(command curl -s -o /dev/null -m 5 -w '%{http_code}' "http://$OLLAMA_ADDR:11434/api/version" 2>/dev/null)
+  code=$(command curl -s -o /dev/null -m 5 -w '%{http_code}' "http://$OLLAMA_ADDR:$OLLAMA_PORT/api/version" 2>/dev/null)
   [ "$code" = 200 ] \
-    || fail "no Ollama answers at http://$OLLAMA_ADDR:11434 (HTTP $code). Install and start it as README \"External Ollama (native)\" says, with its models pulled."
+    || fail "no Ollama answers at http://$OLLAMA_ADDR:$OLLAMA_PORT (HTTP $code). Install and start it as README \"External Ollama (native)\" says, with its models pulled."
 fi
 
 # The reviewed collector pin (#532): the evaluator's file, never the checkout's.
@@ -33266,7 +33331,7 @@ export RAG_VERIFY_LAN="$LAN"
 # External-Ollama mode (#673): its configuration from the start.
 export RAG_VERIFY_EXTERNAL_OLLAMA="$EXTERNAL"
 if [ "$EXTERNAL" = 1 ]; then
-  export COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$CHECKOUT/docker-compose.external-ollama.yml:$HARNESS/docker-compose.verify.yml"
+  export COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$CHECKOUT/docker-compose.external-ollama.yml:$HARNESS/docker-compose.verify.yml:$HARNESS/docker-compose.external-ollama.verify.yml"
   GUARD_MODE=external-ollama
 fi
 # Query-only mode's configuration (#670), switched to by query-only-mode.
@@ -33753,6 +33818,9 @@ do_up() {
       printf 'export %s=%q\n' "$var" "${!var}"
     done
   fi
+  if [ "$EXTERNAL" = 1 ]; then
+    printf 'export %s=%q\n' RAG_VERIFY_OLLAMA_PORT "$RAG_VERIFY_OLLAMA_PORT"
+  fi
   if [ "$TELEMETRY" = 1 ]; then
     for var in COMPOSE_PROFILES RAG_VERIFY_HARNESS RAG_VERIFY_CHECKOUT RAG_VERIFY_OTEL_ENABLED RAG_VERIFY_TELEMETRY_PIN; do
       printf 'export %s=%q\n' "$var" "${!var}"
@@ -33782,8 +33850,13 @@ case "$CMD" in
     [ "$LAN" = 0 ] || [ "${#ARGS[@]}" -gt 0 ] || ARGS=(18_lan)
     # A query-only run checks query-only mode (#670).
     [ "$QUERY_ONLY" = 0 ] || [ "${#ARGS[@]}" -gt 0 ] || ARGS=(24_query_only)
-    # An external-Ollama run checks external-Ollama mode (#673).
-    [ "$EXTERNAL" = 0 ] || [ "${#ARGS[@]}" -gt 0 ] || ARGS=(26_external_ollama)
+    # An external-Ollama run checks external-Ollama mode (#673), or with `all`
+    # runs every suite (#954): all.sh with no names.
+    if [ "$EXTERNAL" = 1 ] && [ "${ARGS[*]-}" = all ]; then
+      ARGS=()
+    elif [ "$EXTERNAL" = 1 ] && [ "${#ARGS[@]}" -eq 0 ]; then
+      ARGS=(26_external_ollama)
+    fi
     # In the background with job control on, all.sh leads a process group of
     # its own (pgid $!), which stop_suite ends; and `wait`, unlike a foreground
     # command, returns as soon as INT or TERM arrives, so the traps act at once.
@@ -40969,7 +41042,7 @@ sys.exit(0 if any('reported by the external Ollama' in n for n in notes) else 1)
 check "the import checked the embedding model through the external Ollama" $? "$(head -c 400 /tmp/vfy_eo.json)"
 imported=$(jfield "['collection']" < /tmp/vfy_eo.json)
 
-section "Reindex keeps the stored endpoint (http://ollama:11434)"
+section "Reindex keeps the stored endpoint (http://ollama:${RAG_VERIFY_OLLAMA_PORT:-11434})"
 api_post "/tune/reindex" "{\"collection\":\"$C\"}" > /tmp/vfy_eo.json
 rjob=$(jfield "['job_id']" < /tmp/vfy_eo.json)
 check_eq "a reindex of the collection completes" "$([ -n "$rjob" ] && wait_for_job "/tune/job/$rjob" 1800 || echo "refused: $(head -c 200 /tmp/vfy_eo.json)")" "completed"
@@ -41004,8 +41077,10 @@ exit $?
 #
 #   bash scripts/check-external-ollama.sh              # on the host, from anywhere
 #   bash scripts/check-external-ollama.sh --host-only  # only the listener check
+#   bash scripts/check-external-ollama.sh --port N     # another port (default 11434)
 #
-# 1. On this host (macOS or Linux): what listens on TCP port 11434. Ollama has
+# 1. On this host (macOS or Linux): what listens on TCP port 11434 (or --port N,
+#    as stack.sh --external-ollama passes RAG_VERIFY_OLLAMA_PORT, #954). Ollama has
 #    no authentication, so it should listen only where Docker reaches it:
 #    loopback (127.0.0.1, ::1) with Docker Desktop, and on Linux the docker0
 #    bridge address too, which is safe only with the README's firewall rule (it
@@ -41024,20 +41099,25 @@ exit $?
 set -uo pipefail
 
 usage() {
-  sed -n '5,6p' "${BASH_SOURCE[0]}" | sed 's/^#  //' >&2
+  sed -n '5,7p' "${BASH_SOURCE[0]}" | sed 's/^#  //' >&2
   exit 2
 }
 
 HOST_ONLY=0
+PORT=11434
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --host-only) HOST_ONLY=1; shift ;;
+    --port) [ "$#" -ge 2 ] || usage; PORT="$2"; shift 2 ;;
     -h|--help) usage ;;
     *) usage ;;
   esac
 done
 
-PORT=11434
+case "$PORT" in ''|*[!0-9]*) usage ;; esac
+[ "${#PORT}" -le 5 ] || usage
+PORT=$((10#$PORT))
+{ [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ]; } || usage
 WARNINGS=0
 PROBLEMS=0
 say() { printf 'check-external-ollama: %s: %s\n' "$1" "$2"; }
@@ -41877,17 +41957,17 @@ SCRIPT = ROOT / 'scripts/check-external-ollama.sh'
 LSOF_HEADER = 'COMMAND   PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME'
 
 
-def lsof_line(address):
-    return 'ollama  4242 mike    3u  IPv4 0x1234567890abcdef      0t0  TCP {}:11434 (LISTEN)'.format(address)
+def lsof_line(address, port=11434):
+    return 'ollama  4242 mike    3u  IPv4 0x1234567890abcdef      0t0  TCP {}:{} (LISTEN)'.format(address, port)
 
 
-def ss_line(address):
-    return 'LISTEN 0      4096      {}:11434      0.0.0.0:*'.format(address)
+def ss_line(address, port=11434):
+    return 'LISTEN 0      4096      {}:{}      0.0.0.0:*'.format(address, port)
 
 
 class HelperTests(unittest.TestCase):
     def run_helper(self, os_name, listening, *args, docker0='172.17.0.1', tools=('lsof', 'ss', 'ip'),
-                   docker_status=0, compose_file=None):
+                   docker_status=0, compose_file=None, port=11434):
         folder = Path(tempfile.mkdtemp())
         self.addCleanup(lambda: __import__('shutil').rmtree(folder, ignore_errors=True))
         log = folder / 'log'
@@ -41897,10 +41977,10 @@ class HelperTests(unittest.TestCase):
                       'echo "ollama-check: ok: stub"; exit {}'.format(log, log, docker_status),
         }
         if 'lsof' in tools:
-            body = '\n'.join([LSOF_HEADER] + [lsof_line(a) for a in listening]) if listening else ''
+            body = '\n'.join([LSOF_HEADER] + [lsof_line(a, port) for a in listening]) if listening else ''
             stubs['lsof'] = 'cat <<\'EOF\'\n{}\nEOF'.format(body) if body else 'exit 1'
         if 'ss' in tools:
-            body = '\n'.join(ss_line(a) for a in listening)
+            body = '\n'.join(ss_line(a, port) for a in listening)
             stubs['ss'] = 'cat <<\'EOF\'\n{}\nEOF'.format(body) if body else 'exit 0'
         if 'ip' in tools:
             stubs['ip'] = ('echo "4: docker0    inet {}/16 brd 172.17.255.255 scope global docker0"'.format(docker0)
@@ -41933,6 +42013,35 @@ class HelperTests(unittest.TestCase):
         self.assertIn('ok: Ollama listens on ::1:11434 (loopback)', out.stdout)
         self.assertIn('docker compose exec -T api python -m ollama_check', calls)
         self.assertIn('COMPOSE_FILE=docker-compose.yml:docker-compose.external-ollama.yml', calls)
+
+    # --port N (#954): stack.sh --external-ollama passes RAG_VERIFY_OLLAMA_PORT.
+    def test_another_port_is_checked_and_named(self):
+        for os_name in ('Darwin', 'Linux'):
+            with self.subTest(os=os_name):
+                out, calls = self.run_helper(os_name, ['127.0.0.1'], '--host-only', '--port', '11435', port=11435)
+                self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+                self.assertIn('ok: Ollama listens on 127.0.0.1:11435 (loopback)', out.stdout)
+                self.assertEqual(calls, '')
+        out, _ = self.run_helper('Linux', ['0.0.0.0'], '--host-only', '--port', '11435', port=11435)
+        self.assertEqual(out.returncode, 3, out.stdout)
+        self.assertIn('warning: Ollama listens on every address (0.0.0.0:11435)', out.stdout)
+
+    def test_a_listener_on_the_default_port_only_is_nothing_on_another(self):
+        out, _ = self.run_helper('Darwin', ['127.0.0.1'], '--host-only', '--port', '11435')
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn('problem: nothing listens on port 11435', out.stdout)
+        self.assertIn('sudo lsof -nP -iTCP:11435 -sTCP:LISTEN', out.stdout)
+        self.assertNotIn('11434', out.stdout)
+
+    def test_a_bad_port_is_a_usage_error(self):
+        for args in (['--port', 'abc'], ['--port', '0'], ['--port', '70000'], ['--port', '123456'],
+                     ['--port', ''], ['--port', '-1'], ['--port']):
+            with self.subTest(args=args):
+                out, calls = self.run_helper('Darwin', ['127.0.0.1'], '--host-only', *args)
+                self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+                self.assertIn('--port N', out.stderr)
+                self.assertEqual(out.stdout, '')
+                self.assertEqual(calls, '')
 
     def test_a_wildcard_is_a_warning(self):
         for os_name, address in (('Darwin', '*'), ('Linux', '0.0.0.0'), ('Linux', '[::]'), ('Linux', '*')):
@@ -50024,8 +50133,15 @@ verify_service_inventory() {
     "$RAG_INFRA_TMP/vfy_compose.json" "$RAG_INFRA_TMP/vfy_running_services" "$RAG_INFRA_TMP/vfy_all_services" \
     --mode "${RAG_VERIFY_TELEMETRY:-0}" --project "${COMPOSE_PROJECT_NAME:-}" --profiles "${COMPOSE_PROFILES:-}"
 }
-verify_service_inventory
-check "exact configured and running service inventory for verification mode" $?
+# External-Ollama mode (#954) has no ollama service, so this inventory doesn't
+# apply there; each inventory check below skips in that mode.
+INVENTORY_SKIP="external-Ollama mode: there is no ollama service, so the default mode's inventory doesn't apply; suite 26 checks that none runs, and the before-release container run checks the inventory (#954)"
+if [ "${RAG_VERIFY_EXTERNAL_OLLAMA:-0}" = 1 ]; then
+  skip "exact configured and running service inventory for verification mode" "$INVENTORY_SKIP"
+else
+  verify_service_inventory
+  check "exact configured and running service inventory for verification mode" $?
+fi
 unhealthy=$( (cd "$REPO_ROOT" && docker compose ps --format '{{.Status}}') | grep -c 'unhealthy' || true)
 check_eq "no service reports unhealthy" "$unhealthy" "0"
 
@@ -50136,8 +50252,12 @@ elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
   # Wait up to twice the limit, so a slow restart is still timed (#130).
   elapsed=$(wait_healthy_timed "$started" $((restart_limit * 2)))
   restart_timing_check "$restart_limit" "$elapsed"
-  verify_service_inventory
-  check "exact service inventory survives restart" $?
+  if [ "${RAG_VERIFY_EXTERNAL_OLLAMA:-0}" = 1 ]; then
+    skip "exact service inventory survives restart" "$INVENTORY_SKIP"
+  else
+    verify_service_inventory
+    check "exact service inventory survives restart" $?
+  fi
   api_get "/collections" > "$RAG_INFRA_TMP/vfy_after.json"
   python3 -c "
 import json,sys,os
@@ -50228,8 +50348,12 @@ ENDPY
   elapsed=$(wait_healthy_timed "$started" $((restart_limit * 2)))
   [ -n "$elapsed" ]
   check "healthy again after a restart from the snapshot (took ${elapsed:-unknown}s)" $? "not healthy after $((restart_limit * 2))s"
-  verify_service_inventory
-  check "exact service inventory survives snapshot restart" $?
+  if [ "${RAG_VERIFY_EXTERNAL_OLLAMA:-0}" = 1 ]; then
+    skip "exact service inventory survives snapshot restart" "$INVENTORY_SKIP"
+  else
+    verify_service_inventory
+    check "exact service inventory survives snapshot restart" $?
+  fi
   # Weaviate logs the snapshot it started from on "raft node constructed".
   restored=$( (cd "$REPO_ROOT" && docker compose -p "$project" logs weaviate 2>/dev/null) | python3 -c "
 import json, sys
@@ -53379,6 +53503,13 @@ sys.exit(0 if model and coll.get("embedding_model") == model == man["embedding"]
 ENDPY
 check "E30: a matching collection records its stored model in collection.json and the manifest" $? "$(tail -1 /tmp/vfy_e30_match.txt)"
 
+# E30's mismatch exports ask for models, which external-Ollama mode refuses
+# before the mismatch check (MODELS_NOT_EXPORTABLE, suite 26), so they skip
+# there (#954). The block below is not indented: it holds a heredoc.
+if [ "${RAG_VERIFY_EXTERNAL_OLLAMA:-0}" = 1 ]; then
+  skip "E30: exports of mismatched collections refuse with the re-embedding remedy and leave nothing behind" \
+    "external-Ollama mode: these exports ask for models, which external mode refuses first (MODELS_NOT_EXPORTABLE, checked by suite 26); the before-release container run covers them (#954)"
+else
 # Collections the API would never create: an equal-width vector from another
 # model's name, a named-vector schema, and no vectorizer. Each export must fail
 # with the re-embedding remedy and leave nothing in the exports folder.
@@ -53428,6 +53559,7 @@ for e30c in "$E30_DRIFT" "$E30_NAMED" "$E30_NONE"; do
 done
 e30_collections drop >/dev/null 2>&1
 check "E30: mismatch fixtures removed" $?
+fi
 
 # ── corruption is detected ───────────────────────────────────────────────────
 python3 - "$EXPORTS/$PKG" <<'ENDPY'
@@ -54137,6 +54269,12 @@ e27c=$(m e27_collection); [ -n "$e27c" ] && [ "$e27c" != "None" ] && [ "$e27c" !
 # that one manifest is written. It runs only when both the api and ollama
 # containers mount rag-verify-ollama-models, never the live volume; stack.sh's
 # copy sync removes anything left behind on the next `up`.
+# External-Ollama mode (#954): there is no ollama container or model copy to
+# install into. The block below is not indented: it holds a heredoc.
+if [ "${RAG_VERIFY_EXTERNAL_OLLAMA:-0}" = 1 ]; then
+  skip "a model installed from a bundle is reported by Ollama's /api/tags (#452)" \
+    "external-Ollama mode: no ollama container mounts the verify model copy, and rag-docker never writes a model in an external Ollama (#673); the before-release container run covers it (#954)"
+else
 alias_mounts=$(cd "$REPO_ROOT" && for mount in api:/ollama ollama:/root/.ollama; do
   docker inspect -f "{{range .Mounts}}{{if eq .Destination \"${mount#*:}\"}}{{.Name}}{{end}}{{end}}" \
     "$(docker compose ps -q "${mount%%:*}")" 2>/dev/null
@@ -54193,6 +54331,7 @@ ENDPY
 else
   check "the install-then-report check runs only on the verify model copy" 1 \
     "api and ollama must both mount rag-verify-ollama-models; found: '${alias_mounts}'"
+fi
 fi
 
 # ── tuning ───────────────────────────────────────────────────────────────────

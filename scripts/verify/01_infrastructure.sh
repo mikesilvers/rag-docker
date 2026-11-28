@@ -172,8 +172,15 @@ verify_service_inventory() {
     "$RAG_INFRA_TMP/vfy_compose.json" "$RAG_INFRA_TMP/vfy_running_services" "$RAG_INFRA_TMP/vfy_all_services" \
     --mode "${RAG_VERIFY_TELEMETRY:-0}" --project "${COMPOSE_PROJECT_NAME:-}" --profiles "${COMPOSE_PROFILES:-}"
 }
-verify_service_inventory
-check "exact configured and running service inventory for verification mode" $?
+# External-Ollama mode (#954) has no ollama service, so this inventory doesn't
+# apply there; each inventory check below skips in that mode.
+INVENTORY_SKIP="external-Ollama mode: there is no ollama service, so the default mode's inventory doesn't apply; suite 26 checks that none runs, and the before-release container run checks the inventory (#954)"
+if [ "${RAG_VERIFY_EXTERNAL_OLLAMA:-0}" = 1 ]; then
+  skip "exact configured and running service inventory for verification mode" "$INVENTORY_SKIP"
+else
+  verify_service_inventory
+  check "exact configured and running service inventory for verification mode" $?
+fi
 unhealthy=$( (cd "$REPO_ROOT" && docker compose ps --format '{{.Status}}') | grep -c 'unhealthy' || true)
 check_eq "no service reports unhealthy" "$unhealthy" "0"
 
@@ -284,8 +291,12 @@ elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
   # Wait up to twice the limit, so a slow restart is still timed (#130).
   elapsed=$(wait_healthy_timed "$started" $((restart_limit * 2)))
   restart_timing_check "$restart_limit" "$elapsed"
-  verify_service_inventory
-  check "exact service inventory survives restart" $?
+  if [ "${RAG_VERIFY_EXTERNAL_OLLAMA:-0}" = 1 ]; then
+    skip "exact service inventory survives restart" "$INVENTORY_SKIP"
+  else
+    verify_service_inventory
+    check "exact service inventory survives restart" $?
+  fi
   api_get "/collections" > "$RAG_INFRA_TMP/vfy_after.json"
   python3 -c "
 import json,sys,os
@@ -376,8 +387,12 @@ ENDPY
   elapsed=$(wait_healthy_timed "$started" $((restart_limit * 2)))
   [ -n "$elapsed" ]
   check "healthy again after a restart from the snapshot (took ${elapsed:-unknown}s)" $? "not healthy after $((restart_limit * 2))s"
-  verify_service_inventory
-  check "exact service inventory survives snapshot restart" $?
+  if [ "${RAG_VERIFY_EXTERNAL_OLLAMA:-0}" = 1 ]; then
+    skip "exact service inventory survives snapshot restart" "$INVENTORY_SKIP"
+  else
+    verify_service_inventory
+    check "exact service inventory survives snapshot restart" $?
+  fi
   # Weaviate logs the snapshot it started from on "raft node constructed".
   restored=$( (cd "$REPO_ROOT" && docker compose -p "$project" logs weaviate 2>/dev/null) | python3 -c "
 import json, sys

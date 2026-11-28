@@ -943,6 +943,14 @@ class StackArgumentTests(unittest.TestCase):
             (['run', '--external-ollama', '--lan'], {}),
             (['up', '--telemetry', '--external-ollama'], {}),
             (['run', '--query-only', '--external-ollama'], {}),
+            # #954: the native Ollama's port is a port number, checked before any
+            # Docker or curl call; `all` is the one suite name of run --external-ollama.
+            *[(['up', '--external-ollama'], {'RAG_VERIFY_OLLAMA_PORT': value})
+              for value in ('abc', '0', '70000', '+11435', '123456', '11 435')],
+            (['run', 'all'], {}),
+            (['run', '--external-ollama', 'all', '02'], {}),
+            (['run', '--external-ollama', '02', 'all'], {}),
+            (['run', '--lan', 'all'], {}),
             (['bogus'], {}),
             ([], {}),
         ]
@@ -957,12 +965,12 @@ class StackArgumentTests(unittest.TestCase):
 class ExternalOllamaPreflightTests(unittest.TestCase):
     """#673: --external-ollama checks the host's Ollama before any Docker command."""
 
-    def sandbox(self, listening, curl_code):
+    def sandbox(self, listening, curl_code, port='11434'):
         box = Sandbox(self)
         stubs = {
             'uname': 'echo Darwin',
             'lsof': ('printf "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\\n'
-                     'ollama 1 u 3u IPv4 0x1 0t0 TCP %s:11434 (LISTEN)\\n" ' + listening) if listening else 'exit 1',
+                     'ollama 1 u 3u IPv4 0x1 0t0 TCP %s:' + port + ' (LISTEN)\\n" ' + listening) if listening else 'exit 1',
         }
         for name, body in stubs.items():
             path = box.bin / name
@@ -995,6 +1003,152 @@ class ExternalOllamaPreflightTests(unittest.TestCase):
         self.assertFalse([c for c in docker if 'rag-docker_ollama_models' in ' '.join(c)])
         self.assertIn(['compose', '-p', 'rag-verify', 'exec', '-T', 'api', 'python', '-m', 'ollama_check'], docker)
         self.assertTrue([c for c in docker if 'build' in c])
+
+    # #954: the native Ollama's port comes from RAG_VERIFY_OLLAMA_PORT.
+    def probes(self, box):
+        return [c[-1] for c in box.calls() if c[0] == 'curl' and c[-1].endswith('/api/version')]
+
+    def test_the_port_setting_reaches_the_listener_check_and_the_probe(self):
+        box = self.sandbox('127.0.0.1', '000', port='11435')
+        result = box.run(['bash', str(STACK), 'up', '--external-ollama'], RAG_VERIFY_OLLAMA_PORT='11435')
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('ok: Ollama listens on 127.0.0.1:11435 (loopback)', result.stdout)
+        self.assertIn('no Ollama answers at http://127.0.0.1:11435', result.stderr)
+        self.assertEqual(self.probes(box), ['http://127.0.0.1:11435/api/version'])
+        self.assertEqual([c for c in box.calls() if c[0] == 'docker'], [])
+
+    def test_a_listener_on_another_port_is_refused_before_docker(self):
+        box = self.sandbox('127.0.0.1', '200', port='11434')
+        result = box.run(['bash', str(STACK), 'up', '--external-ollama'], RAG_VERIFY_OLLAMA_PORT='11435')
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('nothing listens on port 11435', result.stdout + result.stderr)
+        self.assertEqual(self.probes(box), [])
+        self.assertEqual([c for c in box.calls() if c[0] == 'docker'], [])
+
+    def exports_of_up(self, port_setting, port):
+        box = self.sandbox('127.0.0.1', '200', port=port)
+        (box.root / 'config.json').write_text(json.dumps(external_config(ROOT, box.exports)))
+        env = {'STUB_UP_OK': '1'}
+        if port_setting is not None:
+            env['RAG_VERIFY_OLLAMA_PORT'] = port_setting
+        result = box.run(['bash', str(STACK), 'up', '--external-ollama'], **env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        exports = dict(line[len('export '):].split('=', 1) for line in result.stdout.splitlines()
+                       if line.startswith('export '))
+        return box, exports
+
+    def test_up_loads_the_port_overlay_last_and_prints_the_port(self):
+        # Leading zeros are normalised, as RAG_VERIFY_PORT's are.
+        for setting, port in (('11435', '11435'), ('09435', '9435'), (None, '11434'), ('', '11434')):
+            with self.subTest(setting=setting):
+                box, exports = self.exports_of_up(setting, port)
+                self.assertEqual(exports.get('RAG_VERIFY_OLLAMA_PORT'), port)
+                files = shlex.split(exports['COMPOSE_FILE'])[0].split(':')
+                self.assertEqual(files[-1], str(ROOT / 'docker-compose.external-ollama.verify.yml'))
+                self.assertEqual(files[-2], str(ROOT / 'docker-compose.verify.yml'))
+                self.assertEqual(self.probes(box), ['http://127.0.0.1:%s/api/version' % port])
+
+    def test_the_port_setting_is_ignored_without_external_ollama(self):
+        box = Sandbox(self)
+        result = box.run(['bash', str(STACK), 'down'], RAG_VERIFY_OLLAMA_PORT='abc')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        box = Sandbox(self)
+        (box.root / 'config.json').write_text(json.dumps(passing_config(ROOT, box.exports)))
+        result = box.run(['bash', str(STACK), 'up'], RAG_VERIFY_OLLAMA_PORT='abc', STUB_UP_OK='1', STUB_CURL_CODE='200')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn('RAG_VERIFY_OLLAMA_PORT', result.stdout)
+        self.assertNotIn('external-ollama.verify.yml', result.stdout)
+
+
+class ExternalOllamaSuiteSetTests(unittest.TestCase):
+    """#954: run --external-ollama all runs every suite; no names, suite 26 only."""
+
+    def run_with(self, *names):
+        box = ExternalOllamaPreflightTests.sandbox(self, '127.0.0.1', '200')
+        checkout = box.root / 'checkout'
+        (checkout / 'scripts/verify').mkdir(parents=True)
+        (checkout / 'docker-compose.yml').write_text('services: {}\n')
+        (checkout / 'docker-compose.external-ollama.yml').write_text('services: {}\n')
+        (checkout / 'scripts/verify/all.sh').write_text('echo "all.sh args=[$*] port=$RAG_VERIFY_OLLAMA_PORT"\n')
+        (box.root / 'config.json').write_text(json.dumps(external_config(checkout, box.exports)))
+        result = box.run(['bash', str(STACK), 'run', '--external-ollama', '--checkout', str(checkout), *names],
+                         STUB_UP_OK='1')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result.stdout
+
+    def test_all_no_names_and_named_suites(self):
+        for names, expected in ((['all'], 'all.sh args=[] port=11434'),
+                                ([], 'all.sh args=[26_external_ollama] port=11434'),
+                                (['02', '05'], 'all.sh args=[02 05] port=11434')):
+            with self.subTest(names=names):
+                self.assertIn(expected, self.run_with(*names))
+
+
+class ExternalOllamaVerifyOverlayTests(unittest.TestCase):
+    """#954: the harness overlay gives the api and weaviate the native Ollama's
+    port from RAG_VERIFY_OLLAMA_PORT, and nothing else."""
+
+    PATH = ROOT / 'docker-compose.external-ollama.verify.yml'
+    VALUE = '${RAG_VERIFY_OLLAMA_PORT:?set by scripts/verify/stack.sh}'
+
+    def test_it_sets_only_the_two_port_values(self):
+        text = self.PATH.read_text()
+        if yaml is None:
+            self.assertIn('OLLAMA_PORT: "%s"' % self.VALUE, text)
+            self.assertIn('TEXT2VEC_OLLAMA_APIENDPOINT: "http://ollama:%s"' % self.VALUE, text)
+            return
+        data = yaml.safe_load(text)
+        self.assertEqual(data, {'services': {
+            'api': {'environment': {'OLLAMA_PORT': self.VALUE}},
+            'weaviate': {'environment': {'TEXT2VEC_OLLAMA_APIENDPOINT': 'http://ollama:' + self.VALUE}}}})
+
+
+class ExternalOllamaContainerOnlySkipTests(unittest.TestCase):
+    """#954: in external-Ollama mode the checks that need the ollama container
+    skip with a reason (01's exact inventory, 05's E30 mismatch exports and the
+    #452 install-then-report check); the rest of each suite runs."""
+
+    GATE = 'if [ "${RAG_VERIFY_EXTERNAL_OLLAMA:-0}" = 1 ]; then'
+
+    def gated(self, suite, needle):
+        """Each line holding needle sits in the else branch of the nearest
+        external-Ollama gate above it, whose then branch is a skip whose reason
+        starts "external-Ollama mode:" (directly or through $INVENTORY_SKIP)."""
+        text = (VERIFY / suite).read_text()
+        lines = text.splitlines()
+        hits = [i for i, line in enumerate(lines) if needle in line]
+        self.assertTrue(hits, f'{needle!r} not found in {suite}')
+        for i in hits:
+            gate = max((j for j in range(i) if lines[j].strip() == self.GATE), default=None)
+            self.assertIsNotNone(gate, f'{suite}:{i + 1} has no external-Ollama gate above it')
+            indent = lines[gate][:len(lines[gate]) - len(lines[gate].lstrip())]
+            between = lines[gate + 1:i]
+            closers = [k for k, line in enumerate(between) if line == indent + 'fi']
+            self.assertEqual(closers, [], f'{suite}:{i + 1} is past its gate\'s fi')
+            other = [k for k, line in enumerate(between) if line == indent + 'else']
+            self.assertEqual(len(other), 1, f'{suite}:{i + 1} is not in the gate\'s else branch')
+            then = '\n'.join(between[:other[0]]).strip()
+            self.assertTrue(then.startswith('skip '), f'{suite}:{gate + 1}: the then branch is not a skip')
+            if '"$INVENTORY_SKIP"' in then:
+                self.assertIn('INVENTORY_SKIP="external-Ollama mode:', text)
+            else:
+                self.assertIn('"external-Ollama mode:', then)
+
+    def test_01_inventory_checks(self):
+        lines = (VERIFY / '01_infrastructure.sh').read_text()
+        self.assertIn('INVENTORY_SKIP="external-Ollama mode: there is no ollama service', lines)
+        self.assertEqual(lines.count('\n  verify_service_inventory\n') + lines.count('\n    verify_service_inventory\n'), 3)
+        self.gated('01_infrastructure.sh', 'check "exact configured and running service inventory')
+        self.gated('01_infrastructure.sh', 'check "exact service inventory survives')
+        self.gated('01_infrastructure.sh', '  verify_service_inventory')
+        self.assertIn('test_service_inventory.py', lines.split(self.GATE)[0], 'the policy unit check still runs')
+
+    def test_05_e30_and_452(self):
+        self.gated('05_transfer.sh', '"include_models\\":true')
+        self.gated('05_transfer.sh', 'alias_mounts=$(cd')
+        text = (VERIFY / '05_transfer.sh').read_text()
+        self.assertIn('E30: a matching collection records its stored model', text.split(self.GATE)[0],
+                      "E30's matching-collection check runs in every mode")
 
 
 class StackDockerCallTests(unittest.TestCase):
