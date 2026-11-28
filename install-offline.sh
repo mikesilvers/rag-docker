@@ -93,7 +93,7 @@ if [ "$running" != "$EXPECTED" ]; then
 fi
 
 echo
-echo "If the requested services are up, open http://localhost:8080"
+echo "The requested services are up: open http://localhost:8080"
 if [ "$EXTERNAL" = 1 ]; then
   echo "On the Ollama host, pull the models rag-docker uses (it never pulls them itself):"
   # Read from the base file alone: the overlay leaves the ollama service out,
